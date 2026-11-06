@@ -1015,14 +1015,16 @@ impl App {
                 }
                 None => self.set_status("No point here: Enter adds one"),
             },
-            Key::Char('/') => {
-                if self.edit(Edit::SetLane { track, lane, target, ramp: !ramp }) {
-                    self.set_status(if ramp { "Lane holds each point" } else { "Lane ramps between points" });
-                }
-            }
-            Key::Char('-') => {
-                if self.edit(Edit::SetLane { track, lane, target: None, ramp: false }) {
-                    self.set_status(format!("Removed lane {} (u brings it back)", self.lane + 1));
+            Key::Char(c @ ('/' | '-')) => {
+                let (edit, status) = if c == '/' {
+                    let s = if ramp { "Lane holds each point" } else { "Lane ramps between points" };
+                    (Edit::SetLane { track, lane, target, ramp: !ramp }, s.to_string())
+                } else {
+                    let s = format!("Removed lane {} (u brings it back)", self.lane + 1);
+                    (Edit::SetLane { track, lane, target: None, ramp: false }, s)
+                };
+                if self.edit(edit) {
+                    self.set_status(status);
                 }
             }
             _ => {}

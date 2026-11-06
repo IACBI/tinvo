@@ -510,9 +510,7 @@ impl Track {
         for p in &mut self.steps {
             p.fill(None);
         }
-        for l in &mut self.lanes {
-            *l = Lane::EMPTY;
-        }
+        self.lanes.fill(Lane::EMPTY);
         self.base = base_params(kind);
         self.gain_db = 0.0;
         self.pan = 0.0;
