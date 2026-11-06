@@ -67,7 +67,7 @@ Known limits, planned for later phases:
 - Song-position markers and export ranges between them.
 - Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
 
-## Phase 4a: Channel strip ✅ (0.7.0, this release)
+## Phase 4a: Channel strip ✅ (0.7.0)
 
 - Every track: high-pass, low shelf, mid bell, high shelf (RBJ cookbook biquads in `f64`), a feed-forward compressor with a soft knee, and `tanh` drive with first-order antiderivative antialiasing (measured on a driven 4.5 kHz sine: folded-back energy −34 dB against −25 dB for a plain `tanh`).
 - Parameters glide over about 20 ms on a 32-frame tick kept in the strip's state, so output does not depend on buffer size; neutral settings bypass the strip bit-exactly.
@@ -80,12 +80,27 @@ Known limits:
 - There is no gain-reduction meter yet.
 - Drive's antialiasing averages neighbouring samples in its linear region, a high-frequency roll-off of −3 dB at a quarter of the sample rate (12 kHz at 48 kHz); oversampled drive would avoid it.
 
-## Phase 4b: Effects and buses
+## Phase 4b: Effect buses and master ✅ (0.8.0, this release)
 
-- Send/return buses with delay (tempo-synced), algorithmic reverb and chorus.
-- Sidechain input for the compressor.
-- Master chain: true-peak limiter, LUFS loudness metering (ITU-R BS.1770), oversampled processing where it reduces aliasing.
-- Gain-reduction and output meters for the strip.
+- Post-fader sends on every track to a delay bus and a reverb bus.
+- Delay: tempo-synced note values, feedback with a low-pass in the loop, stereo or ping-pong; time changes glide instead of jumping.
+- Reverb: an eight-line feedback delay network with a Hadamard mixing matrix, prime line lengths, per-line damping and four input diffusers; decay time is measured within 15 % of the setting (T30, Schroeder integration).
+- Master: a stereo-linked true-peak limiter (look-ahead with a running minimum and a moving average, so the ceiling holds without the gain ever stepping), compensated in exports.
+- Export reports integrated loudness (BS.1770-4, checked against EBU Tech 3341 cases 1 and 2) and true peak.
+- Buses that receive nothing and have fallen silent cost nothing; projects without sends render bit-exactly as in 0.7.0.
+- Demo with buses and limiter: about 1.7 % of one core (`tinvo bench`), from 1.3 %.
+- Project format 8.
+
+Known limits:
+- Bus and master settings cannot be automated yet, and change at once rather than gliding (except the delay time and the return levels).
+- The true-peak estimate is a 4× interpolation with a 12-tap kernel: within 0.15 dB up to 12 kHz, but up to 0.5 dB low around 18 kHz (at 48 kHz), so material with strong content up there can peak slightly above the ceiling.
+
+## Phase 4c: More mixing
+
+- Chorus on a third bus, sidechain input for the compressor.
+- Gain-reduction and loudness meters in the editor.
+- Automation of bus and master settings.
+- Oversampled drive.
 
 ## Phase 5: Devices and I/O
 

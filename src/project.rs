@@ -3,13 +3,14 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 7
+//! tinvo 8
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
 //! master_gain_db 0
 //! song A A A B               # only when the song is not empty
 //! loop 2 3                   # song entries, 0-based; only when set
+//! mix reverb_decay 2.4       # buses and master; only values off their default
 //!
 //! track kick
 //! name Kick
@@ -18,7 +19,7 @@
 //! mute false
 //! solo false
 //! param decay 0.45
-//! param eq_mid_gain -3       # channel strip; only values off their default
+//! param eq_mid_gain -3       # channel strip and sends; only values off their default
 //! lane 0 decay ramp          # lane, parameter id (or volume, pan), hold or ramp
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! point 0 0 0.2              # lane step value
@@ -34,7 +35,7 @@
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
-//! 6 (no channel strip) are still read.
+//! 6 (no channel strip) and 7 (no sends or buses) are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
@@ -43,11 +44,12 @@ use crate::engine::{
     MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::mix::{MIX_PARAMS, mp, send};
 use crate::strip::{sp, track_param, track_param_count};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -138,6 +140,8 @@ pub struct Project {
     pub song: Vec<u8>,
     /// Song entries `start..=end` that repeat while the song plays.
     pub loop_region: Option<(u16, u16)>,
+    /// Bus and master settings (see [`MIX_PARAMS`]).
+    pub mix: [f32; mp::COUNT],
 }
 
 impl Default for Project {
@@ -212,6 +216,7 @@ impl Project {
             tracks: Vec::new(),
             song: Vec::new(),
             loop_region: None,
+            mix: MIX_PARAMS.map(|p| p.default),
         }
     }
 
@@ -294,6 +299,16 @@ impl Project {
                 (sp::DRIVE, 4.0),
             ],
         );
+        // Room on the snare and clap, echoes on the open hat and the clap,
+        // and the limiter on the master.
+        let sends = sp::COUNT;
+        strip(1, &[(sends + send::REVERB, -12.0)]);
+        strip(3, &[(sends + send::DELAY, -14.0)]);
+        strip(4, &[(sends + send::REVERB, -9.0), (sends + send::DELAY, -20.0)]);
+        p.mix[mp::REVERB_DECAY] = 1.2;
+        p.mix[mp::LIMITER] = 1.0;
+        // 3 dB hotter, with the limiter catching the kick's peaks.
+        p.master_gain_db = 3.0;
         p.song = vec![0, 0, 0, 1];
         p
     }
@@ -401,6 +416,12 @@ impl Project {
                 self.track_mut(track)?.lanes[usize::from(lane)].points[usize::from(pattern)][usize::from(step)] = value;
                 Edit::SetPoint { track, lane, pattern, step, value }
             }
+            Edit::SetMixParam { index, value } => {
+                let spec = MIX_PARAMS.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                let value = spec.clamp(value);
+                self.mix[usize::from(index)] = value;
+                Edit::SetMixParam { index, value }
+            }
             Edit::SetParam { track, index, value } => {
                 let tr = self.track_mut(track)?;
                 let spec = track_param(tr.kind, usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
@@ -492,6 +513,9 @@ impl Project {
             e.push(Edit::InsertSongEntry { index: i as u16, pattern });
         }
         e.push(Edit::SetLoop(self.loop_region));
+        for (index, &value) in self.mix.iter().enumerate() {
+            e.push(Edit::SetMixParam { index: index as u8, value });
+        }
         for (i, t) in self.tracks.iter().enumerate() {
             e.push(Edit::AddTrack(t.kind));
             push_track_state(&mut e, i as u8, t);
@@ -531,6 +555,10 @@ impl Project {
                 vec![Edit::SetLoop(self.loop_region)]
             }
             Edit::SetMasterGain(_) => vec![Edit::SetMasterGain(self.master_gain_db)],
+            Edit::SetMixParam { index, .. } => {
+                let value = *self.mix.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                vec![Edit::SetMixParam { index, value }]
+            }
             Edit::AddTrack(_) => {
                 if self.tracks.len() >= MAX_TRACKS {
                     return Err(EditError::TooManyTracks);
@@ -610,6 +638,11 @@ impl Project {
         if let Some((a, b)) = self.loop_region {
             let _ = writeln!(s, "loop {a} {b}");
         }
+        for (spec, &v) in MIX_PARAMS.iter().zip(&self.mix) {
+            if v != spec.default {
+                let _ = writeln!(s, "mix {} {v}", spec.id);
+            }
+        }
         for t in &self.tracks {
             let _ = writeln!(s, "\ntrack {}", t.kind.id());
             let _ = writeln!(s, "name {}", sanitize_name(&t.name));
@@ -623,7 +656,8 @@ impl Project {
             let n = t.kind.params().len();
             for (i, v) in t.params.iter().enumerate() {
                 let spec = track_param(t.kind, i).expect("one value per parameter");
-                // The strip is neutral by default; only settings are written.
+                // The strip and the sends are neutral by default; only
+                // settings are written.
                 if i < n || *v != spec.default {
                     let _ = writeln!(s, "param {} {}", spec.id, v);
                 }
@@ -725,8 +759,7 @@ impl Project {
                         if k >= MAX_LANES {
                             return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
                         }
-                        // Strip parameters exist from format 7 on.
-                        let count = if ver >= 7 { track_param_count(t.kind) } else { t.kind.params().len() };
+                        let count = params_in_format(t.kind, ver);
                         let target = (0..2 + count as u8)
                             .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
@@ -759,8 +792,7 @@ impl Project {
                         let (id, value) = rest
                             .split_once(char::is_whitespace)
                             .ok_or_else(|| err("expected 'param <id> <value>'".into()))?;
-                        // Strip parameters exist from format 7 on.
-                        let count = if ver >= 7 { track_param_count(t.kind) } else { t.kind.params().len() };
+                        let count = params_in_format(t.kind, ver);
                         let (i, spec) = (0..count)
                             .filter_map(|i| track_param(t.kind, i).map(|s| (i, s)))
                             .find(|(_, s)| s.id == id)
@@ -857,6 +889,16 @@ impl Project {
                     p.loop_region = Some(r);
                 }
                 "master_gain_db" => p.master_gain_db = parse_in(rest, &VOLUME).map_err(err)?,
+                "mix" if ver >= 8 => {
+                    let (id, value) = rest
+                        .split_once(char::is_whitespace)
+                        .ok_or_else(|| err("expected 'mix <id> <value>'".into()))?;
+                    let i = MIX_PARAMS
+                        .iter()
+                        .position(|s| s.id == id)
+                        .ok_or_else(|| err(format!("unknown mix parameter '{id}'")))?;
+                    p.mix[i] = parse_in(value.trim(), &MIX_PARAMS[i]).map_err(err)?;
+                }
                 "track" => {
                     let kind =
                         InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?;
@@ -957,6 +999,16 @@ fn parse_chord(text: &str) -> Result<[u8; MAX_CHORD - 1], String> {
 
 /// Appends the edits that give track `track` (already created with the right
 /// kind and default state) the settings and steps of `t`.
+/// How many track parameters a file of format `ver` can name: the strip
+/// arrived in format 7, the sends in 8.
+fn params_in_format(kind: InstrumentKind, ver: u32) -> usize {
+    match ver {
+        8.. => track_param_count(kind),
+        7 => kind.params().len() + sp::COUNT,
+        _ => kind.params().len(),
+    }
+}
+
 fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     for (index, &value) in t.params.iter().enumerate() {
         e.push(Edit::SetParam { track, index: index as u8, value });
@@ -1039,7 +1091,7 @@ mod tests {
         p.song = vec![0, 15, 2, 2, 1];
         p.loop_region = Some((1, 3));
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 7\n"));
+        assert!(text.starts_with("tinvo 8\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
         assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
@@ -1063,10 +1115,23 @@ mod tests {
         let n = q.tracks[0].kind.params().len();
         q.apply(Edit::SetParam { track: 0, index: (n + sp::MID_GAIN) as u8, value: 99.0 }).unwrap();
         assert_eq!(q.tracks[0].params[n + sp::MID_GAIN], 18.0);
+        let past = (n + sp::COUNT + send::COUNT) as u8;
+        assert_eq!(q.apply(Edit::SetParam { track: 0, index: past, value: 0.0 }), Err(EditError::NoSuchParam(past)));
+        // Sends and bus settings: only those set are written, and they load.
+        assert!(text.contains("param send_reverb -12\n") && !text.contains("param send_delay -60"), "{text}");
+        assert!(text.contains("\nmix reverb_decay 1.2\nmix limiter 1\n") && !text.contains("mix delay_time"), "{text}");
+        q.apply(Edit::SetMixParam { index: mp::DELAY_TIME as u8, value: 3.0 }).unwrap();
+        let q2 = Project::from_text(&q.to_text()).unwrap();
+        assert_eq!(q2.mix[mp::DELAY_TIME], 3.0);
         assert_eq!(
-            q.apply(Edit::SetParam { track: 0, index: (n + sp::COUNT) as u8, value: 0.0 }),
-            Err(EditError::NoSuchParam((n + sp::COUNT) as u8))
+            q.inverse(&Edit::SetMixParam { index: 0, value: 1.0 }),
+            Ok(vec![Edit::SetMixParam { index: 0, value: 3.0 }])
         );
+        assert_eq!(q.apply(Edit::SetMixParam { index: 99, value: 0.0 }), Err(EditError::NoSuchParam(99)));
+        // Format 7 knows neither sends nor mix lines.
+        for text in ["tinvo 7\ntrack kick\nparam send_delay -6\nend", "tinvo 7\nmix limiter 1"] {
+            assert!(Project::from_text(text).is_err(), "{text}");
+        }
     }
 
     #[test]
@@ -1130,9 +1195,10 @@ mod tests {
         let mut p = Project::demo();
         let lane = |lane, target| Edit::SetLane { track: 0, lane, target, ramp: false };
         assert_eq!(p.apply(lane(4, Some(0))), Err(EditError::NoSuchLane(4)));
-        // The kick has 4 instrument and 14 strip parameters: indices 0..20,
-        // so 6 is the strip's first.
-        assert_eq!(p.apply(lane(0, Some(20))), Err(EditError::NoSuchTarget(20)));
+        // The kick has 4 instrument parameters, 14 strip parameters and 2
+        // sends after volume and pan: targets 0..22, so 6 is the strip's first.
+        assert_eq!(p.apply(lane(0, Some(22))), Err(EditError::NoSuchTarget(22)));
+        assert_eq!(target_spec(p.tracks[0].kind, 21).map(|s| s.id), Some("send_reverb"));
         assert_eq!(target_spec(p.tracks[0].kind, 6).map(|s| s.id), Some("hp_freq"));
         p.apply(lane(0, Some(3))).unwrap();
         assert_eq!(p.apply(lane(1, Some(3))), Err(EditError::DuplicateLane));
@@ -1347,7 +1413,7 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 8", 1, "version"),
+            ("tinvo 9", 1, "version"),
             ("tinvo 6\ntrack kick\nparam eq_mid_gain 3\nend", 3, "unknown parameter"),
             ("tinvo 6\ntrack kick\nlane 0 hp_freq hold\nend", 3, "unknown parameter 'hp_freq'"),
             ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),

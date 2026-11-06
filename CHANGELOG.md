@@ -6,6 +6,19 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-06
+
+### Added
+- Two effect buses fed by sends on every track: a tempo-synced delay (1/32 to 1/2, straight, dotted and triplet; feedback, a tone low-pass in the feedback path, stereo or ping-pong) and an algorithmic reverb (an eight-line feedback delay network with decay time, damping and pre-delay). Sends are taken after the fader and pan, so mute, solo and fader moves apply to them.
+- A true-peak limiter on the master: 1.5 ms look-ahead, ceiling and release, 4× oversampled peak detection. Exports compensate its look-ahead, so they still start on the first beat; with it off, nothing in the signal path changes.
+- `tinvo render` and the in-app export report integrated loudness (ITU-R BS.1770-4, gated, in LUFS) and the true peak alongside the sample peak.
+- `f` now steps through three panel pages: instrument, channel strip (now with the two sends) and buses and master. Send levels can be automated; bus and master settings cannot yet.
+- The demo sends its snare and clap to the reverb and its open hat and clap to the delay, and runs 3 dB hotter into the limiter.
+
+### Changed
+- Project files are now format 8, which adds `send_delay` and `send_reverb` parameters and `mix <id> <value>` lines; only settings away from their defaults are written. Formats 1–7 still load and sound exactly as before.
+- Stems are taken before the master limiter and carry their own share of the delay and reverb returns.
+
 ## [0.7.0] - 2026-11-06
 
 ### Added
@@ -101,7 +114,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/IACBI/tinvo/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/IACBI/tinvo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/IACBI/tinvo/compare/v0.4.0...v0.5.0

@@ -9,11 +9,15 @@
 pub mod biquad;
 pub mod drive;
 pub mod dynamics;
+pub mod echo;
 pub mod env;
 pub mod fft;
 pub mod filter;
+pub mod limiter;
+pub mod loudness;
 pub mod noise;
 pub mod osc;
+pub mod reverb;
 pub mod smooth;
 
 /// `ln(1000)`: the number of nepers in 60 dB.

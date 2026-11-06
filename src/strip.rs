@@ -12,6 +12,7 @@ use crate::dsp::biquad::{Biquad, Coefs, Shape};
 use crate::dsp::drive::Drive;
 use crate::dsp::dynamics::Compressor;
 use crate::instrument::{InstrumentKind, ParamSpec, Unit};
+use crate::mix::{SEND_PARAMS, send};
 
 /// Parameter indices.
 pub mod sp {
@@ -55,15 +56,22 @@ pub static PARAMS: [ParamSpec; sp::COUNT] = [
     ParamSpec::linear("drive", "Drive", 0.0, 24.0, 0.0, 0.5, Unit::Decibels),
 ];
 
-/// A track's parameters: the instrument's, then the strip's.
+/// A track's parameters: the instrument's, then the strip's, then its
+/// sends.
 pub fn track_param(kind: InstrumentKind, index: usize) -> Option<&'static ParamSpec> {
     let n = kind.params().len();
-    if index < n { kind.params().get(index) } else { PARAMS.get(index - n) }
+    if index < n {
+        kind.params().get(index)
+    } else if index < n + sp::COUNT {
+        PARAMS.get(index - n)
+    } else {
+        SEND_PARAMS.get(index - n - sp::COUNT)
+    }
 }
 
 /// Number of [`track_param`]s of a track of `kind`.
 pub fn track_param_count(kind: InstrumentKind) -> usize {
-    kind.params().len() + sp::COUNT
+    kind.params().len() + sp::COUNT + send::COUNT
 }
 
 /// Frames between parameter updates.
@@ -343,8 +351,9 @@ mod tests {
             assert_eq!(a.clamp(a.default), a.default);
         }
         let k = InstrumentKind::Kick;
-        assert_eq!(track_param_count(k), k.params().len() + sp::COUNT);
+        assert_eq!(track_param_count(k), k.params().len() + sp::COUNT + send::COUNT);
         assert_eq!(track_param(k, k.params().len()).unwrap().id, "hp_freq");
+        assert_eq!(track_param(k, k.params().len() + sp::COUNT).unwrap().id, "send_delay");
         assert!(track_param(k, track_param_count(k)).is_none());
     }
 

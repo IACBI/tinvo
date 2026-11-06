@@ -7,12 +7,14 @@
 
 use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
+use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
 use crate::engine::{
     Command, Edit, Engine, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS,
     MIN_SWING, PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::mix;
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::spsc::{self, Consumer, Producer};
@@ -182,6 +184,7 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetPan { track, .. } => (7, track, 0, 0),
         Edit::SetSongEntry { index, .. } => (8, (index >> 8) as u8, index as u8, 0),
         Edit::SetPoint { track, lane, pattern, step, .. } => (9 + lane, track, pattern, step),
+        Edit::SetMixParam { index, .. } => (9 + MAX_LANES as u8, index, 0, 0),
         _ => return None,
     })
 }
@@ -206,8 +209,24 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetPan { .. } => "pan",
         Edit::SetMute { .. } => "mute",
         Edit::SetSolo { .. } => "solo",
+        Edit::SetMixParam { .. } => "bus or master setting",
     }
 }
+
+/// Pages of the parameter panel, in the order `f` steps through them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    /// Volume, pan and the instrument's parameters.
+    Instrument,
+    /// Volume, pan, the channel strip and the sends.
+    Strip,
+    /// The buses and the master, shared by all tracks.
+    Mix,
+}
+
+/// Panel index of the first bus and master parameter; lower indices are
+/// volume, pan and the track's parameters.
+const MIX_INDEX: usize = 1 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -260,8 +279,8 @@ pub struct App {
     pub auto_view: bool,
     /// Lane under the cursor in the automation view.
     pub lane: usize,
-    /// The parameter panel shows the channel strip instead of the instrument.
-    pub strip_page: bool,
+    /// What the parameter panel shows.
+    pub page: Page,
     pub export_format: SampleFormat,
     pub export_loops: u32,
     /// What export plays; `Pattern` means the pattern being edited.
@@ -321,7 +340,7 @@ impl App {
             song_cursor: 0,
             auto_view: false,
             lane: 0,
-            strip_page: false,
+            page: Page::Instrument,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
             export_source: Source::Auto,
@@ -741,18 +760,24 @@ impl App {
         self.lane = self.lane.min(MAX_LANES - 1);
         let page = self.page_params();
         if !page.contains(&self.param) {
-            self.param = if self.param < 2 { self.param } else { page.get(2).copied().unwrap_or(0) };
+            self.param = page.iter().copied().find(|&p| p >= 2).unwrap_or(0);
         }
     }
 
-    /// The parameters on the panel's current page: volume and pan, then
-    /// the instrument's or the strip's. Parameter indices run over volume,
-    /// pan, the instrument's and the strip's, and are also automation
-    /// targets.
+    /// The parameters on the panel's current page. Indices below
+    /// [`MIX_INDEX`] run over volume, pan, the instrument's, the strip's and
+    /// the sends, and are also automation targets; the bus and master
+    /// parameters follow from [`MIX_INDEX`].
     fn page_params(&self) -> Vec<usize> {
+        if self.page == Page::Mix {
+            return (MIX_INDEX..MIX_INDEX + mix::mp::COUNT).collect();
+        }
         let Some(t) = self.project.tracks.get(self.track) else { return Vec::new() };
         let n = t.kind.params().len();
-        let rest = if self.strip_page { 2 + n..2 + n + strip::sp::COUNT } else { 2..2 + n };
+        let rest = match self.page {
+            Page::Strip => 2 + n..2 + strip::track_param_count(t.kind),
+            _ => 2..2 + n,
+        };
         [0, 1].into_iter().chain(rest).collect()
     }
 
@@ -760,11 +785,15 @@ impl App {
         match i {
             0 => &VOLUME,
             1 => &PAN,
+            MIX_INDEX.. => &mix::MIX_PARAMS[i - MIX_INDEX],
             _ => track_param(self.project.tracks[self.track].kind, i - 2).expect("parameter index in range"),
         }
     }
 
     fn param_value(&self, i: usize) -> f32 {
+        if i >= MIX_INDEX {
+            return self.project.mix[i - MIX_INDEX];
+        }
         let t = &self.project.tracks[self.track];
         match i {
             0 => t.gain_db,
@@ -778,6 +807,7 @@ impl App {
         let e = match i {
             0 => Edit::SetGain { track, db: value },
             1 => Edit::SetPan { track, pan: value },
+            MIX_INDEX.. => Edit::SetMixParam { index: (i - MIX_INDEX) as u8, value },
             _ => Edit::SetParam { track, index: (i - 2) as u8, value },
         };
         self.edit_with(e, coalesce);
@@ -900,15 +930,18 @@ impl App {
             }
             Key::Char('?') | Key::F(1) => self.mode = Mode::Help,
             Key::Char('f') => {
-                self.strip_page = !self.strip_page;
+                let (page, status) = match self.page {
+                    Page::Instrument => {
+                        (Page::Strip, "Channel strip: high-pass, EQ, compressor, drive, sends (f: buses and master)")
+                    }
+                    Page::Strip => (Page::Mix, "Buses and master: delay, reverb, limiter (f: instrument)"),
+                    Page::Mix => (Page::Instrument, "Instrument parameters (f: channel strip)"),
+                };
+                self.page = page;
                 if self.param >= 2 {
-                    self.param = self.page_params().get(2).copied().unwrap_or(0);
+                    self.param = self.page_params().into_iter().find(|&p| p >= 2).unwrap_or(0);
                 }
-                self.set_status(if self.strip_page {
-                    "Channel strip: high-pass, EQ, compressor, drive (f: instrument)"
-                } else {
-                    "Instrument parameters (f: channel strip)"
-                });
+                self.set_status(status);
             }
             Key::Char('q') | Key::Ctrl('c') | Key::Ctrl('q') => {
                 if self.dirty {
@@ -962,6 +995,14 @@ impl App {
                 None => self.set_status("Nothing copied yet (y copies a pattern)"),
             },
             Key::Char('X') => self.replace_pattern(None, "clear pattern"),
+            // The buses and master need no track.
+            _ if self.track_count() == 0
+                && !self.song_view
+                && self.focus == Focus::Params
+                && self.page == Page::Mix =>
+            {
+                self.key_params(key);
+            }
             // The rest acts on the selected track, which the song view hides.
             _ if self.track_count() == 0 || self.song_view => {}
             Key::Char('D') => self.mode = Mode::Confirm(Confirm::DeleteTrack),
@@ -988,6 +1029,9 @@ impl App {
                 } else {
                     self.set_status("Samples load into sampler tracks (a, 7 adds one)");
                 }
+            }
+            Key::Char('A') if self.focus == Focus::Params && self.param >= MIX_INDEX => {
+                self.set_status("Bus and master settings cannot be automated yet");
             }
             Key::Char('A') if self.focus == Focus::Params => self.automate_param(self.param),
             Key::Char('A') => {
@@ -1334,8 +1378,12 @@ impl App {
         };
         let started = Instant::now();
         let samples = self.track_samples();
+        let mut meter = ExportMeter::new(self.sample_rate);
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
-            let frames = render::render_into(&self.project, &samples, &opts, &mut |b| file.write(b))?;
+            let frames = render::render_into(&self.project, &samples, &opts, &mut |b| {
+                meter.push(b);
+                file.write(b)
+            })?;
             Ok((frames, file.finish()?))
         });
         match result {
@@ -1347,12 +1395,12 @@ impl App {
                     String::new()
                 };
                 self.set_status(format!(
-                    "Exported {:.1} s {} to {} in {:.2} s (peak {:.1} dBFS{clip})",
+                    "Exported {:.1} s {} to {} in {:.2} s ({}{clip})",
                     secs,
                     self.export_format.label(),
                     path.display(),
                     started.elapsed().as_secs_f32(),
-                    gain_to_db(stats.peak),
+                    meter.finish().summary(),
                 ));
             }
             Err(e) => self.set_status(format!("Export failed: {e}")),
@@ -1701,25 +1749,35 @@ impl App {
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
         let dim = Style::fg(Color::Gray);
         s.fill(0, y, w, '─', dim);
-        let Some(t) = self.project.tracks.get(self.track) else { return };
-        let page = if self.strip_page { " · channel strip" } else { "" };
-        let title = match (&t.sample, t.kind) {
-            (Some(path), _) => {
-                let file = Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
-                let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
-                format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
+        let track = self.project.tracks.get(self.track);
+        let title = match (self.page, track) {
+            // Shared by all tracks, so shown with or without one.
+            (Page::Mix, _) => " Buses & master (all tracks) ".to_string(),
+            (_, None) => return,
+            (page, Some(t)) => {
+                let page = if page == Page::Strip { " · channel strip" } else { "" };
+                match (&t.sample, t.kind) {
+                    (Some(path), _) => {
+                        let file =
+                            Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+                        let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
+                        format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
+                    }
+                    (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o{page} ", t.name),
+                    (None, kind) => format!(" {} · {}{page} ", t.name, kind.label()),
+                }
             }
-            (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o{page} ", t.name),
-            (None, kind) => format!(" {} · {}{page} ", t.name, kind.label()),
         };
         let title_style =
             if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
         s.put(2, y, &title, title_style);
-        let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
-            Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
-            None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
-        };
-        s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
+        if let Some(t) = track.filter(|_| self.page != Page::Mix) {
+            let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
+                Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
+                None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
+            };
+            s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
+        }
         let cols = (w / PARAM_COL).max(1) as usize;
         for (slot, i) in self.page_params().into_iter().enumerate() {
             let (row, col) = (slot / cols, slot % cols);
@@ -1786,7 +1844,7 @@ impl App {
                                 "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  - = chance  / ratchet  u undo  Space play  ? help"
                             }
                             Focus::Params => {
-                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  f strip  A automate  m mute  s solo  Tab grid  ? help"
+                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  f page  A automate  m mute  s solo  Tab grid  ? help"
                             }
                         },
                         Style::fg(Color::Gray).on(Color::Black),
@@ -1829,7 +1887,7 @@ fn draw_help(s: &mut Screen) {
         ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
-        ("f", "parameter panel: instrument or channel strip (high-pass, EQ, compressor, drive)"),
+        ("f", "parameter panel: instrument, channel strip (EQ, compressor, drive, sends), buses and master"),
         ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
         ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
         ("w  Ctrl+S", "save (W: save as)"),
@@ -2100,7 +2158,7 @@ mod tests {
         let kind = a.project.tracks[0].kind;
         let n = kind.params().len();
         keys(&mut a, &[Key::Tab, Key::Down, Key::Down, Key::Char('f')]);
-        assert!(a.strip_page);
+        assert_eq!(a.page, Page::Strip);
         // The page starts at the strip's first parameter, after volume and pan.
         assert_eq!(a.param, 2 + n);
         assert_eq!(a.param_spec(a.param).id, "hp_freq");
@@ -2123,11 +2181,52 @@ mod tests {
         // Strip parameters can be automated like any other.
         keys(&mut a, &[Key::Char('A')]);
         assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == Some(2 + index as u8)).count(), 1);
-        // Back to the instrument page; the cursor follows.
-        keys(&mut a, &[Key::Tab, Key::Char('f')]);
-        assert!(!a.strip_page && a.param == 2);
+        // On through the buses back to the instrument page; the cursor follows.
+        keys(&mut a, &[Key::Tab, Key::Char('f'), Key::Char('f')]);
+        assert!(a.page == Page::Instrument && a.param == 2);
         keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
         assert_eq!(a.project.tracks[0].params[index], 0.0);
+    }
+
+    #[test]
+    fn the_buses_and_master_page() {
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a =
+            App::new(Project::demo(), None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "t".into());
+        keys(&mut a, &[Key::Tab, Key::Down, Key::Down, Key::Char('f'), Key::Char('f')]);
+        assert_eq!(a.page, Page::Mix);
+        assert_eq!(a.param_spec(a.param).id, "delay_time");
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Buses & master") && text.contains("1/8D") && text.contains("Reverb decay"), "{text}");
+        assert!(!text.contains("Volume"), "{text}");
+        while rx.pop().is_some() {}
+        keys(&mut a, &[Key::Right]);
+        assert_eq!(a.project.mix[mix::mp::DELAY_TIME], 7.0);
+        let mut got = None;
+        while let Some(cmd) = rx.pop() {
+            if let Command::Edit(e) = cmd {
+                got = Some(e);
+            }
+        }
+        assert_eq!(got, Some(Edit::SetMixParam { index: mix::mp::DELAY_TIME as u8, value: 7.0 }));
+        // Shared settings have no automation lanes.
+        let lanes = a.project.tracks[0].lanes.clone();
+        keys(&mut a, &[Key::Char('A')]);
+        assert_eq!(a.project.tracks[0].lanes, lanes);
+        assert!(a.status_text().is_some_and(|t| t.contains("cannot be automated")));
+        keys(&mut a, &[Key::Tab, Key::Char('u')]);
+        assert_eq!(a.project.mix[mix::mp::DELAY_TIME], 6.0);
+        // The page works on a project without tracks too.
+        let mut b = App::new(Project::new(), None, None, 48_000, "t".into());
+        keys(&mut b, &[Key::Char('f'), Key::Char('f'), Key::Tab, Key::Right]);
+        assert_eq!(b.page, Page::Mix);
+        assert_eq!(b.project.mix[mix::mp::DELAY_TIME], 7.0);
+        let mut s = Screen::new(120, 40);
+        b.draw(&mut s);
+        let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Buses & master") && text.contains("1/4T"), "{text}");
     }
 
     #[test]

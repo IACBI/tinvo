@@ -17,6 +17,7 @@ use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
+use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
@@ -278,6 +279,12 @@ pub enum Edit {
         track: u8,
         solo: bool,
     },
+    /// Sets a parameter of the buses or the master (see
+    /// [`mix::MIX_PARAMS`]).
+    SetMixParam {
+        index: u8,
+        value: f32,
+    },
 }
 
 /// Messages from the UI to the audio thread.
@@ -491,6 +498,8 @@ struct Track {
     solo: bool,
     gain_l: Smoother,
     gain_r: Smoother,
+    /// Send levels, applied after fader and pan.
+    sends: [Smoother; send::COUNT],
     offs: [PendingOff; MAX_PENDING_OFFS],
     off_count: usize,
     ons: [PendingOn; MAX_PENDING_ONS],
@@ -514,6 +523,7 @@ impl Track {
             solo: false,
             gain_l: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             gain_r: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
+            sends: [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT],
             offs: [PendingOff { frame: 0, voice: VoiceId::NONE }; MAX_PENDING_OFFS],
             off_count: 0,
             ons: [PendingOn { frame: 0, step: Step::new(0, 1, 1), gate: 0 }; MAX_PENDING_ONS],
@@ -540,6 +550,7 @@ impl Track {
         self.solo = false;
         self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.gain_r = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
+        self.sends = [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT];
         self.off_count = 0;
         self.on_count = 0;
         self.peak = 0.0;
@@ -568,8 +579,10 @@ impl Track {
         let n = self.instrument.kind().params().len();
         if i < n {
             self.instrument.set_param(i, value);
-        } else {
+        } else if i < n + strip::sp::COUNT {
             self.strip.set_param(i - n, value);
+        } else if let Some(spec) = mix::SEND_PARAMS.get(i - n - strip::sp::COUNT) {
+            self.sends[i - n - strip::sp::COUNT].set_target(mix::level_gain(spec.clamp(value)));
         }
     }
 
@@ -655,7 +668,7 @@ impl Track {
 }
 
 /// Most parameters a track has: its instrument's and its strip's.
-const MAX_TRACK_PARAMS: usize = MAX_PARAMS + strip::sp::COUNT;
+const MAX_TRACK_PARAMS: usize = MAX_PARAMS + strip::sp::COUNT + send::COUNT;
 
 fn base_params(kind: InstrumentKind) -> [f32; MAX_TRACK_PARAMS] {
     let mut b = [0.0; MAX_TRACK_PARAMS];
@@ -705,6 +718,8 @@ pub struct Engine {
     mix_l: [f32; BLOCK],
     mix_r: [f32; BLOCK],
     scratch: [f32; BLOCK],
+    /// Effect buses and the master limiter.
+    mix: Mix,
     commands: Option<Consumer<Command>>,
     shared: Arc<Shared>,
     /// Decides step chances. Re-seeded on every Play so a pattern with
@@ -745,6 +760,7 @@ impl Engine {
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             scratch: [0.0; BLOCK],
+            mix: Mix::new(sample_rate, 120.0, BLOCK),
             commands,
             shared,
             rng: Rng::new(CHANCE_SEED),
@@ -771,6 +787,12 @@ impl Engine {
 
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Frames by which the output lags the sequencer (the master limiter's
+    /// look-ahead while it is on).
+    pub fn latency(&self) -> usize {
+        self.mix.latency()
     }
 
     /// Routes every sample the engine releases from now on to `queue`.
@@ -803,7 +825,12 @@ impl Engine {
             t.gain_l.snap(l);
             t.gain_r.snap(r);
             t.strip.snap();
+            for s in &mut t.sends {
+                let v = s.target();
+                s.snap(v);
+            }
         }
+        self.mix.snap();
     }
 
     /// Handles one command immediately.
@@ -897,6 +924,7 @@ impl Engine {
             Edit::SetTempo(bpm) => {
                 self.tempo = bpm.clamp(MIN_TEMPO, MAX_TEMPO);
                 self.transport.set_tempo(self.tempo, self.sample_rate, self.now);
+                self.mix.set_tempo(self.tempo);
             }
             Edit::SetPatternLength { pattern, len } => {
                 if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
@@ -1029,6 +1057,7 @@ impl Engine {
                     self.update_gains();
                 }
             }
+            Edit::SetMixParam { index, value } => self.mix.set_param(usize::from(index), value),
         }
     }
 
@@ -1210,6 +1239,7 @@ impl Engine {
         debug_assert!(n <= BLOCK && out.len() % 2 == 0);
         self.mix_l[..n].fill(0.0);
         self.mix_r[..n].fill(0.0);
+        self.mix.begin(n);
         let start = self.now;
         let end = start + n as u64;
         let mut pos = start;
@@ -1234,16 +1264,18 @@ impl Engine {
             pos = next;
         }
         self.now = end;
+        self.mix.add_returns(&mut self.mix_l[..n], &mut self.mix_r[..n], n);
 
-        let (mut pl, mut pr) = (0.0f32, 0.0f32);
         for i in 0..n {
             let g = self.master.tick();
-            let l = self.mix_l[i] * g;
-            let r = self.mix_r[i] * g;
-            out[2 * i] = l;
-            out[2 * i + 1] = r;
-            pl = pl.max(l.abs());
-            pr = pr.max(r.abs());
+            out[2 * i] = self.mix_l[i] * g;
+            out[2 * i + 1] = self.mix_r[i] * g;
+        }
+        self.mix.master(out);
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for f in out.chunks_exact(2) {
+            pl = pl.max(f[0].abs());
+            pr = pr.max(f[1].abs());
         }
         if pl.is_finite() && pr.is_finite() {
             self.shared.master_peaks[0].fetch_max_non_negative(pl);
@@ -1252,19 +1284,42 @@ impl Engine {
     }
 
     fn render_segment(&mut self, a: usize, b: usize) {
-        let Self { tracks, track_count, scratch, mix_l, mix_r, .. } = self;
+        let Self { tracks, track_count, scratch, mix_l, mix_r, mix, .. } = self;
         for t in &mut tracks[..*track_count] {
             let buf = &mut scratch[a..b];
             buf.fill(0.0);
             t.instrument.render(buf);
             t.strip.process(buf);
             let mut peak = t.peak;
-            for (i, &s) in buf.iter().enumerate() {
-                let l = s * t.gain_l.tick();
-                let r = s * t.gain_r.tick();
-                mix_l[a + i] += l;
-                mix_r[a + i] += r;
-                peak = peak.max(l.abs()).max(r.abs());
+            let sending = t.sends.map(|s| s.current() != 0.0 || s.target() != 0.0);
+            if sending.contains(&true) {
+                let [delay, reverb] = mix.inputs(sending);
+                for (i, &s) in buf.iter().enumerate() {
+                    let l = s * t.gain_l.tick();
+                    let r = s * t.gain_r.tick();
+                    mix_l[a + i] += l;
+                    mix_r[a + i] += r;
+                    peak = peak.max(l.abs()).max(r.abs());
+                    let j = 2 * (a + i);
+                    if sending[send::DELAY] {
+                        let g = t.sends[send::DELAY].tick();
+                        delay[j] += l * g;
+                        delay[j + 1] += r * g;
+                    }
+                    if sending[send::REVERB] {
+                        let g = t.sends[send::REVERB].tick();
+                        reverb[j] += l * g;
+                        reverb[j + 1] += r * g;
+                    }
+                }
+            } else {
+                for (i, &s) in buf.iter().enumerate() {
+                    let l = s * t.gain_l.tick();
+                    let r = s * t.gain_r.tick();
+                    mix_l[a + i] += l;
+                    mix_r[a + i] += r;
+                    peak = peak.max(l.abs()).max(r.abs());
+                }
             }
             if peak.is_finite() {
                 t.peak = peak;
@@ -1938,6 +1993,39 @@ mod tests {
         let b = run(&mut later, 6000);
         assert!(a.iter().any(|x| x.abs() > 1e-3));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sends_feed_the_buses_after_the_fader() {
+        use crate::mix::mp;
+        let n = InstrumentKind::HatClosed.params().len();
+        let send_delay = (n + strip::sp::COUNT + send::DELAY) as u8;
+        let edits = [
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::SetPan { track: 0, pan: -0.5 },
+            // A quarter note at 120 BPM is 24000 frames; one clean repeat.
+            Edit::SetMixParam { index: mp::DELAY_TIME as u8, value: 8.0 },
+            Edit::SetMixParam { index: mp::DELAY_FEEDBACK as u8, value: 0.0 },
+            Edit::SetMixParam { index: mp::DELAY_MODE as u8, value: 0.0 },
+        ];
+        let render = |extra: &[Edit]| {
+            let mut e = engine(&[&edits[..], extra].concat());
+            e.handle(Command::Play);
+            run(&mut e, 30_000)
+        };
+        let dry = render(&[]);
+        let wet = render(&[Edit::SetParam { track: 0, index: send_delay, value: 0.0 }]);
+        // The repeat is the panned, faded hit, a beat later.
+        let worst = (0..2 * 6000).map(|k| (wet[48_000 + k] - dry[48_000 + k] - dry[k]).abs()).fold(0.0f32, f32::max);
+        assert!(dry[..2 * 6000].iter().any(|v| v.abs() > 0.01));
+        assert!(worst < 1e-6, "{worst}");
+        // A muted track sends nothing.
+        let muted = render(&[
+            Edit::SetParam { track: 0, index: send_delay, value: 0.0 },
+            Edit::SetMute { track: 0, mute: true },
+        ]);
+        assert!(muted.iter().all(|&v| v == 0.0));
     }
 
     #[test]

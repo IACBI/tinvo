@@ -12,6 +12,8 @@ use std::f64::consts::PI;
 pub enum Shape {
     /// 12 dB/octave high-pass with quality `q`.
     HighPass { q: f64 },
+    /// 12 dB/octave low-pass with quality `q`.
+    LowPass { q: f64 },
     /// Bell boosting or cutting `gain_db` around the frequency.
     Peak { gain_db: f64, q: f64 },
     /// Shelf below the frequency (slope 1, the steepest without overshoot).
@@ -43,6 +45,10 @@ impl Coefs {
             Shape::HighPass { q } => {
                 let alpha = sin / (2.0 * q);
                 ((1.0 + cos) / 2.0, -(1.0 + cos), (1.0 + cos) / 2.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
+            }
+            Shape::LowPass { q } => {
+                let alpha = sin / (2.0 * q);
+                ((1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha)
             }
             Shape::Peak { gain_db, q } => {
                 let a = 10f64.powf(gain_db / 40.0);
@@ -76,6 +82,11 @@ impl Coefs {
             }
         };
         Coefs { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+    }
+
+    /// Coefficients given directly, already divided by `a0`.
+    pub const fn normalized(b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> Self {
+        Coefs { b0, b1, b2, a1, a2 }
     }
 
     /// Magnitude response in dB at `freq` Hz.
@@ -205,6 +216,19 @@ mod tests {
         assert!((slope + 12.0).abs() < 0.2, "{slope}");
         assert!(c.response_db(5000.0, SR).abs() < 0.01);
         assert!((measured_db(c, 50.0) - c.response_db(50.0, SR)).abs() < 0.05);
+    }
+
+    #[test]
+    fn low_pass_is_3_db_down_at_the_corner_and_rolls_off() {
+        let c = Coefs::new(Shape::LowPass { q: std::f64::consts::FRAC_1_SQRT_2 }, 2000.0, SR);
+        assert!((c.response_db(2000.0, SR) + 3.01).abs() < 0.01);
+        assert!(c.response_db(20.0, SR).abs() < 0.01);
+        assert!((measured_db(c, 2000.0) + 3.01).abs() < 0.05);
+        // 12 dB per octave well above the corner (and well below Nyquist,
+        // where the bilinear transform's zero steepens it further).
+        let c = Coefs::new(Shape::LowPass { q: std::f64::consts::FRAC_1_SQRT_2 }, 200.0, SR);
+        let slope = c.response_db(1600.0, SR) - c.response_db(3200.0, SR);
+        assert!((slope - 12.0).abs() < 0.5, "{slope}");
     }
 
     #[test]

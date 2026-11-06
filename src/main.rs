@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tinvo::audio::{self, AudioCallback};
+use tinvo::dsp::loudness::ExportMeter;
 use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
 use tinvo::instrument::InstrumentKind;
 use tinvo::project::{Project, pattern_name};
@@ -120,15 +121,20 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     };
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
-    let frames = render::render_into(&project, &track_samples, &opts, &mut |b| file.write(b))?;
+    let mut meter = ExportMeter::new(opts.sample_rate);
+    let frames = render::render_into(&project, &track_samples, &opts, &mut |b| {
+        meter.push(b);
+        file.write(b)
+    })?;
     let stats = file.finish()?;
     let elapsed = start.elapsed();
     let secs = frames as f64 / f64::from(opts.sample_rate);
     println!(
-        "Rendered {what}, {secs:.2} s ({}, {} Hz), to {out} in {:.3} s; peak {:.2} dBFS; {} clipped samples",
+        "Rendered {what}, {secs:.2} s ({}, {} Hz), to {out} in {:.3} s; {}; sample peak {:.2} dBFS; {} clipped samples",
         format.label(),
         opts.sample_rate,
         elapsed.as_secs_f64(),
+        meter.finish().summary(),
         tinvo::dsp::gain_to_db(stats.peak),
         stats.clipped
     );

@@ -110,14 +110,32 @@ pub fn render_into(
     }
     let mut buf = vec![0.0f32; CHUNK * 2];
     let main = main_frames(project, opts);
+    // The master limiter delays the output; render that much ahead and drop
+    // it, so the file still starts on the first beat. The transport stops
+    // at the same musical point either way.
+    let mut skip = engine.latency() as u64;
+    while skip > 0 {
+        let n = skip.min(CHUNK as u64) as usize;
+        engine.process(&mut buf[..n * 2]);
+        skip -= n as u64;
+    }
+    let stop_at = main.saturating_sub(engine.latency() as u64);
     let mut done = 0u64;
+    let mut stopped = false;
     while done < main {
-        let n = (main - done).min(CHUNK as u64) as usize;
+        if !stopped && done == stop_at {
+            engine.handle(Command::Stop);
+            stopped = true;
+        }
+        let limit = if stopped { main } else { stop_at };
+        let n = (limit - done).min(CHUNK as u64) as usize;
         engine.process(&mut buf[..n * 2]);
         sink(&buf[..n * 2])?;
         done += n as u64;
     }
-    engine.handle(Command::Stop);
+    if !stopped {
+        engine.handle(Command::Stop);
+    }
 
     // The tail ends after `quiet_needed` frames of silence, which are not
     // part of the result: quiet blocks wait in `held` until sound follows.
@@ -164,13 +182,16 @@ pub fn stem_tracks(project: &Project) -> Vec<usize> {
 
 /// The project as heard in the stem of track `i`. Other tracks are muted,
 /// not removed: they still use the chance generator and choke open hats
-/// exactly as in the mix, so the stems add up to it.
+/// exactly as in the mix, so the stems add up to it. A stem carries the
+/// track's own share of the delay and reverb returns, and is taken before
+/// the master limiter.
 pub fn stem_project(project: &Project, i: usize) -> Project {
     let mut solo = project.clone();
     for (j, t) in solo.tracks.iter_mut().enumerate() {
         t.mute = j != i;
         t.solo = false;
     }
+    solo.mix[crate::mix::mp::LIMITER] = 0.0;
     solo
 }
 
@@ -291,6 +312,9 @@ mod tests {
     fn stems_add_up_to_the_mix() {
         let mut p = Project::demo();
         p.tracks[4].mute = true; // a muted track gets no stem
+        // Stems are taken before the master limiter, so they add up to the
+        // mix without it.
+        p.mix[crate::mix::mp::LIMITER] = 0.0;
         let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
         let mix = render(&p, &[], &opts);
         let stems = render_stems(&p, &[], &opts);
@@ -302,6 +326,37 @@ mod tests {
             .map(|k| (stems.iter().map(|(_, s)| s[k]).sum::<f32>() - mix[k]).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 1e-5, "stems differ from the mix by {worst}");
+    }
+
+    #[test]
+    fn the_limiter_keeps_exports_on_the_beat_and_under_the_ceiling() {
+        use crate::mix::mp;
+        let mut p = Project::demo();
+        p.mix[mp::LIMITER] = 0.0;
+        p.master_gain_db = 0.0;
+        // No tail: a louder mix would take longer to fall silent.
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
+        let plain = render(&p, &[], &opts);
+        // Below the ceiling the limiter changes nothing, not even timing.
+        p.mix[mp::LIMITER] = 1.0;
+        p.mix[mp::LIMITER_CEILING] = 0.0;
+        let same = render(&p, &[], &opts);
+        assert!(
+            same == plain,
+            "{} of {} samples differ",
+            same.iter().zip(&plain).filter(|(a, b)| a != b).count(),
+            plain.len()
+        );
+        // Pushed into it, the file starts at the same frame and stays under.
+        p.master_gain_db = 12.0;
+        p.mix[mp::LIMITER_CEILING] = -1.0;
+        let loud = render(&p, &[], &opts);
+        assert_eq!(loud.len(), plain.len());
+        let first = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-4);
+        assert_eq!(first(&loud), first(&plain));
+        let mut tp = [crate::dsp::limiter::TruePeak::new(), crate::dsp::limiter::TruePeak::new()];
+        let peak = loud.chunks(2).fold(0.0f32, |m, f| m.max(tp[0].push(f[0])).max(tp[1].push(f[1])));
+        assert!(crate::dsp::gain_to_db(peak) <= -0.95, "{}", crate::dsp::gain_to_db(peak));
     }
 
     #[test]

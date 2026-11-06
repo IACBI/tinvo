@@ -24,6 +24,7 @@ pub mod dsp;
 pub mod engine;
 pub mod fsutil;
 pub mod instrument;
+pub mod mix;
 pub mod project;
 pub mod render;
 pub mod rt;
