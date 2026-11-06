@@ -1,11 +1,15 @@
 [package]
 name = "tinvo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["A.C.B"]
-description = "Terminal-based digital audio workstation"
-readme = false
+description = "Keyboard-driven terminal digital audio workstation with zero dependencies"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/IACBI/tinvo"
+keywords = ["daw", "audio", "synthesizer", "sequencer", "terminal"]
+categories = ["multimedia::audio", "command-line-utilities"]
 publish = false
 
 # TINVO deliberately has no third-party dependencies. Everything is built on

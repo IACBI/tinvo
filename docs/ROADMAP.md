@@ -67,5 +67,5 @@ These need a step to hold more than one note, which changes the pattern data str
 - Linux and macOS backends compile and pass lint, but have not yet been run on real hardware.
 - ALSA and CoreAudio open at a fixed 48 kHz (the OS resamples). WASAPI uses the device's mix rate.
 - Removing a track while it is sounding cuts it off immediately, with no fade. The same applies to undoing an added track.
-- The CI workflow is written but has not run yet: the repository has no remote.
+- CI runs on hosted Windows, Linux and macOS machines, which have no sound card: the backends are compiled and linted there, not played through.
 - Drum tone parameters apply from the next hit, not to a hit that is still ringing.
