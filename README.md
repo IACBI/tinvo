@@ -28,6 +28,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - A piano roll for melodic tracks.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
+- An 8-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
@@ -80,6 +81,7 @@ The main keys in the editor (press `?` for the full list):
 | `u` `U` | undo / redo (also `Ctrl+Z` / `Ctrl+Y`) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
+| `o` | load a WAV file into a sampler track (`a` `7` adds one) |
 | `w` `W` `e` | save, save as, export WAV |
 | `q` | quit |
 
@@ -110,6 +112,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - Melodik kanallar için piyano rulosu.
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
+- WAV dosyalarını windowed-sinc interpolasyonla çalan 8 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
@@ -162,6 +165,7 @@ Editördeki temel tuşlar (tam liste için `?`):
 | `u` `U` | geri al / yinele (`Ctrl+Z` / `Ctrl+Y` de olur) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
+| `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `q` | çık |
 

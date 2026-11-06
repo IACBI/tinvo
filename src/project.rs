@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 3
+//! tinvo 4
 //! tempo 92
 //! swing 50
 //! pattern_length 16
@@ -21,9 +21,10 @@
 //! ```
 //!
 //! `chord` is `-` or the extra notes as comma-separated semitones above
-//! `note`, ascending (`4,7` is a major triad). Versions 1 (no swing,
-//! `index note velocity length`) and 2 (`... chance ratchet`) are still
-//! read. Floats are written with Rust's shortest round-trip formatting, so
+//! `note`, ascending (`4,7` is a major triad). A sampler track may have a
+//! `sample <path>` line; relative paths are relative to the project file.
+//! Versions 1 (no swing, `index note velocity length`), 2 (`... chance
+//! ratchet`) and 3 (no samples) are still read. Floats are written with Rust's shortest round-trip formatting, so
 //! saving and loading is lossless.
 
 use crate::engine::{
@@ -33,7 +34,7 @@ use crate::instrument::{InstrumentKind, ParamSpec, SILENT_DB, Unit};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -54,6 +55,9 @@ pub struct TrackData {
     pub mute: bool,
     pub solo: bool,
     pub steps: [Option<Step>; MAX_STEPS],
+    /// Sampler tracks: the sample file. Absolute in memory; written relative
+    /// to the project file when it sits inside the project's directory.
+    pub sample: Option<String>,
 }
 
 impl TrackData {
@@ -67,6 +71,7 @@ impl TrackData {
             mute: false,
             solo: false,
             steps: [None; MAX_STEPS],
+            sample: None,
         }
     }
 }
@@ -324,8 +329,14 @@ impl Project {
         Ok(inv)
     }
 
-    /// Serializes to the text format.
+    /// Serializes to the text format, with sample paths exactly as stored.
     pub fn to_text(&self) -> String {
+        self.to_text_in(None)
+    }
+
+    /// Serializes for a file in `dir`: sample paths inside `dir` are written
+    /// relative to it.
+    pub fn to_text_in(&self, dir: Option<&Path>) -> String {
         let mut s = String::new();
         // `write!` into a String cannot fail.
         let _ = writeln!(s, "tinvo {FORMAT_VERSION}");
@@ -336,6 +347,9 @@ impl Project {
         for t in &self.tracks {
             let _ = writeln!(s, "\ntrack {}", t.kind.id());
             let _ = writeln!(s, "name {}", sanitize_name(&t.name));
+            if let Some(path) = &t.sample {
+                let _ = writeln!(s, "sample {}", crate::sample::relativize(path, dir));
+            }
             let _ = writeln!(s, "gain_db {}", t.gain_db);
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
@@ -397,6 +411,15 @@ impl Project {
             if let Some(t) = current.as_mut() {
                 match key {
                     "name" => t.name = sanitize_name(rest),
+                    "sample" if ver >= 4 => {
+                        if t.kind != InstrumentKind::Sampler {
+                            return Err(err(format!("a {} track has no sample", t.kind.id())));
+                        }
+                        if rest.is_empty() {
+                            return Err(err("expected 'sample <path>'".into()));
+                        }
+                        t.sample = Some(rest.to_string());
+                    }
                     "gain_db" => t.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
                     "mute" => t.mute = parse_bool(rest).map_err(err)?,
@@ -502,14 +525,42 @@ impl Project {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
-        std::fs::write(&tmp, self.to_text())?;
+        std::fs::write(&tmp, self.to_text_in(project_dir(path).as_deref()))?;
         std::fs::rename(&tmp, path)
     }
 
+    /// Loads every track's sample file. Returns one entry per track (`None`
+    /// for tracks without a sample or whose file failed) and the errors.
+    pub fn load_samples(&self) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
+        let mut errors = Vec::new();
+        let samples = self
+            .tracks
+            .iter()
+            .map(|t| {
+                let path = t.sample.as_ref()?;
+                crate::sample::load(Path::new(path)).map(std::sync::Arc::new).map_err(|e| errors.push(e)).ok()
+            })
+            .collect();
+        (samples, errors)
+    }
+
+    /// Loads a project file; sample paths come back absolute.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_text(&text).map_err(|e| format!("{}: {e}", path.display()))
+        let mut p = Self::from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let dir = project_dir(path);
+        for t in &mut p.tracks {
+            if let Some(s) = &mut t.sample {
+                *s = crate::sample::resolve(s, dir.as_deref()).to_string_lossy().into_owned();
+            }
+        }
+        Ok(p)
     }
+}
+
+/// The absolute directory holding a project file.
+fn project_dir(path: &Path) -> Option<std::path::PathBuf> {
+    crate::sample::absolute(&path.to_string_lossy()).parent().map(Path::to_path_buf)
 }
 
 fn chord_text(st: &Step) -> String {
@@ -595,9 +646,39 @@ mod tests {
         p.tracks[2].steps[3] = Some(Step { chance: 35, ratchet: 3, offset: -7, ..Step::new(60, 90, 1) });
         p.tracks[5].steps[1] = Some(Step { chord: [3, 7, 10], offset: 12, ..Step::new(45, 100, 3) });
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 3\n"));
+        assert!(text.starts_with("tinvo 4\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert_eq!(Project::from_text(&text).unwrap(), p);
+    }
+
+    #[test]
+    fn sample_paths_are_saved_relative_and_loaded_absolute() {
+        let dir = std::env::temp_dir().join(format!("tinvo-proj-{}", std::process::id()));
+        let kits = dir.join("kits");
+        std::fs::create_dir_all(&kits).unwrap();
+        let inside = kits.join("my kick.wav").to_string_lossy().into_owned();
+        let outside = crate::sample::absolute("elsewhere/snare.wav").to_string_lossy().into_owned();
+        let mut p = Project::new();
+        for path in [&inside, &outside] {
+            p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+            p.tracks.last_mut().unwrap().sample = Some(path.clone());
+        }
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let file = dir.join("song.tvo");
+        p.save(&file).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\nsample kits/my kick.wav\n"), "{text}");
+        assert!(text.contains(&format!("\nsample {outside}\n")), "{text}");
+        let back = Project::load(&file).unwrap();
+        assert_eq!(
+            back.tracks[0].sample.as_deref().map(std::path::Path::new),
+            Some(kits.join("my kick.wav").as_path())
+        );
+        assert_eq!(back.tracks[1].sample.as_deref(), Some(outside.as_str()));
+        assert_eq!(back.tracks[2].sample, None);
+        // In memory and in plain text the path is kept exactly.
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -707,7 +788,10 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 4", 1, "version"),
+            ("tinvo 5", 1, "version"),
+            ("tinvo 4\ntrack kick\nsample a.wav\nend", 3, "has no sample"),
+            ("tinvo 3\ntrack sampler\nsample a.wav\nend", 3, "unknown track key"),
+            ("tinvo 4\ntrack sampler\nsample\nend", 3, "expected 'sample"),
             ("tinvo 0", 1, "version"),
             ("tinvo 2\nswing 90", 2, "swing"),
             ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 5\nend", 3, "out of range"),

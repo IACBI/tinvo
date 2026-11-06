@@ -23,7 +23,8 @@ Each layer depends only on the ones below it.
  render       offline rendering (same Engine)
  project      document model, Edit validation, text file format
  engine       transport, tracks, mixer, command handling
- instrument   polyphonic synth, synthesized drums, parameter specs
+ instrument   polyphonic synth, sampler, synthesized drums, parameter specs
+ sample       in-memory sample buffers, interpolation, WAV loading, paths
  dsp          oscillators, envelopes, filters, smoothing, noise, FFT
  rt           wait-free SPSC queue, atomic f32
  wav          WAV encode (16/24-bit dithered, 32-bit float) and decode
@@ -46,6 +47,7 @@ Each layer depends only on the ones below it.
 
 - **Command queue** (`rt::spsc`): bounded, wait-free, cache-padded. If it is ever full, `EngineLink` keeps the remaining commands in order and retries every UI frame, so no edit is lost.
 - **Telemetry** (`engine::Shared`): playhead step, per-track and master peaks (lock-free `fetch_max` on the bit patterns of non-negative floats), and smoothed callback load.
+- **Sample buffers**: the UI loads a WAV file into an `Arc<Sample>` and sends it in a `SetSample` command. When the engine lets go of a buffer (replaced, track removed), it pushes the `Arc` into a second SPSC queue back to the UI, which drops it there, so the audio thread never frees memory. If that queue were full the engine would leak the buffer rather than free it. The UI keeps every loaded sample by path, so undo can restore one without reading the disk.
 - **Start-up**: the backend opens the device first, then calls a factory on the audio thread with the real sample rate. That is when the engine is allocated, before the stream starts.
 
 ## Engine
@@ -68,6 +70,7 @@ Each layer depends only on the ones below it.
 | Envelopes | Linear attack, exponential decay/release (times are to −60 dB); retriggers start from the current level |
 | Synth modulation | One free-running LFO per synth, computed per 64-sample chunk, to pitch, pulse width, cutoff and level; glide is exponential in pitch (99 % of the interval in the glide time); pitch is recomputed per sample only while gliding or under LFO pitch modulation |
 | Unison | Up to 4 copies of each oscillator spread evenly across ±detune, started at random phases and summed at 1/√n so the level stays steady |
+| Sampler | 8-tap windowed-sinc (Blackman window, 256 phases with linear blending between them) or linear interpolation, over a buffer padded with zeros so reads need no bounds checks; pitch ratio 2^(semitones/12) × file rate / engine rate; loops wrap exactly; a 64-frame fade at the region end; ADSR and an optional low-pass filter per voice |
 | Drums | Kick (pitch-swept sine plus click), snare (two tones plus filtered noise), hats (six band-limited squares, metallic), clap (three bursts plus tail); retriggers cross-fade the old tail over 1 ms |
 | Export | TPDF dither (±1 LSB) for 16/24-bit; clipped samples are counted and reported |
 
@@ -81,13 +84,13 @@ Each layer depends only on the ones below it.
 
 ## Project file (`.tvo`)
 
-Line-based UTF-8 text with a version header (`tinvo 3`). Format 2 added `swing` and per-step chance and ratchet; format 3 adds the micro-timing offset and the chord (`-` or intervals such as `3,7,10`). Older files still load, with the newer fields at their neutral values. A chord must be written in canonical form (ascending, no duplicates, in MIDI range), so every file has exactly one spelling. Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
+Line-based UTF-8 text with a version header (`tinvo 4`). Format 2 added `swing` and per-step chance and ratchet; format 3 adds the micro-timing offset and the chord (`-` or intervals such as `3,7,10`); format 4 adds a `sample` line to sampler tracks, relative with `/` separators when the file is inside the project folder. Older files still load, with the newer fields at their neutral values. A chord must be written in canonical form (ascending, no duplicates, in MIDI range), so every file has exactly one spelling. Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
 
 ## Undo
 
-`Project::inverse` returns, for any valid edit, the edits that restore the state before it. The UI records each change as an (undo, redo) pair of edit lists, and replays them through the same path as normal edits, so the engine stays in sync. Deleting a track inverts to inserting it back at its index and restoring every parameter and step. Track names are not edits, so each history entry stores the names before and after.
+`Project::inverse` returns, for any valid edit, the edits that restore the state before it. The UI records each change as an (undo, redo) pair of edit lists, and replays them through the same path as normal edits, so the engine stays in sync. Deleting a track inverts to inserting it back at its index and restoring every parameter and step. Track names and sample paths are not edits, so each history entry stores them before and after, and the UI sends the engine any sample that changed.
 
 ## Verification
 
-- 124 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, swing/chance/ratchet/choke timing, glide and LFO, chords and micro-timing (including early hits under maximum swing), pulse width (measured second harmonic), noise and unison, reading format 1 and 2 files, edit inversion for every edit kind, undo/redo, and UI behaviour (including that the engine receives exactly the edits the project applied, through undo and redo).
+- 137 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, swing/chance/ratchet/choke timing, glide and LFO, chords and micro-timing (including early hits under maximum swing), pulse width (measured second harmonic), noise and unison, the sampler (pitch and sample-rate following for both interpolators, loop, gate and one-shot modes, regions, sinc accuracy against linear), buffers returning through the release queue, sample paths in project files, reading format 1 and 2 files, edit inversion for every edit kind, undo/redo, and UI behaviour (including that the engine receives exactly the edits the project applied, through undo and redo).
 - `tinvo probe` exercises the real device. `tinvo bench` measures rendering cost for the demo and for a worst-case synth track (about 1 % and 5 % of one core on a current desktop CPU).

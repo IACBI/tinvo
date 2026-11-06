@@ -16,7 +16,8 @@ use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, SILENT_DB, VoiceId};
 use crate::rt::AtomicF32;
-use crate::rt::spsc::Consumer;
+use crate::rt::spsc::{Consumer, Producer};
+use crate::sample::Sample;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
@@ -216,7 +217,7 @@ pub enum Edit {
 }
 
 /// Messages from the UI to the audio thread.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Edit(Edit),
     /// Start playback from the first step.
@@ -229,6 +230,27 @@ pub enum Command {
         step: Step,
         frames: u32,
     },
+    /// Gives a sampler track its sample (other tracks ignore it). The sample
+    /// it replaces goes back through the retirement queue.
+    SetSample {
+        track: u8,
+        sample: Option<Arc<Sample>>,
+    },
+}
+
+/// Capacity of the queue that returns released samples to the UI thread.
+pub const RETIRE_QUEUE: usize = 64;
+
+/// Hands a sample the engine no longer uses to the UI thread, so the audio
+/// thread never frees it. Without a queue (offline rendering) it is dropped
+/// here, which is fine off the audio thread.
+fn retire(queue: &mut Option<Producer<Arc<Sample>>>, sample: Option<Arc<Sample>>) {
+    let (Some(q), Some(s)) = (queue.as_mut(), sample) else { return };
+    if let Err(s) = q.push(s) {
+        // The UI drains the queue every frame, so this needs 64 sample
+        // changes within ~16 ms. Leaking is the real-time-safe fallback.
+        std::mem::forget(s);
+    }
 }
 
 /// State published by the audio thread for the UI.
@@ -428,6 +450,8 @@ pub struct Engine {
     rng: Rng,
     /// Absolute step whose early (negative offset) hits are already queued.
     early_queued: Option<u64>,
+    /// Where released samples go; `None` when not running in real time.
+    retired: Option<Producer<Arc<Sample>>>,
 }
 
 const CHANCE_SEED: u64 = 0x5EED_C4A2_CE00_0001;
@@ -436,6 +460,7 @@ impl Engine {
     /// Creates an empty engine (120 BPM, 16 steps, no tracks). All memory the
     /// engine will ever use is allocated here.
     pub fn new(sample_rate: f32, shared: Arc<Shared>, commands: Option<Consumer<Command>>) -> Box<Self> {
+        crate::sample::init();
         let tracks: Vec<Track> = (0..MAX_TRACKS).map(|_| Track::new(InstrumentKind::Synth, sample_rate)).collect();
         Box::new(Self {
             sample_rate,
@@ -455,6 +480,7 @@ impl Engine {
             shared,
             rng: Rng::new(CHANCE_SEED),
             early_queued: None,
+            retired: None,
         })
     }
 
@@ -476,6 +502,20 @@ impl Engine {
 
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Routes every sample the engine releases from now on to `queue`.
+    pub fn attach_retirement(&mut self, queue: Producer<Arc<Sample>>) {
+        self.retired = Some(queue);
+    }
+
+    /// Same as handling [`Command::SetSample`].
+    pub fn set_sample(&mut self, track: usize, sample: Option<Arc<Sample>>) {
+        let old = match self.tracks[..self.track_count].get_mut(track) {
+            Some(t) => t.instrument.set_sample(sample),
+            None => sample,
+        };
+        retire(&mut self.retired, old);
     }
 
     pub fn track_count(&self) -> usize {
@@ -514,6 +554,7 @@ impl Engine {
                     t.release_all();
                 }
             }
+            Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
             Command::Audition { track, step, frames } => {
                 let (now, n) = (self.now, self.track_count);
                 let i = usize::from(track);
@@ -541,6 +582,8 @@ impl Engine {
             Edit::InsertTrack { index, kind } => {
                 let i = usize::from(index);
                 if n < MAX_TRACKS && i <= n {
+                    let old = self.tracks[n].instrument.set_sample(None);
+                    retire(&mut self.retired, old);
                     self.tracks[n] = Track::new(kind, self.sample_rate);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
@@ -553,6 +596,8 @@ impl Engine {
             }
             Edit::AddTrack(kind) => {
                 if n < MAX_TRACKS {
+                    let old = self.tracks[n].instrument.set_sample(None);
+                    retire(&mut self.retired, old);
                     self.tracks[n] = Track::new(kind, self.sample_rate);
                     self.track_count += 1;
                     self.update_gains();
@@ -562,6 +607,8 @@ impl Engine {
                 let i = usize::from(i);
                 if i < n {
                     self.tracks[i..n].rotate_left(1);
+                    let old = self.tracks[n - 1].instrument.set_sample(None);
+                    retire(&mut self.retired, old);
                     self.track_count -= 1;
                     self.update_gains();
                 }
@@ -1053,6 +1100,40 @@ mod tests {
         let out = run(&mut e, 12_000);
         // Step 1 spans 9000..12000 with swing, so its halves start 1500 apart.
         assert_eq!(onsets(&out, 600), vec![9000, 10_500]);
+    }
+
+    #[test]
+    fn released_samples_go_back_through_the_queue() {
+        let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
+        let a = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
+        let b = Arc::new(Sample::from_mono(&tone, 44_100).unwrap());
+        let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Sampler), Edit::AddTrack(InstrumentKind::Kick)]);
+        e.attach_retirement(tx);
+        let mut back = Vec::new();
+        let mut drain = |rx: &mut spsc::Consumer<Arc<Sample>>| {
+            while let Some(s) = rx.pop() {
+                back.push(s);
+            }
+            back.len()
+        };
+
+        e.handle(Command::SetSample { track: 0, sample: Some(a.clone()) });
+        assert_eq!(drain(&mut rx), 0);
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 1000 });
+        assert!(run(&mut e, 256).iter().any(|x| x.abs() > 0.01), "the sampler track plays");
+        // Replacing returns the old sample; a non-sampler track hands it straight back.
+        e.handle(Command::SetSample { track: 0, sample: Some(b.clone()) });
+        e.handle(Command::SetSample { track: 1, sample: Some(a.clone()) });
+        e.handle(Command::SetSample { track: 9, sample: Some(a.clone()) });
+        assert_eq!(drain(&mut rx), 3);
+        // Removing the track releases its sample too.
+        e.apply(Edit::RemoveTrack(0));
+        assert_eq!(drain(&mut rx), 4);
+        assert!(Arc::ptr_eq(&back[3], &b));
+        // The engine holds no reference any more: every count is ours.
+        drop(back);
+        assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (1, 1));
     }
 
     #[test]

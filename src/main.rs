@@ -87,8 +87,12 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         return Err(format!("render needs PROJECT and OUT.wav\n\n{USAGE}"));
     };
     let project = Project::load(project.as_ref())?;
+    let (track_samples, errors) = project.load_samples();
+    if !errors.is_empty() {
+        return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
+    }
     let start = Instant::now();
-    let samples = render::render(&project, &opts);
+    let samples = render::render(&project, &track_samples, &opts);
     let elapsed = start.elapsed();
     let stats = wav::write_file(out.as_ref(), &samples, 2, opts.sample_rate, format)?;
     let secs = samples.len() as f64 / 2.0 / f64::from(opts.sample_rate);
@@ -167,9 +171,9 @@ fn cmd_bench() -> Result<(), String> {
 fn bench(label: &str, project: &Project) -> Result<(), String> {
     let opts = RenderOptions { sample_rate: 48_000, loops: 16, max_tail_seconds: 0.0 };
     // Warm up caches and the allocator before timing.
-    render::render(project, &RenderOptions { loops: 1, ..opts });
+    render::render(project, &[], &RenderOptions { loops: 1, ..opts });
     let start = Instant::now();
-    let samples = render::render(project, &opts);
+    let samples = render::render(project, &[], &opts);
     let elapsed = start.elapsed().as_secs_f64();
     let audio = samples.len() as f64 / 2.0 / 48_000.0;
     println!(

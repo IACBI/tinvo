@@ -6,6 +6,18 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-06
+
+### Added
+- Sampler instrument (add-track key `7`): plays a WAV file (16/24/32-bit PCM or 32-bit float, any sample rate) with 8 voices, root note, tune and fine tune, start/end points, a loop with its own start, gate or one-shot mode, ADSR, and a low-pass filter.
+- Windowed-sinc interpolation (8 taps, polyphase) by default, with linear as an option. At the root pitch, playback returns the original samples.
+- `o` loads a WAV file into the selected sampler track. Loading is one undo step, and deleting a sampler track and undoing brings its sample back.
+- `tinvo render` plays sampler tracks and stops with an error if a sample file is missing.
+
+### Changed
+- Project files are now format 4, which adds a `sample` line to sampler tracks. A sample inside the project's folder is stored as a relative path, so the folder can be moved. Formats 1–3 still load.
+- Sample buffers that the engine releases go back to the UI thread through a queue, so the audio thread never frees memory.
+
 ## [0.3.0] - 2026-11-06
 
 ### Added
@@ -43,7 +55,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/IACBI/tinvo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/IACBI/tinvo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/IACBI/tinvo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/IACBI/tinvo/releases/tag/v0.1.0

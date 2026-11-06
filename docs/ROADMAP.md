@@ -23,7 +23,7 @@ Author: 𝓐.𝓒.𝓑
 - Project format 2 (swing, chance, ratchet); format 1 files still load.
 - CI on Windows, Linux and macOS: format, clippy, tests in debug and release, CLI smoke test, minimum Rust version.
 
-## Phase 1b: Notes ✅ (0.3.0, this release)
+## Phase 1b: Notes ✅ (0.3.0)
 
 - Chords: a step holds up to 4 notes, stored as intervals above its lowest note, so transposing keeps the shape. `c` cycles common chords.
 - Piano roll (`v`) for melodic tracks: pitch × step, held notes drawn through their length.
@@ -32,11 +32,19 @@ Author: 𝓐.𝓒.𝓑
 - Project format 3; formats 1 and 2 still load.
 - `tinvo bench` also measures a worst-case synth (8 voices, unison 4, noise, LFO).
 
-## Phase 2: Sampler
+## Phase 2: Sampler ✅ (0.4.0, this release)
 
-- WAV import (the decoder already exists) and a sample-streaming voice with linear and windowed-sinc interpolation.
-- One-shot and key-mapped playback, start/end/loop points, ADSR, pitch, filter.
-- Sample loading on a worker thread; buffers handed to the audio thread through the queue and freed off the audio thread.
+- Sampler track: 8 voices playing a WAV file in memory, pitched from a root note (±24 semitones of tune plus fine tune), following the file's own sample rate.
+- 8-tap polyphase windowed-sinc interpolation (Blackman window, 256 interpolated phases) or linear. The sinc kernel is exact at integer positions, so the root pitch plays the file back unchanged.
+- Start/end points, a loop with its own start point, gate or one-shot mode, ADSR, low-pass filter.
+- Sample buffers reach the audio thread inside a command and leave it through a return queue, so they are freed on the UI thread.
+- Project format 4: relative sample paths inside the project folder, absolute elsewhere.
+
+Known limits, planned for later phases:
+- Files load on the UI thread. A long file pauses the editor briefly while it is read; playback is not affected.
+- Stereo files are mixed to mono.
+- One sample per track; there are no multi-sample key maps yet.
+- The interpolation kernel does not lower its cutoff when pitching up, so a sample transposed far upwards can alias.
 
 ## Phase 3: Arrangement
 

@@ -1,18 +1,24 @@
 //! Instruments: sound generators driven by note events.
 //!
-//! Every instrument is a fixed-size value with no heap allocation, so the
-//! engine can create, replace and move instruments on the audio thread.
+//! Every instrument is a fixed-size value that never allocates, so the
+//! engine can create, replace and move instruments on the audio thread. The
+//! sampler holds its audio behind an `Arc` it neither allocates nor frees.
 
 mod drums;
+mod sampler;
 mod synth;
 
+use crate::sample::Sample;
 pub use drums::Drum;
+pub use sampler::{SAMPLER_VOICES, Sampler};
+use std::sync::Arc;
 pub use synth::{PolySynth, SYNTH_VOICES};
 
 /// The kinds of instrument a track can host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InstrumentKind {
     Synth,
+    Sampler,
     Kick,
     Snare,
     HatClosed,
@@ -21,19 +27,21 @@ pub enum InstrumentKind {
 }
 
 impl InstrumentKind {
-    pub const ALL: [InstrumentKind; 6] = [
+    pub const ALL: [InstrumentKind; 7] = [
         InstrumentKind::Synth,
         InstrumentKind::Kick,
         InstrumentKind::Snare,
         InstrumentKind::HatClosed,
         InstrumentKind::HatOpen,
         InstrumentKind::Clap,
+        InstrumentKind::Sampler,
     ];
 
     /// Stable identifier used in project files.
     pub fn id(self) -> &'static str {
         match self {
             InstrumentKind::Synth => "synth",
+            InstrumentKind::Sampler => "sampler",
             InstrumentKind::Kick => "kick",
             InstrumentKind::Snare => "snare",
             InstrumentKind::HatClosed => "hat",
@@ -50,6 +58,7 @@ impl InstrumentKind {
     pub fn label(self) -> &'static str {
         match self {
             InstrumentKind::Synth => "Synth",
+            InstrumentKind::Sampler => "Sampler",
             InstrumentKind::Kick => "Kick",
             InstrumentKind::Snare => "Snare",
             InstrumentKind::HatClosed => "Hi-hat",
@@ -62,6 +71,7 @@ impl InstrumentKind {
     pub fn params(self) -> &'static [ParamSpec] {
         match self {
             InstrumentKind::Synth => &synth::PARAMS,
+            InstrumentKind::Sampler => &sampler::PARAMS,
             k => drums::params(k),
         }
     }
@@ -75,7 +85,7 @@ impl InstrumentKind {
     }
 
     pub fn is_drum(self) -> bool {
-        self != InstrumentKind::Synth
+        !matches!(self, InstrumentKind::Synth | InstrumentKind::Sampler)
     }
 }
 
@@ -101,6 +111,16 @@ pub enum Unit {
     Octaves,
     Decibels,
     Pan,
+    /// A MIDI note number, shown as a note name.
+    Note,
+    /// A fraction in `[0, 1]`, shown as a percentage.
+    Percent,
+}
+
+/// Scientific pitch notation: 60 = C4.
+pub fn note_name(note: u8) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}{}", NAMES[usize::from(note % 12)], i32::from(note / 12) - 1)
 }
 
 /// Static description of one instrument or mixer parameter.
@@ -208,6 +228,8 @@ impl ParamSpec {
             Unit::Pan if value.abs() < 0.005 => "C".to_string(),
             Unit::Pan if value < 0.0 => format!("L{:.0}", -value * 100.0),
             Unit::Pan => format!("R{:.0}", value * 100.0),
+            Unit::Note => note_name(value.round().clamp(0.0, 127.0) as u8),
+            Unit::Percent => format!("{:.1} %", value * 100.0),
         }
     }
 }
@@ -225,6 +247,7 @@ impl VoiceId {
 #[allow(clippy::large_enum_variant)]
 pub enum Instrument {
     Synth(PolySynth),
+    Sampler(Sampler),
     Drum(Drum),
 }
 
@@ -232,6 +255,7 @@ impl Instrument {
     pub fn new(kind: InstrumentKind, sample_rate: f32) -> Self {
         match kind {
             InstrumentKind::Synth => Instrument::Synth(PolySynth::new(sample_rate)),
+            InstrumentKind::Sampler => Instrument::Sampler(Sampler::new(sample_rate)),
             k => Instrument::Drum(Drum::new(k, sample_rate)),
         }
     }
@@ -239,6 +263,7 @@ impl Instrument {
     pub fn kind(&self) -> InstrumentKind {
         match self {
             Instrument::Synth(_) => InstrumentKind::Synth,
+            Instrument::Sampler(_) => InstrumentKind::Sampler,
             Instrument::Drum(d) => d.kind(),
         }
     }
@@ -247,6 +272,7 @@ impl Instrument {
     pub fn set_param(&mut self, index: usize, value: f32) {
         match self {
             Instrument::Synth(s) => s.set_param(index, value),
+            Instrument::Sampler(s) => s.set_param(index, value),
             Instrument::Drum(d) => d.set_param(index, value),
         }
     }
@@ -254,6 +280,7 @@ impl Instrument {
     pub fn param(&self, index: usize) -> Option<f32> {
         match self {
             Instrument::Synth(s) => s.param(index),
+            Instrument::Sampler(s) => s.param(index),
             Instrument::Drum(d) => d.param(index),
         }
     }
@@ -261,6 +288,7 @@ impl Instrument {
     pub fn note_on(&mut self, note: u8, velocity: u8) -> VoiceId {
         match self {
             Instrument::Synth(s) => s.note_on(note, velocity),
+            Instrument::Sampler(s) => s.note_on(note, velocity),
             Instrument::Drum(d) => {
                 d.trigger(note, velocity);
                 VoiceId::NONE
@@ -269,15 +297,30 @@ impl Instrument {
     }
 
     pub fn note_off(&mut self, id: VoiceId) {
-        if let Instrument::Synth(s) = self {
-            s.note_off(id);
+        match self {
+            Instrument::Synth(s) => s.note_off(id),
+            Instrument::Sampler(s) => s.note_off(id),
+            Instrument::Drum(_) => {}
         }
     }
 
     /// Releases every held note (drums ring out naturally).
     pub fn release_all(&mut self) {
-        if let Instrument::Synth(s) = self {
-            s.release_all();
+        match self {
+            Instrument::Synth(s) => s.release_all(),
+            Instrument::Sampler(s) => s.release_all(),
+            Instrument::Drum(_) => {}
+        }
+    }
+
+    /// Gives a sampler its sample and returns the one it replaces. Other
+    /// instruments hand the sample straight back. The result must be
+    /// disposed of off the audio thread.
+    #[must_use]
+    pub fn set_sample(&mut self, sample: Option<Arc<Sample>>) -> Option<Arc<Sample>> {
+        match self {
+            Instrument::Sampler(s) => s.set_sample(sample),
+            _ => sample,
         }
     }
 
@@ -291,13 +334,14 @@ impl Instrument {
 
     /// Whether this instrument responds to note-off at all.
     pub fn uses_note_off(&self) -> bool {
-        matches!(self, Instrument::Synth(_))
+        matches!(self, Instrument::Synth(_) | Instrument::Sampler(_))
     }
 
     /// Adds the instrument's mono output into `out`.
     pub fn render(&mut self, out: &mut [f32]) {
         match self {
             Instrument::Synth(s) => s.render(out),
+            Instrument::Sampler(s) => s.render(out),
             Instrument::Drum(d) => d.render(out),
         }
     }
@@ -423,6 +467,11 @@ mod tests {
     fn instruments_make_sound_at_defaults() {
         for k in InstrumentKind::ALL {
             let mut inst = Instrument::new(k, SR);
+            // A sampler is silent until it has a sample.
+            let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
+            let sample = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
+            let returned = inst.set_sample(Some(sample));
+            assert_eq!(returned.is_some(), k != InstrumentKind::Sampler, "{k:?}");
             inst.note_on(k.default_note(), 100);
             let mut buf = vec![0.0f32; 4800];
             inst.render(&mut buf);

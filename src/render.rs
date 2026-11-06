@@ -6,6 +6,7 @@
 use crate::engine::transport::Transport;
 use crate::engine::{Command, Engine, Shared};
 use crate::project::Project;
+use crate::sample::Sample;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,10 +35,14 @@ pub fn pattern_frames(project: &Project, sample_rate: u32, loops: u32) -> u64 {
     (sps * f64::from(project.pattern_len) * f64::from(loops)).round() as u64
 }
 
-/// Renders the project to interleaved stereo.
-pub fn render(project: &Project, opts: &RenderOptions) -> Vec<f32> {
+/// Renders the project to interleaved stereo. `samples` holds each track's
+/// sample (see [`Project::load_samples`]); missing entries play silence.
+pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<f32> {
     let sr = opts.sample_rate;
     let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::new(Shared::new()), None);
+    for (track, sample) in samples.iter().enumerate() {
+        engine.set_sample(track, sample.clone());
+    }
     engine.handle(Command::Play);
     let main = pattern_frames(project, sr, opts.loops) as usize;
     let mut out = vec![0.0f32; main * 2];
@@ -76,8 +81,8 @@ mod tests {
     fn demo_renders_deterministically() {
         let p = Project::demo();
         let opts = RenderOptions { loops: 1, ..Default::default() };
-        let a = render(&p, &opts);
-        let b = render(&p, &opts);
+        let a = render(&p, &[], &opts);
+        let b = render(&p, &[], &opts);
         assert_eq!(a, b);
         let main = pattern_frames(&p, 48_000, 1) as usize;
         assert!(a.len() / 2 >= main);
@@ -95,7 +100,7 @@ mod tests {
         assert_eq!(pattern_frames(&p, 48_000, 1), 96_000);
         assert_eq!(pattern_frames(&p, 48_000, 3), 288_000);
         // An empty project renders exactly the pattern, no tail.
-        let out = render(&p, &RenderOptions { loops: 2, ..Default::default() });
+        let out = render(&p, &[], &RenderOptions { loops: 2, ..Default::default() });
         assert_eq!(out.len(), 192_000 * 2);
         assert!(out.iter().all(|&x| x == 0.0));
     }
@@ -108,7 +113,7 @@ mod tests {
         p.tracks[0].params[16] = 10.0;
         p.tracks[0].steps[0] = Some(crate::engine::Step::new(48, 127, 16));
         let opts = RenderOptions { loops: 1, max_tail_seconds: 1.0, ..Default::default() };
-        let out = render(&p, &opts);
+        let out = render(&p, &[], &opts);
         assert_eq!(out.len() / 2, pattern_frames(&p, 48_000, 1) as usize + 48_000);
     }
 }

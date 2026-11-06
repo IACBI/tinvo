@@ -9,7 +9,8 @@
 //!   render     offline rendering, sharing the exact real-time code path
 //!   project    document model, edits, persistence
 //!   engine     real-time audio graph: transport, tracks, mixer
-//!   instrument synthesizers and drum voices
+//!   instrument synthesizers, sampler and drum voices
+//!   sample     loaded audio samples and their interpolation
 //!   dsp        allocation-free signal-processing primitives
 //!   rt         lock-free primitives for crossing the real-time boundary
 //!   wav        WAV encoding/decoding
@@ -25,5 +26,6 @@ pub mod instrument;
 pub mod project;
 pub mod render;
 pub mod rt;
+pub mod sample;
 pub mod tui;
 pub mod wav;

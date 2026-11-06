@@ -8,14 +8,17 @@
 use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
 use crate::engine::{
-    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, Shared, Step,
+    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, RETIRE_QUEUE, Shared,
+    Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME};
 use crate::render::{self, RenderOptions};
-use crate::rt::spsc::{self, Producer};
+use crate::rt::spsc::{self, Consumer, Producer};
+use crate::sample::{self as sample_mod, Sample};
 use crate::tui::{Color, Event, Key, Screen, Style, Terminal};
 use crate::wav::{self, SampleFormat};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,16 +48,24 @@ const CHORDS: [(&str, [u8; MAX_CHORD - 1]); 7] = [
 const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
 /// UI-side end of the command queue. Commands that do not fit are kept in
-/// order and retried, so the engine never misses an edit.
+/// order and retried, so the engine never misses an edit. It also receives
+/// the samples the engine has released and frees them here, on the UI thread.
 pub struct EngineLink {
     tx: Producer<Command>,
     backlog: VecDeque<Command>,
     shared: Arc<Shared>,
+    retired: Option<Consumer<Arc<Sample>>>,
 }
 
 impl EngineLink {
     pub fn new(tx: Producer<Command>, shared: Arc<Shared>) -> Self {
-        Self { tx, backlog: VecDeque::new(), shared }
+        Self { tx, backlog: VecDeque::new(), shared, retired: None }
+    }
+
+    /// Takes over the receiving end of the engine's retirement queue.
+    pub fn with_retirement(mut self, retired: Consumer<Arc<Sample>>) -> Self {
+        self.retired = Some(retired);
+        self
     }
 
     pub fn send(&mut self, cmd: Command) {
@@ -67,11 +78,14 @@ impl EngineLink {
     }
 
     pub fn flush(&mut self) {
-        while let Some(&cmd) = self.backlog.front() {
-            if self.tx.push(cmd).is_err() {
+        while let Some(cmd) = self.backlog.pop_front() {
+            if let Err(cmd) = self.tx.push(cmd) {
+                self.backlog.push_front(cmd);
                 break;
             }
-            self.backlog.pop_front();
+        }
+        if let Some(rx) = &mut self.retired {
+            while rx.pop().is_some() {}
         }
     }
 }
@@ -98,15 +112,23 @@ impl AudioCallback for EngineCallback {
     }
 }
 
+/// The parts of a track that live outside the [`Edit`] stream.
+#[derive(Clone, Debug, PartialEq)]
+struct TrackMeta {
+    name: String,
+    sample: Option<String>,
+}
+
 /// One undoable user action.
 struct Change {
     /// Edits that restore the state before the action, in order.
     undo: Vec<Edit>,
     /// Edits that reproduce the action.
     redo: Vec<Edit>,
-    /// Track names are not part of [`Edit`], so they are restored wholesale.
-    names_before: Vec<String>,
-    names_after: Vec<String>,
+    /// Track names and samples are not part of [`Edit`], so they are
+    /// restored wholesale.
+    meta_before: Vec<TrackMeta>,
+    meta_after: Vec<TrackMeta>,
     what: &'static str,
     /// Set when later nudges of the same value may merge into this change.
     key: Option<(u8, u8, u8)>,
@@ -162,6 +184,7 @@ pub enum PromptKind {
     SaveAs,
     Export,
     Rename,
+    LoadSample,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +214,9 @@ pub struct App {
     pub quit: bool,
     /// Per-track template for newly placed steps, parallel to `project.tracks`.
     brushes: Vec<Step>,
+    /// Every sample loaded this session, by absolute path. Undo can bring a
+    /// sample back without reading the disk again.
+    bank: HashMap<String, Arc<Sample>>,
     undo: VecDeque<Change>,
     redo: Vec<Change>,
     /// Stops the next edit merging into a change that was just undone/redone.
@@ -237,6 +263,7 @@ impl App {
             export_loops: 4,
             quit: false,
             brushes,
+            bank: HashMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
             sealed: false,
@@ -285,7 +312,7 @@ impl App {
                 return false;
             }
         };
-        let names_before = self.track_names();
+        let meta_before = self.track_meta();
         let Some(applied) = self.apply_raw(e) else { return false };
         if inverse == [applied] {
             // Already in that state (e.g. tempo at its limit): nothing to undo.
@@ -302,12 +329,12 @@ impl App {
                 return true;
             }
         }
-        let names_after = self.track_names();
+        let meta_after = self.track_meta();
         self.push_change(Change {
             undo: inverse,
             redo: vec![applied],
-            names_before,
-            names_after,
+            meta_before,
+            meta_after,
             what: describe(&applied),
             key,
             at: now,
@@ -350,16 +377,80 @@ impl App {
         }
     }
 
-    fn track_names(&self) -> Vec<String> {
-        self.project.tracks.iter().map(|t| t.name.clone()).collect()
+    fn track_meta(&self) -> Vec<TrackMeta> {
+        self.project.tracks.iter().map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone() }).collect()
     }
 
-    fn restore_names(&mut self, names: &[String]) {
-        if names.len() == self.project.tracks.len() {
-            for (t, n) in self.project.tracks.iter_mut().zip(names) {
-                t.name.clone_from(n);
+    fn restore_meta(&mut self, meta: &[TrackMeta]) {
+        if meta.len() != self.project.tracks.len() {
+            return;
+        }
+        for (i, m) in meta.iter().enumerate() {
+            self.project.tracks[i].name.clone_from(&m.name);
+            if self.project.tracks[i].sample != m.sample {
+                self.project.tracks[i].sample.clone_from(&m.sample);
+                self.send_sample(i);
             }
         }
+    }
+
+    /// Sends track `i`'s sample (from the bank) to the engine.
+    fn send_sample(&mut self, i: usize) {
+        let sample = self.project.tracks[i].sample.as_ref().and_then(|p| self.bank.get(p)).cloned();
+        self.send(Command::SetSample { track: i as u8, sample });
+    }
+
+    /// Each track's loaded sample, for the engine and for export.
+    pub fn track_samples(&self) -> Vec<Option<Arc<Sample>>> {
+        self.project.tracks.iter().map(|t| t.sample.as_ref().and_then(|p| self.bank.get(p)).cloned()).collect()
+    }
+
+    /// Adds already-loaded samples (one per track, as from
+    /// [`Project::load_samples`]) to the bank.
+    pub fn with_samples(mut self, samples: Vec<Option<Arc<Sample>>>) -> Self {
+        for (t, s) in self.project.tracks.iter().zip(samples) {
+            if let (Some(path), Some(s)) = (&t.sample, s) {
+                self.bank.insert(path.clone(), s);
+            }
+        }
+        self
+    }
+
+    /// Loads a WAV file into the selected sampler track, as one undo step.
+    fn load_sample(&mut self, text: &str) {
+        let path = sample_mod::absolute(text);
+        let key = path.to_string_lossy().into_owned();
+        if key.contains(['\n', '\r']) {
+            self.set_status("A sample path cannot contain line breaks");
+            return;
+        }
+        let loaded = match sample_mod::load(&path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.set_status(format!("Cannot load sample: {e}"));
+                return;
+            }
+        };
+        let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
+        let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
+        let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
+        self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
+        self.bank.insert(key.clone(), loaded);
+        let meta_before = self.track_meta();
+        self.project.tracks[self.track].sample = Some(key);
+        self.send_sample(self.track);
+        self.dirty = true;
+        self.redo.clear();
+        let meta_after = self.track_meta();
+        self.push_change(Change {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            meta_before,
+            meta_after,
+            what: "load sample",
+            key: None,
+            at: Instant::now(),
+        });
     }
 
     pub fn undo(&mut self) {
@@ -370,7 +461,7 @@ impl App {
         for &e in &c.undo {
             self.apply_raw(e);
         }
-        self.restore_names(&c.names_before);
+        self.restore_meta(&c.meta_before);
         self.after_history_move(&c, "Undid");
         self.redo.push(c);
     }
@@ -383,7 +474,7 @@ impl App {
         for &e in &c.redo {
             self.apply_raw(e);
         }
-        self.restore_names(&c.names_after);
+        self.restore_meta(&c.meta_after);
         self.after_history_move(&c, "Redid");
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
@@ -511,7 +602,7 @@ impl App {
 
     fn key_add_track(&mut self, key: Key) {
         self.mode = Mode::Normal;
-        if let Key::Char(c @ '1'..='6') = key {
+        if let Key::Char(c @ '1'..='7') = key {
             let kind = InstrumentKind::ALL[c as usize - '1' as usize];
             if self.edit(Edit::AddTrack(kind)) {
                 self.track = self.track_count() - 1;
@@ -554,6 +645,7 @@ impl App {
                     PromptKind::SaveAs => self.save_to(with_extension(&text, FILE_EXTENSION)),
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
+                    PromptKind::LoadSample => self.load_sample(&text),
                 }
                 return;
             }
@@ -577,16 +669,16 @@ impl App {
         if self.project.tracks.get(self.track).is_none_or(|t| t.name == name) {
             return;
         }
-        let names_before = self.track_names();
+        let meta_before = self.track_meta();
         self.project.tracks[self.track].name = name;
         self.dirty = true;
         self.redo.clear();
-        let names_after = self.track_names();
+        let meta_after = self.track_meta();
         self.push_change(Change {
             undo: Vec::new(),
             redo: Vec::new(),
-            names_before,
-            names_after,
+            meta_before,
+            meta_after,
             what: "rename",
             key: None,
             at: Instant::now(),
@@ -661,6 +753,14 @@ impl App {
             Key::Char('p') => {
                 let b = self.brushes[self.track];
                 self.audition(b);
+            }
+            Key::Char('o') => {
+                if self.project.tracks[self.track].kind == InstrumentKind::Sampler {
+                    let current = self.project.tracks[self.track].sample.clone().unwrap_or_default();
+                    self.mode = Mode::Prompt(PromptKind::LoadSample, current);
+                } else {
+                    self.set_status("Samples load into sampler tracks (a, 7 adds one)");
+                }
             }
             Key::Char('v') => {
                 if self.project.tracks[self.track].kind.is_drum() {
@@ -834,7 +934,7 @@ impl App {
     pub fn export_to(&mut self, path: &Path) {
         let opts = RenderOptions { sample_rate: self.sample_rate, loops: self.export_loops, ..Default::default() };
         let started = Instant::now();
-        let samples = render::render(&self.project, &opts);
+        let samples = render::render(&self.project, &self.track_samples(), &opts);
         let secs = samples.len() as f32 / 2.0 / self.sample_rate as f32;
         match wav::write_file(path, &samples, 2, self.sample_rate, self.export_format) {
             Ok(stats) => {
@@ -1074,7 +1174,15 @@ impl App {
         let dim = Style::fg(Color::Gray);
         s.fill(0, y, w, '─', dim);
         let Some(t) = self.project.tracks.get(self.track) else { return };
-        let title = format!(" {} · {} ", t.name, t.kind.label());
+        let title = match (&t.sample, t.kind) {
+            (Some(path), _) => {
+                let file = Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+                let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
+                format!(" {} · {} · {file}{missing} ", t.name, t.kind.label())
+            }
+            (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o ", t.name),
+            (None, kind) => format!(" {} · {} ", t.name, kind.label()),
+        };
         let title_style =
             if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
         s.put(2, y, &title, title_style);
@@ -1109,6 +1217,7 @@ impl App {
                 let label = match kind {
                     PromptKind::SaveAs => "Save as: ".to_string(),
                     PromptKind::Rename => "Track name: ".to_string(),
+                    PromptKind::LoadSample => "Load WAV sample: ".to_string(),
                     PromptKind::Export => format!(
                         "Export [{}, {} loop{}] (Tab format, ↑↓ loops) file: ",
                         self.export_format.label(),
@@ -1128,7 +1237,12 @@ impl App {
                 s.put(0, y, &format!("Delete track '{name}'? (y/n)"), prompt);
             }
             Mode::AddTrack => {
-                s.put(0, y, "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  (Esc cancels)", prompt);
+                s.put(
+                    0,
+                    y,
+                    "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  7 Sampler  (Esc cancels)",
+                    prompt,
+                );
             }
             _ => {
                 let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
@@ -1179,6 +1293,7 @@ fn draw_help(s: &mut Screen) {
         ("g G", "swing down / up (50-75 %)"),
         ("l L", "pattern length down / up"),
         ("a D r", "add / delete / rename track"),
+        ("o", "load a WAV file into a sampler track"),
         ("w  Ctrl+S", "save (W: save as)"),
         ("e", "export WAV (Tab picks format, ↑↓ loop count)"),
         ("q  Ctrl+C", "quit"),
@@ -1241,11 +1356,7 @@ fn velocity_glyph(v: u8) -> char {
     }
 }
 
-/// Scientific pitch notation: 60 = C4.
-pub fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-    format!("{}{}", NAMES[usize::from(note % 12)], i32::from(note / 12) - 1)
-}
+pub use crate::instrument::note_name;
 
 fn with_extension(text: &str, ext: &str) -> PathBuf {
     let p = PathBuf::from(text);
@@ -1254,19 +1365,23 @@ fn with_extension(text: &str, ext: &str) -> PathBuf {
 
 /// Starts the audio engine for `project`. Returns the stream and UI link, or
 /// the reason audio is unavailable.
-pub fn start_audio(project: &Project) -> Result<(Stream, EngineLink, u32), String> {
+pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result<(Stream, EngineLink, u32), String> {
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
+    let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
     let edits = project.to_edits();
+    let samples = samples.to_vec();
     let cb_shared = shared.clone();
-    let stream = audio::open(move |sample_rate| EngineCallback {
-        engine: Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx)),
-        shared: cb_shared,
-        sample_rate: sample_rate as f32,
-        load: 0.0,
+    let stream = audio::open(move |sample_rate| {
+        let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
+        engine.attach_retirement(retire_tx);
+        for (track, sample) in samples.into_iter().enumerate() {
+            engine.set_sample(track, sample);
+        }
+        EngineCallback { engine, shared: cb_shared, sample_rate: sample_rate as f32, load: 0.0 }
     })?;
     let sr = stream.info().sample_rate;
-    Ok((stream, EngineLink::new(tx, shared), sr))
+    Ok((stream, EngineLink::new(tx, shared).with_retirement(retire_rx), sr))
 }
 
 /// Runs the interactive session until the user quits.
@@ -1288,7 +1403,11 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
         None => (Project::demo(), None, "Demo beat loaded. Space plays, ? shows all keys.".to_string()),
     };
 
-    let (stream, link, sample_rate, label) = match start_audio(&project) {
+    let (samples, errors) = project.load_samples();
+    if let Some(first) = errors.first() {
+        message = format!("{} sample(s) missing, e.g. {first}", errors.len());
+    }
+    let (stream, link, sample_rate, label) = match start_audio(&project, &samples) {
         Ok((stream, link, sr)) => {
             let label = format!("{} {} Hz", stream.info().backend, sr);
             (Some(stream), Some(link), sr, label)
@@ -1298,7 +1417,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
             (None, None, 48_000, "no audio".to_string())
         }
     };
-    let mut app = App::new(project, path, link, sample_rate, label);
+    let mut app = App::new(project, path, link, sample_rate, label).with_samples(samples);
     app.set_status(message);
 
     crate::tui::term::install_panic_hook();
@@ -1650,6 +1769,70 @@ mod tests {
         keys(&mut a, &[Key::Char('c')]);
         assert_eq!(a.project.tracks[0].steps[0].unwrap().chord, [0; MAX_CHORD - 1]);
         assert_eq!(step_summary(&Step { chord: [3, 7, 0], offset: -2, ..Step::new(57, 90, 1) }), "A3min v90 len1 -2t");
+    }
+
+    #[test]
+    fn sampler_tracks_load_undo_and_export_samples() {
+        let dir = std::env::temp_dir().join(format!("tinvo-sampler-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav_path = dir.join("tone.wav");
+        let tone: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.06).sin() * 0.8).collect();
+        wav::write_file(&wav_path, &tone, 1, 48_000, SampleFormat::Float32).unwrap();
+
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(Project::new(), None, Some(link), 48_000, "test".into());
+        let sent = |rx: &mut spsc::Consumer<Command>| {
+            let mut v = Vec::new();
+            while let Some(cmd) = rx.pop() {
+                if let Command::SetSample { track, sample } = cmd {
+                    v.push((track, sample.is_some()));
+                }
+            }
+            v
+        };
+        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('o')]);
+        assert!(a.status_text().unwrap().contains("sampler tracks"));
+        keys(&mut a, &[Key::Char('a'), Key::Char('7'), Key::Char('o')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::LoadSample, String::new()));
+        a.mode = Mode::Prompt(PromptKind::LoadSample, dir.join("nope.wav").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Cannot load sample"));
+        assert!(a.undo.iter().all(|c| c.what != "load sample"));
+        while rx.pop().is_some() {}
+
+        a.mode = Mode::Prompt(PromptKind::LoadSample, wav_path.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Loaded tone.wav: 0.50 s"), "{:?}", a.status_text());
+        let stored = a.project.tracks[1].sample.clone().unwrap();
+        assert!(Path::new(&stored).is_absolute());
+        assert_eq!(sent(&mut rx), [(1, true)]);
+        assert!(a.track_samples()[1].is_some());
+
+        // Undo and redo move the sample, and the engine follows.
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!((a.project.tracks[1].sample.as_deref(), sent(&mut rx)), (None, vec![(1, false)]));
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(sent(&mut rx), [(1, true)]);
+        // A deleted sampler track comes back with its sample.
+        a.track = 1;
+        keys(&mut a, &[Key::Char('D'), Key::Char('y'), Key::Char('u')]);
+        assert_eq!(a.project.tracks[1].sample.as_deref(), Some(stored.as_str()));
+        assert_eq!(sent(&mut rx), [(1, true)]);
+
+        // The export plays the sample.
+        a.step = 0;
+        a.track = 1;
+        keys(&mut a, &[Key::Enter]);
+        a.export_loops = 1;
+        let out = dir.join("out.wav");
+        a.export_to(&out);
+        let d = wav::decode(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(d.samples.iter().any(|x| x.abs() > 0.1), "the sample is audible in the export");
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!((0..30).any(|y| s.row_text(y).contains("tone.wav")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

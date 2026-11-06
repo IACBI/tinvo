@@ -59,7 +59,7 @@ pub(super) fn params(kind: InstrumentKind) -> &'static [ParamSpec] {
         InstrumentKind::HatClosed => &HAT_CLOSED,
         InstrumentKind::HatOpen => &HAT_OPEN,
         InstrumentKind::Clap => &CLAP,
-        InstrumentKind::Synth => &[],
+        InstrumentKind::Synth | InstrumentKind::Sampler => &[],
     }
 }
 
@@ -206,7 +206,7 @@ impl Drum {
                 self.spread = ((p[2] * sr) as u32).max(1);
                 self.f1.set_q(p[0] * self.pitch, 1.5, sr);
             }
-            InstrumentKind::Synth => unreachable!("Drum is never constructed for Synth"),
+            InstrumentKind::Synth | InstrumentKind::Sampler => unreachable!("Drum is only constructed for drum kinds"),
         }
     }
 
@@ -293,7 +293,7 @@ impl Drum {
                 self.amp2 *= self.amp2_coef;
                 1.4 * y
             }
-            InstrumentKind::Synth => 0.0,
+            InstrumentKind::Synth | InstrumentKind::Sampler => 0.0,
         };
         self.t = self.t.saturating_add(1);
         let min_len = if self.kind == InstrumentKind::Clap { 3 * self.spread } else { 0 };
