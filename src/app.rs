@@ -7,7 +7,9 @@
 
 use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
-use crate::engine::{Command, Edit, Engine, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, Shared, Step};
+use crate::engine::{
+    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, Shared, Step,
+};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME};
 use crate::render::{self, RenderOptions};
@@ -29,6 +31,16 @@ const PARAM_COL: u16 = 28;
 const MIN_W: u16 = 64;
 const MIN_H: u16 = 16;
 const HISTORY_LIMIT: usize = 1000;
+/// Chord shapes that `c` cycles through, as intervals above the root.
+const CHORDS: [(&str, [u8; MAX_CHORD - 1]); 7] = [
+    ("", [0, 0, 0]),
+    ("maj", [4, 7, 0]),
+    ("min", [3, 7, 0]),
+    ("7", [4, 7, 10]),
+    ("m7", [3, 7, 10]),
+    ("maj7", [4, 7, 11]),
+    ("sus4", [5, 7, 0]),
+];
 /// Repeated nudges of one value within this window undo as a single change.
 const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -169,6 +181,10 @@ pub struct App {
     pub step: usize,
     pub param: usize,
     pub focus: Focus,
+    /// Piano-roll view of the selected (melodic) track instead of the grid.
+    pub roll: bool,
+    /// Pitch under the piano-roll cursor.
+    pub roll_note: u8,
     pub mode: Mode,
     pub export_format: SampleFormat,
     pub export_loops: u32,
@@ -214,6 +230,8 @@ impl App {
             step: 0,
             param: 0,
             focus: Focus::Grid,
+            roll: false,
+            roll_note: 48,
             mode: Mode::Normal,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
@@ -398,11 +416,16 @@ impl App {
         }
     }
 
-    fn audition(&mut self, note: u8, velocity: u8) {
+    fn audition(&mut self, step: Step) {
         if self.track < self.project.tracks.len() {
             let frames = (self.sample_rate as f32 * AUDITION_SECONDS) as u32;
-            self.send(Command::Audition { track: self.track as u8, note, velocity, frames });
+            self.send(Command::Audition { track: self.track as u8, step, frames });
         }
+    }
+
+    /// Whether the piano roll is showing (it only applies to melodic tracks).
+    pub fn roll_active(&self) -> bool {
+        self.roll && self.project.tracks.get(self.track).is_some_and(|t| !t.kind.is_drum())
     }
 
     pub fn toggle_play(&mut self) {
@@ -637,9 +660,22 @@ impl App {
             }
             Key::Char('p') => {
                 let b = self.brushes[self.track];
-                self.audition(b.note, b.velocity);
+                self.audition(b);
+            }
+            Key::Char('v') => {
+                if self.project.tracks[self.track].kind.is_drum() {
+                    self.set_status("The piano roll is for melodic tracks");
+                } else {
+                    self.roll = !self.roll;
+                    if self.roll {
+                        let t = &self.project.tracks[self.track];
+                        self.roll_note = t.steps[self.step].map_or(self.brushes[self.track].note, |s| s.note);
+                        self.focus = Focus::Grid;
+                    }
+                }
             }
             _ => match self.focus {
+                Focus::Grid if self.roll_active() => self.key_roll(key),
                 Focus::Grid => self.key_grid(key),
                 Focus::Params => self.key_params(key),
             },
@@ -659,10 +695,28 @@ impl App {
             Key::Delete | Key::Backspace => {
                 self.edit(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: None });
             }
-            Key::Char(',') => self.modify_step(|s| s.note = s.note.saturating_sub(1), true),
-            Key::Char('.') => self.modify_step(|s| s.note = (s.note + 1).min(127), true),
-            Key::Char('<') => self.modify_step(|s| s.note = s.note.saturating_sub(12), true),
-            Key::Char('>') => self.modify_step(|s| s.note = s.note.saturating_add(12).min(127), true),
+            _ => self.key_step_options(key),
+        }
+    }
+
+    /// Step keys shared by the grid and the piano roll.
+    fn key_step_options(&mut self, key: Key) {
+        match key {
+            Key::Char(',') => self.modify_step(|s| *s = s.transposed(-1), true),
+            Key::Char('.') => self.modify_step(|s| *s = s.transposed(1), true),
+            Key::Char('<') => self.modify_step(|s| *s = s.transposed(-12), true),
+            Key::Char('>') => self.modify_step(|s| *s = s.transposed(12), true),
+            Key::Char('c') if !self.project.tracks[self.track].kind.is_drum() => {
+                self.modify_step(
+                    |s| {
+                        let i = CHORDS.iter().position(|(_, c)| *c == s.chord).map_or(0, |i| (i + 1) % CHORDS.len());
+                        *s = Step { chord: CHORDS[i].1, ..*s }.sanitized();
+                    },
+                    true,
+                );
+            }
+            Key::Char('(') => self.modify_step(|s| s.offset = (s.offset - 1).max(-MAX_OFFSET), false),
+            Key::Char(')') => self.modify_step(|s| s.offset = (s.offset + 1).min(MAX_OFFSET), false),
             Key::Char('[') => self.modify_step(|s| s.velocity = s.velocity.saturating_sub(8).max(1), true),
             Key::Char(']') => self.modify_step(|s| s.velocity = s.velocity.saturating_add(8).min(127), true),
             Key::Char('{') => self.modify_step(|s| s.length = s.length.saturating_sub(1).max(1), false),
@@ -675,6 +729,46 @@ impl App {
         }
     }
 
+    fn key_roll(&mut self, key: Key) {
+        let len = usize::from(self.project.pattern_len);
+        match key {
+            Key::Left => self.step = (self.step + len - 1) % len,
+            Key::Right => self.step = (self.step + 1) % len,
+            Key::Home => self.step = 0,
+            Key::End => self.step = len - 1,
+            Key::Up => self.roll_note = (self.roll_note + 1).min(127),
+            Key::Down => self.roll_note = self.roll_note.saturating_sub(1),
+            Key::PageUp => self.roll_note = self.roll_note.saturating_add(12).min(127),
+            Key::PageDown => self.roll_note = self.roll_note.saturating_sub(12),
+            Key::Enter | Key::Char('x') => self.toggle_roll_note(),
+            Key::Delete | Key::Backspace => {
+                self.edit(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: None });
+            }
+            _ => self.key_step_options(key),
+        }
+    }
+
+    /// Adds or removes the cursor pitch in the cursor step's chord.
+    fn toggle_roll_note(&mut self) {
+        let (track, step, note) = (self.track as u8, self.step as u8, self.roll_note);
+        let brush = self.brushes[self.track];
+        let value = match self.project.tracks[self.track].steps[self.step] {
+            None => Some(Step { note, chord: [0; MAX_CHORD - 1], ..brush }.sanitized()),
+            Some(s) if s.has_note(note) => s.without_note(note),
+            Some(s) => match s.with_note(note) {
+                Some(v) => Some(v),
+                None => {
+                    self.set_status(format!("A step holds at most {MAX_CHORD} notes"));
+                    return;
+                }
+            },
+        };
+        let adding = value.is_some_and(|v| v.has_note(note));
+        if self.edit(Edit::SetStep { track, step, value }) && adding {
+            self.audition(Step::new(note, brush.velocity, 1));
+        }
+    }
+
     fn toggle_step(&mut self) {
         let (track, step) = (self.track as u8, self.step as u8);
         let value = match self.project.tracks[self.track].steps[self.step] {
@@ -683,7 +777,7 @@ impl App {
         };
         if self.edit(Edit::SetStep { track, step, value }) {
             if let Some(s) = value {
-                self.audition(s.note, s.velocity);
+                self.audition(s);
             }
         }
     }
@@ -698,7 +792,7 @@ impl App {
             self.edit_with(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: Some(s) }, true);
         }
         if audition {
-            self.audition(s.note, s.velocity);
+            self.audition(s);
         }
         if current.is_none() {
             self.set_status(format!("New steps: {}", step_summary(&s)));
@@ -779,7 +873,11 @@ impl App {
         let params_rows = self.params_rows(w);
         // header, ruler, separator, params block, status line
         let track_rows = h.saturating_sub(2 + 1 + params_rows + 1).max(1);
-        self.draw_grid(s, w, track_rows);
+        if self.roll_active() {
+            self.draw_roll(s, w, track_rows);
+        } else {
+            self.draw_grid(s, w, track_rows);
+        }
         let sep_y = 2 + track_rows;
         self.draw_params(s, w, sep_y);
         self.draw_status(s, w, h - 1);
@@ -825,13 +923,9 @@ impl App {
         (first, (first + cap).min(len))
     }
 
-    fn draw_grid(&self, s: &mut Screen, w: u16, rows: u16) {
-        let dim = Style::fg(Color::Gray);
-        // Column positions match the track rows drawn below.
-        s.put(1, 1, " # Track        Type", dim);
-        s.put(26, 1, "M S", dim);
-        s.put(30, 1, "Level", dim);
-        s.put(LEFT - 1, 1, "│", dim);
+    /// Beat labels and the playhead marker above the step columns.
+    fn draw_ruler(&self, s: &mut Screen, w: u16) {
+        s.put(LEFT - 1, 1, "│", Style::fg(Color::Gray));
         let (first, last) = self.visible_steps(w);
         for (col, i) in (first..last).enumerate() {
             let x = LEFT + col as u16 * CELL;
@@ -843,6 +937,74 @@ impl App {
                 s.put(x + 2, 1, "▼", Style::fg(Color::BrightGreen));
             }
         }
+    }
+
+    fn draw_roll(&self, s: &mut Screen, w: u16, rows: u16) {
+        let dim = Style::fg(Color::Gray);
+        let t = &self.project.tracks[self.track];
+        s.put(1, 1, &format!("Piano roll · {:<16.16} v: grid", t.name), Style::fg(Color::BrightWhite).bold());
+        self.draw_ruler(s, w);
+        let (first, last) = self.visible_steps(w);
+        // Pitches sounding at each step because an earlier note is still held.
+        let mut held = [0u128; MAX_STEPS];
+        for (j, step) in t.steps.iter().enumerate() {
+            let Some(st) = step.filter(|st| st.ratchet == 1) else { continue };
+            let mask = st.notes().fold(0u128, |m, n| m | 1 << n);
+            for h in held.iter_mut().take((j + usize::from(st.length)).min(MAX_STEPS)).skip(j + 1) {
+                *h |= mask;
+            }
+        }
+        // Keep the cursor pitch in the middle of the view where possible.
+        let rows = rows.min(128);
+        let top = (u16::from(self.roll_note) + rows / 2).clamp(rows - 1, 127);
+        for row in 0..rows {
+            let y = 2 + row;
+            let pitch = (top - row) as u8;
+            let black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
+            let label_style = if pitch == self.roll_note {
+                Style::fg(Color::BrightYellow).bold()
+            } else if pitch % 12 == 0 {
+                Style::fg(Color::BrightWhite)
+            } else {
+                dim
+            };
+            s.put(LEFT - 6, y, &format!("{:>4}", note_name(pitch)), label_style);
+            s.put(LEFT - 1, y, if black { "▌" } else { "│" }, dim);
+            for (col, i) in (first..last).enumerate() {
+                let x = LEFT + col as u16 * CELL;
+                let step = t.steps[i];
+                let (text, mut st) = match step {
+                    Some(sp) if sp.has_note(pitch) => {
+                        let r = if sp.ratchet > 1 { char::from(b'0' + sp.ratchet) } else { '■' };
+                        let color = if sp.chance < 100 { Color::Yellow } else { Color::BrightMagenta };
+                        (format!("■■{r}"), Style::fg(color))
+                    }
+                    _ if held[i] >> pitch & 1 == 1 => ("───".to_string(), Style::fg(Color::Magenta)),
+                    _ if black => (" · ".to_string(), Style::fg(Color::Black).on(Color::Default)),
+                    _ if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
+                    _ => (" · ".to_string(), dim),
+                };
+                if self.play_step == Some(i) {
+                    st.bg = Color::Blue;
+                }
+                if i == self.step && pitch == self.roll_note {
+                    st = Style::fg(Color::Black).on(Color::BrightWhite);
+                } else if i == self.step && st.bg == Color::Default {
+                    st.bg = Color::Black;
+                }
+                s.put(x, y, &text, st);
+            }
+        }
+    }
+
+    fn draw_grid(&self, s: &mut Screen, w: u16, rows: u16) {
+        let dim = Style::fg(Color::Gray);
+        // Column positions match the track rows drawn below.
+        s.put(1, 1, " # Track        Type", dim);
+        s.put(26, 1, "M S", dim);
+        s.put(30, 1, "Level", dim);
+        self.draw_ruler(s, w);
+        let (first, last) = self.visible_steps(w);
 
         let n = self.track_count();
         if n == 0 {
@@ -874,10 +1036,11 @@ impl App {
                         } else {
                             format!("{:<3}", note_name(step.note))
                         };
-                        let color = match (step.chance < 100, t.kind.is_drum()) {
-                            (true, _) => Color::Yellow,
-                            (false, true) => Color::BrightCyan,
-                            (false, false) => Color::BrightMagenta,
+                        let color = match (step.chance < 100, t.kind.is_drum(), step.note_count() > 1) {
+                            (true, ..) => Color::Yellow,
+                            (false, true, _) => Color::BrightCyan,
+                            (false, false, true) => Color::BrightGreen,
+                            (false, false, false) => Color::BrightMagenta,
                         };
                         (text, Style::fg(color))
                     }
@@ -1005,6 +1168,9 @@ fn draw_help(s: &mut Screen) {
         ("{ }", "step length down / up"),
         ("- =", "step chance down / up (yellow: below 100 %)"),
         ("/", "step ratchet: 1-4 hits per step"),
+        ("( )", "move the step earlier / later (1/24 step, up to half a step)"),
+        ("c", "cycle chord: maj, min, 7, m7, maj7, sus4 (green in the grid)"),
+        ("v", "piano roll for the track: ↑↓ pitch, PgUp/PgDn octave, Enter adds/removes a note"),
         ("u U", "undo / redo (also Ctrl+Z / Ctrl+Y)"),
         ("p", "preview the track's note"),
         ("PgUp PgDn", "coarse parameter change; 0 resets to default"),
@@ -1041,7 +1207,22 @@ fn draw_meter(s: &mut Screen, x: u16, y: u16, width: u16, level: f32, bg: Color)
 }
 
 fn step_summary(s: &Step) -> String {
-    let mut t = format!("{} v{} len{}", note_name(s.note), s.velocity, s.length);
+    let mut t = note_name(s.note);
+    if s.note_count() > 1 {
+        match CHORDS.iter().find(|(_, c)| *c == s.chord) {
+            Some((name, _)) => t += name,
+            None => {
+                for n in s.notes().skip(1) {
+                    t += "+";
+                    t += &note_name(n);
+                }
+            }
+        }
+    }
+    t += &format!(" v{} len{}", s.velocity, s.length);
+    if s.offset != 0 {
+        t += &format!(" {:+}t", s.offset);
+    }
     if s.chance < 100 {
         t += &format!(" {}%", s.chance);
     }
@@ -1404,6 +1585,74 @@ mod tests {
     }
 
     #[test]
+    fn piano_roll_builds_chords() {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('2'), Key::Char('v')]);
+        assert!(!a.roll_active(), "drum tracks have no piano roll");
+        assert!(a.status_text().unwrap().contains("melodic"));
+        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('v')]);
+        assert!(a.roll_active());
+        a.roll_note = 48;
+        // C3, then E3 and G3 on the same step.
+        keys(
+            &mut a,
+            &[Key::Enter, Key::Up, Key::Up, Key::Up, Key::Up, Key::Enter, Key::Up, Key::Up, Key::Up, Key::Enter],
+        );
+        let st = a.project.tracks[1].steps[0].unwrap();
+        assert_eq!(st.notes().collect::<Vec<_>>(), [48, 52, 55]);
+        // A fourth note fits, a fifth does not.
+        keys(&mut a, &[Key::PageUp, Key::Enter, Key::Down, Key::Enter]);
+        assert_eq!(a.project.tracks[1].steps[0].unwrap().note_count(), 4);
+        assert!(a.status_text().unwrap().contains("at most"));
+        // Removing notes one by one finally clears the step.
+        assert_eq!(a.project.tracks[1].steps[0].unwrap().top(), 67);
+        for n in [67, 55, 52, 48] {
+            a.roll_note = n;
+            keys(&mut a, &[Key::Enter]);
+        }
+        assert_eq!(a.project.tracks[1].steps[0], None);
+        // Each toggle was its own undo step.
+        for _ in 0..4 {
+            a.handle_key(Key::Char('u'));
+        }
+        assert_eq!(a.project.tracks[1].steps[0].unwrap().note_count(), 4);
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!(s.row_text(1).contains("Piano roll"));
+        // The view is centred on the cursor pitch (C3), where a note sits.
+        let c3 = (2..20).find(|&y| s.row_text(y).contains("  C3")).expect("C3 row");
+        assert!(s.row_text(c3).contains("■■"), "{}", s.row_text(c3));
+        keys(&mut a, &[Key::Char('v')]);
+        assert!(!a.roll_active());
+    }
+
+    #[test]
+    fn chord_offset_and_transpose_keys() {
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        a.track = bass;
+        a.step = 0;
+        let root = a.project.tracks[bass].steps[0].unwrap().note;
+        keys(&mut a, &[Key::Char('c')]);
+        assert_eq!(a.project.tracks[bass].steps[0].unwrap().chord, [4, 7, 0]);
+        keys(&mut a, &[Key::Char('c'), Key::Char('.')]);
+        let st = a.project.tracks[bass].steps[0].unwrap();
+        assert_eq!((st.note, st.chord), (root + 1, [3, 7, 0]));
+        keys(&mut a, &[Key::Char(')'), Key::Char(')'), Key::Char('(')]);
+        assert_eq!(a.project.tracks[bass].steps[0].unwrap().offset, 1);
+        for _ in 0..20 {
+            a.handle_key(Key::Char('('));
+        }
+        assert_eq!(a.project.tracks[bass].steps[0].unwrap().offset, -MAX_OFFSET);
+        assert!(a.status_text().is_none_or(|t| !t.starts_with("Cannot")));
+        // Drums have no chords.
+        a.track = 0;
+        keys(&mut a, &[Key::Char('c')]);
+        assert_eq!(a.project.tracks[0].steps[0].unwrap().chord, [0; MAX_CHORD - 1]);
+        assert_eq!(step_summary(&Step { chord: [3, 7, 0], offset: -2, ..Step::new(57, 90, 1) }), "A3min v90 len1 -2t");
+    }
+
+    #[test]
     fn quit_asks_when_dirty() {
         let mut a = app();
         keys(&mut a, &[Key::Char('q')]);
@@ -1516,15 +1765,20 @@ mod tests {
     #[test]
     fn draws_without_panicking_at_any_size() {
         let mut a = app();
-        for (w, h) in [(20, 5), (64, 16), (80, 24), (120, 40), (300, 80)] {
+        let synth = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        for (w, h) in [(20, 5), (64, 16), (80, 24), (120, 40), (300, 80), (300, 200)] {
             let mut s = Screen::new(w, h);
-            for mode in [Mode::Normal, Mode::Help, Mode::AddTrack, Mode::Prompt(PromptKind::Export, "x".into())] {
-                a.mode = mode;
-                a.draw(&mut s);
-                let mut out = String::new();
-                s.flush_into(&mut out);
+            for (roll, note) in [(false, 48), (true, 0), (true, 127), (true, 60)] {
+                (a.roll, a.roll_note, a.track) = (roll, note, if roll { synth } else { 0 });
+                for mode in [Mode::Normal, Mode::Help, Mode::AddTrack, Mode::Prompt(PromptKind::Export, "x".into())] {
+                    a.mode = mode;
+                    a.draw(&mut s);
+                    let mut out = String::new();
+                    s.flush_into(&mut out);
+                }
             }
         }
+        (a.roll, a.track) = (false, 0);
         a.mode = Mode::Normal;
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);

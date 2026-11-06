@@ -52,7 +52,8 @@ Each layer depends only on the ones below it.
 
 - **Tracks**: up to 16 slots, each with an `Instrument`, a 64-step pattern, fader/pan/mute/solo, and smoothed left/right gains (5 ms time constant, so changes never click).
 - **Transport**: 16th-note steps. The frame of step *n* is `origin + round((n + swing(n) − origin_step) × samples_per_step)`, where `swing(n)` is `percent/50 − 1` for odd *n* and 0 otherwise. A tempo change moves the origin to the current position, so the playhead stays continuous.
-- **Step options**: chance is rolled for every track before any track plays, from a seeded generator that restarts on Play, so playback and export always produce the same sequence of hits from the start. Ratchets split the (swung) step span evenly; the later hits are queued per track as pending note-ons and fire sample-accurately like any other event.
+- **Steps and hits**: a step is a note or a chord of up to 4 notes (stored as intervals above the lowest note) with velocity, length, chance, ratchet and a micro-timing offset. When the transport reaches step *n* it queues hits, never plays them directly: step *n*'s on-time and late hits, and step *n+1*'s early ones. An early hit is at most half a straight step early, and the shortest swung step is half a straight step, so an early hit is never due before it is queued. Every queued hit fires through the same path, after note-offs and the choke check, at its exact frame.
+- **Chance**: rolled per step when its hits are queued, from a seeded generator that restarts on Play, so playback and export always produce the same sequence of hits from the start. Ratchets split the (swung) step span evenly, starting at the shifted position.
 - **Choke**: when a closed hat fires, open hats on all tracks fade out over 12 ms.
 - **Sample-accurate events**: each 64-frame block is split at every step boundary and note-off inside it. Note-offs fire before note-ons that land on the same frame.
 - **Voice identity**: `note_on` returns a `VoiceId`, and note-offs target that exact voice, so retriggering a pitch never cuts off the wrong note.
@@ -65,7 +66,8 @@ Each layer depends only on the ones below it.
 | Oscillators | Saw and square with PolyBLEP, triangle with PolyBLAMP, sine; phase kept in f64 |
 | Filter | TPT/ZDF state-variable filter (LP, unity-peak BP, HP); stable under per-sample modulation |
 | Envelopes | Linear attack, exponential decay/release (times are to −60 dB); retriggers start from the current level |
-| Synth modulation | One free-running LFO per synth, computed per 64-sample chunk; glide is exponential in pitch (99 % of the interval in the glide time); pitch is recomputed per sample only while gliding or under LFO pitch modulation |
+| Synth modulation | One free-running LFO per synth, computed per 64-sample chunk, to pitch, pulse width, cutoff and level; glide is exponential in pitch (99 % of the interval in the glide time); pitch is recomputed per sample only while gliding or under LFO pitch modulation |
+| Unison | Up to 4 copies of each oscillator spread evenly across ±detune, started at random phases and summed at 1/√n so the level stays steady |
 | Drums | Kick (pitch-swept sine plus click), snare (two tones plus filtered noise), hats (six band-limited squares, metallic), clap (three bursts plus tail); retriggers cross-fade the old tail over 1 ms |
 | Export | TPDF dither (±1 LSB) for 16/24-bit; clipped samples are counted and reported |
 
@@ -79,7 +81,7 @@ Each layer depends only on the ones below it.
 
 ## Project file (`.tvo`)
 
-Line-based UTF-8 text with a version header (`tinvo 2`). Format 2 adds `swing` and per-step chance and ratchet. Format 1 files still load, with swing off and every step at 100 % chance and one hit. Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
+Line-based UTF-8 text with a version header (`tinvo 3`). Format 2 added `swing` and per-step chance and ratchet; format 3 adds the micro-timing offset and the chord (`-` or intervals such as `3,7,10`). Older files still load, with the newer fields at their neutral values. A chord must be written in canonical form (ascending, no duplicates, in MIDI range), so every file has exactly one spelling. Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
 
 ## Undo
 
@@ -87,5 +89,5 @@ Line-based UTF-8 text with a version header (`tinvo 2`). Format 2 adds `swing` a
 
 ## Verification
 
-- 114 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, swing/chance/ratchet/choke timing, glide and LFO, reading format 1 files, edit inversion for every edit kind, undo/redo, and UI behaviour (including that the engine receives exactly the edits the project applied, through undo and redo).
-- `tinvo probe` exercises the real device. `tinvo bench` measures rendering cost.
+- 124 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, swing/chance/ratchet/choke timing, glide and LFO, chords and micro-timing (including early hits under maximum swing), pulse width (measured second harmonic), noise and unison, reading format 1 and 2 files, edit inversion for every edit kind, undo/redo, and UI behaviour (including that the engine receives exactly the edits the project applied, through undo and redo).
+- `tinvo probe` exercises the real device. `tinvo bench` measures rendering cost for the demo and for a worst-case synth track (about 1 % and 5 % of one core on a current desktop CPU).

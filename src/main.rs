@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tinvo::audio::{self, AudioCallback};
+use tinvo::engine::{Edit, Step};
+use tinvo::instrument::InstrumentKind;
 use tinvo::project::Project;
 use tinvo::render::{self, RenderOptions};
 use tinvo::wav::{self, SampleFormat};
@@ -158,19 +160,43 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_bench() -> Result<(), String> {
-    let project = Project::demo();
+    bench("Demo project", &Project::demo())?;
+    bench("Worst-case synth (8 voices, unison 4, noise, LFO)", &synth_stress_project()?)
+}
+
+fn bench(label: &str, project: &Project) -> Result<(), String> {
     let opts = RenderOptions { sample_rate: 48_000, loops: 16, max_tail_seconds: 0.0 };
     // Warm up caches and the allocator before timing.
-    render::render(&project, &RenderOptions { loops: 1, ..opts });
+    render::render(project, &RenderOptions { loops: 1, ..opts });
     let start = Instant::now();
-    let samples = render::render(&project, &opts);
+    let samples = render::render(project, &opts);
     let elapsed = start.elapsed().as_secs_f64();
     let audio = samples.len() as f64 / 2.0 / 48_000.0;
     println!(
-        "Demo project ({} tracks): rendered {audio:.1} s of audio in {elapsed:.3} s = {:.0}x real time ({:.2} % of one core)",
+        "{label}, {} track(s): {audio:.1} s of audio in {elapsed:.3} s = {:.0}x real time ({:.2} % of one core)",
         project.tracks.len(),
         audio / elapsed,
         elapsed / audio * 100.0
     );
     Ok(())
+}
+
+/// One synth track with every voice busy and every per-sample feature on.
+fn synth_stress_project() -> Result<Project, String> {
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).map_err(|e| e.to_string())?;
+    let specs = InstrumentKind::Synth.params();
+    let mut set = |id: &str, value: f32| -> Result<(), String> {
+        let index = specs.iter().position(|s| s.id == id).ok_or(format!("no synth parameter {id}"))? as u8;
+        p.apply(Edit::SetParam { track: 0, index, value }).map(drop).map_err(|e| e.to_string())
+    };
+    for (id, v) in [("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)] {
+        set(id, v)?;
+    }
+    // Two overlapping four-note chords keep all eight voices sounding.
+    let chord = Step { chord: [3, 7, 10], ..Step::new(48, 100, 2) };
+    for step in 0..16 {
+        p.apply(Edit::SetStep { track: 0, step, value: Some(chord) }).map_err(|e| e.to_string())?;
+    }
+    Ok(p)
 }

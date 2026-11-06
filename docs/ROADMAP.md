@@ -13,7 +13,7 @@ Author: 𝓐.𝓒.𝓑
 - Lossless `.tvo` project format, atomic saves; WAV export at 16/24-bit (dithered) or 32-bit float.
 - CLI: `render`, `demo`, `probe`, `bench`.
 
-## Phase 1: Sound and feel ✅ (this release)
+## Phase 1: Sound and feel ✅ (0.2.0)
 
 - Swing 50–75 % (delays odd 16ths, sample-accurate, ratchets follow it).
 - Per-step chance (1–100 %, reproducible: the random sequence restarts on every Play) and ratchets (1–4 evenly spaced hits).
@@ -23,13 +23,14 @@ Author: 𝓐.𝓒.𝓑
 - Project format 2 (swing, chance, ratchet); format 1 files still load.
 - CI on Windows, Linux and macOS: format, clippy, tests in debug and release, CLI smoke test, minimum Rust version.
 
-## Phase 1b: Notes (moved from Phase 1)
+## Phase 1b: Notes ✅ (0.3.0, this release)
 
-- Polyphonic steps (chords) and a piano-roll view with ticks finer than a step.
-- Per-step micro-timing.
-- Synth: pulse-width modulation, noise oscillator, unison/detune spread.
-
-These need a step to hold more than one note, which changes the pattern data structure. They were split out so that change gets its own release.
+- Chords: a step holds up to 4 notes, stored as intervals above its lowest note, so transposing keeps the shape. `c` cycles common chords.
+- Piano roll (`v`) for melodic tracks: pitch × step, held notes drawn through their length.
+- Micro-timing: each step moves up to half a step early or late in 1/24-step ticks (96 per quarter note). Early hits are queued a step ahead, so they play on time even at the first step after a loop, and stay exact under swing.
+- Synth: pulse width with LFO modulation, a noise source, and unison (up to 4 detuned copies per oscillator).
+- Project format 3; formats 1 and 2 still load.
+- `tinvo bench` also measures a worst-case synth (8 voices, unison 4, noise, LFO).
 
 ## Phase 2: Sampler
 
@@ -61,6 +62,7 @@ These need a step to hold more than one note, which changes the pattern data str
 - Crash-safe autosave and recovery.
 - Fuzzing of the project and WAV parsers.
 - Performance budgets enforced in CI via `tinvo bench`.
+- Notes that span the loop point in the piano roll display (they already play correctly).
 
 ## Known limitations of the foundation
 

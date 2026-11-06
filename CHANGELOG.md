@@ -6,6 +6,20 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
+### Added
+- Chords: up to 4 notes per step. `c` cycles major, minor, 7, m7, maj7 and sus4; chord steps are green in the grid.
+- Piano roll (`v`) for melodic tracks: `↑`/`↓` pitch, `PgUp`/`PgDn` octave, `Enter` adds or removes a note.
+- Micro-timing: `(` and `)` move a step up to half a step early or late, in 1/24-step ticks.
+- Synth pulse width with LFO modulation, a noise source, and unison with detune.
+- `tinvo bench` also measures a worst-case synth track.
+
+### Changed
+- Project files are now format 3. Formats 1 and 2 still load.
+- Pitch keys transpose a whole chord and keep it inside the MIDI range.
+- CI runs on pushes to `main`, on tags and on pull requests, instead of on every branch push.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added
@@ -29,6 +43,7 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/IACBI/tinvo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/IACBI/tinvo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/IACBI/tinvo/releases/tag/v0.1.0

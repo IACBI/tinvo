@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 2
+//! tinvo 3
 //! tempo 92
 //! swing 50
 //! pattern_length 16
@@ -16,20 +16,24 @@
 //! mute false
 //! solo false
 //! param decay 0.45
-//! step 0 60 120 1 100 1  # index note velocity length chance ratchet
+//! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! end
 //! ```
 //!
-//! Version 1 files (no swing, four-field steps) are still read. Floats are
-//! written with Rust's shortest round-trip formatting, so saving and loading
-//! is lossless.
+//! `chord` is `-` or the extra notes as comma-separated semitones above
+//! `note`, ascending (`4,7` is a major triad). Versions 1 (no swing,
+//! `index note velocity length`) and 2 (`... chance ratchet`) are still
+//! read. Floats are written with Rust's shortest round-trip formatting, so
+//! saving and loading is lossless.
 
-use crate::engine::{Edit, MAX_GAIN_DB, MAX_STEPS, MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step};
+use crate::engine::{
+    Edit, MAX_CHORD, MAX_GAIN_DB, MAX_STEPS, MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step,
+};
 use crate::instrument::{InstrumentKind, ParamSpec, SILENT_DB, Unit};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -341,8 +345,17 @@ impl Project {
             }
             for (i, step) in t.steps.iter().enumerate() {
                 if let Some(st) = step {
-                    let _ =
-                        writeln!(s, "step {i} {} {} {} {} {}", st.note, st.velocity, st.length, st.chance, st.ratchet);
+                    let _ = writeln!(
+                        s,
+                        "step {i} {} {} {} {} {} {} {}",
+                        st.note,
+                        st.velocity,
+                        st.length,
+                        st.chance,
+                        st.ratchet,
+                        st.offset,
+                        chord_text(st)
+                    );
                 }
             }
             let _ = writeln!(s, "end");
@@ -401,15 +414,19 @@ impl Project {
                     }
                     "step" => {
                         let f: Vec<&str> = rest.split_whitespace().collect();
-                        let expected = if ver == 1 { 4 } else { 6 };
+                        let (expected, form) = match ver {
+                            1 => (4, "<index> <note> <velocity> <length>"),
+                            2 => (6, "<index> <note> <velocity> <length> <chance> <ratchet>"),
+                            _ => (8, "<index> <note> <velocity> <length> <chance> <ratchet> <offset> <chord>"),
+                        };
                         if f.len() != expected {
-                            return Err(err(if ver == 1 {
-                                "expected 'step <index> <note> <velocity> <length>'".into()
-                            } else {
-                                "expected 'step <index> <note> <velocity> <length> <chance> <ratchet>'".into()
-                            }));
+                            return Err(err(format!("expected 'step {form}'")));
                         }
-                        let n: Vec<u8> = f[1..].iter().map(|s| parse_num(s)).collect::<Result<_, _>>().map_err(err)?;
+                        let n: Vec<u8> = f[1..expected.min(6)]
+                            .iter()
+                            .map(|s| parse_num(s))
+                            .collect::<Result<_, _>>()
+                            .map_err(err)?;
                         let i: usize = parse_num(f[0]).map_err(err)?;
                         if i >= MAX_STEPS {
                             return Err(err(format!("step index {i} out of range")));
@@ -418,6 +435,10 @@ impl Project {
                         if ver >= 2 {
                             st.chance = n[3];
                             st.ratchet = n[4];
+                        }
+                        if ver >= 3 {
+                            st.offset = parse_num(f[6]).map_err(err)?;
+                            st.chord = parse_chord(f[7]).map_err(err)?;
                         }
                         if st.sanitized() != st {
                             return Err(err("step value out of range".into()));
@@ -491,6 +512,29 @@ impl Project {
     }
 }
 
+fn chord_text(st: &Step) -> String {
+    let ivs: Vec<String> = st.chord.iter().filter(|&&i| i > 0).map(u8::to_string).collect();
+    if ivs.is_empty() { "-".into() } else { ivs.join(",") }
+}
+
+fn parse_chord(text: &str) -> Result<[u8; MAX_CHORD - 1], String> {
+    let mut chord = [0u8; MAX_CHORD - 1];
+    if text == "-" {
+        return Ok(chord);
+    }
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() > chord.len() {
+        return Err(format!("a chord has at most {MAX_CHORD} notes"));
+    }
+    for (slot, part) in chord.iter_mut().zip(parts) {
+        *slot = parse_num(part)?;
+        if *slot == 0 {
+            return Err("chord intervals must be above the root".into());
+        }
+    }
+    Ok(chord)
+}
+
 /// Appends the edits that give track `track` (already created with the right
 /// kind and default state) the settings and steps of `t`.
 fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
@@ -548,10 +592,21 @@ mod tests {
         p.tracks[5].params[5] = 1_234.567_9;
         p.tempo = 97.31;
         p.swing = 61.5;
-        p.tracks[2].steps[3] = Some(Step { chance: 35, ratchet: 3, ..Step::new(60, 90, 1) });
+        p.tracks[2].steps[3] = Some(Step { chance: 35, ratchet: 3, offset: -7, ..Step::new(60, 90, 1) });
+        p.tracks[5].steps[1] = Some(Step { chord: [3, 7, 10], offset: 12, ..Step::new(45, 100, 3) });
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 2\n"));
+        assert!(text.starts_with("tinvo 3\n"));
+        assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert_eq!(Project::from_text(&text).unwrap(), p);
+    }
+
+    #[test]
+    fn reads_version_2_files() {
+        let v2 = "tinvo 2\ntempo 100\nswing 60\npattern_length 8\nmaster_gain_db 0\n\ntrack synth\n\
+                  step 3 48 90 2 50 2\nend\n";
+        let p = Project::from_text(v2).unwrap();
+        assert_eq!(p.swing, 60.0);
+        assert_eq!(p.tracks[0].steps[3], Some(Step { chance: 50, ratchet: 2, ..Step::new(48, 90, 2) }));
     }
 
     #[test]
@@ -652,11 +707,20 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 3", 1, "version"),
+            ("tinvo 4", 1, "version"),
             ("tinvo 0", 1, "version"),
             ("tinvo 2\nswing 90", 2, "swing"),
             ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 5\nend", 3, "out of range"),
             ("tinvo 2\ntrack kick\nstep 0 60 100 1 0 1\nend", 3, "out of range"),
+            ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 1 0 -\nend", 3, "expected 'step"),
+            ("tinvo 3\ntrack kick\nstep 0 60 100 1 100 1\nend", 3, "expected 'step"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 13 -\nend", 3, "out of range"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 0 7,4\nend", 3, "out of range"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 0 4,4\nend", 3, "out of range"),
+            ("tinvo 3\ntrack synth\nstep 0 120 100 1 100 1 0 12\nend", 3, "out of range"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 0 0\nend", 3, "above the root"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 0 1,2,3,4\nend", 3, "at most"),
+            ("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 x -\nend", 3, "invalid number"),
             ("tinvo 1\ntempo fast", 2, "invalid number"),
             ("tinvo 1\ntempo 500", 2, "tempo"),
             ("tinvo 1\ntrack drum", 2, "unknown instrument"),

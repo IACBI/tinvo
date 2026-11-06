@@ -1,7 +1,8 @@
-//! Polyphonic subtractive synthesizer: two band-limited oscillators into a
+//! Polyphonic subtractive synthesizer: two band-limited oscillators (each
+//! optionally stacked up to four times, detuned) plus noise into a
 //! state-variable filter with its own envelope, then an amplitude envelope.
-//! A free-running LFO can modulate pitch, cutoff and level; glide slides
-//! each new note from the previously played pitch.
+//! A free-running LFO can modulate pitch, pulse width, cutoff and level;
+//! glide slides each new note from the previously played pitch.
 
 use super::{ParamSpec, Unit, VoiceId};
 use crate::dsp::env::{Adsr, AdsrParams};
@@ -12,6 +13,8 @@ use crate::dsp::{midi_to_hz, semitones_to_ratio, velocity_to_gain};
 use std::f64::consts::TAU;
 
 pub const SYNTH_VOICES: usize = 8;
+/// Most oscillator copies per voice for unison.
+pub const MAX_UNISON: usize = 4;
 
 /// Per-voice output scale; leaves headroom for chords before the fader.
 const VOICE_GAIN: f32 = 0.3;
@@ -21,6 +24,9 @@ const CHUNK: usize = 64;
 const WAVES: &[&str] = &["saw", "square", "tri", "sine"];
 const FILTERS: &[&str] = &["lowpass", "bandpass", "highpass"];
 const LFO_WAVES: &[&str] = &["sine", "tri", "saw", "square", "s&h"];
+const UNISON: &[&str] = &["1", "2", "3", "4"];
+const MIN_PW: f32 = 0.05;
+const MAX_PW: f32 = 0.95;
 
 mod p {
     pub const WAVE1: usize = 0;
@@ -48,7 +54,13 @@ mod p {
     pub const LFO_CUTOFF: usize = 21;
     pub const LFO_AMP: usize = 22;
     pub const VEL_CUTOFF: usize = 23;
-    pub const COUNT: usize = 24;
+    // Added in format 3.
+    pub const PW: usize = 24;
+    pub const PWM: usize = 25;
+    pub const NOISE: usize = 26;
+    pub const UNISON: usize = 27;
+    pub const DETUNE: usize = 28;
+    pub const COUNT: usize = 29;
 }
 
 /// Semitone-sized steps for frequencies, ~10 % steps for times.
@@ -80,6 +92,11 @@ pub static PARAMS: [ParamSpec; p::COUNT] = [
     ParamSpec::linear("lfo_cutoff", "LFO>cutoff", 0.0, 4.0, 0.0, 0.05, Unit::Octaves),
     ParamSpec::linear("lfo_amp", "LFO>level", 0.0, 1.0, 0.0, 0.01, Unit::None),
     ParamSpec::linear("vel_cutoff", "Vel>cutoff", 0.0, 4.0, 0.0, 0.1, Unit::Octaves),
+    ParamSpec::linear("pulse_width", "Pulse width", MIN_PW, MAX_PW, 0.5, 0.01, Unit::None),
+    ParamSpec::linear("lfo_pw", "LFO>PW", 0.0, 0.45, 0.0, 0.01, Unit::None),
+    ParamSpec::linear("noise", "Noise", 0.0, 1.0, 0.0, 0.01, Unit::None),
+    ParamSpec::stepped("unison", "Unison", UNISON, 0.0),
+    ParamSpec::linear("detune", "Detune", 0.0, 50.0, 12.0, 1.0, Unit::Cents),
 ];
 
 /// Glide covers 99 % of the interval in the glide time.
@@ -97,8 +114,8 @@ struct Voice {
     vel_gain: f32,
     /// Velocity normalised to `[0, 1]`, for velocity-to-cutoff.
     vel_norm: f32,
-    osc1: Oscillator,
-    osc2: Oscillator,
+    osc1: [Oscillator; MAX_UNISON],
+    osc2: [Oscillator; MAX_UNISON],
     filter: Svf,
     amp: Adsr,
     fenv: Adsr,
@@ -114,8 +131,8 @@ impl Voice {
             age: 0,
             vel_gain: 0.0,
             vel_norm: 0.0,
-            osc1: Oscillator::new(),
-            osc2: Oscillator::new(),
+            osc1: [Oscillator::new(); MAX_UNISON],
+            osc2: [Oscillator::new(); MAX_UNISON],
             filter: Svf::new(),
             amp: Adsr::new(),
             fenv: Adsr::new(),
@@ -172,6 +189,13 @@ pub struct PolySynth {
     osc2_ratio: f32,
     mode: FilterMode,
     glide_coef: f32,
+    /// Active unison copies and their frequency ratios.
+    unison: usize,
+    unison_ratio: [f32; MAX_UNISON],
+    /// Keeps the summed copies at about the level of one.
+    unison_gain: f32,
+    /// Noise source and unison start phases.
+    rng: Rng,
 }
 
 impl PolySynth {
@@ -189,6 +213,10 @@ impl PolySynth {
             osc2_ratio: 1.0,
             mode: FilterMode::LowPass,
             glide_coef: 0.0,
+            unison: 1,
+            unison_ratio: [1.0; MAX_UNISON],
+            unison_gain: 1.0,
+            rng: Rng::new(0x5E7_0015E),
         };
         for (v, spec) in s.params.iter_mut().zip(PARAMS.iter()) {
             *v = spec.default;
@@ -216,6 +244,15 @@ impl PolySynth {
         self.mode = FilterMode::from_index(pr[p::MODE] as usize);
         let glide = pr[p::GLIDE];
         self.glide_coef = if glide > 0.0 { (-GLIDE_NEPERS / (glide * self.sample_rate)).exp() } else { 0.0 };
+        let u = (pr[p::UNISON] as usize + 1).min(MAX_UNISON);
+        self.unison = u;
+        // Copies spread evenly across +-detune; uncorrelated copies add in
+        // power, so 1/sqrt(n) keeps the level steady.
+        for (k, r) in self.unison_ratio.iter_mut().enumerate() {
+            let spread = if u > 1 && k < u { 2.0 * k as f32 / (u - 1) as f32 - 1.0 } else { 0.0 };
+            *r = semitones_to_ratio(spread * pr[p::DETUNE] * 0.01);
+        }
+        self.unison_gain = 1.0 / (u as f32).sqrt();
         let amp = AdsrParams { attack: pr[p::A_A], decay: pr[p::A_D], sustain: pr[p::A_S], release: pr[p::A_R] };
         let flt = AdsrParams { attack: pr[p::F_A], decay: pr[p::F_D], sustain: pr[p::F_S], release: pr[p::F_R] };
         let sr = self.sample_rate;
@@ -250,10 +287,18 @@ impl PolySynth {
         let note = note.min(127);
         let idx = self.pick_voice();
         let glide_from = if self.glide_coef > 0.0 { self.last_note } else { None };
+        let mut phases = [0.0f64; MAX_UNISON];
+        // Unison copies start at random phases; in phase they would sum to
+        // one louder oscillator until the detune pulls them apart.
+        for ph in phases.iter_mut().skip(1) {
+            *ph = f64::from(self.rng.next_f32());
+        }
         let v = &mut self.voices[idx];
         if !v.amp.is_active() {
-            v.osc1.reset(0.0);
-            v.osc2.reset(0.0);
+            for (k, &ph) in phases.iter().enumerate() {
+                v.osc1[k].reset(ph);
+                v.osc2[k].reset(ph);
+            }
             v.filter.reset();
             v.fenv.reset();
         }
@@ -310,6 +355,15 @@ impl PolySynth {
         let (lfo_pitch, lfo_cut, lfo_amp, vel_cut) =
             (pr[p::LFO_PITCH], pr[p::LFO_CUTOFF], pr[p::LFO_AMP], pr[p::VEL_CUTOFF]);
         let (w1, w2, mode, ratio, glide) = (self.wave1, self.wave2, self.mode, self.osc2_ratio, self.glide_coef);
+        let (pw, pwm, noise) = (pr[p::PW], pr[p::PWM], pr[p::NOISE]);
+        let (u, uni_ratio, uni_gain) = (self.unison, self.unison_ratio, self.unison_gain);
+        let incs = |f: f32, inc1: &mut [f64; MAX_UNISON], inc2: &mut [f64; MAX_UNISON]| {
+            for k in 0..u {
+                let fk = f * uni_ratio[k];
+                inc1[k] = f64::from(fk.min(max_hz) / sr);
+                inc2[k] = f64::from((fk * ratio).min(max_hz) / sr);
+            }
+        };
 
         // The LFO runs even when no voice sounds, so its phase is a function
         // of time only.
@@ -320,17 +374,16 @@ impl PolySynth {
             *l = self.lfo.tick(shape, inc);
         }
 
+        let rng = &mut self.rng;
         for v in self.voices.iter_mut().filter(|v| v.amp.is_active()) {
             let gain = v.vel_gain * VOICE_GAIN;
             let target = f32::from(v.note);
             let cutoff_base = base_cutoff * (vel_cut * (v.vel_norm - 1.0)).exp2();
             // Pitch only needs per-sample work while gliding or modulated.
             let static_pitch = v.pitch == target && lfo_pitch == 0.0;
-            let (mut inc1, mut inc2) = (0.0, 0.0);
+            let (mut inc1, mut inc2) = ([0.0; MAX_UNISON], [0.0; MAX_UNISON]);
             if static_pitch {
-                let f = midi_to_hz(target);
-                inc1 = f64::from(f.min(max_hz) / sr);
-                inc2 = f64::from((f * ratio).min(max_hz) / sr);
+                incs(midi_to_hz(target), &mut inc1, &mut inc2);
             }
             for (o, &l) in out.iter_mut().zip(&lfo) {
                 if !static_pitch {
@@ -340,11 +393,17 @@ impl PolySynth {
                             v.pitch = target;
                         }
                     }
-                    let f = midi_to_hz(v.pitch + l * lfo_pitch);
-                    inc1 = f64::from(f.min(max_hz) / sr);
-                    inc2 = f64::from((f * ratio).min(max_hz) / sr);
+                    incs(midi_to_hz(v.pitch + l * lfo_pitch), &mut inc1, &mut inc2);
                 }
-                let s = v.osc1.next(w1, inc1, 0.5) * (1.0 - mix) + v.osc2.next(w2, inc2, 0.5) * mix;
+                let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
+                let mut s = 0.0;
+                for k in 0..u {
+                    s += v.osc1[k].next(w1, inc1[k], width) * (1.0 - mix) + v.osc2[k].next(w2, inc2[k], width) * mix;
+                }
+                s *= uni_gain;
+                if noise > 0.0 {
+                    s += noise * rng.bipolar();
+                }
                 let fe = v.fenv.tick();
                 v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
                 let y = v.filter.process(s, mode);
@@ -488,6 +547,86 @@ mod tests {
         let hard = rms(&mut s, 127);
         // Soft notes are darker, not just quieter.
         assert!(soft < hard * 0.9, "{soft} vs {hard}");
+    }
+
+    /// Amplitude of the `hz` component (a single-bin DFT over whole periods).
+    fn magnitude(buf: &[f32], hz: f32) -> f32 {
+        let w = std::f64::consts::TAU * f64::from(hz) / f64::from(SR);
+        let (re, im) = buf.iter().enumerate().fold((0.0, 0.0), |(re, im), (i, &x)| {
+            (re + f64::from(x) * (w * i as f64).cos(), im + f64::from(x) * (w * i as f64).sin())
+        });
+        (2.0 * (re * re + im * im).sqrt() / buf.len() as f64) as f32
+    }
+
+    /// One held note on a square wave through an open filter.
+    fn square_note(setup: impl Fn(&mut PolySynth)) -> Vec<f32> {
+        let mut s = PolySynth::new(SR);
+        s.set_param(p::WAVE1, 1.0);
+        s.set_param(p::MIX, 0.0);
+        s.set_param(p::CUTOFF, 20_000.0);
+        s.set_param(p::ENV_AMT, 0.0);
+        s.set_param(p::A_S, 1.0);
+        setup(&mut s);
+        s.note_on(69, 127);
+        let mut buf = vec![0.0f32; 48_000];
+        s.render(&mut buf);
+        buf.split_off(4800)
+    }
+
+    #[test]
+    fn pulse_width_shapes_the_harmonics() {
+        // 440 Hz: 0.9 s holds exactly 396 periods.
+        let ratio = |pw: f32| {
+            let b = square_note(|s| s.set_param(p::PW, pw));
+            magnitude(&b, 880.0) / magnitude(&b, 440.0)
+        };
+        // A square has no even harmonics; a 25 % pulse has a strong second
+        // harmonic (|sin(2*pi/4)|/2 over |sin(pi/4)| = 0.71).
+        assert!(ratio(0.5) < 0.02, "{}", ratio(0.5));
+        assert!((ratio(0.25) - 0.707).abs() < 0.08, "{}", ratio(0.25));
+    }
+
+    #[test]
+    fn noise_adds_broadband_energy() {
+        let hf = |b: &[f32]| magnitude(b, 15_010.0) + magnitude(b, 17_330.0) + magnitude(b, 19_870.0);
+        let sine = |noise: f32| {
+            let mut s = sine_synth();
+            s.set_param(p::NOISE, noise);
+            s.note_on(45, 127);
+            let mut b = vec![0.0f32; 24_000];
+            s.render(&mut b);
+            b
+        };
+        let (clean, noisy) = (sine(0.0), sine(0.5));
+        assert!(hf(&noisy) > 20.0 * hf(&clean).max(1e-6), "{} vs {}", hf(&noisy), hf(&clean));
+        assert!(noisy.iter().all(|x| x.is_finite() && x.abs() < 1.0));
+    }
+
+    #[test]
+    fn unison_detunes_without_changing_level_or_pitch() {
+        let rms_windows = |b: &[f32]| -> Vec<f32> {
+            b.chunks(480).map(|c| (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt()).collect()
+        };
+        let sine = |unison: f32| {
+            let mut s = sine_synth();
+            s.set_param(p::UNISON, unison);
+            s.set_param(p::DETUNE, 20.0);
+            s.note_on(69, 127);
+            let mut b = vec![0.0f32; 96_000];
+            s.render(&mut b);
+            b.split_off(4800)
+        };
+        let one = rms_windows(&sine(0.0));
+        let three = rms_windows(&sine(2.0));
+        let spread = |w: &[f32]| w.iter().cloned().fold(0.0, f32::max) / w.iter().cloned().fold(f32::MAX, f32::min);
+        // Detuned copies beat against each other; a single one is steady.
+        assert!(spread(&one) < 1.02, "{}", spread(&one));
+        assert!(spread(&three) > 1.5, "{}", spread(&three));
+        let mean = |w: &[f32]| (w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt();
+        let level = mean(&three) / mean(&one);
+        assert!((0.6..1.5).contains(&level), "{level}");
+        // The centre copy keeps the note in tune.
+        assert!((freq(&sine(2.0)) - 440.0).abs() < 3.0);
     }
 
     #[test]

@@ -24,8 +24,9 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 ### Features
 
 - 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
-- Per step: note, velocity, length, chance (1–100 %) and ratchets (1–4 hits).
-- 8-voice subtractive synth with two band-limited oscillators, a state-variable filter, two envelopes, glide, an LFO (to pitch, cutoff and level), and velocity → cutoff.
+- Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–4 hits) and micro-timing (up to half a step early or late).
+- A piano roll for melodic tracks.
+- 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
@@ -73,6 +74,9 @@ The main keys in the editor (press `?` for the full list):
 | `,` `.` / `<` `>` | pitch down / up by a semitone / an octave |
 | `[` `]` / `{` `}` | velocity / length |
 | `-` `=` / `/` | chance / ratchets |
+| `(` `)` | move the step earlier / later |
+| `c` | cycle chords (maj, min, 7, m7, maj7, sus4) |
+| `v` | piano roll for the track (`↑` `↓` pitch, `Enter` adds or removes a note) |
 | `u` `U` | undo / redo (also `Ctrl+Z` / `Ctrl+Y`) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
@@ -102,8 +106,9 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 ### Özellikler
 
 - 16 kanal, 64'e kadar 16'lık adım, 20–300 BPM tempo, %50–75 swing.
-- Her adımda nota, velocity, uzunluk, olasılık (%1–100) ve ratchet (1–4 vuruş).
-- 8 sesli subtractive synth: iki band-limited osilatör, state-variable filtre, iki zarf, glide, LFO (pitch, cutoff ve seviyeye) ve velocity → cutoff.
+- Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–4 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
+- Melodik kanallar için piyano rulosu.
+- 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
@@ -151,6 +156,9 @@ Editördeki temel tuşlar (tam liste için `?`):
 | `,` `.` / `<` `>` | perdeyi yarım ton / oktav düşür, yükselt |
 | `[` `]` / `{` `}` | velocity / uzunluk |
 | `-` `=` / `/` | olasılık / ratchet |
+| `(` `)` | adımı erkene / geçe kaydır |
+| `c` | akorlar arasında dolaş (maj, min, 7, m7, maj7, sus4) |
+| `v` | kanalın piyano rulosu (`↑` `↓` perde, `Enter` nota ekler ya da siler) |
 | `u` `U` | geri al / yinele (`Ctrl+Z` / `Ctrl+Y` de olur) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |

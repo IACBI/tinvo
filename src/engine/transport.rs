@@ -43,6 +43,11 @@ impl Transport {
         f64::from(sample_rate) * 60.0 / (f64::from(bpm) * f64::from(STEPS_PER_BEAT))
     }
 
+    /// Length of an unswung step at the current tempo, in frames.
+    pub fn step_frames(&self) -> f64 {
+        self.samples_per_step
+    }
+
     pub fn is_playing(&self) -> bool {
         self.playing
     }
