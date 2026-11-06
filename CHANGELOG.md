@@ -11,7 +11,8 @@ Author: 𝓐.𝓒.𝓑
 ### Added
 - A channel strip on every track, between the instrument and the fader: high-pass (12 dB/octave), low shelf, mid bell and high shelf (±18 dB), a compressor (threshold, ratio, attack, release, makeup, 6 dB soft knee) and drive (antialiased `tanh` saturation). At its defaults the strip is bypassed bit-exactly and costs nothing.
 - `f` switches the parameter panel between the instrument and the strip. Strip parameters can be automated like any other.
-- Strip parameter changes glide over about 20 ms, so turning a knob or a hold point does not click.
+- Strip parameter changes glide over about 20 ms, so turning a knob or a hold point does not click. The high-pass and the drive, which are not transparent even at their lowest settings, crossfade in and out over 10 ms; a compressor turned down to 1:1 releases at its release time; an opened project starts on its strip settings instead of gliding into them, so export and playback match from the first sample.
+- `tinvo bench` also measures the demo with every strip stage on and the mid band swept.
 - The demo uses the strip: high-passed hats, snare and clap, a low shelf on the kick, a compressed and driven bass.
 
 ### Changed

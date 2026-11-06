@@ -5,7 +5,12 @@
 //! from `u[n-1]` to `u[n]`, `(F(u[n]) - F(u[n-1])) / (u[n] - u[n-1])` with
 //! `F = ln cosh`. That suppresses the harmonics a plain waveshaper folds back
 //! below Nyquist, without oversampling, at the cost of half a sample of
-//! delay and a gentle high-frequency roll-off.
+//! delay and a high-frequency roll-off: in the linear region the stage
+//! averages two neighbouring samples, which is -3 dB at a quarter of the
+//! sample rate (12 kHz at 48 kHz).
+//!
+//! The stage is never transparent, not even at 0 dB of drive; the channel
+//! strip fades it in and out instead of switching it.
 
 use super::db_to_gain;
 
@@ -15,15 +20,14 @@ const EPS: f64 = 1e-6;
 #[derive(Clone, Copy, Debug)]
 pub struct Drive {
     gain: f64,
-    on: bool,
-    /// Previous driven input and its antiderivative.
-    prev: f64,
-    prev_f: f64,
+    /// Previous driven input and its antiderivative; `None` right after a
+    /// reset, when the first sample has nothing to average with.
+    prev: Option<(f64, f64)>,
 }
 
 impl Default for Drive {
     fn default() -> Self {
-        Self { gain: 1.0, on: false, prev: 0.0, prev_f: 0.0 }
+        Self { gain: 1.0, prev: None }
     }
 }
 
@@ -35,29 +39,25 @@ fn log_cosh(u: f64) -> f64 {
 }
 
 impl Drive {
-    /// `drive_db` boosts the signal into the curve; 0 dB is off and passes
-    /// the signal through untouched.
+    /// `drive_db` boosts the signal into the curve.
     pub fn set(&mut self, drive_db: f32) {
-        let on = drive_db > 0.0;
         self.gain = f64::from(db_to_gain(drive_db.max(0.0)));
-        if on && !self.on {
-            self.prev = 0.0;
-            self.prev_f = 0.0;
-        }
-        self.on = on;
+    }
+
+    /// Forgets the previous sample, for a stage that starts on a running
+    /// signal: averaging from zero instead would make the first output jump.
+    pub fn reset(&mut self) {
+        self.prev = None;
     }
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        if !self.on {
-            return x;
-        }
         let u = self.gain * f64::from(x);
         let f = log_cosh(u);
-        let d = u - self.prev;
-        let y = if d.abs() > EPS { (f - self.prev_f) / d } else { (0.5 * (u + self.prev)).tanh() };
-        self.prev = u;
-        self.prev_f = f;
+        let (p, pf) = self.prev.unwrap_or((u, f));
+        let d = u - p;
+        let y = if d.abs() > EPS { (f - pf) / d } else { (0.5 * (u + p)).tanh() };
+        self.prev = Some((u, f));
         y as f32
     }
 }
@@ -77,13 +77,12 @@ mod tests {
     }
 
     #[test]
-    fn off_is_transparent_and_on_stays_bounded() {
+    fn starts_without_a_jump_and_stays_bounded() {
         let mut d = Drive::default();
         d.set(0.0);
-        for i in 0..100 {
-            let x = (i as f32 * 0.3).sin() * 1.5;
-            assert_eq!(d.process(x), x);
-        }
+        // On a constant signal the first output already equals tanh.
+        let y = d.process(0.8);
+        assert!((f64::from(y) - 0.8f64.tanh()).abs() < 1e-6, "{y}");
         d.set(24.0);
         for i in 0..10_000 {
             let y = d.process((i as f32 * 0.01).sin() * 4.0);

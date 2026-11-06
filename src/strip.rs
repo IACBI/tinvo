@@ -70,6 +70,10 @@ pub fn track_param_count(kind: InstrumentKind) -> usize {
 pub const TICK: u32 = 32;
 /// Time constant of the parameter glide.
 const GLIDE_SECONDS: f32 = 0.02;
+/// Length of the crossfade that switches the high-pass or the drive in or
+/// out. Neither is transparent at its lowest setting, so switching it
+/// abruptly would step the signal.
+const FADE_SECONDS: f32 = 0.01;
 const BUTTERWORTH_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +91,13 @@ pub struct Strip {
     drive: Drive,
     /// Which stages run; all false means the strip is bypassed.
     on: [bool; 6],
+    /// Whether the high-pass and the drive should be in the chain, and how
+    /// far each is faded in (0 dry, 1 fully in).
+    hp_want: bool,
+    hp_mix: f32,
+    drive_want: bool,
+    drive_mix: f32,
+    fade_step: f32,
     countdown: u32,
     glide: f32,
     sample_rate: f32,
@@ -106,13 +117,32 @@ impl Strip {
             comp: Compressor::new(sample_rate),
             drive: Drive::default(),
             on: [false; 6],
+            hp_want: false,
+            hp_mix: 0.0,
+            drive_want: false,
+            drive_mix: 0.0,
+            fade_step: 1.0 / (FADE_SECONDS * sample_rate),
             countdown: 0,
             glide: (-(TICK as f32) / (GLIDE_SECONDS * sample_rate)).exp(),
             sample_rate,
         };
-        s.apply();
-        s.settled = true;
+        s.snap();
         s
+    }
+
+    /// Jumps every parameter to its target without gliding, as for a project
+    /// that is opened rather than edited.
+    pub fn snap(&mut self) {
+        self.current = self.target;
+        self.apply();
+        self.settled = true;
+        self.hp_mix = if self.hp_want { 1.0 } else { 0.0 };
+        self.on[0] = self.hp_want;
+        if !self.hp_want {
+            self.hp.reset();
+        }
+        self.drive_mix = if self.drive_want { 1.0 } else { 0.0 };
+        self.on[5] = self.drive_want;
     }
 
     pub fn set_param(&mut self, index: usize, value: f32) {
@@ -135,6 +165,21 @@ impl Strip {
     /// stages.
     fn update(&mut self) {
         if self.settled {
+            // A band that went flat while its filter still held state, or a
+            // compressor set neutral while still releasing, stays in the
+            // chain until that has drained.
+            for (k, (filter, gain)) in
+                [(&self.low, sp::LOW_GAIN), (&self.mid, sp::MID_GAIN), (&self.high, sp::HIGH_GAIN)]
+                    .into_iter()
+                    .enumerate()
+            {
+                if self.on[1 + k] && self.current[gain] == 0.0 && filter.is_quiet() {
+                    self.on[1 + k] = false;
+                }
+            }
+            if self.on[4] && !self.comp_wanted() && self.comp.gain_reduction_db() == 0.0 {
+                self.on[4] = false;
+            }
             return;
         }
         let mut settled = true;
@@ -162,13 +207,18 @@ impl Strip {
         let c = &self.current;
         let sr = f64::from(self.sample_rate);
         let hz = |i: usize| f64::from(c[i]);
-        // A band is switched out only once it is flat and its filter has rung
-        // out, so switching it never cuts a decaying tail.
-        let hp_on = c[sp::HP_FREQ] > PARAMS[sp::HP_FREQ].min;
-        if hp_on {
+        self.hp_want = c[sp::HP_FREQ] > PARAMS[sp::HP_FREQ].min;
+        if self.hp_want {
             self.hp.set(Coefs::new(Shape::HighPass { q: BUTTERWORTH_Q }, hz(sp::HP_FREQ), sr));
+            if !self.on[0] {
+                self.hp.reset();
+                self.on[0] = true;
+            }
         }
-        self.on[0] = hp_on;
+        // A band is switched out once it is flat and its filter state is
+        // zero. The gain glides to 0 dB first, where the filter is so close
+        // to the identity that loading the identity changes the output by
+        // far less than one f32 step of the signal.
         for (k, (filter, gain, shape)) in [
             (&mut self.low, sp::LOW_GAIN, Shape::LowShelf { gain_db: f64::from(c[sp::LOW_GAIN]) }),
             (&mut self.mid, sp::MID_GAIN, Shape::Peak { gain_db: f64::from(c[sp::MID_GAIN]), q: hz(sp::MID_Q) }),
@@ -182,9 +232,6 @@ impl Strip {
             filter.set(if flat { Coefs::IDENTITY } else { Coefs::new(shape, freq, sr) });
             self.on[1 + k] = !flat || !filter.is_quiet();
         }
-        if !hp_on {
-            self.hp.reset();
-        }
         self.comp.set(
             c[sp::COMP_THRESHOLD],
             c[sp::COMP_RATIO],
@@ -192,9 +239,17 @@ impl Strip {
             c[sp::COMP_RELEASE],
             c[sp::COMP_MAKEUP],
         );
-        self.on[4] = c[sp::COMP_RATIO] > 1.0 || c[sp::COMP_MAKEUP] != 0.0;
+        self.on[4] = self.comp_wanted() || self.comp.gain_reduction_db() != 0.0;
         self.drive.set(c[sp::DRIVE]);
-        self.on[5] = c[sp::DRIVE] > 0.0;
+        self.drive_want = c[sp::DRIVE] > 0.0;
+        if self.drive_want && !self.on[5] {
+            self.drive.reset();
+            self.on[5] = true;
+        }
+    }
+
+    fn comp_wanted(&self) -> bool {
+        self.current[sp::COMP_RATIO] > 1.0 || self.current[sp::COMP_MAKEUP] != 0.0
     }
 
     /// Processes `buf` in place.
@@ -212,7 +267,8 @@ impl Strip {
                 for x in &mut buf[i..i + n] {
                     let mut y = *x;
                     if on[0] {
-                        y = self.hp.process(y);
+                        let w = self.hp.process(y);
+                        y = fade(y, w, &mut self.hp_mix, self.hp_want, self.fade_step);
                     }
                     if on[1] {
                         y = self.low.process(y);
@@ -227,9 +283,17 @@ impl Strip {
                         y = self.comp.process(y);
                     }
                     if on[5] {
-                        y = self.drive.process(y);
+                        let w = self.drive.process(y);
+                        y = fade(y, w, &mut self.drive_mix, self.drive_want, self.fade_step);
                     }
                     *x = y;
+                }
+                if on[0] && !self.hp_want && self.hp_mix == 0.0 {
+                    self.on[0] = false;
+                    self.hp.reset();
+                }
+                if on[5] && !self.drive_want && self.drive_mix == 0.0 {
+                    self.on[5] = false;
                 }
             }
             i += n;
@@ -242,10 +306,21 @@ impl Strip {
     }
 }
 
+/// Output of a stage that is fading in or out: `dry` with `wet` mixed in by
+/// `mix`, which moves one step towards `want`.
+#[inline]
+fn fade(dry: f32, wet: f32, mix: &mut f32, want: bool, step: f32) -> f32 {
+    if want && *mix == 1.0 {
+        return wet;
+    }
+    *mix = if want { (*mix + step).min(1.0) } else { (*mix - step).max(0.0) };
+    dry + *mix * (wet - dry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::gain_to_db;
+    use crate::dsp::{db_to_gain, gain_to_db};
 
     const SR: f32 = 48_000.0;
 
@@ -288,6 +363,19 @@ mod tests {
         let mut quiet = vec![0.0; 48_000];
         s.process(&mut quiet);
         assert!(!s.is_active());
+        // The same while signal keeps flowing as the band settles flat: its
+        // filter still holds state then and must be switched out later.
+        s.set_param(sp::MID_GAIN, 6.0);
+        let mut y = sine(440.0, 0.9, 48_000);
+        s.process(&mut y);
+        s.set_param(sp::MID_GAIN, 0.0);
+        let mut y = sine(440.0, 0.9, 48_000);
+        s.process(&mut y);
+        let x = sine(440.0, 0.9, 4096);
+        let mut y = x.clone();
+        s.process(&mut y);
+        assert!(!s.is_active());
+        assert_eq!(x, y);
     }
 
     #[test]
@@ -357,6 +445,96 @@ mod tests {
         for c in rest.chunks_mut(1000) {
             s.process(c);
         }
+        assert_eq!(a, b);
+    }
+
+    /// Largest step between neighbouring samples.
+    fn max_step(x: &[f32]) -> f32 {
+        x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    /// Runs `s` on a constant `level` for `seconds` and returns the output.
+    fn hold(s: &mut Strip, level: f32, seconds: f32) -> Vec<f32> {
+        let mut y = vec![level; (seconds * SR) as usize];
+        s.process(&mut y);
+        y
+    }
+
+    #[test]
+    fn switching_the_high_pass_out_fades_to_the_dry_signal() {
+        // On a constant level the high-pass outputs silence; with the
+        // filter dropped at once the output jumped to the full level.
+        let mut s = Strip::new(SR);
+        s.set_param(sp::HP_FREQ, 200.0);
+        let mut y = hold(&mut s, 0.5, 1.0);
+        s.set_param(sp::HP_FREQ, 20.0);
+        y.extend(hold(&mut s, 0.5, 1.0));
+        assert!(max_step(&y) < 0.01, "{}", max_step(&y));
+        assert_eq!(y.last(), Some(&0.5));
+        assert!(!s.is_active());
+        // Switching it back in fades as well.
+        s.set_param(sp::HP_FREQ, 200.0);
+        let y = hold(&mut s, 0.5, 1.0);
+        assert!(max_step(&y) < 0.01, "{}", max_step(&y));
+        assert!(y.last().unwrap().abs() < 1e-3);
+    }
+
+    #[test]
+    fn drive_fades_in_and_out_without_a_jump() {
+        // The first driven sample used to be averaged from zero: 0.8 in,
+        // 0.36 out, then 0.66.
+        let mut s = Strip::new(SR);
+        let mut y = hold(&mut s, 0.8, 0.1);
+        s.set_param(sp::DRIVE, 0.5);
+        y.extend(hold(&mut s, 0.8, 0.5));
+        assert!(max_step(&y) < 0.01, "{}", max_step(&y));
+        let driven = f64::from(db_to_gain(0.5)) * 0.8;
+        assert!((f64::from(*y.last().unwrap()) - driven.tanh()).abs() < 1e-6);
+        s.set_param(sp::DRIVE, 0.0);
+        let y = hold(&mut s, 0.8, 0.5);
+        assert!(max_step(&y) < 0.01, "{}", max_step(&y));
+        assert_eq!(y.last(), Some(&0.8));
+        assert!(!s.is_active());
+    }
+
+    #[test]
+    fn a_compressor_set_to_1_1_releases_instead_of_jumping() {
+        let mut s = Strip::new(SR);
+        s.set_param(sp::COMP_THRESHOLD, -30.0);
+        s.set_param(sp::COMP_RATIO, 20.0);
+        s.set_param(sp::COMP_ATTACK, 0.001);
+        s.set_param(sp::COMP_RELEASE, 1.0);
+        let squashed = *hold(&mut s, 0.9, 1.0).last().unwrap();
+        assert!(squashed < 0.1, "{squashed}");
+        s.set_param(sp::COMP_RATIO, 1.0);
+        let y = hold(&mut s, 0.9, 0.5);
+        assert!(max_step(&y) < 0.001, "{}", max_step(&y));
+        // Still releasing (1 s time constant) half a second later.
+        assert!(*y.last().unwrap() < 0.5, "{}", y.last().unwrap());
+        let y = hold(&mut s, 0.9, 20.0);
+        assert_eq!(y.last(), Some(&0.9));
+        assert!(!s.is_active());
+    }
+
+    #[test]
+    fn snap_lands_on_the_settings_at_once() {
+        let settings = |s: &mut Strip| {
+            s.set_param(sp::HP_FREQ, 150.0);
+            s.set_param(sp::MID_GAIN, 9.0);
+            s.set_param(sp::COMP_THRESHOLD, -20.0);
+            s.set_param(sp::COMP_RATIO, 4.0);
+            s.set_param(sp::DRIVE, 6.0);
+        };
+        let mut snapped = Strip::new(SR);
+        settings(&mut snapped);
+        snapped.snap();
+        let mut settled = Strip::new(SR);
+        settings(&mut settled);
+        hold(&mut settled, 0.0, 1.0);
+        let x = sine(440.0, 0.5, 4800);
+        let (mut a, mut b) = (x.clone(), x);
+        snapped.process(&mut a);
+        settled.process(&mut b);
         assert_eq!(a, b);
     }
 }

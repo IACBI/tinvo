@@ -48,9 +48,8 @@ impl Compressor {
         self.release = (-1.0 / (release.max(1e-5) * self.sample_rate)).exp();
         self.makeup = db_to_gain(makeup_db);
         self.knee_floor = db_to_gain(threshold_db - KNEE_DB / 2.0);
-        if self.ratio == 1.0 {
-            self.gr_db = 0.0;
-        }
+        // Gain reduction already applied is released at the release time,
+        // also when the ratio drops to 1:1: clearing it would jump the gain.
     }
 
     /// Static curve: the gain change in dB for an input level in dB.
@@ -74,11 +73,9 @@ impl Compressor {
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        if self.ratio == 1.0 {
-            return x * self.makeup;
-        }
         let a = x.abs();
-        let target = if a <= self.knee_floor { 0.0 } else { self.static_gain_db(20.0 * a.log10()) };
+        let target =
+            if self.ratio == 1.0 || a <= self.knee_floor { 0.0 } else { self.static_gain_db(20.0 * a.log10()) };
         if target == 0.0 && self.gr_db > -1e-4 {
             // Fully released and below the knee: nothing to compute.
             self.gr_db = 0.0;

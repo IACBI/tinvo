@@ -72,11 +72,13 @@ Known limits, planned for later phases:
 - Every track: high-pass, low shelf, mid bell, high shelf (RBJ cookbook biquads in `f64`), a feed-forward compressor with a soft knee, and `tanh` drive with first-order antiderivative antialiasing (measured on a driven 4.5 kHz sine: folded-back energy −34 dB against −25 dB for a plain `tanh`).
 - Parameters glide over about 20 ms on a 32-frame tick kept in the strip's state, so output does not depend on buffer size; neutral settings bypass the strip bit-exactly.
 - Strip parameters share the panel (`f` switches pages) and the automation lanes with the instrument's.
+- High-pass and drive crossfade in and out over 10 ms; a compressor set to 1:1 finishes its release before it leaves the chain.
+- Every stage on, with an automated mid band: about 0.2 % of one core per track (`tinvo bench`).
 - Project format 7.
 
 Known limits:
 - There is no gain-reduction meter yet.
-- Switching the high-pass off (down to 20 Hz) or drive off (to 0 dB) takes the stage out of the chain at once; at those settings the stage is nearly transparent, but not exactly.
+- Drive's antialiasing averages neighbouring samples in its linear region, a high-frequency roll-off of −3 dB at a quarter of the sample rate (12 kHz at 48 kHz); oversampled drive would avoid it.
 
 ## Phase 4b: Effects and buses
 

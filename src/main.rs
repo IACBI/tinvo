@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tinvo::audio::{self, AudioCallback};
-use tinvo::engine::{Edit, Step};
+use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
 use tinvo::instrument::InstrumentKind;
 use tinvo::project::{Project, pattern_name};
 use tinvo::render::{self, RenderOptions, Source};
+use tinvo::strip::sp;
 use tinvo::wav::{self, SampleFormat};
 
 const USAGE: &str = "\
@@ -216,6 +217,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 
 fn cmd_bench() -> Result<(), String> {
     bench("Demo project", &Project::demo())?;
+    bench("Demo, every strip stage on, mid band swept", &strip_stress_project()?)?;
     bench("Worst-case synth (8 voices, unison 4, noise, LFO)", &synth_stress_project()?)
 }
 
@@ -236,6 +238,40 @@ fn bench(label: &str, project: &Project) -> Result<(), String> {
         elapsed / audio * 100.0
     );
     Ok(())
+}
+
+/// The demo with every stage of every track's channel strip on, and the mid
+/// band's frequency automated on a ramp so its coefficients never settle.
+fn strip_stress_project() -> Result<Project, String> {
+    let mut p = Project::demo();
+    let ok = |r: Result<Edit, tinvo::project::EditError>| r.map(drop).map_err(|e| e.to_string());
+    for track in 0..p.tracks.len() as u8 {
+        let kind = p.tracks[usize::from(track)].kind;
+        let base = kind.params().len() as u8;
+        let settings = [
+            (sp::HP_FREQ, 40.0),
+            (sp::LOW_GAIN, 2.0),
+            (sp::MID_GAIN, -3.0),
+            (sp::HIGH_GAIN, 2.0),
+            (sp::COMP_THRESHOLD, -30.0),
+            (sp::COMP_RATIO, 4.0),
+            (sp::DRIVE, 6.0),
+        ];
+        for (i, value) in settings {
+            ok(p.apply(Edit::SetParam { track, index: base + i as u8, value }))?;
+        }
+        let lane = (0..MAX_LANES as u8)
+            .find(|&l| p.tracks[usize::from(track)].lanes[usize::from(l)].target.is_none())
+            .ok_or("no free lane")?;
+        let target = Some(2 + base + sp::MID_FREQ as u8);
+        ok(p.apply(Edit::SetLane { track, lane, target, ramp: true }))?;
+        for pattern in 0..MAX_PATTERNS as u8 {
+            for (step, value) in [(0, 300.0), (8, 4000.0)] {
+                ok(p.apply(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }))?;
+            }
+        }
+    }
+    Ok(p)
 }
 
 /// One synth track with every voice busy and every per-sample feature on.

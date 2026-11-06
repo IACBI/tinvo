@@ -725,7 +725,9 @@ impl Project {
                         if k >= MAX_LANES {
                             return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
                         }
-                        let target = (0..2 + track_param_count(t.kind) as u8)
+                        // Strip parameters exist from format 7 on.
+                        let count = if ver >= 7 { track_param_count(t.kind) } else { t.kind.params().len() };
+                        let target = (0..2 + count as u8)
                             .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
                         let ramp = match mode {
@@ -1347,6 +1349,7 @@ mod tests {
             ("hello 1", 1, "not a TINVO"),
             ("tinvo 8", 1, "version"),
             ("tinvo 6\ntrack kick\nparam eq_mid_gain 3\nend", 3, "unknown parameter"),
+            ("tinvo 6\ntrack kick\nlane 0 hp_freq hold\nend", 3, "unknown parameter 'hp_freq'"),
             ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),
             ("tinvo 6\ntrack kick\nlane 0 cutoff hold\nend", 3, "unknown parameter 'cutoff'"),
             ("tinvo 6\ntrack kick\nlane 4 decay hold\nend", 3, "out of range"),

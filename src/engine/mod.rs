@@ -802,6 +802,7 @@ impl Engine {
             let (l, r) = (t.gain_l.target(), t.gain_r.target());
             t.gain_l.snap(l);
             t.gain_r.snap(r);
+            t.strip.snap();
         }
     }
 
@@ -1915,6 +1916,28 @@ mod tests {
         assert_eq!(e.tracks[0].strip.param(strip::sp::COMP_MAKEUP), Some(12.0));
         e.handle(Command::Stop);
         assert_eq!(e.tracks[0].strip.param(strip::sp::COMP_MAKEUP), Some(0.0));
+    }
+
+    #[test]
+    fn an_opened_project_sounds_the_same_whenever_it_starts() {
+        // Export starts playing at once; the live engine may run idle first.
+        // The strip must not still be gliding into its settings in either.
+        let n = InstrumentKind::Synth.params().len() as u8;
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(40) },
+            Edit::SetParam { track: 0, index: n + strip::sp::HP_FREQ as u8, value: 200.0 },
+            Edit::SetParam { track: 0, index: n + strip::sp::DRIVE as u8, value: 12.0 },
+        ];
+        let mut now = engine(&edits);
+        now.handle(Command::Play);
+        let a = run(&mut now, 6000);
+        let mut later = engine(&edits);
+        run(&mut later, 24_000);
+        later.handle(Command::Play);
+        let b = run(&mut later, 6000);
+        assert!(a.iter().any(|x| x.abs() > 1e-3));
+        assert_eq!(a, b);
     }
 
     #[test]
