@@ -84,6 +84,10 @@ impl<T> Producer<T> {
 }
 
 impl<T> Consumer<T> {
+    pub fn capacity(&self) -> usize {
+        self.ring.mask + 1
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         let r = &*self.ring;
         let head = r.head.0.load(Ordering::Relaxed);

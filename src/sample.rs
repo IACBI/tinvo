@@ -92,16 +92,36 @@ impl Sample {
     }
 }
 
-/// Reads a WAV file into a mono [`Sample`].
+/// Reads a WAV file into a mono [`Sample`]. The length is checked against
+/// [`MAX_FRAMES`] from the header, before anything is allocated for the
+/// audio, which is then mixed down block by block.
 pub fn load(path: &Path) -> Result<Sample, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let d = wav::decode(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ch = usize::from(d.channels);
+    load_limited(path, MAX_FRAMES)
+}
+
+fn load_limited(path: &Path, max_frames: usize) -> Result<Sample, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| fail(&e))?);
+    let info = wav::read_info(&mut file).map_err(|e| fail(&e))?;
+    if info.frames == 0 {
+        return Err(fail(&"the file contains no audio"));
+    }
+    if info.frames > max_frames as u64 {
+        return Err(fail(&format!("longer than {max_frames} frames")));
+    }
+    let ch = usize::from(info.channels);
     let gain = 1.0 / ch as f32;
-    let mono: Vec<f32> = d.samples.chunks_exact(ch).map(|f| f.iter().sum::<f32>() * gain).collect();
-    let mut s = Sample::from_mono(&mono, d.sample_rate).map_err(|e| format!("{}: {e}", path.display()))?;
-    s.source_channels = d.channels;
-    Ok(s)
+    let mut data = Vec::with_capacity(info.frames as usize + 2 * PAD);
+    data.resize(PAD, 0.0);
+    wav::read_samples(&mut file, &info, |block| {
+        data.extend(block.chunks_exact(ch).map(|f| {
+            let m = f.iter().sum::<f32>() * gain;
+            if m.is_finite() { m } else { 0.0 }
+        }));
+    })
+    .map_err(|e| fail(&e))?;
+    data.resize(data.len() + PAD, 0.0);
+    Ok(Sample { data: data.into_boxed_slice(), sample_rate: info.sample_rate, source_channels: info.channels })
 }
 
 /// The polyphase sinc table; built once, on first use. The engine calls
@@ -196,6 +216,9 @@ mod tests {
         let s = load(&path).unwrap();
         assert_eq!((s.frames(), s.sample_rate, s.source_channels), (100, 44_100, 2));
         assert!(s.audio().iter().all(|&x| (x - 0.125).abs() < 1e-6));
+        // The length limit applies from the header.
+        assert!(load_limited(&path, 99).unwrap_err().contains("longer than 99 frames"));
+        assert_eq!(load_limited(&path, 100).unwrap().frames(), 100);
         std::fs::write(&path, b"not a wav").unwrap();
         assert!(load(&path).unwrap_err().contains("st.wav"));
         assert!(load(&dir.join("missing.wav")).is_err());

@@ -6,7 +6,9 @@
 
 use crate::dsp::noise::Rng;
 use std::fmt;
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 const TAG_PCM: u16 = 1;
 const TAG_FLOAT: u16 = 3;
@@ -63,6 +65,7 @@ pub enum WavError {
     Malformed(&'static str),
     Unsupported(String),
     TooLarge,
+    Io(String),
 }
 
 impl fmt::Display for WavError {
@@ -71,14 +74,144 @@ impl fmt::Display for WavError {
             WavError::Malformed(m) => write!(f, "malformed WAV: {m}"),
             WavError::Unsupported(m) => write!(f, "unsupported WAV: {m}"),
             WavError::TooLarge => write!(f, "audio too long for a WAV file (4 GiB limit)"),
+            WavError::Io(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for WavError {}
 
-/// Encodes interleaved samples. `dither_seed` makes dithered output
-/// reproducible.
+/// Streams interleaved samples into a WAV container. The header is written
+/// first with placeholder sizes and patched by [`Writer::finish`], so memory
+/// use does not depend on the length of the audio.
+pub struct Writer<W: Write + Seek> {
+    out: W,
+    channels: u16,
+    format: SampleFormat,
+    rng: Rng,
+    stats: EncodeStats,
+    /// Samples (not frames) written so far.
+    samples: u64,
+    buf: Vec<u8>,
+}
+
+/// Bytes before the sample data: RIFF + fmt (+ fact for float) + data headers.
+fn header_len(format: SampleFormat) -> u64 {
+    if format == SampleFormat::Float32 { 12 + 8 + 18 + 12 + 8 } else { 12 + 8 + 16 + 8 }
+}
+
+impl<W: Write + Seek> Writer<W> {
+    /// Writes the header to `out`. `dither_seed` makes dithered output
+    /// reproducible.
+    pub fn new(
+        mut out: W,
+        channels: u16,
+        sample_rate: u32,
+        format: SampleFormat,
+        dither_seed: u64,
+    ) -> Result<Self, WavError> {
+        assert!(channels > 0, "channel count must be positive");
+        let is_float = format == SampleFormat::Float32;
+        let bytes_per_sample = u32::from(format.bits() / 8);
+        let mut h = Vec::with_capacity(header_len(format) as usize);
+        h.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
+        h.extend_from_slice(&(if is_float { 18u32 } else { 16 }).to_le_bytes());
+        h.extend_from_slice(&(if is_float { TAG_FLOAT } else { TAG_PCM }).to_le_bytes());
+        h.extend_from_slice(&channels.to_le_bytes());
+        h.extend_from_slice(&sample_rate.to_le_bytes());
+        let block_align = u32::from(channels) * bytes_per_sample;
+        h.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
+        h.extend_from_slice(&(block_align as u16).to_le_bytes());
+        h.extend_from_slice(&format.bits().to_le_bytes());
+        if is_float {
+            h.extend_from_slice(&0u16.to_le_bytes()); // cbSize
+            h.extend_from_slice(b"fact");
+            h.extend_from_slice(&4u32.to_le_bytes());
+            h.extend_from_slice(&0u32.to_le_bytes()); // frames, patched
+        }
+        h.extend_from_slice(b"data\0\0\0\0");
+        out.write_all(&h).map_err(io_error)?;
+        Ok(Self {
+            out,
+            channels,
+            format,
+            rng: Rng::new(dither_seed),
+            stats: EncodeStats::default(),
+            samples: 0,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Appends interleaved samples.
+    pub fn write(&mut self, samples: &[f32]) -> Result<(), WavError> {
+        let width = u64::from(self.format.bits() / 8);
+        let data_len = (self.samples + samples.len() as u64) * width;
+        // RIFF size field: everything after it, including a pad byte.
+        if header_len(self.format) - 8 + data_len + (data_len & 1) > u64::from(u32::MAX) {
+            return Err(WavError::TooLarge);
+        }
+        self.buf.clear();
+        for &x in samples {
+            let x = if x.is_finite() { x } else { 0.0 };
+            self.stats.peak = self.stats.peak.max(x.abs());
+            match self.format {
+                SampleFormat::Float32 => self.buf.extend_from_slice(&x.to_le_bytes()),
+                SampleFormat::Pcm16 | SampleFormat::Pcm24 => {
+                    if x.abs() > 1.0 {
+                        self.stats.clipped += 1;
+                    }
+                    let full = f64::from(1u32 << (self.format.bits() - 1));
+                    // TPDF dither: sum of two uniform variables, ±1 LSB peak.
+                    let dither = f64::from(self.rng.next_f32()) + f64::from(self.rng.next_f32()) - 1.0;
+                    let q = (f64::from(x) * full + dither).round().clamp(-full, full - 1.0) as i32;
+                    if self.format == SampleFormat::Pcm16 {
+                        self.buf.extend_from_slice(&(q as i16).to_le_bytes());
+                    } else {
+                        self.buf.extend_from_slice(&q.to_le_bytes()[..3]);
+                    }
+                }
+            }
+        }
+        self.out.write_all(&self.buf).map_err(io_error)?;
+        self.samples += samples.len() as u64;
+        Ok(())
+    }
+
+    /// Frames written so far.
+    pub fn frames(&self) -> u64 {
+        self.samples / u64::from(self.channels)
+    }
+
+    /// Pads the data chunk, patches the sizes and returns the output.
+    pub fn finish(mut self) -> Result<(W, EncodeStats), WavError> {
+        let data_len = self.samples * u64::from(self.format.bits() / 8);
+        let pad = data_len & 1;
+        if pad == 1 {
+            self.out.write_all(&[0]).map_err(io_error)?;
+        }
+        let riff_len = (header_len(self.format) - 8 + data_len + pad) as u32;
+        let frames = self.frames() as u32;
+        let mut patch = |at: u64, v: u32| -> Result<(), WavError> {
+            self.out.seek(SeekFrom::Start(at)).map_err(io_error)?;
+            self.out.write_all(&v.to_le_bytes()).map_err(io_error)
+        };
+        patch(4, riff_len)?;
+        if self.format == SampleFormat::Float32 {
+            patch(46, frames)?;
+        }
+        patch(header_len(self.format) - 4, data_len as u32)?;
+        self.out.seek(SeekFrom::End(0)).map_err(io_error)?;
+        self.out.flush().map_err(io_error)?;
+        Ok((self.out, self.stats))
+    }
+}
+
+fn io_error(e: std::io::Error) -> WavError {
+    WavError::Io(e.to_string())
+}
+
+/// Encodes interleaved samples in memory. `dither_seed` makes dithered
+/// output reproducible.
 pub fn encode(
     samples: &[f32],
     channels: u16,
@@ -86,68 +219,72 @@ pub fn encode(
     format: SampleFormat,
     dither_seed: u64,
 ) -> Result<(Vec<u8>, EncodeStats), WavError> {
-    assert!(channels > 0, "channel count must be positive");
-    let bytes_per_sample = u32::from(format.bits() / 8);
-    let data_len = (samples.len() as u64) * u64::from(bytes_per_sample);
-    let is_float = format == SampleFormat::Float32;
-    let fmt_len: u32 = if is_float { 18 } else { 16 };
-    let fact_len: u64 = if is_float { 12 } else { 0 };
-    let pad = data_len & 1;
-    let riff_len = 4 + (8 + u64::from(fmt_len)) + fact_len + 8 + data_len + pad;
-    if riff_len > u64::from(u32::MAX) {
-        return Err(WavError::TooLarge);
+    let mut w = Writer::new(Cursor::new(Vec::new()), channels, sample_rate, format, dither_seed)?;
+    w.write(samples)?;
+    let (out, stats) = w.finish()?;
+    Ok((out.into_inner(), stats))
+}
+
+/// The seed every file export uses, so exports are reproducible.
+const FILE_DITHER_SEED: u64 = 0x7153_0d1f;
+
+/// A WAV file being written. The audio goes to `<path>.tmp`, which
+/// [`FileWriter::finish`] renames over `path`; if the writer is dropped
+/// unfinished (an error, a cancelled export) the temporary file is removed
+/// and `path` is left untouched.
+pub struct FileWriter {
+    inner: Option<Writer<BufWriter<File>>>,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl FileWriter {
+    pub fn create(path: &Path, channels: u16, sample_rate: u32, format: SampleFormat) -> Result<Self, String> {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let file = File::create(&tmp).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut w = Self { inner: None, tmp, path: path.to_path_buf() };
+        let writer =
+            Writer::new(BufWriter::with_capacity(1 << 16, file), channels, sample_rate, format, FILE_DITHER_SEED);
+        w.inner = Some(writer.map_err(|e| w.error(&e))?);
+        Ok(w)
     }
 
-    let mut out = Vec::with_capacity(riff_len as usize + 8);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(riff_len as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&fmt_len.to_le_bytes());
-    out.extend_from_slice(&(if is_float { TAG_FLOAT } else { TAG_PCM }).to_le_bytes());
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    let block_align = u32::from(channels) * bytes_per_sample;
-    out.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
-    out.extend_from_slice(&(block_align as u16).to_le_bytes());
-    out.extend_from_slice(&format.bits().to_le_bytes());
-    if is_float {
-        out.extend_from_slice(&0u16.to_le_bytes()); // cbSize
-        out.extend_from_slice(b"fact");
-        out.extend_from_slice(&4u32.to_le_bytes());
-        let frames = (samples.len() / usize::from(channels)) as u32;
-        out.extend_from_slice(&frames.to_le_bytes());
+    fn error(&self, e: &dyn fmt::Display) -> String {
+        format!("{}: {e}", self.path.display())
     }
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(data_len as u32).to_le_bytes());
 
-    let mut stats = EncodeStats::default();
-    let mut rng = Rng::new(dither_seed);
-    for &x in samples {
-        let x = if x.is_finite() { x } else { 0.0 };
-        stats.peak = stats.peak.max(x.abs());
-        match format {
-            SampleFormat::Float32 => out.extend_from_slice(&x.to_le_bytes()),
-            SampleFormat::Pcm16 | SampleFormat::Pcm24 => {
-                if x.abs() > 1.0 {
-                    stats.clipped += 1;
-                }
-                let full = f64::from(1u32 << (format.bits() - 1));
-                // TPDF dither: sum of two uniform variables, ±1 LSB peak.
-                let dither = f64::from(rng.next_f32()) + f64::from(rng.next_f32()) - 1.0;
-                let q = (f64::from(x) * full + dither).round().clamp(-full, full - 1.0) as i32;
-                if format == SampleFormat::Pcm16 {
-                    out.extend_from_slice(&(q as i16).to_le_bytes());
-                } else {
-                    out.extend_from_slice(&q.to_le_bytes()[..3]);
-                }
-            }
+    pub fn write(&mut self, samples: &[f32]) -> Result<(), String> {
+        let result = self.inner.as_mut().expect("written after finish").write(samples);
+        result.map_err(|e| self.error(&e))
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.inner.as_ref().map_or(0, Writer::frames)
+    }
+
+    pub fn finish(mut self) -> Result<EncodeStats, String> {
+        let w = self.inner.take().expect("finished twice");
+        let result = w.finish().map_err(|e| self.error(&e)).and_then(|(buf, stats)| {
+            let file = buf.into_inner().map_err(|e| self.error(&e.into_error()))?;
+            drop(file);
+            std::fs::rename(&self.tmp, &self.path).map_err(|e| self.error(&e))?;
+            Ok(stats)
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        result
+    }
+}
+
+impl Drop for FileWriter {
+    fn drop(&mut self) {
+        if self.inner.take().is_some() {
+            let _ = std::fs::remove_file(&self.tmp);
         }
     }
-    if pad == 1 {
-        out.push(0);
-    }
-    Ok((out, stats))
 }
 
 /// Encodes and writes a file atomically (temporary file, then rename).
@@ -158,12 +295,129 @@ pub fn write_file(
     sample_rate: u32,
     format: SampleFormat,
 ) -> Result<EncodeStats, String> {
-    let (bytes, stats) = encode(samples, channels, sample_rate, format, 0x7153_0d1f).map_err(|e| e.to_string())?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(stats)
+    let mut w = FileWriter::create(path, channels, sample_rate, format)?;
+    w.write(samples)?;
+    w.finish()
+}
+
+/// The format and location of a WAV file's audio, read from its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Info {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bits: u16,
+    pub is_float: bool,
+    /// Byte offset of the sample data.
+    pub data_offset: u64,
+    /// Whole frames in the data chunk.
+    pub frames: u64,
+}
+
+impl Info {
+    fn width(&self) -> usize {
+        usize::from(self.bits.div_ceil(8))
+    }
+
+    fn block_align(&self) -> usize {
+        self.width() * usize::from(self.channels)
+    }
+}
+
+/// Reads and validates the header of a WAV stream without reading its
+/// audio, so a caller can refuse a file before allocating for it.
+pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
+    let file_len = r.seek(SeekFrom::End(0)).map_err(io_error)?;
+    r.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let mut head = [0u8; 12];
+    if file_len < 12 || r.read_exact(&mut head).is_err() || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return Err(WavError::Malformed("missing RIFF/WAVE header"));
+    }
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let mut pos = 12u64;
+    let mut fmt: Option<(u16, u16, u32, u16, u16)> = None; // tag, ch, rate, align, bits
+    let mut data: Option<(u64, u64)> = None;
+    while pos + 8 <= file_len {
+        let mut ch = [0u8; 8];
+        r.seek(SeekFrom::Start(pos)).map_err(io_error)?;
+        r.read_exact(&mut ch).map_err(io_error)?;
+        let len = u64::from(u32_at(&ch, 4));
+        let body = pos + 8;
+        let end = body + len;
+        if end > file_len {
+            return Err(WavError::Malformed("chunk extends past end of file"));
+        }
+        match &ch[0..4] {
+            b"fmt " => {
+                if len < 16 {
+                    return Err(WavError::Malformed("fmt chunk too short"));
+                }
+                // Only the first 40 bytes matter, whatever length the chunk claims.
+                let mut c = vec![0u8; len.min(40) as usize];
+                r.read_exact(&mut c).map_err(io_error)?;
+                let mut tag = u16_at(&c, 0);
+                if tag == TAG_EXTENSIBLE {
+                    if c.len() < 40 {
+                        return Err(WavError::Malformed("extensible fmt chunk too short"));
+                    }
+                    // The sub-format GUID starts with the plain format tag.
+                    tag = u16_at(&c, 24);
+                }
+                fmt = Some((tag, u16_at(&c, 2), u32_at(&c, 4), u16_at(&c, 12), u16_at(&c, 14)));
+            }
+            b"data" => data = Some((body, len)),
+            _ => {}
+        }
+        pos = end + (len & 1);
+    }
+    let (tag, channels, sample_rate, block_align, bits) = fmt.ok_or(WavError::Malformed("no fmt chunk"))?;
+    let (data_offset, data_len) = data.ok_or(WavError::Malformed("no data chunk"))?;
+    if channels == 0 || sample_rate == 0 {
+        return Err(WavError::Malformed("zero channels or sample rate"));
+    }
+    let width = usize::from(bits.div_ceil(8));
+    if width == 0 || usize::from(block_align) != width * usize::from(channels) {
+        return Err(WavError::Malformed("inconsistent block alignment"));
+    }
+    let is_float = match (tag, bits) {
+        (TAG_PCM, 8 | 16 | 24 | 32) => false,
+        (TAG_FLOAT, 32 | 64) => true,
+        _ => return Err(WavError::Unsupported(format!("format tag {tag} with {bits} bits"))),
+    };
+    let frames = data_len / u64::from(block_align);
+    Ok(Info { sample_rate, channels, bits, is_float, data_offset, frames })
+}
+
+/// Reads the `info.frames` frames of audio from `r`, a block at a time, and
+/// hands each block to `sink` as interleaved samples in `[-1, 1)`.
+pub fn read_samples<R: Read + Seek>(r: &mut R, info: &Info, mut sink: impl FnMut(&[f32])) -> Result<(), WavError> {
+    const BLOCK_FRAMES: usize = 4096;
+    let (width, align) = (info.width(), info.block_align());
+    r.seek(SeekFrom::Start(info.data_offset)).map_err(io_error)?;
+    let mut bytes = vec![0u8; BLOCK_FRAMES * align];
+    let mut out = Vec::with_capacity(BLOCK_FRAMES * usize::from(info.channels));
+    let mut left = info.frames;
+    while left > 0 {
+        let n = left.min(BLOCK_FRAMES as u64) as usize;
+        let b = &mut bytes[..n * align];
+        r.read_exact(b).map_err(io_error)?;
+        out.clear();
+        out.extend(b.chunks_exact(width).map(|s| sample_value(info.is_float, s)));
+        sink(&out);
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+fn sample_value(is_float: bool, s: &[u8]) -> f32 {
+    match (is_float, s.len()) {
+        (false, 1) => (f32::from(s[0]) - 128.0) / 128.0,
+        (false, 2) => f32::from(i16::from_le_bytes([s[0], s[1]])) / 32_768.0,
+        (false, 3) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
+        (false, _) => (f64::from(i32::from_le_bytes([s[0], s[1], s[2], s[3]])) / 2_147_483_648.0) as f32,
+        (true, 4) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        (true, _) => f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
+    }
 }
 
 /// A decoded WAV file with samples converted to `f32` in `[-1, 1)`.
@@ -177,72 +431,19 @@ pub struct Decoded {
     pub samples: Vec<f32>,
 }
 
+/// Decodes a whole WAV file held in memory.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, WavError> {
-    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(WavError::Malformed("missing RIFF/WAVE header"));
-    }
-    let mut pos = 12;
-    let mut fmt: Option<(u16, u16, u32, u16, u16)> = None; // tag, ch, rate, align, bits
-    let mut data: Option<&[u8]> = None;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let len = u32_at(bytes, pos + 4) as usize;
-        let body = pos + 8;
-        let end = body.checked_add(len).ok_or(WavError::Malformed("chunk length overflow"))?;
-        if end > bytes.len() {
-            return Err(WavError::Malformed("chunk extends past end of file"));
-        }
-        let chunk = &bytes[body..end];
-        match id {
-            b"fmt " => {
-                if chunk.len() < 16 {
-                    return Err(WavError::Malformed("fmt chunk too short"));
-                }
-                let mut tag = u16_at(chunk, 0);
-                if tag == TAG_EXTENSIBLE {
-                    if chunk.len() < 40 {
-                        return Err(WavError::Malformed("extensible fmt chunk too short"));
-                    }
-                    // The sub-format GUID starts with the plain format tag.
-                    tag = u16_at(chunk, 24);
-                }
-                fmt = Some((tag, u16_at(chunk, 2), u32_at(chunk, 4), u16_at(chunk, 12), u16_at(chunk, 14)));
-            }
-            b"data" => data = Some(chunk),
-            _ => {}
-        }
-        pos = end + (len & 1);
-    }
-    let (tag, channels, sample_rate, block_align, bits) = fmt.ok_or(WavError::Malformed("no fmt chunk"))?;
-    let data = data.ok_or(WavError::Malformed("no data chunk"))?;
-    if channels == 0 || sample_rate == 0 {
-        return Err(WavError::Malformed("zero channels or sample rate"));
-    }
-    let width = usize::from(bits.div_ceil(8));
-    if width == 0 || usize::from(block_align) != width * usize::from(channels) {
-        return Err(WavError::Malformed("inconsistent block alignment"));
-    }
-    let is_float = match (tag, bits) {
-        (TAG_PCM, 8 | 16 | 24 | 32) => false,
-        (TAG_FLOAT, 32 | 64) => true,
-        _ => return Err(WavError::Unsupported(format!("format tag {tag} with {bits} bits"))),
-    };
-    let frames = data.len() / usize::from(block_align);
-    let samples = data[..frames * usize::from(block_align)]
-        .chunks_exact(width)
-        .map(|s| match (is_float, width) {
-            (false, 1) => (f32::from(s[0]) - 128.0) / 128.0,
-            (false, 2) => f32::from(i16::from_le_bytes([s[0], s[1]])) / 32_768.0,
-            (false, 3) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
-            (false, _) => (f64::from(i32::from_le_bytes([s[0], s[1], s[2], s[3]])) / 2_147_483_648.0) as f32,
-            (true, 4) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
-            (true, _) => f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
-        })
-        .collect();
-    Ok(Decoded { sample_rate, channels, bits, is_float, samples })
+    let mut r = Cursor::new(bytes);
+    let info = read_info(&mut r)?;
+    let mut samples = Vec::with_capacity(info.frames as usize * usize::from(info.channels));
+    read_samples(&mut r, &info, |b| samples.extend_from_slice(b))?;
+    Ok(Decoded {
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+        bits: info.bits,
+        is_float: info.is_float,
+        samples,
+    })
 }
 
 #[cfg(test)]
@@ -349,6 +550,57 @@ mod tests {
         b8.extend_from_slice(&2u32.to_le_bytes());
         b8.extend_from_slice(&[128, 0]);
         assert_eq!(decode(&b8).unwrap().samples, vec![0.0, -1.0]);
+    }
+
+    #[test]
+    fn streaming_matches_one_shot_encoding() {
+        let sig = test_signal();
+        for fmt in SampleFormat::ALL {
+            let (whole, a) = encode(&sig, 2, 44_100, fmt, 3).unwrap();
+            let mut w = Writer::new(Cursor::new(Vec::new()), 2, 44_100, fmt, 3).unwrap();
+            for part in sig.chunks(333) {
+                w.write(part).unwrap();
+            }
+            assert_eq!(w.frames(), 1000);
+            let (parts, b) = w.finish().unwrap();
+            assert_eq!(parts.into_inner(), whole, "{fmt:?}");
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn file_writer_is_atomic() {
+        let dir = std::env::temp_dir().join(format!("tinvo-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        std::fs::write(&path, b"previous").unwrap();
+        let tmp = dir.join("out.wav.tmp");
+        // Dropped unfinished: the old file stays and the temporary is gone.
+        let mut w = FileWriter::create(&path, 1, 8000, SampleFormat::Pcm16).unwrap();
+        w.write(&[0.5; 100]).unwrap();
+        assert!(tmp.exists());
+        drop(w);
+        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        let mut w = FileWriter::create(&path, 1, 8000, SampleFormat::Float32).unwrap();
+        w.write(&[0.5; 100]).unwrap();
+        w.finish().unwrap();
+        assert!(!tmp.exists());
+        let d = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(d.samples, vec![0.5; 100]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn header_is_read_without_the_audio() {
+        let (b, _) = encode(&[0.25; 6], 2, 22_050, SampleFormat::Pcm24, 0).unwrap();
+        let info = read_info(&mut Cursor::new(&b)).unwrap();
+        assert_eq!((info.sample_rate, info.channels, info.bits, info.is_float), (22_050, 2, 24, false));
+        assert_eq!((info.data_offset, info.frames), (44, 3));
+        // A fmt chunk claiming more than the file holds is refused up front.
+        let mut big = b.clone();
+        big[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(read_info(&mut Cursor::new(&big)), Err(WavError::Malformed("chunk extends past end of file")));
     }
 
     #[test]

@@ -320,8 +320,10 @@ pub const RETIRE_QUEUE: usize = 64;
 fn retire(queue: &mut Option<Producer<Arc<Sample>>>, sample: Option<Arc<Sample>>) {
     let (Some(q), Some(s)) = (queue.as_mut(), sample) else { return };
     if let Err(s) = q.push(s) {
-        // The UI drains the queue every frame, so this needs 64 sample
-        // changes within ~16 ms. Leaking is the real-time-safe fallback.
+        // Unreachable while the UI keeps at most `RETIRE_QUEUE` samples in
+        // flight, as `EngineLink` does. Leaking is the real-time-safe
+        // fallback if that bookkeeping is ever wrong.
+        debug_assert!(false, "retirement queue overflow");
         std::mem::forget(s);
     }
 }
@@ -1014,7 +1016,11 @@ impl Engine {
     /// commands. Real-time safe.
     pub fn process(&mut self, out: &mut [f32]) {
         if let Some(mut rx) = self.commands.take() {
-            while let Some(cmd) = rx.pop() {
+            // The UI may keep pushing while this drains; taking at most one
+            // queue's worth keeps a callback's work bounded. The rest waits,
+            // in order, for the next callback.
+            for _ in 0..rx.capacity() {
+                let Some(cmd) = rx.pop() else { break };
                 self.handle(cmd);
             }
             self.commands = Some(rx);

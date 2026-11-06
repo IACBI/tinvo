@@ -118,10 +118,11 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         Source::Auto => unreachable!("resolved"),
     };
     let start = Instant::now();
-    let samples = render::render(&project, &track_samples, &opts);
+    let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
+    let frames = render::render_into(&project, &track_samples, &opts, &mut |b| file.write(b))?;
+    let stats = file.finish()?;
     let elapsed = start.elapsed();
-    let stats = wav::write_file(out.as_ref(), &samples, 2, opts.sample_rate, format)?;
-    let secs = samples.len() as f64 / 2.0 / f64::from(opts.sample_rate);
+    let secs = frames as f64 / f64::from(opts.sample_rate);
     println!(
         "Rendered {what}, {secs:.2} s ({}, {} Hz), to {out} in {:.3} s; peak {:.2} dBFS; {} clipped samples",
         format.label(),
@@ -133,11 +134,24 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if stems {
         let out_path = std::path::Path::new(out);
         let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
-        for (i, audio) in render::render_stems(&project, &track_samples, &opts) {
+        let mut files = Vec::new();
+        for i in render::stem_tracks(&project) {
             let name: String =
                 project.tracks[i].name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
             let path = out_path.with_file_name(format!("{stem}-{:02}-{name}.wav", i + 1));
-            let st = wav::write_file(&path, &audio, 2, opts.sample_rate, format)?;
+            let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
+            render::render_into(&render::stem_project(&project, i), &track_samples, &opts, &mut |b| file.write(b))?;
+            files.push((path, file));
+        }
+        // Stems end at different times; pad them to one length so they line up.
+        let len = files.iter().map(|(_, f)| f.frames()).max().unwrap_or(0);
+        let silence = [0.0f32; 2 * 1024];
+        for (path, mut file) in files {
+            while file.frames() < len {
+                let n = (len - file.frames()).min(1024) as usize;
+                file.write(&silence[..2 * n])?;
+            }
+            let st = file.finish()?;
             println!("  stem {}: peak {:.2} dBFS", path.display(), tinvo::dsp::gain_to_db(st.peak));
         }
     }

@@ -51,16 +51,23 @@ const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 /// UI-side end of the command queue. Commands that do not fit are kept in
 /// order and retried, so the engine never misses an edit. It also receives
 /// the samples the engine has released and frees them here, on the UI thread.
+///
+/// Every sample the engine holds or releases arrived in a `SetSample`
+/// command and is released at most once, so the retirement queue never
+/// holds more than the samples sent and not yet received back. Keeping that
+/// count at most `RETIRE_QUEUE` means the engine's push into the queue
+/// cannot fail; a sample command waits in the backlog until there is room.
 pub struct EngineLink {
     tx: Producer<Command>,
     backlog: VecDeque<Command>,
     shared: Arc<Shared>,
     retired: Option<Consumer<Arc<Sample>>>,
+    in_flight: usize,
 }
 
 impl EngineLink {
     pub fn new(tx: Producer<Command>, shared: Arc<Shared>) -> Self {
-        Self { tx, backlog: VecDeque::new(), shared, retired: None }
+        Self { tx, backlog: VecDeque::new(), shared, retired: None, in_flight: 0 }
     }
 
     /// Takes over the receiving end of the engine's retirement queue.
@@ -73,21 +80,33 @@ impl EngineLink {
         self.flush();
         if !self.backlog.is_empty() {
             self.backlog.push_back(cmd);
-        } else if let Err(cmd) = self.tx.push(cmd) {
+        } else if let Err(cmd) = self.try_push(cmd) {
             self.backlog.push_back(cmd);
         }
     }
 
     pub fn flush(&mut self) {
+        if let Some(rx) = &mut self.retired {
+            while rx.pop().is_some() {
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
+        }
         while let Some(cmd) = self.backlog.pop_front() {
-            if let Err(cmd) = self.tx.push(cmd) {
+            if let Err(cmd) = self.try_push(cmd) {
                 self.backlog.push_front(cmd);
                 break;
             }
         }
-        if let Some(rx) = &mut self.retired {
-            while rx.pop().is_some() {}
+    }
+
+    fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
+        let carries = self.retired.is_some() && matches!(&cmd, Command::SetSample { sample: Some(_), .. });
+        if carries && self.in_flight >= RETIRE_QUEUE {
+            return Err(cmd);
         }
+        self.tx.push(cmd)?;
+        self.in_flight += usize::from(carries);
+        Ok(())
     }
 }
 
@@ -1268,10 +1287,14 @@ impl App {
             ..Default::default()
         };
         let started = Instant::now();
-        let samples = render::render(&self.project, &self.track_samples(), &opts);
-        let secs = samples.len() as f32 / 2.0 / self.sample_rate as f32;
-        match wav::write_file(path, &samples, 2, self.sample_rate, self.export_format) {
-            Ok(stats) => {
+        let samples = self.track_samples();
+        let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
+            let frames = render::render_into(&self.project, &samples, &opts, &mut |b| file.write(b))?;
+            Ok((frames, file.finish()?))
+        });
+        match result {
+            Ok((frames, stats)) => {
+                let secs = frames as f32 / self.sample_rate as f32;
                 let clip = if stats.clipped > 0 {
                     format!(", {} samples CLIPPED - lower the master", stats.clipped)
                 } else {
@@ -2236,6 +2259,36 @@ mod tests {
         keys(&mut a, &[Key::Char('c')]);
         assert_eq!(a.project.tracks[0].steps[0][0].unwrap().chord, [0; MAX_CHORD - 1]);
         assert_eq!(step_summary(&Step { chord: [3, 7, 0], offset: -2, ..Step::new(57, 90, 1) }), "A3min v90 len1 -2t");
+    }
+
+    #[test]
+    fn sample_changes_never_overflow_the_retirement_queue() {
+        let tone: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin()).collect();
+        let s = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
+        let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
+        let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
+        let shared = Arc::new(Shared::new());
+        let mut e = Engine::with_edits(48_000.0, &[Edit::AddTrack(InstrumentKind::Sampler)], shared.clone(), Some(rx));
+        e.attach_retirement(retire_tx);
+        let mut link = EngineLink::new(tx, shared).with_retirement(retire_rx);
+        let mut out = vec![0.0f32; 128];
+        // Far more sample changes than the queue holds, between two callbacks.
+        for round in 0..10 {
+            for _ in 0..300 {
+                link.send(Command::SetSample { track: 0, sample: Some(s.clone()) });
+            }
+            assert!(link.in_flight <= RETIRE_QUEUE, "round {round}: {}", link.in_flight);
+            e.process(&mut out);
+        }
+        while !link.backlog.is_empty() {
+            link.flush();
+            e.process(&mut out);
+        }
+        e.process(&mut out);
+        link.flush();
+        // Ours plus the one the track holds: nothing was leaked.
+        assert_eq!(Arc::strong_count(&s), 2);
+        assert_eq!(link.in_flight, 1);
     }
 
     #[test]

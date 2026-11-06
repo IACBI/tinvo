@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-06
+
+### Fixed
+- Changing samples faster than the UI collected the released ones could overflow the queue that returns them, and the engine then leaked them on purpose. The UI now keeps at most as many samples in flight as that queue holds, so nothing is leaked; a sample change past that waits for the next screen frame.
+- The audio callback handles at most one queue's worth of commands per call, so a UI that keeps sending while the callback drains cannot stretch it.
+
+### Changed
+- Export streams to disk: memory use no longer grows with the length of the export. A 17-minute song took 771 MB to export before and takes 7 MB now; the files are byte-for-byte the same. Stems are written the same way.
+- An export that fails part-way leaves no temporary file behind and does not touch an existing file of the same name.
+- Loading a sample reads the WAV header first and refuses a file that is too long before reading its audio, which is then mixed to mono a block at a time instead of being held twice in memory.
+
 ## [0.6.0] - 2026-11-06
 
 ### Added
@@ -81,7 +92,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/IACBI/tinvo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/IACBI/tinvo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/IACBI/tinvo/compare/v0.3.0...v0.4.0

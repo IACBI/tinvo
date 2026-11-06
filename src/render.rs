@@ -74,9 +74,20 @@ pub fn main_frames(project: &Project, opts: &RenderOptions) -> u64 {
     (sps * (source_steps(project, opts.source) * u64::from(opts.loops)) as f64).round() as u64
 }
 
-/// Renders the project to interleaved stereo. `samples` holds each track's
-/// sample (see [`Project::load_samples`]); missing entries play silence.
-pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<f32> {
+/// Frames the engine renders per call while exporting.
+const CHUNK: usize = 4096;
+
+/// Renders the project as interleaved stereo, handing it to `sink` block by
+/// block, and returns the number of frames rendered. Memory use does not
+/// depend on the length of the render. `samples` holds each track's sample
+/// (see [`Project::load_samples`]); missing entries play silence. A `sink`
+/// error stops the render and is returned.
+pub fn render_into(
+    project: &Project,
+    samples: &[Option<Arc<Sample>>],
+    opts: &RenderOptions,
+    sink: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+) -> Result<u64, String> {
     let sr = opts.sample_rate;
     let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::new(Shared::new()), None);
     for (track, sample) in samples.iter().enumerate() {
@@ -97,60 +108,82 @@ pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderO
         }
         Source::Auto => unreachable!("resolved above"),
     }
-    let main = main_frames(project, opts) as usize;
-    let mut out = vec![0.0f32; main * 2];
-    engine.process(&mut out);
+    let mut buf = vec![0.0f32; CHUNK * 2];
+    let main = main_frames(project, opts);
+    let mut done = 0u64;
+    while done < main {
+        let n = (main - done).min(CHUNK as u64) as usize;
+        engine.process(&mut buf[..n * 2]);
+        sink(&buf[..n * 2])?;
+        done += n as u64;
+    }
     engine.handle(Command::Stop);
 
-    let chunk = 512usize;
+    // The tail ends after `quiet_needed` frames of silence, which are not
+    // part of the result: quiet blocks wait in `held` until sound follows.
     let max_tail = (opts.max_tail_seconds.max(0.0) * sr as f32) as usize;
     let quiet_needed = (TAIL_QUIET_SECONDS * sr as f32) as usize;
-    let mut quiet = 0usize;
+    let mut held: Vec<f32> = Vec::new();
     let mut tail = 0usize;
-    let mut buf = vec![0.0f32; chunk * 2];
-    while tail < max_tail && quiet < quiet_needed {
-        let n = chunk.min(max_tail - tail);
+    while tail < max_tail && held.len() / 2 < quiet_needed {
+        let n = 512.min(max_tail - tail);
         let b = &mut buf[..n * 2];
         engine.process(b);
-        out.extend_from_slice(b);
         tail += n;
         if b.iter().all(|x| x.abs() < TAIL_THRESHOLD) {
-            quiet += n;
+            held.extend_from_slice(b);
         } else {
-            quiet = 0;
+            if !held.is_empty() {
+                sink(&held)?;
+                done += (held.len() / 2) as u64;
+                held.clear();
+            }
+            sink(b)?;
+            done += n as u64;
         }
     }
-    // Drop the trailing silence used to detect the end of the tail.
-    let keep = (main + tail - quiet.min(tail)) * 2;
-    out.truncate(keep);
+    Ok(done)
+}
+
+/// [`render_into`] collected in memory.
+pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut sink = |b: &[f32]| {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    render_into(project, samples, opts, &mut sink).expect("collecting cannot fail");
     out
 }
 
+/// The tracks that get a stem: the audible ones.
+pub fn stem_tracks(project: &Project) -> Vec<usize> {
+    let any_solo = project.tracks.iter().any(|t| t.solo);
+    (0..project.tracks.len()).filter(|&i| !project.tracks[i].mute && (!any_solo || project.tracks[i].solo)).collect()
+}
+
+/// The project as heard in the stem of track `i`. Other tracks are muted,
+/// not removed: they still use the chance generator and choke open hats
+/// exactly as in the mix, so the stems add up to it.
+pub fn stem_project(project: &Project, i: usize) -> Project {
+    let mut solo = project.clone();
+    for (j, t) in solo.tracks.iter_mut().enumerate() {
+        t.mute = j != i;
+        t.solo = false;
+    }
+    solo
+}
+
 /// Renders each audible track on its own (with the master level applied),
-/// as `(track index, audio)`. All stems have the same length, so they line
-/// up when imported elsewhere; added together they make the mix.
+/// as `(track index, audio)`. All stems are padded to the same length, so
+/// they line up when imported elsewhere; added together they make the mix.
 pub fn render_stems(
     project: &Project,
     samples: &[Option<Arc<Sample>>],
     opts: &RenderOptions,
 ) -> Vec<(usize, Vec<f32>)> {
-    let any_solo = project.tracks.iter().any(|t| t.solo);
-    let audible: Vec<usize> = (0..project.tracks.len())
-        .filter(|&i| !project.tracks[i].mute && (!any_solo || project.tracks[i].solo))
-        .collect();
-    let mut stems: Vec<(usize, Vec<f32>)> = audible
-        .iter()
-        .map(|&i| {
-            // Other tracks are muted, not removed: they still use the chance
-            // generator and choke open hats exactly as in the mix.
-            let mut solo = project.clone();
-            for (j, t) in solo.tracks.iter_mut().enumerate() {
-                t.mute = j != i;
-                t.solo = false;
-            }
-            (i, render(&solo, samples, opts))
-        })
-        .collect();
+    let mut stems: Vec<(usize, Vec<f32>)> =
+        stem_tracks(project).into_iter().map(|i| (i, render(&stem_project(project, i), samples, opts))).collect();
     let len = stems.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
     for (_, s) in &mut stems {
         s.resize(len, 0.0);
