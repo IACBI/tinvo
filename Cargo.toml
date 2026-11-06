@@ -1,0 +1,22 @@
+[package]
+name = "tinvo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["A.C.B"]
+description = "Terminal-based digital audio workstation"
+readme = false
+publish = false
+
+# TINVO deliberately has no third-party dependencies. Everything is built on
+# the Rust standard library plus direct FFI to native operating-system APIs.
+[dependencies]
+
+[profile.dev]
+# Tests render seconds of audio; unoptimised DSP makes them needlessly slow.
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
