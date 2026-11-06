@@ -9,8 +9,8 @@ use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
 use crate::engine::transport::Transport;
 use crate::engine::{
-    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING,
-    PlayPosition, RETIRE_QUEUE, Shared, Step,
+    Command, Edit, Engine, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS,
+    MIN_SWING, PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
@@ -113,6 +113,16 @@ impl AudioCallback for EngineCallback {
     }
 }
 
+/// One track's part of a copied pattern: its steps and each lane's points.
+type ClipTrack = ([Option<Step>; MAX_STEPS], [[Option<f32>; MAX_STEPS]; MAX_LANES]);
+
+/// A copied pattern.
+#[derive(Clone)]
+struct Clip {
+    len: u8,
+    tracks: Vec<ClipTrack>,
+}
+
 /// The parts of a track that live outside the [`Edit`] stream.
 #[derive(Clone, Debug, PartialEq)]
 struct TrackMeta {
@@ -148,6 +158,7 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetGain { track, .. } => (6, track, 0, 0),
         Edit::SetPan { track, .. } => (7, track, 0, 0),
         Edit::SetSongEntry { index, .. } => (8, (index >> 8) as u8, index as u8, 0),
+        Edit::SetPoint { track, lane, pattern, step, .. } => (9 + lane, track, pattern, step),
         _ => return None,
     })
 }
@@ -162,6 +173,8 @@ fn describe(e: &Edit) -> &'static str {
         Edit::RemoveSongEntry(_) => "remove song entry",
         Edit::SetSongEntry { .. } => "song entry",
         Edit::SetLoop(_) => "loop region",
+        Edit::SetLane { .. } => "automation lane",
+        Edit::SetPoint { .. } => "automation point",
         Edit::AddTrack(_) | Edit::InsertTrack { .. } => "add track",
         Edit::RemoveTrack(_) => "delete track",
         Edit::SetStep { .. } => "step",
@@ -220,6 +233,10 @@ pub struct App {
     /// Song view instead of the step grid.
     pub song_view: bool,
     pub song_cursor: usize,
+    /// Automation lanes of the selected track instead of the step grid.
+    pub auto_view: bool,
+    /// Lane under the cursor in the automation view.
+    pub lane: usize,
     pub export_format: SampleFormat,
     pub export_loops: u32,
     /// What export plays; `Pattern` means the pattern being edited.
@@ -227,8 +244,8 @@ pub struct App {
     pub quit: bool,
     /// Per-track template for newly placed steps, parallel to `project.tracks`.
     brushes: Vec<Step>,
-    /// A copied pattern: its length and each track's steps.
-    clipboard: Option<(u8, Vec<[Option<Step>; MAX_STEPS]>)>,
+    /// A copied pattern: its length and each track's steps and lane points.
+    clipboard: Option<Clip>,
     /// Every sample loaded this session, by absolute path. Undo can bring a
     /// sample back without reading the disk again.
     bank: HashMap<String, Arc<Sample>>,
@@ -277,6 +294,8 @@ impl App {
             pattern: 0,
             song_view: false,
             song_cursor: 0,
+            auto_view: false,
+            lane: 0,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
             export_source: Source::Auto,
@@ -534,6 +553,13 @@ impl App {
                 self.step = usize::from(*step);
             }
             Some(Edit::SetPatternLength { pattern, .. }) => self.pattern = usize::from(*pattern),
+            Some(Edit::SetPoint { track, lane, pattern, step, .. }) => {
+                (self.track, self.lane) = (usize::from(*track), usize::from(*lane));
+                (self.pattern, self.step) = (usize::from(*pattern), usize::from(*step));
+            }
+            Some(Edit::SetLane { track, lane, .. }) => {
+                (self.track, self.lane) = (usize::from(*track), usize::from(*lane));
+            }
             Some(
                 Edit::InsertSongEntry { index, .. } | Edit::RemoveSongEntry(index) | Edit::SetSongEntry { index, .. },
             ) => self.song_cursor = usize::from(*index),
@@ -604,21 +630,34 @@ impl App {
     }
 
     fn copy_pattern(&mut self) {
-        let steps = self.project.tracks.iter().map(|t| t.steps[self.pattern]).collect();
-        self.clipboard = Some((self.project.pattern_lens[self.pattern], steps));
-        self.set_status(format!("Copied pattern {}", pattern_name(self.pattern as u8)));
+        let p = self.pattern;
+        let tracks =
+            self.project.tracks.iter().map(|t| (t.steps[p], std::array::from_fn(|k| t.lanes[k].points[p]))).collect();
+        self.clipboard = Some(Clip { len: self.project.pattern_lens[p], tracks });
+        self.set_status(format!("Copied pattern {}", pattern_name(p as u8)));
     }
 
-    /// Replaces the edited pattern with the copied one (or clears it), as one
-    /// undo step. Tracks are matched by position.
-    fn replace_pattern(&mut self, with: Option<(u8, Vec<[Option<Step>; MAX_STEPS]>)>, what: &'static str) {
-        let pattern = self.pattern as u8;
-        let (len, steps) = with.unwrap_or((self.project.pattern_lens[self.pattern], Vec::new()));
-        let mut edits = vec![Edit::SetPatternLength { pattern, len }];
+    /// Replaces the edited pattern (steps and automation points) with the
+    /// copied one, or clears it, as one undo step. Tracks and lanes are
+    /// matched by position; points go only to lanes that have a parameter.
+    fn replace_pattern(&mut self, with: Option<Clip>, what: &'static str) {
+        let (p, pattern) = (self.pattern, self.pattern as u8);
+        let clip = with.unwrap_or(Clip { len: self.project.pattern_lens[p], tracks: Vec::new() });
+        let empty = ([None; MAX_STEPS], [[None; MAX_STEPS]; MAX_LANES]);
+        let mut edits = vec![Edit::SetPatternLength { pattern, len: clip.len }];
         for (t, track) in self.project.tracks.iter().enumerate() {
-            for (i, &value) in steps.get(t).unwrap_or(&[None; MAX_STEPS]).iter().enumerate() {
-                if track.steps[self.pattern][i] != value {
+            let (steps, lanes) = clip.tracks.get(t).unwrap_or(&empty);
+            for (i, &value) in steps.iter().enumerate() {
+                if track.steps[p][i] != value {
                     edits.push(Edit::SetStep { track: t as u8, pattern, step: i as u8, value });
+                }
+            }
+            for (k, l) in track.lanes.iter().enumerate().filter(|(_, l)| l.target.is_some()) {
+                for (i, &value) in lanes[k].iter().enumerate() {
+                    if l.points[p][i] != value {
+                        let (track, lane, step) = (t as u8, k as u8, i as u8);
+                        edits.push(Edit::SetPoint { track, lane, pattern, step, value });
+                    }
                 }
             }
         }
@@ -655,6 +694,7 @@ impl App {
         self.track = if n == 0 { 0 } else { self.track.min(n - 1) };
         self.step = self.step.min(self.pattern_len() - 1);
         self.song_cursor = self.song_cursor.min(self.project.song.len().saturating_sub(1));
+        self.lane = self.lane.min(MAX_LANES - 1);
         self.param = self.param.min(self.param_count().saturating_sub(1));
     }
 
@@ -885,6 +925,13 @@ impl App {
                     self.set_status("Samples load into sampler tracks (a, 7 adds one)");
                 }
             }
+            Key::Char('A') if self.focus == Focus::Params => self.automate_param(self.param),
+            Key::Char('A') => {
+                self.auto_view = !self.auto_view;
+                if self.auto_view && self.project.tracks[self.track].lanes.iter().all(|l| l.target.is_none()) {
+                    self.set_status("No lanes yet: pick a parameter (Tab) and press A");
+                }
+            }
             Key::Char('v') => {
                 if self.project.tracks[self.track].kind.is_drum() {
                     self.set_status("The piano roll is for melodic tracks");
@@ -899,11 +946,96 @@ impl App {
                 }
             }
             _ => match self.focus {
+                Focus::Grid if self.auto_view => self.key_auto(key),
                 Focus::Grid if self.roll_active() => self.key_roll(key),
                 Focus::Grid => self.key_grid(key),
                 Focus::Params => self.key_params(key),
             },
         }
+    }
+
+    /// Opens the lane for panel parameter `target`, giving it a free lane if
+    /// it has none.
+    fn automate_param(&mut self, target: usize) {
+        let t = &self.project.tracks[self.track];
+        let label = self.param_spec(target).label;
+        let target = target as u8;
+        if let Some(k) = t.lanes.iter().position(|l| l.target == Some(target)) {
+            self.lane = k;
+        } else if let Some(k) = t.lanes.iter().position(|l| l.target.is_none()) {
+            let track = self.track as u8;
+            if !self.edit(Edit::SetLane { track, lane: k as u8, target: Some(target), ramp: false }) {
+                return;
+            }
+            self.lane = k;
+            self.set_status(format!("Lane {}: {label}. Enter adds a point, / switches hold and ramp", k + 1));
+        } else {
+            self.set_status(format!("A track has at most {MAX_LANES} lanes (- in the automation view frees one)"));
+            return;
+        }
+        self.auto_view = true;
+        self.focus = Focus::Grid;
+    }
+
+    /// Automation view keys.
+    fn key_auto(&mut self, key: Key) {
+        let len = self.pattern_len();
+        let (track, lane, pattern, step) = (self.track as u8, self.lane as u8, self.pattern as u8, self.step as u8);
+        let l = &self.project.tracks[self.track].lanes[self.lane];
+        let (target, ramp, point) = (l.target, l.ramp, l.points[self.pattern][self.step]);
+        match key {
+            Key::Left => self.step = (self.step + len - 1) % len,
+            Key::Right => self.step = (self.step + 1) % len,
+            Key::Home => self.step = 0,
+            Key::End => self.step = len - 1,
+            Key::Up => self.lane = self.lane.saturating_sub(1),
+            Key::Down => self.lane = (self.lane + 1).min(MAX_LANES - 1),
+            _ if target.is_none() => {
+                self.set_status(format!("Lane {} is free: pick a parameter (Tab) and press A", self.lane + 1));
+            }
+            Key::Enter | Key::Char('x') => {
+                // A new point starts at the value already in force there.
+                let value = match point {
+                    Some(_) => None,
+                    None => Some(
+                        self.lane_value(self.lane, self.step)
+                            .unwrap_or(self.param_value(usize::from(target.unwrap_or(0)))),
+                    ),
+                };
+                self.edit(Edit::SetPoint { track, lane, pattern, step, value });
+            }
+            Key::Delete | Key::Backspace => {
+                self.edit(Edit::SetPoint { track, lane, pattern, step, value: None });
+            }
+            Key::Char(c @ ('[' | ']' | '{' | '}')) => match point {
+                Some(v) => {
+                    let spec = self.param_spec(usize::from(target.unwrap_or(0)));
+                    let value = spec.nudge(v, if matches!(c, '[' | '{') { -1 } else { 1 }, matches!(c, '{' | '}'));
+                    self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
+                }
+                None => self.set_status("No point here: Enter adds one"),
+            },
+            Key::Char('/') => {
+                if self.edit(Edit::SetLane { track, lane, target, ramp: !ramp }) {
+                    self.set_status(if ramp { "Lane holds each point" } else { "Lane ramps between points" });
+                }
+            }
+            Key::Char('-') => {
+                if self.edit(Edit::SetLane { track, lane, target: None, ramp: false }) {
+                    self.set_status(format!("Removed lane {} (u brings it back)", self.lane + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The value lane `k` of the selected track gives at the start of
+    /// `step` in the edited pattern, if a point is in force there.
+    fn lane_value(&self, k: usize, step: usize) -> Option<f32> {
+        let t = &self.project.tracks[self.track];
+        let l = &t.lanes[k];
+        let spec = crate::engine::target_spec(t.kind, l.target?)?;
+        l.value_at(spec, self.pattern, self.pattern_len(), step)
     }
 
     /// Song view keys. Returns whether the key was used.
@@ -1175,6 +1307,8 @@ impl App {
         let track_rows = h.saturating_sub(2 + 1 + params_rows + 1).max(1);
         if self.song_view {
             self.draw_song(s, w, track_rows);
+        } else if self.auto_view && self.track < self.track_count() {
+            self.draw_auto(s, w, track_rows);
         } else if self.roll_active() {
             self.draw_roll(s, w, track_rows);
         } else {
@@ -1304,6 +1438,66 @@ impl App {
                 }
                 s.put(x, y, &text, st);
             }
+        }
+    }
+
+    /// The selected track's lanes over the steps of the edited pattern:
+    /// bright cells are points, dim ones the value in force.
+    fn draw_auto(&self, s: &mut Screen, w: u16, rows: u16) {
+        const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let t = &self.project.tracks[self.track];
+        let dim = Style::fg(Color::Gray);
+        s.put(1, 1, &format!("Automation · {:<16.16} A: grid", t.name), Style::fg(Color::BrightWhite).bold());
+        self.draw_ruler(s, w);
+        let (first, last) = self.visible_steps(w);
+        for (k, l) in t.lanes.iter().enumerate().take(usize::from(rows)) {
+            let y = 2 + k as u16;
+            let selected = k == self.lane;
+            s.put(0, y, if selected { "▸" } else { " " }, Style::fg(Color::BrightYellow));
+            let spec = l.target.and_then(|x| crate::engine::target_spec(t.kind, x));
+            let label = match spec {
+                Some(sp) => format!("{} {:<16.16} {}", k + 1, sp.label, if l.ramp { "ramp" } else { "hold" }),
+                None => format!("{} (free)", k + 1),
+            };
+            s.put(1, y, &label, if selected { Style::fg(Color::BrightWhite).bold() } else { Style::DEFAULT });
+            s.put(LEFT - 1, y, "│", dim);
+            for (col, i) in (first..last).enumerate() {
+                let x = LEFT + col as u16 * CELL;
+                let value = spec.and_then(|sp| l.value_at(sp, self.pattern, self.pattern_len(), i).map(|v| (sp, v)));
+                let glyph = |sp: &ParamSpec, v: f32| GLYPHS[(sp.to_unit(v) * 7.0).round() as usize];
+                let (text, mut st) = match (l.points[self.pattern][i], value) {
+                    (Some(_), Some((sp, v))) => (format!(" {} ", glyph(sp, v)), Style::fg(Color::BrightYellow).bold()),
+                    (None, Some((sp, v))) => (format!(" {} ", glyph(sp, v)), Style::fg(Color::Yellow)),
+                    _ if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
+                    _ => (" · ".to_string(), dim),
+                };
+                if self.play_step() == Some(i) {
+                    st.bg = Color::Blue;
+                }
+                if selected && i == self.step {
+                    st = Style::fg(Color::Black).on(Color::BrightWhite);
+                }
+                s.put(x, y, &text, st);
+            }
+        }
+        let info_y = 2 + MAX_LANES as u16 + 1;
+        if info_y < 2 + rows {
+            let l = &t.lanes[self.lane];
+            let info = match l.target.and_then(|x| crate::engine::target_spec(t.kind, x)) {
+                None => "Free lane. In the parameter panel (Tab), A gives the selected parameter a lane.".to_string(),
+                Some(sp) => {
+                    let at = format!("{} at step {}: ", sp.label, self.step + 1);
+                    match (l.points[self.pattern][self.step], self.lane_value(self.lane, self.step)) {
+                        (Some(v), _) => format!("{at}{} (point)", sp.format(v)),
+                        (None, Some(v)) => format!("{at}{} ({})", sp.format(v), if l.ramp { "ramp" } else { "held" }),
+                        (None, None) => format!(
+                            "{at}knob value {}",
+                            sp.format(self.param_value(usize::from(l.target.unwrap_or(0))))
+                        ),
+                    }
+                }
+            };
+            s.put(1, info_y, &info, Style::fg(Color::White));
         }
     }
 
@@ -1513,11 +1707,14 @@ impl App {
                     Some((m, _)) => (m.as_str(), Style::fg(Color::BrightYellow).on(Color::Black)),
                     None => (
                         match self.focus {
+                            Focus::Grid if self.auto_view => {
+                                "←→ step  ↑↓ lane  Enter point  [ ] value  { } coarse  / hold-ramp  - remove lane  A grid  u undo"
+                            }
                             Focus::Grid => {
                                 "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  - = chance  / ratchet  u undo  Space play  ? help"
                             }
                             Focus::Params => {
-                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  m mute  s solo  u undo  Tab grid  ? help"
+                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  A automate  m mute  s solo  u undo  Tab grid  ? help"
                             }
                         },
                         Style::fg(Color::Gray).on(Color::Black),
@@ -1560,6 +1757,8 @@ fn draw_help(s: &mut Screen) {
         ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
+        ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
+        ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
         ("w  Ctrl+S", "save (W: save as)"),
         ("e", "export WAV (←→ song / pattern / loop region, Tab format, ↑↓ repeats)"),
         ("q  Ctrl+C", "quit"),
@@ -2189,6 +2388,72 @@ mod tests {
         keys(&mut a, &[Key::Char(' '), Key::Char(' '), Key::Char('S'), Key::Char(' ')]);
         let sent: Vec<Command> = std::iter::from_fn(|| rx.pop()).collect();
         assert_eq!(sent, [Command::PlaySong { entry: 1 }, Command::Stop, Command::Cue(1), Command::Play], "{sent:?}");
+    }
+
+    #[test]
+    fn automation_lanes_from_the_parameter_panel() {
+        let mut a = app();
+        a.track = 5; // bass synth, without the demo's cutoff lane
+        a.project.tracks[5].lanes[0] = crate::project::LaneData::new(None, false);
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(a.auto_view);
+        assert!(a.status_text().unwrap().starts_with("No lanes yet"));
+        keys(&mut a, &[Key::Char('A'), Key::Tab]);
+        // Panel row 7 is the synth cutoff.
+        a.param = 7;
+        keys(&mut a, &[Key::Char('A')]);
+        assert_eq!((a.auto_view, a.focus, a.lane), (true, Focus::Grid, 0));
+        assert_eq!(a.project.tracks[5].lanes[0].target, Some(7));
+        // A new point starts at the knob value; ] nudges it.
+        a.step = 2;
+        keys(&mut a, &[Key::Enter, Key::Char(']')]);
+        let knob = a.project.tracks[5].params[5];
+        let v = a.project.tracks[5].lanes[0].points[0][2].unwrap();
+        assert_eq!(v, InstrumentKind::Synth.params()[5].nudge(knob, 1, false));
+        keys(&mut a, &[Key::Char('/'), Key::Home, Key::Char('[')]);
+        assert!(a.project.tracks[5].lanes[0].ramp);
+        assert!(a.status_text().unwrap().starts_with("No point here"));
+        a.step = 6;
+        keys(&mut a, &[Key::Enter, Key::Char('}'), Key::Char('}')]);
+        let mut s = Screen::new(120, 30);
+        a.draw(&mut s);
+        let text: String = (0..30).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Automation · Bass"), "{text}");
+        assert!(text.contains("1 Cutoff") && text.contains("ramp"), "{text}");
+        assert!(text.contains("Cutoff at step 7"), "{text}");
+        // A free lane says how to use it; the parameter already has a lane.
+        keys(&mut a, &[Key::Down, Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Lane 2 is free"));
+        keys(&mut a, &[Key::Tab, Key::Char('A')]);
+        assert_eq!((a.lane, a.project.tracks[5].lanes[1].target), (0, None));
+        // Removing the lane drops its points; undo brings everything back.
+        let with_points = a.project.clone();
+        keys(&mut a, &[Key::Char('-')]);
+        assert_eq!(a.project.tracks[5].lanes[0], crate::project::LaneData::new(None, false));
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project, with_points);
+        // Copy and paste carry the points.
+        keys(&mut a, &[Key::Char('y'), Key::Char('n'), Key::Char('Y')]);
+        assert_eq!(a.project.tracks[5].lanes[0].points[1], a.project.tracks[5].lanes[0].points[0]);
+        keys(&mut a, &[Key::Char('X')]);
+        assert!(a.project.tracks[5].lanes[0].points[1].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_track_has_at_most_four_lanes() {
+        let mut a = app();
+        a.track = 5;
+        a.project.tracks[5].lanes[0] = crate::project::LaneData::new(None, false);
+        a.focus = Focus::Params;
+        for param in 0..MAX_LANES {
+            a.param = param;
+            keys(&mut a, &[Key::Char('A')]);
+            a.focus = Focus::Params;
+        }
+        a.param = MAX_LANES;
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(a.status_text().unwrap().contains("at most 4 lanes"), "{:?}", a.status_text());
+        assert_eq!(a.project.tracks[5].lanes.iter().filter(|l| l.target.is_some()).count(), MAX_LANES);
     }
 
     #[test]

@@ -206,7 +206,9 @@ fn cmd_bench() -> Result<(), String> {
 }
 
 fn bench(label: &str, project: &Project) -> Result<(), String> {
-    let opts = RenderOptions { sample_rate: 48_000, loops: 16, max_tail_seconds: 0.0, source: Source::Pattern(0) };
+    // The demo song is four patterns long, so both benches render 16 bars.
+    let loops = if project.song.is_empty() { 16 } else { 4 };
+    let opts = RenderOptions { sample_rate: 48_000, loops, max_tail_seconds: 0.0, source: Source::Auto };
     // Warm up caches and the allocator before timing.
     render::render(project, &[], &RenderOptions { loops: 1, ..opts });
     let start = Instant::now();

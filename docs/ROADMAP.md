@@ -46,7 +46,7 @@ Known limits, planned for later phases:
 - One sample per track; there are no multi-sample key maps yet.
 - The interpolation kernel does not lower its cutoff when pitching up, so a sample transposed far upwards can alias.
 
-## Phase 3a: Arrangement ✅ (0.5.0, this release)
+## Phase 3a: Arrangement ✅ (0.5.0)
 
 - 16 patterns per project, each with its own length (1–64 steps); every track has steps in every pattern.
 - Pattern switching while playing: the chosen pattern takes over at the end of the current one, sample-accurately. A switch made during the last step of a pattern lands one pattern later, because that step has already queued the next step's early hits.
@@ -55,9 +55,15 @@ Known limits, planned for later phases:
 - Copy, paste and clear a pattern, each one undo step.
 - Project format 5; formats 1–4 load into pattern A.
 
-## Phase 3b: Automation
+## Phase 3b: Automation ✅ (0.6.0, this release)
 
-- Automation lanes for any parameter, with sample-accurate ramps, per pattern.
+- Up to 4 automation lanes per track, for volume, pan or any instrument parameter, with points per pattern and step.
+- Hold lanes change value exactly at the step's frame, before that step's notes start. Ramp lanes glide in the parameter's own scale and are evaluated every 32 frames on the absolute sample clock, so a render is identical at any buffer size.
+- Before the first point of a pattern, and after stop, a parameter is at its knob value. Notes with a negative micro-timing offset start before their step and so use the value in force before it.
+- Project format 6; formats 1–5 load without automation.
+
+## Later in Phase 3
+
 - Song-position markers and export ranges between them.
 - Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
 

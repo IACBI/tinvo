@@ -16,7 +16,7 @@ pub mod transport;
 use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
-use crate::instrument::{Instrument, InstrumentKind, SILENT_DB, VoiceId};
+use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
 use crate::rt::AtomicF32;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
@@ -32,6 +32,25 @@ pub const MAX_PATTERNS: usize = 16;
 pub const MAX_SONG: usize = 256;
 /// Length of a new pattern.
 pub const DEFAULT_PATTERN_LEN: u8 = 16;
+/// Automation lanes per track.
+pub const MAX_LANES: usize = 4;
+/// Ramps move in steps of this many frames (0.67 ms at 48 kHz), aligned to
+/// the engine clock, so the result does not depend on the buffer size.
+const AUTOMATION_TICK: u64 = 32;
+
+/// Mixer parameters, shown and automated alongside instrument parameters.
+pub static VOLUME: ParamSpec = ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
+pub static PAN: ParamSpec = ParamSpec::linear("pan", "Pan", -1.0, 1.0, 0.0, 0.05, Unit::Pan);
+
+/// What an automation lane controls: 0 is the volume, 1 the pan, and `2 + i`
+/// the instrument's parameter `i` (the order of the parameter panel).
+pub fn target_spec(kind: InstrumentKind, target: u8) -> Option<&'static ParamSpec> {
+    match target {
+        0 => Some(&VOLUME),
+        1 => Some(&PAN),
+        t => kind.params().get(usize::from(t) - 2),
+    }
+}
 /// Internal processing block. Events inside a block are still sample-accurate.
 pub const BLOCK: usize = 64;
 pub const MIN_TEMPO: f32 = 20.0;
@@ -220,6 +239,23 @@ pub enum Edit {
     /// reaches past the end of the song is ignored until the song is long
     /// enough again.
     SetLoop(Option<(u16, u16)>),
+    /// Points a lane at a parameter (see [`target_spec`]), or frees it.
+    /// Giving a lane a different target clears its points. `ramp` lanes
+    /// glide from point to point; others hold each value.
+    SetLane {
+        track: u8,
+        lane: u8,
+        target: Option<u8>,
+        ramp: bool,
+    },
+    /// An automation point: the lane's value from this step on.
+    SetPoint {
+        track: u8,
+        lane: u8,
+        pattern: u8,
+        step: u8,
+        value: Option<f32>,
+    },
     SetParam {
         track: u8,
         index: u8,
@@ -377,11 +413,62 @@ struct PendingOn {
 /// a late offset, plus the next step's early hits. Twice that is headroom.
 const MAX_PENDING_ONS: usize = 4 * MAX_RATCHET as usize;
 
+/// The part of a lane from a point (`v0` at frame `f0`) to the next one
+/// (`v1` at `f1`); `f1 == f0` holds `v0`.
+#[derive(Clone, Copy)]
+struct Segment {
+    f0: u64,
+    v0: f32,
+    f1: u64,
+    v1: f32,
+}
+
+impl Segment {
+    /// The value at `frame`: exactly the points' values at and beyond the
+    /// ends, and in between a straight line in [`ParamSpec::to_unit`] terms.
+    fn value_at(&self, spec: &ParamSpec, frame: u64) -> f32 {
+        if self.f1 <= self.f0 || frame <= self.f0 {
+            return self.v0;
+        }
+        if frame >= self.f1 {
+            return self.v1;
+        }
+        let t = ((frame - self.f0) as f64 / (self.f1 - self.f0) as f64) as f32;
+        let (u0, u1) = (spec.to_unit(self.v0), spec.to_unit(self.v1));
+        spec.from_unit(u0 + (u1 - u0) * t)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Lane {
+    target: Option<u8>,
+    ramp: bool,
+    /// Point values per pattern and step; NaN means no point.
+    points: [[f32; MAX_STEPS]; MAX_PATTERNS],
+    /// What the lane does from the current step on; `None` leaves the
+    /// parameter at its base value.
+    segment: Option<Segment>,
+    /// The value last written to the target (`None`: the base value).
+    applied: Option<f32>,
+}
+
+impl Lane {
+    const EMPTY: Self =
+        Self { target: None, ramp: false, points: [[f32::NAN; MAX_STEPS]; MAX_PATTERNS], segment: None, applied: None };
+}
+
 struct Track {
     instrument: Instrument,
     steps: [[Option<Step>; MAX_STEPS]; MAX_PATTERNS],
+    lanes: [Lane; MAX_LANES],
+    /// Parameter values set by edits; automation overrides them while a
+    /// point is in force and returns to them afterwards.
+    base: [f32; MAX_PARAMS],
     gain_db: f32,
     pan: f32,
+    /// Automated volume and pan, overriding `gain_db` and `pan`.
+    auto_gain: Option<f32>,
+    auto_pan: Option<f32>,
     mute: bool,
     solo: bool,
     gain_l: Smoother,
@@ -398,8 +485,12 @@ impl Track {
         Self {
             instrument: Instrument::new(kind, sample_rate),
             steps: [[None; MAX_STEPS]; MAX_PATTERNS],
+            lanes: [Lane::EMPTY; MAX_LANES],
+            base: base_params(kind),
             gain_db: 0.0,
             pan: 0.0,
+            auto_gain: None,
+            auto_pan: None,
             mute: false,
             solo: false,
             gain_l: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
@@ -410,6 +501,52 @@ impl Track {
             on_count: 0,
             peak: 0.0,
         }
+    }
+
+    /// Turns the slot into a fresh track of `kind` in place. A whole new
+    /// `Track` would be built on the (audio thread's) stack first.
+    fn reset(&mut self, kind: InstrumentKind, sample_rate: f32) {
+        self.instrument = Instrument::new(kind, sample_rate);
+        for p in &mut self.steps {
+            p.fill(None);
+        }
+        for l in &mut self.lanes {
+            *l = Lane::EMPTY;
+        }
+        self.base = base_params(kind);
+        self.gain_db = 0.0;
+        self.pan = 0.0;
+        self.auto_gain = None;
+        self.auto_pan = None;
+        self.mute = false;
+        self.solo = false;
+        self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
+        self.gain_r = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
+        self.off_count = 0;
+        self.on_count = 0;
+        self.peak = 0.0;
+    }
+
+    /// Writes an automation value (`None`: the base value) to `target`.
+    /// Returns whether the mixer gains need updating.
+    fn write_target(&mut self, target: u8, value: Option<f32>) -> bool {
+        match target {
+            0 => self.auto_gain = value,
+            1 => self.auto_pan = value,
+            t => {
+                let i = usize::from(t) - 2;
+                if let Some(&base) = self.base.get(i) {
+                    self.instrument.set_param(i, value.unwrap_or(base));
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a lane currently overrides `target`.
+    fn automated(&self, target: u8) -> bool {
+        self.lanes.iter().any(|l| l.target == Some(target) && l.applied.is_some())
     }
 
     /// Starts every note of `step` now and schedules their release `gate`
@@ -488,6 +625,14 @@ impl Track {
     }
 }
 
+fn base_params(kind: InstrumentKind) -> [f32; MAX_PARAMS] {
+    let mut b = [0.0; MAX_PARAMS];
+    for (v, s) in b.iter_mut().zip(kind.params()) {
+        *v = s.default;
+    }
+    b
+}
+
 /// A loop region in canonical order, or `None` if it cannot exist.
 pub fn loop_region((a, b): (u16, u16)) -> Option<(u16, u16)> {
     let (a, b) = (a.min(b), a.max(b));
@@ -519,6 +664,8 @@ pub struct Engine {
     /// The step the next transport step plays.
     next_pos: PlayPosition,
     current: Option<PlayPosition>,
+    /// Whether any lane is ramping, so automation needs regular updates.
+    ramping: bool,
     tracks: Box<[Track]>,
     track_count: usize,
     master: Smoother,
@@ -558,6 +705,7 @@ impl Engine {
             song_mode: false,
             next_pos: PlayPosition { entry: None, pattern: 0, step: 0 },
             current: None,
+            ramping: false,
             tracks: tracks.into_boxed_slice(),
             track_count: 0,
             master: Smoother::new(1.0, SMOOTHING_TIME, sample_rate),
@@ -637,7 +785,13 @@ impl Engine {
                 self.current = None;
                 for t in &mut self.tracks[..self.track_count] {
                     t.release_all();
+                    for l in &mut t.lanes {
+                        l.segment = None;
+                    }
                 }
+                self.ramping = false;
+                // Back to the knob values, so auditions sound as set.
+                self.automate(self.now);
             }
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
             Command::Audition { track, step, frames } => {
@@ -745,7 +899,7 @@ impl Engine {
                 if n < MAX_TRACKS && i <= n {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
-                    self.tracks[n] = Track::new(kind, self.sample_rate);
+                    self.tracks[n].reset(kind, self.sample_rate);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
@@ -759,7 +913,7 @@ impl Engine {
                 if n < MAX_TRACKS {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
-                    self.tracks[n] = Track::new(kind, self.sample_rate);
+                    self.tracks[n].reset(kind, self.sample_rate);
                     self.track_count += 1;
                     self.update_gains();
                 }
@@ -784,7 +938,38 @@ impl Engine {
             }
             Edit::SetParam { track, index, value } => {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
-                    t.instrument.set_param(usize::from(index), value);
+                    let i = usize::from(index);
+                    if let Some(spec) = t.instrument.kind().params().get(i) {
+                        t.base[i] = spec.clamp(value);
+                        if !t.automated(index.saturating_add(2)) {
+                            t.instrument.set_param(i, value);
+                        }
+                    }
+                }
+            }
+            Edit::SetLane { track, lane, target, ramp } => {
+                let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
+                let kind = t.instrument.kind();
+                if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| target_spec(kind, x).is_none()) {
+                    return;
+                }
+                let old = t.lanes[usize::from(lane)];
+                if old.target != target {
+                    if let (Some(x), Some(_)) = (old.target, old.applied) {
+                        t.write_target(x, None);
+                    }
+                    t.lanes[usize::from(lane)] = Lane { target, ..Lane::EMPTY };
+                    self.update_gains();
+                }
+                self.tracks[usize::from(track)].lanes[usize::from(lane)].ramp = ramp;
+            }
+            Edit::SetPoint { track, lane, pattern, step, value } => {
+                let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
+                let kind = t.instrument.kind();
+                let Some(l) = t.lanes.get_mut(usize::from(lane)) else { return };
+                let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { return };
+                if let Some(slot) = l.points.get_mut(usize::from(pattern)).and_then(|p| p.get_mut(usize::from(step))) {
+                    *slot = value.map_or(f32::NAN, |v| spec.clamp(v));
                 }
             }
             Edit::SetGain { track, db } => {
@@ -820,8 +1005,8 @@ impl Engine {
         let any_solo = tracks.iter().any(|t| t.solo);
         for t in tracks {
             let audible = !t.mute && (!any_solo || t.solo);
-            let g = if audible { fader_gain(t.gain_db) } else { 0.0 };
-            let (l, r) = pan_gains(t.pan);
+            let g = if audible { fader_gain(t.auto_gain.unwrap_or(t.gain_db)) } else { 0.0 };
+            let (l, r) = pan_gains(t.auto_pan.unwrap_or(t.pan));
             t.gain_l.set_target(g * l);
             t.gain_r.set_target(g * r);
         }
@@ -869,7 +1054,7 @@ impl Engine {
             match self.transport.next_step_frame() {
                 // The step only queues hits; the next pass fires the ones
                 // due now, after the closed-hat choke check.
-                Some(f) if f <= frame => self.fire_step(),
+                Some(f) if f <= frame => self.fire_step(frame),
                 _ => break,
             }
         }
@@ -879,16 +1064,73 @@ impl Engine {
     /// for this step, and early ones for the step after it (they fall inside
     /// this step). Early hits of the very first step after Play cannot be
     /// played early, so they play at once.
-    fn fire_step(&mut self) {
+    fn fire_step(&mut self, frame: u64) {
         let abs = self.transport.advance();
         let pos = self.checked(self.next_pos);
         self.current = Some(pos);
+        // Before the step's hits fire, so a point shapes the hit on its step.
+        self.update_segments(abs, pos);
+        self.automate(frame);
         let first = self.early_queued != Some(abs);
         self.queue_hits(abs, pos, if first { None } else { Some(false) });
         let next = self.following(pos);
         self.queue_hits(abs + 1, next, Some(true));
         self.early_queued = Some(abs + 1);
         self.next_pos = next;
+    }
+
+    /// Sets every lane's segment for absolute step `abs`, which plays `pos`:
+    /// the last point at or before the step holds, or ramps towards the next
+    /// point in the pattern. Without an earlier point in the pattern the
+    /// parameter is at its base value.
+    fn update_segments(&mut self, abs: u64, pos: PlayPosition) {
+        let (pattern, s) = (usize::from(pos.pattern), usize::from(pos.step));
+        let len = usize::from(self.pattern_lens[pattern]);
+        let transport = &self.transport;
+        let mut ramping = false;
+        for t in &mut self.tracks[..self.track_count] {
+            let kind = t.instrument.kind();
+            for l in &mut t.lanes {
+                let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { continue };
+                let pts = &l.points[pattern];
+                l.segment = (0..=s).rev().find(|&i| !pts[i].is_nan()).map(|i| {
+                    let v0 = spec.clamp(pts[i]);
+                    match (s + 1..len).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
+                        Some(j) => Segment {
+                            f0: transport.frame_of_step(abs.saturating_sub((s - i) as u64)),
+                            v0,
+                            f1: transport.frame_of_step(abs + (j - s) as u64),
+                            v1: spec.clamp(pts[j]),
+                        },
+                        None => Segment { f0: 0, v0, f1: 0, v1: v0 },
+                    }
+                });
+                ramping |= l.segment.is_some_and(|g| g.f1 > g.f0);
+            }
+        }
+        self.ramping = ramping;
+    }
+
+    /// Brings every automated parameter to its value at `frame`. Ramps are
+    /// evaluated at the start of the automation tick holding `frame`.
+    fn automate(&mut self, frame: u64) {
+        let frame = frame - frame % AUTOMATION_TICK;
+        let mut gains = false;
+        for t in &mut self.tracks[..self.track_count] {
+            let kind = t.instrument.kind();
+            for k in 0..MAX_LANES {
+                let l = t.lanes[k];
+                let Some((target, spec)) = l.target.and_then(|x| Some((x, target_spec(kind, x)?))) else { continue };
+                let want = l.segment.map(|g| g.value_at(spec, frame));
+                if want != l.applied {
+                    t.lanes[k].applied = want;
+                    gains |= t.write_target(target, want);
+                }
+            }
+        }
+        if gains {
+            self.update_gains();
+        }
     }
 
     /// Queues the hits of absolute step `abs`, which plays `pos`, on every
@@ -935,6 +1177,10 @@ impl Engine {
         while pos < end {
             self.fire_due(pos);
             let mut next = end;
+            if self.ramping {
+                self.automate(pos);
+                next = next.min((pos / AUTOMATION_TICK + 1) * AUTOMATION_TICK);
+            }
             if let Some(f) = self.transport.next_step_frame() {
                 next = next.min(f);
             }
@@ -1558,6 +1804,106 @@ mod tests {
         e.handle(Command::PlaySong { entry: 0 });
         run(&mut e, 10);
         assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0 }));
+    }
+
+    /// A synth whose cutoff (panel index 7) ramps from 1 kHz at step 2 to
+    /// 4 kHz at step 6, and whose volume drops to -12 dB from step 1, in an
+    /// 8-step pattern.
+    fn automated_synth() -> Vec<Edit> {
+        let point = |lane, step, value| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(value) };
+        vec![
+            Edit::SetPatternLength { pattern: 0, len: 8 },
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(45, 100, 8)) },
+            Edit::SetLane { track: 0, lane: 0, target: Some(7), ramp: true },
+            Edit::SetLane { track: 0, lane: 2, target: Some(0), ramp: false },
+            point(0, 2, 1000.0),
+            point(0, 6, 4000.0),
+            point(2, 1, -12.0),
+        ]
+    }
+
+    #[test]
+    fn automation_holds_ramps_and_returns_to_the_knob() {
+        let mut e = engine(&automated_synth());
+        let base = e.tracks[0].instrument.param(5).unwrap();
+        let cutoff = |e: &Engine| e.tracks[0].instrument.param(5).unwrap();
+        e.handle(Command::Play);
+        // Steps are 6000 frames. Nothing is automated before step 1.
+        run(&mut e, 6000);
+        assert_eq!((cutoff(&e), e.tracks[0].auto_gain), (base, None));
+        run(&mut e, 1);
+        assert_eq!(e.tracks[0].auto_gain, Some(-12.0));
+        run(&mut e, 5999);
+        assert_eq!(cutoff(&e), base);
+        // The ramp starts exactly on step 2 and is geometric: 2 kHz halfway.
+        run(&mut e, 1);
+        assert_eq!(cutoff(&e), 1000.0);
+        run(&mut e, 12_000);
+        assert!((cutoff(&e) / 2000.0 - 1.0).abs() < 0.01, "{}", cutoff(&e));
+        run(&mut e, 12_000);
+        assert_eq!(cutoff(&e), 4000.0);
+        // A knob change while automated moves the base, not the sound.
+        e.apply(Edit::SetParam { track: 0, index: 5, value: 300.0 });
+        assert_eq!(cutoff(&e), 4000.0);
+        // The next pass starts without automation until its first point.
+        run(&mut e, 12_000);
+        assert_eq!((cutoff(&e), e.tracks[0].auto_gain), (300.0, None));
+        run(&mut e, 6000);
+        assert_eq!(e.tracks[0].auto_gain, Some(-12.0));
+        // Stop returns to the knob values; so does freeing a lane.
+        e.handle(Command::Stop);
+        assert_eq!((cutoff(&e), e.tracks[0].auto_gain), (300.0, None));
+        e.handle(Command::Play);
+        run(&mut e, 6001);
+        e.apply(Edit::SetLane { track: 0, lane: 2, target: None, ramp: false });
+        assert_eq!(e.tracks[0].auto_gain, None);
+    }
+
+    #[test]
+    fn automation_is_independent_of_buffer_size() {
+        let mut edits = automated_synth();
+        edits.push(Edit::SetSwing(62.0));
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            run(&mut e, 60_000)
+        };
+        for size in [1usize, 17, 100, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut got = Vec::new();
+            while got.len() < reference.len() {
+                got.extend(run(&mut e, size.min((reference.len() - got.len()) / 2)));
+            }
+            assert_eq!(got, reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_point_shapes_the_hit_on_its_own_step() {
+        // A closed hat on steps 0 and 1; step 1 gets a 2 s decay (panel
+        // index 3) instead of the default 50 ms.
+        let render = |automate: bool| {
+            let mut edits = vec![
+                Edit::AddTrack(InstrumentKind::HatClosed),
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+                Edit::SetStep { track: 0, pattern: 0, step: 1, value: step(60) },
+            ];
+            if automate {
+                edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(3), ramp: false });
+                edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 1, value: Some(2.0) });
+            }
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let out = run(&mut e, 12_000);
+            let peak = |a: usize, b: usize| out[2 * a..2 * b].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            (peak(4000, 6000), peak(10_000, 12_000))
+        };
+        let (plain_0, plain_1) = render(false);
+        let (auto_0, auto_1) = render(true);
+        assert_eq!(plain_0, auto_0, "step 0 is not automated");
+        assert!(plain_1 < 1e-3 && auto_1 > 0.05, "{plain_1} {auto_1}");
     }
 
     #[test]

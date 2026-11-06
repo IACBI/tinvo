@@ -18,38 +18,41 @@
 //! mute false
 //! solo false
 //! param decay 0.45
+//! lane 0 decay ramp          # lane, parameter id (or volume, pan), hold or ramp
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
-//! pattern B                  # the following steps belong to pattern B
+//! point 0 0 0.2              # lane step value
+//! point 0 15 0.9
+//! pattern B                  # the following steps and points belong to pattern B
 //! step 0 60 120 1 100 1 0 -
 //! end
 //! ```
 //!
-//! Steps before any `pattern` line belong to pattern A. `chord` is `-` or
+//! Steps and points before any `pattern` line belong to pattern A. `chord` is `-` or
 //! the extra notes as comma-separated semitones above `note`, ascending
 //! (`4,7` is a major triad). A sampler track may have a `sample <path>`
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
-//! samples) and 4 (one pattern, `pattern_length <n>`) are still read.
+//! samples), 4 (one pattern, `pattern_length <n>`) and 5 (no automation)
+//! are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
 use crate::engine::{
-    DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_GAIN_DB, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region,
+    DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region, target_spec,
 };
-use crate::instrument::{InstrumentKind, ParamSpec, SILENT_DB, Unit};
+use crate::instrument::{InstrumentKind, ParamSpec};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
 const MAX_NAME_CHARS: usize = 32;
 
 /// Mixer parameters presented alongside instrument parameters.
-pub static VOLUME: ParamSpec = ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
-pub static PAN: ParamSpec = ParamSpec::linear("pan", "Pan", -1.0, 1.0, 0.0, 0.05, Unit::Pan);
+pub use crate::engine::{PAN, VOLUME};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackData {
@@ -66,6 +69,42 @@ pub struct TrackData {
     /// Sampler tracks: the sample file. Absolute in memory; written relative
     /// to the project file when it sits inside the project's directory.
     pub sample: Option<String>,
+    pub lanes: [LaneData; MAX_LANES],
+}
+
+/// An automation lane: a parameter (see [`target_spec`]) and its points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneData {
+    pub target: Option<u8>,
+    /// Glide between points instead of holding each value.
+    pub ramp: bool,
+    /// `points[pattern][step]`.
+    pub points: Box<[[Option<f32>; MAX_STEPS]; MAX_PATTERNS]>,
+}
+
+impl LaneData {
+    pub fn new(target: Option<u8>, ramp: bool) -> Self {
+        Self { target, ramp, points: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]) }
+    }
+
+    /// The value in force at the start of `step` in `pattern` (of length
+    /// `len`), or `None` before the pattern's first point: a point holds, or
+    /// in a ramp lane glides (in [`ParamSpec::to_unit`] terms) to the next
+    /// point. The engine ramps over time, so with swing its values between
+    /// points differ slightly from these step-based ones.
+    pub fn value_at(&self, spec: &ParamSpec, pattern: usize, len: usize, step: usize) -> Option<f32> {
+        let pts = &self.points[pattern];
+        let i = (0..=step.min(MAX_STEPS - 1)).rev().find(|&i| pts[i].is_some())?;
+        let v0 = pts[i]?;
+        let next = (step + 1..len.min(MAX_STEPS)).find(|&j| pts[j].is_some()).filter(|_| self.ramp && i < step);
+        Some(match next {
+            Some(j) => {
+                let (u0, u1) = (spec.to_unit(v0), spec.to_unit(pts[j]?));
+                spec.from_unit(u0 + (u1 - u0) * (step - i) as f32 / (j - i) as f32)
+            }
+            None => v0,
+        })
+    }
 }
 
 impl TrackData {
@@ -80,6 +119,7 @@ impl TrackData {
             solo: false,
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
+            lanes: std::array::from_fn(|_| LaneData::new(None, false)),
         }
     }
 }
@@ -111,6 +151,12 @@ pub enum EditError {
     NoSuchStep(u8),
     NoSuchParam(u8),
     NoSuchPattern(u8),
+    NoSuchLane(u8),
+    NoSuchTarget(u8),
+    /// Another lane of the track already automates that parameter.
+    DuplicateLane,
+    /// The lane has no parameter yet.
+    LaneUnassigned(u8),
     NoSuchEntry(u16),
     TooManyTracks,
     SongFull,
@@ -124,6 +170,10 @@ impl fmt::Display for EditError {
             EditError::NoSuchStep(s) => write!(f, "no step {}", u32::from(*s) + 1),
             EditError::NoSuchParam(p) => write!(f, "no parameter {p}"),
             EditError::NoSuchPattern(p) => write!(f, "no pattern {}", u32::from(*p) + 1),
+            EditError::NoSuchLane(l) => write!(f, "no lane {}", u32::from(*l) + 1),
+            EditError::NoSuchTarget(t) => write!(f, "no parameter {t} to automate"),
+            EditError::DuplicateLane => write!(f, "that parameter already has a lane"),
+            EditError::LaneUnassigned(l) => write!(f, "lane {} has no parameter", u32::from(*l) + 1),
             EditError::NoSuchEntry(e) => write!(f, "no song entry {}", u32::from(*e) + 1),
             EditError::TooManyTracks => write!(f, "track limit ({MAX_TRACKS}) reached"),
             EditError::SongFull => write!(f, "the song is full ({MAX_SONG} entries)"),
@@ -213,6 +263,12 @@ impl Project {
         }
         p.tracks[3].steps[1][14] = None;
         p.tracks[b].steps[1][14] = Some(Step::new(34, 110, 2));
+        // In B the bass filter opens across the bar (panel index 7 is the
+        // cutoff).
+        let lane = &mut p.tracks[b].lanes[0];
+        *lane = LaneData::new(Some(7), true);
+        lane.points[1][0] = Some(380.0);
+        lane.points[1][15] = Some(2400.0);
         p.song = vec![0, 0, 0, 1];
         p
     }
@@ -303,6 +359,23 @@ impl Project {
                 *slot = value;
                 Edit::SetStep { track, pattern, step, value }
             }
+            Edit::SetLane { track, lane, target, ramp } => {
+                self.check_lane(track, lane, target)?;
+                let l = &mut self.track_mut(track)?.lanes[usize::from(lane)];
+                // A free lane has nothing to ramp.
+                let ramp = ramp && target.is_some();
+                if l.target != target {
+                    *l = LaneData::new(target, ramp);
+                }
+                l.ramp = ramp;
+                Edit::SetLane { track, lane, target, ramp }
+            }
+            Edit::SetPoint { track, lane, pattern, step, value } => {
+                let spec = self.point_spec(track, lane, pattern, step)?;
+                let value = value.map(|v| spec.clamp(v));
+                self.track_mut(track)?.lanes[usize::from(lane)].points[usize::from(pattern)][usize::from(step)] = value;
+                Edit::SetPoint { track, lane, pattern, step, value }
+            }
             Edit::SetParam { track, index, value } => {
                 let tr = self.track_mut(track)?;
                 let spec = tr.kind.params().get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
@@ -338,6 +411,34 @@ impl Project {
 
     fn track_mut(&mut self, t: u8) -> Result<&mut TrackData, EditError> {
         self.tracks.get_mut(usize::from(t)).ok_or(EditError::NoSuchTrack(t))
+    }
+
+    /// Validates giving lane `lane` of `track` the target `target`.
+    fn check_lane(&self, track: u8, lane: u8, target: Option<u8>) -> Result<(), EditError> {
+        let t = self.track(track)?;
+        if usize::from(lane) >= MAX_LANES {
+            return Err(EditError::NoSuchLane(lane));
+        }
+        if let Some(x) = target {
+            target_spec(t.kind, x).ok_or(EditError::NoSuchTarget(x))?;
+            if t.lanes.iter().enumerate().any(|(k, l)| k != usize::from(lane) && l.target == target) {
+                return Err(EditError::DuplicateLane);
+            }
+        }
+        Ok(())
+    }
+
+    /// The parameter a point on (`track`, `lane`) sets, after validating
+    /// the point's position.
+    fn point_spec(&self, track: u8, lane: u8, pattern: u8, step: u8) -> Result<&'static ParamSpec, EditError> {
+        let t = self.track(track)?;
+        let l = t.lanes.get(usize::from(lane)).ok_or(EditError::NoSuchLane(lane))?;
+        let spec = l.target.and_then(|x| target_spec(t.kind, x)).ok_or(EditError::LaneUnassigned(lane))?;
+        check_pattern(pattern)?;
+        if usize::from(step) >= MAX_STEPS {
+            return Err(EditError::NoSuchStep(step));
+        }
+        Ok(spec)
     }
 
     fn entry(&self, index: u16) -> Result<u8, EditError> {
@@ -432,6 +533,20 @@ impl Project {
                 let old = *steps.get(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
                 vec![Edit::SetStep { track, pattern, step, value: old }]
             }
+            Edit::SetLane { track, lane, target, .. } => {
+                self.check_lane(track, lane, target)?;
+                let old = &self.track(track)?.lanes[usize::from(lane)];
+                let mut v = vec![Edit::SetLane { track, lane, target: old.target, ramp: old.ramp }];
+                if old.target != target {
+                    push_points(&mut v, track, lane, old);
+                }
+                v
+            }
+            Edit::SetPoint { track, lane, pattern, step, .. } => {
+                self.point_spec(track, lane, pattern, step)?;
+                let old = self.track(track)?.lanes[usize::from(lane)].points[usize::from(pattern)][usize::from(step)];
+                vec![Edit::SetPoint { track, lane, pattern, step, value: old }]
+            }
             Edit::SetParam { track, index, .. } => {
                 let old = *self.track(track)?.params.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
                 vec![Edit::SetParam { track, index, value: old }]
@@ -483,8 +598,14 @@ impl Project {
             for (spec, v) in t.kind.params().iter().zip(&t.params) {
                 let _ = writeln!(s, "param {} {}", spec.id, v);
             }
+            for (k, l) in t.lanes.iter().enumerate() {
+                if let Some(spec) = l.target.and_then(|x| target_spec(t.kind, x)) {
+                    let _ = writeln!(s, "lane {k} {} {}", spec.id, if l.ramp { "ramp" } else { "hold" });
+                }
+            }
             for (p, steps) in t.steps.iter().enumerate() {
-                if p > 0 && steps.iter().any(Option::is_some) {
+                let points = t.lanes.iter().any(|l| l.points[p].iter().any(Option::is_some));
+                if p > 0 && (points || steps.iter().any(Option::is_some)) {
                     let _ = writeln!(s, "pattern {}", pattern_name(p as u8));
                 }
                 for (i, step) in steps.iter().enumerate() {
@@ -500,6 +621,13 @@ impl Project {
                             st.offset,
                             chord_text(st)
                         );
+                    }
+                }
+                for (k, l) in t.lanes.iter().enumerate() {
+                    for (i, v) in l.points[p].iter().enumerate() {
+                        if let Some(v) = v {
+                            let _ = writeln!(s, "point {k} {i} {v}");
+                        }
                     }
                 }
             }
@@ -558,6 +686,43 @@ impl Project {
                     "mute" => t.mute = parse_bool(rest).map_err(err)?,
                     "solo" => t.solo = parse_bool(rest).map_err(err)?,
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
+                    "lane" if ver >= 6 => {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let [k, id, mode] = f[..] else {
+                            return Err(err("expected 'lane <lane> <parameter> <hold|ramp>'".into()));
+                        };
+                        let k: usize = parse_num(k).map_err(err)?;
+                        if k >= MAX_LANES {
+                            return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
+                        }
+                        let target = (0..2 + t.kind.params().len() as u8)
+                            .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
+                            .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
+                        let ramp = match mode {
+                            "hold" => false,
+                            "ramp" => true,
+                            _ => return Err(err(format!("expected hold or ramp, got '{mode}'"))),
+                        };
+                        if t.lanes.iter().any(|l| l.target == Some(target)) || t.lanes[k].target.is_some() {
+                            return Err(err(format!("lane {k} or parameter '{id}' given twice")));
+                        }
+                        t.lanes[k] = LaneData::new(Some(target), ramp);
+                    }
+                    "point" if ver >= 6 => {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let [k, i, v] = f[..] else { return Err(err("expected 'point <lane> <step> <value>'".into())) };
+                        let (k, i): (usize, usize) = (parse_num(k).map_err(err)?, parse_num(i).map_err(err)?);
+                        let spec = t
+                            .lanes
+                            .get(k)
+                            .and_then(|l| l.target)
+                            .and_then(|x| target_spec(t.kind, x))
+                            .ok_or_else(|| err(format!("lane {k} is not defined")))?;
+                        if i >= MAX_STEPS {
+                            return Err(err(format!("step index {i} out of range")));
+                        }
+                        t.lanes[k].points[pattern][i] = Some(parse_in(v, spec).map_err(err)?);
+                    }
                     "param" => {
                         let (id, value) = rest
                             .split_once(char::is_whitespace)
@@ -777,6 +942,23 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
             }
         }
     }
+    for (k, l) in t.lanes.iter().enumerate() {
+        if l.target.is_some() {
+            e.push(Edit::SetLane { track, lane: k as u8, target: l.target, ramp: l.ramp });
+            push_points(e, track, k as u8, l);
+        }
+    }
+}
+
+/// Appends a `SetPoint` for every point of lane `lane`.
+fn push_points(e: &mut Vec<Edit>, track: u8, lane: u8, l: &LaneData) {
+    for (p, pts) in l.points.iter().enumerate() {
+        for (s, v) in pts.iter().enumerate() {
+            if v.is_some() {
+                e.push(Edit::SetPoint { track, lane, pattern: p as u8, step: s as u8, value: *v });
+            }
+        }
+    }
 }
 
 /// Track names are single-line, printable and bounded in length.
@@ -827,7 +1009,7 @@ mod tests {
         p.song = vec![0, 15, 2, 2, 1];
         p.loop_region = Some((1, 3));
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 5\n"));
+        assert!(text.starts_with("tinvo 6\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
         assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
@@ -836,6 +1018,101 @@ mod tests {
         // A project without a song or loop writes neither line.
         let plain = Project::new().to_text();
         assert!(!plain.contains("song") && !plain.contains("loop") && !plain.contains("pattern"), "{plain}");
+    }
+
+    #[test]
+    fn automation_round_trips_and_inverts() {
+        let mut p = Project::demo();
+        p.tracks[5].lanes[0] = LaneData::new(None, false);
+        let bass = 5u8;
+        let cutoff = 2 + 5; // panel index of the synth cutoff
+        for e in [
+            Edit::SetLane { track: bass, lane: 1, target: Some(cutoff), ramp: true },
+            Edit::SetLane { track: bass, lane: 3, target: Some(0), ramp: false },
+            Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 0, value: Some(200.0) },
+            Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 12, value: Some(1e9) },
+            Edit::SetPoint { track: bass, lane: 3, pattern: 4, step: 63, value: Some(-6.5) },
+        ] {
+            p.apply(e).unwrap();
+        }
+        // Values are clamped to the parameter's range.
+        assert_eq!(p.tracks[5].lanes[1].points[0][12], Some(20_000.0));
+        let text = p.to_text();
+        assert!(text.contains("\nlane 1 cutoff ramp\nlane 3 volume hold\nstep 0 36"), "{text}");
+        assert!(text.contains("\npoint 1 0 200\npoint 1 12 20000\npattern B\n"), "{text}");
+        assert!(text.contains("\npattern E\npoint 3 63 -6.5\nend"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+
+        // The edits rebuild it, and every lane edit inverts exactly.
+        let mut q = Project::new();
+        for e in p.to_edits() {
+            q.apply(e).unwrap();
+        }
+        for (a, b) in q.tracks.iter_mut().zip(&p.tracks) {
+            a.name = b.name.clone();
+        }
+        assert_eq!(q, p);
+        for e in [
+            Edit::SetLane { track: bass, lane: 1, target: None, ramp: false },
+            Edit::SetLane { track: bass, lane: 1, target: Some(1), ramp: false },
+            Edit::SetLane { track: bass, lane: 1, target: Some(cutoff), ramp: false },
+            Edit::SetLane { track: bass, lane: 0, target: Some(2), ramp: true },
+            Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 12, value: None },
+            Edit::SetPoint { track: bass, lane: 1, pattern: 9, step: 3, value: Some(500.0) },
+            Edit::RemoveTrack(bass),
+        ] {
+            let mut r = p.clone();
+            let inv = r.inverse(&e).unwrap();
+            r.apply(e).unwrap();
+            assert_ne!(r, p, "{e:?} changed nothing");
+            for i in inv {
+                r.apply(i).unwrap();
+            }
+            r.tracks[5].name = p.tracks[5].name.clone();
+            assert_eq!(r, p, "{e:?}");
+        }
+        // Freeing a lane drops its points; a free lane cannot ramp.
+        p.apply(Edit::SetLane { track: bass, lane: 1, target: None, ramp: true }).unwrap();
+        assert_eq!(p.tracks[5].lanes[1], LaneData::new(None, false));
+    }
+
+    #[test]
+    fn lane_edits_are_validated() {
+        let mut p = Project::demo();
+        let lane = |lane, target| Edit::SetLane { track: 0, lane, target, ramp: false };
+        assert_eq!(p.apply(lane(4, Some(0))), Err(EditError::NoSuchLane(4)));
+        // The kick has 4 parameters: panel indices 0..6.
+        assert_eq!(p.apply(lane(0, Some(6))), Err(EditError::NoSuchTarget(6)));
+        p.apply(lane(0, Some(3))).unwrap();
+        assert_eq!(p.apply(lane(1, Some(3))), Err(EditError::DuplicateLane));
+        assert_eq!(p.inverse(&lane(1, Some(3))), Err(EditError::DuplicateLane));
+        let point = |lane, step| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(0.1) };
+        assert_eq!(p.apply(point(1, 0)), Err(EditError::LaneUnassigned(1)));
+        assert_eq!(p.apply(point(0, 64)), Err(EditError::NoSuchStep(64)));
+        assert_eq!(p.inverse(&point(2, 0)), Err(EditError::LaneUnassigned(2)));
+        assert!(p.apply(point(0, 63)).is_ok());
+    }
+
+    #[test]
+    fn lane_values_hold_and_ramp_between_points() {
+        let spec = &crate::engine::VOLUME;
+        let mut l = LaneData::new(Some(0), false);
+        l.points[0][2] = Some(-30.0);
+        l.points[0][6] = Some(6.0);
+        let at = |l: &LaneData, step| l.value_at(spec, 0, 8, step);
+        assert_eq!((at(&l, 0), at(&l, 1)), (None, None));
+        assert_eq!((at(&l, 2), at(&l, 5), at(&l, 6), at(&l, 7)), (Some(-30.0), Some(-30.0), Some(6.0), Some(6.0)));
+        l.ramp = true;
+        assert_eq!((at(&l, 2), at(&l, 6), at(&l, 7)), (Some(-30.0), Some(6.0), Some(6.0)));
+        assert!((at(&l, 4).unwrap() + 12.0).abs() < 1e-4);
+        // Points past the end of the pattern are not reached.
+        assert_eq!(l.value_at(spec, 0, 5, 4), Some(-30.0));
+        // Log parameters ramp geometrically.
+        let cutoff = &InstrumentKind::Synth.params()[5];
+        let mut c = LaneData::new(Some(7), true);
+        c.points[0][0] = Some(100.0);
+        c.points[0][2] = Some(10_000.0);
+        assert!((c.value_at(cutoff, 0, 16, 1).unwrap() - 1000.0).abs() < 0.5);
     }
 
     #[test]
@@ -1019,7 +1296,17 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 6", 1, "version"),
+            ("tinvo 7", 1, "version"),
+            ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),
+            ("tinvo 6\ntrack kick\nlane 0 cutoff hold\nend", 3, "unknown parameter 'cutoff'"),
+            ("tinvo 6\ntrack kick\nlane 4 decay hold\nend", 3, "out of range"),
+            ("tinvo 6\ntrack kick\nlane 0 decay hold\nlane 1 decay ramp\nend", 4, "twice"),
+            ("tinvo 6\ntrack kick\nlane 0 decay hold\nlane 0 pan ramp\nend", 4, "twice"),
+            ("tinvo 6\ntrack kick\npoint 0 0 0.3\nend", 3, "not defined"),
+            ("tinvo 6\ntrack kick\nlane 0 decay hold\npoint 0 0 99\nend", 4, "out of range"),
+            ("tinvo 6\ntrack kick\nlane 0 decay hold\npoint 0 64 0.3\nend", 4, "out of range"),
+            ("tinvo 6\ntrack kick\nlane 0 decay hold\npoint 0 1\nend", 4, "expected 'point"),
+            ("tinvo 5\ntrack kick\nlane 0 decay hold\nend", 3, "unknown track key"),
             ("tinvo 5\nsong A Q", 2, "unknown pattern 'Q'"),
             ("tinvo 5\nsong A b", 2, "unknown pattern 'b'"),
             ("tinvo 5\nloop 3 1", 2, "loop region"),

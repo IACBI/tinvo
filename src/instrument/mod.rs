@@ -139,6 +139,9 @@ pub struct ParamSpec {
 /// Values at or below this level are displayed and treated as silence.
 pub const SILENT_DB: f32 = -60.0;
 
+/// Most parameters any instrument has.
+pub const MAX_PARAMS: usize = 32;
+
 impl ParamSpec {
     pub const fn linear(
         id: &'static str,
@@ -186,6 +189,27 @@ impl ParamSpec {
             ParamScale::Stepped(_) => v.round(),
             _ => v,
         }
+    }
+
+    /// Position of `value` in the range, from 0 to 1: linear, or
+    /// logarithmic for log-scaled parameters (so ramps sweep evenly by ear).
+    pub fn to_unit(&self, value: f32) -> f32 {
+        let v = self.clamp(value);
+        match self.scale {
+            ParamScale::Log { .. } => (v / self.min).ln() / (self.max / self.min).ln(),
+            _ => (v - self.min) / (self.max - self.min),
+        }
+    }
+
+    /// The inverse of [`ParamSpec::to_unit`], clamped (and rounded for
+    /// stepped parameters).
+    pub fn from_unit(&self, unit: f32) -> f32 {
+        let u = if unit.is_finite() { unit.clamp(0.0, 1.0) } else { 0.0 };
+        let v = match self.scale {
+            ParamScale::Log { .. } => self.min * (self.max / self.min).powf(u),
+            _ => self.min + (self.max - self.min) * u,
+        };
+        self.clamp(v)
     }
 
     /// Moves `value` by `steps` increments (negative moves down). Coarse
@@ -374,6 +398,16 @@ mod tests {
                 }
                 assert!(specs[..i].iter().all(|o| o.id != s.id), "duplicate id {}", s.id);
                 assert!(s.id.bytes().all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()));
+            }
+            assert!(specs.len() <= MAX_PARAMS, "{k:?}");
+            for s in specs {
+                for u in [0.0, 0.25, 0.5, 1.0] {
+                    let v = s.from_unit(u);
+                    if !matches!(s.scale, ParamScale::Stepped(_)) {
+                        assert!((s.to_unit(v) - u).abs() < 1e-4, "{k:?} {} at {u}", s.id);
+                    }
+                }
+                assert_eq!((s.from_unit(0.0), s.from_unit(1.0)), (s.min, s.max), "{k:?} {}", s.id);
             }
             let inst = Instrument::new(k, SR);
             for (i, s) in specs.iter().enumerate() {

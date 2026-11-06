@@ -6,6 +6,19 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+### Added
+- Automation lanes: up to 4 per track, for volume, pan or any instrument parameter. Points are set per pattern and step. A hold lane keeps each point's value until the next point; a ramp lane glides to it, in the parameter's own scale (frequencies glide geometrically).
+- `A` in the parameter panel gives the selected parameter a lane and opens the automation view; `A` in the grid toggles the view. In the view, `Enter`/`x` adds or removes a point, `[` `]` `{` `}` change its value, `/` switches hold and ramp, `-` frees the lane.
+- Copy, paste and clear of a pattern include its automation points.
+- The demo bass opens its filter across the fill pattern.
+
+### Changed
+- Project files are now format 6, which adds `lane` and `point` lines. Formats 1–5 still load.
+- While a parameter is automated, turning its knob sets the value it returns to when playback stops and before the first point of a pattern.
+- `tinvo bench` renders the demo song instead of pattern A.
+
 ## [0.5.0] - 2026-11-06
 
 ### Added
@@ -68,7 +81,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/IACBI/tinvo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/IACBI/tinvo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/IACBI/tinvo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/IACBI/tinvo/compare/v0.2.0...v0.3.0
