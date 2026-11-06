@@ -2,12 +2,12 @@
 //!
 //! `App` is a plain state machine over [`Key`]s with no terminal or audio
 //! dependency, so its behaviour is unit-tested directly. Every document
-//! change goes through [`App::edit`], which applies it to the project and
-//! forwards the exact applied edit to the engine.
+//! change goes through [`App::edit`], which records how to undo it, applies
+//! it to the project and forwards the exact applied edit to the engine.
 
 use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
-use crate::engine::{Command, Edit, Engine, MAX_STEPS, MAX_TRACKS, Shared, Step};
+use crate::engine::{Command, Edit, Engine, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, Shared, Step};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME};
 use crate::render::{self, RenderOptions};
@@ -28,6 +28,9 @@ const CELL: u16 = 3;
 const PARAM_COL: u16 = 28;
 const MIN_W: u16 = 64;
 const MIN_H: u16 = 16;
+const HISTORY_LIMIT: usize = 1000;
+/// Repeated nudges of one value within this window undo as a single change.
+const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
 /// UI-side end of the command queue. Commands that do not fit are kept in
 /// order and retried, so the engine never misses an edit.
@@ -83,6 +86,53 @@ impl AudioCallback for EngineCallback {
     }
 }
 
+/// One undoable user action.
+struct Change {
+    /// Edits that restore the state before the action, in order.
+    undo: Vec<Edit>,
+    /// Edits that reproduce the action.
+    redo: Vec<Edit>,
+    /// Track names are not part of [`Edit`], so they are restored wholesale.
+    names_before: Vec<String>,
+    names_after: Vec<String>,
+    what: &'static str,
+    /// Set when later nudges of the same value may merge into this change.
+    key: Option<(u8, u8, u8)>,
+    at: Instant,
+}
+
+/// Identifies the value an edit sets, for coalescing repeated nudges.
+fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8)> {
+    Some(match *e {
+        Edit::SetTempo(_) => (0, 0, 0),
+        Edit::SetSwing(_) => (1, 0, 0),
+        Edit::SetMasterGain(_) => (2, 0, 0),
+        Edit::SetPatternLength(_) => (3, 0, 0),
+        Edit::SetStep { track, step, .. } => (4, track, step),
+        Edit::SetParam { track, index, .. } => (5, track, index),
+        Edit::SetGain { track, .. } => (6, track, 0),
+        Edit::SetPan { track, .. } => (7, track, 0),
+        _ => return None,
+    })
+}
+
+fn describe(e: &Edit) -> &'static str {
+    match e {
+        Edit::SetTempo(_) => "tempo",
+        Edit::SetSwing(_) => "swing",
+        Edit::SetMasterGain(_) => "master level",
+        Edit::SetPatternLength(_) => "pattern length",
+        Edit::AddTrack(_) | Edit::InsertTrack { .. } => "add track",
+        Edit::RemoveTrack(_) => "delete track",
+        Edit::SetStep { .. } => "step",
+        Edit::SetParam { .. } => "parameter",
+        Edit::SetGain { .. } => "level",
+        Edit::SetPan { .. } => "pan",
+        Edit::SetMute { .. } => "mute",
+        Edit::SetSolo { .. } => "solo",
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Grid,
@@ -125,6 +175,10 @@ pub struct App {
     pub quit: bool,
     /// Per-track template for newly placed steps, parallel to `project.tracks`.
     brushes: Vec<Step>,
+    undo: VecDeque<Change>,
+    redo: Vec<Change>,
+    /// Stops the next edit merging into a change that was just undone/redone.
+    sealed: bool,
     link: Option<EngineLink>,
     sample_rate: u32,
     audio_label: String,
@@ -149,11 +203,7 @@ impl App {
             .iter()
             .map(|t| {
                 // Start from the first programmed step so new steps match.
-                t.steps.iter().flatten().next().copied().unwrap_or(Step {
-                    note: t.kind.default_note(),
-                    velocity: 100,
-                    length: 1,
-                })
+                t.steps.iter().flatten().next().copied().unwrap_or(Step::new(t.kind.default_note(), 100, 1))
             })
             .collect();
         Self {
@@ -169,6 +219,9 @@ impl App {
             export_loops: 4,
             quit: false,
             brushes,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            sealed: false,
             link,
             sample_rate,
             audio_label,
@@ -199,17 +252,69 @@ impl App {
         }
     }
 
-    /// Applies an edit to the project and mirrors it to the engine.
+    /// Applies a user edit as its own undo step. Returns whether it was valid.
     pub fn edit(&mut self, e: Edit) -> bool {
+        self.edit_with(e, false)
+    }
+
+    /// Like [`App::edit`]; with `coalesce`, quick repeats on the same value
+    /// merge into one undo step.
+    fn edit_with(&mut self, e: Edit, coalesce: bool) -> bool {
+        let inverse = match self.project.inverse(&e) {
+            Ok(v) => v,
+            Err(err) => {
+                self.set_status(format!("Cannot do that: {err}"));
+                return false;
+            }
+        };
+        let names_before = self.track_names();
+        let Some(applied) = self.apply_raw(e) else { return false };
+        if inverse == [applied] {
+            // Already in that state (e.g. tempo at its limit): nothing to undo.
+            return true;
+        }
+        self.dirty = true;
+        self.redo.clear();
+        let now = Instant::now();
+        let key = if coalesce { coalesce_key(&applied) } else { None };
+        if let (Some(k), false, Some(last)) = (key, self.sealed, self.undo.back_mut()) {
+            if last.key == Some(k) && now.duration_since(last.at) < COALESCE_WINDOW {
+                last.redo = vec![applied];
+                last.at = now;
+                return true;
+            }
+        }
+        let names_after = self.track_names();
+        self.push_change(Change {
+            undo: inverse,
+            redo: vec![applied],
+            names_before,
+            names_after,
+            what: describe(&applied),
+            key,
+            at: now,
+        });
+        true
+    }
+
+    fn push_change(&mut self, c: Change) {
+        self.sealed = false;
+        self.undo.push_back(c);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.pop_front();
+        }
+    }
+
+    /// Applies an edit to the project and mirrors it to the engine, without
+    /// touching the history.
+    fn apply_raw(&mut self, e: Edit) -> Option<Edit> {
         match self.project.apply(e) {
             Ok(applied) => {
-                self.dirty = true;
                 match applied {
-                    Edit::AddTrack(kind) => self.brushes.push(Step {
-                        note: kind.default_note(),
-                        velocity: 100,
-                        length: 1,
-                    }),
+                    Edit::AddTrack(kind) => self.brushes.push(Step::new(kind.default_note(), 100, 1)),
+                    Edit::InsertTrack { index, kind } => {
+                        self.brushes.insert(usize::from(index), Step::new(kind.default_note(), 100, 1));
+                    }
                     Edit::RemoveTrack(t) => {
                         self.brushes.remove(usize::from(t));
                     }
@@ -218,13 +323,73 @@ impl App {
                 if let Some(l) = &mut self.link {
                     l.send(Command::Edit(applied));
                 }
-                true
+                Some(applied)
             }
             Err(err) => {
                 self.set_status(format!("Cannot do that: {err}"));
-                false
+                None
             }
         }
+    }
+
+    fn track_names(&self) -> Vec<String> {
+        self.project.tracks.iter().map(|t| t.name.clone()).collect()
+    }
+
+    fn restore_names(&mut self, names: &[String]) {
+        if names.len() == self.project.tracks.len() {
+            for (t, n) in self.project.tracks.iter_mut().zip(names) {
+                t.name.clone_from(n);
+            }
+        }
+    }
+
+    pub fn undo(&mut self) {
+        let Some(c) = self.undo.pop_back() else {
+            self.set_status("Nothing to undo");
+            return;
+        };
+        for &e in &c.undo {
+            self.apply_raw(e);
+        }
+        self.restore_names(&c.names_before);
+        self.after_history_move(&c, "Undid");
+        self.redo.push(c);
+    }
+
+    pub fn redo(&mut self) {
+        let Some(c) = self.redo.pop() else {
+            self.set_status("Nothing to redo");
+            return;
+        };
+        for &e in &c.redo {
+            self.apply_raw(e);
+        }
+        self.restore_names(&c.names_after);
+        self.after_history_move(&c, "Redid");
+        // Not via push_change: the remaining redo stack stays valid.
+        self.undo.push_back(c);
+    }
+
+    fn after_history_move(&mut self, c: &Change, verb: &str) {
+        self.dirty = true;
+        self.sealed = true;
+        // Move the cursor to where the change happened.
+        match c.redo.first() {
+            Some(Edit::SetStep { track, step, .. }) => {
+                self.track = usize::from(*track);
+                self.step = usize::from(*step);
+            }
+            Some(
+                Edit::SetParam { track, .. }
+                | Edit::SetGain { track, .. }
+                | Edit::SetPan { track, .. }
+                | Edit::SetMute { track, .. }
+                | Edit::SetSolo { track, .. },
+            ) => self.track = usize::from(*track),
+            _ => {}
+        }
+        self.set_status(format!("{verb} {}", c.what));
     }
 
     fn send(&mut self, cmd: Command) {
@@ -300,14 +465,14 @@ impl App {
         }
     }
 
-    fn set_param_value(&mut self, i: usize, value: f32) {
+    fn set_param_value(&mut self, i: usize, value: f32, coalesce: bool) {
         let track = self.track as u8;
         let e = match i {
             0 => Edit::SetGain { track, db: value },
             1 => Edit::SetPan { track, pan: value },
             _ => Edit::SetParam { track, index: (i - 2) as u8, value },
         };
-        self.edit(e);
+        self.edit_with(e, coalesce);
     }
 
     pub fn handle_key(&mut self, key: Key) {
@@ -365,12 +530,7 @@ impl App {
                 match kind {
                     PromptKind::SaveAs => self.save_to(with_extension(&text, FILE_EXTENSION)),
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
-                    PromptKind::Rename => {
-                        if let Some(t) = self.project.tracks.get_mut(self.track) {
-                            t.name = project::sanitize_name(&text);
-                            self.dirty = true;
-                        }
-                    }
+                    PromptKind::Rename => self.rename_track(&text),
                 }
                 return;
             }
@@ -387,6 +547,27 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Prompt(kind, text);
+    }
+
+    fn rename_track(&mut self, text: &str) {
+        let name = project::sanitize_name(text);
+        if self.project.tracks.get(self.track).is_none_or(|t| t.name == name) {
+            return;
+        }
+        let names_before = self.track_names();
+        self.project.tracks[self.track].name = name;
+        self.dirty = true;
+        self.redo.clear();
+        let names_after = self.track_names();
+        self.push_change(Change {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            names_before,
+            names_after,
+            what: "rename",
+            key: None,
+            at: Instant::now(),
+        });
     }
 
     fn key_normal(&mut self, key: Key) {
@@ -419,18 +600,26 @@ impl App {
                     .map_or("tinvo_export".into(), |s| s.to_string_lossy().into_owned());
                 self.mode = Mode::Prompt(PromptKind::Export, format!("{stem}.wav"));
             }
+            Key::Char('u') | Key::Ctrl('z') => self.undo(),
+            Key::Char('U') | Key::Ctrl('y') => self.redo(),
             Key::Char('a') => self.mode = Mode::AddTrack,
             Key::Char('t') => {
-                self.edit(Edit::SetTempo(self.project.tempo.round() - 1.0));
+                self.edit_with(Edit::SetTempo(self.project.tempo.round() - 1.0), true);
             }
             Key::Char('T') => {
-                self.edit(Edit::SetTempo(self.project.tempo.round() + 1.0));
+                self.edit_with(Edit::SetTempo(self.project.tempo.round() + 1.0), true);
+            }
+            Key::Char('g') => {
+                self.edit_with(Edit::SetSwing(self.project.swing.round() - 1.0), true);
+            }
+            Key::Char('G') => {
+                self.edit_with(Edit::SetSwing(self.project.swing.round() + 1.0), true);
             }
             Key::Char('l') => {
-                self.edit(Edit::SetPatternLength(self.project.pattern_len.saturating_sub(1)));
+                self.edit_with(Edit::SetPatternLength(self.project.pattern_len.saturating_sub(1)), true);
             }
             Key::Char('L') => {
-                self.edit(Edit::SetPatternLength(self.project.pattern_len.saturating_add(1)));
+                self.edit_with(Edit::SetPatternLength(self.project.pattern_len.saturating_add(1)), true);
             }
             _ if self.track_count() == 0 => {}
             Key::Char('D') => self.mode = Mode::Confirm(Confirm::DeleteTrack),
@@ -477,9 +666,11 @@ impl App {
             Key::Char('[') => self.modify_step(|s| s.velocity = s.velocity.saturating_sub(8).max(1), true),
             Key::Char(']') => self.modify_step(|s| s.velocity = s.velocity.saturating_add(8).min(127), true),
             Key::Char('{') => self.modify_step(|s| s.length = s.length.saturating_sub(1).max(1), false),
-            Key::Char('}') => {
-                self.modify_step(|s| s.length = s.length.saturating_add(1).min(MAX_STEPS as u8), false)
-            }
+            Key::Char('}') => self.modify_step(|s| s.length = s.length.saturating_add(1).min(MAX_STEPS as u8), false),
+            // Chance moves in tens but can still reach 1 % at the bottom.
+            Key::Char('-') => self.modify_step(|s| s.chance = s.chance.saturating_sub(10).max(1), false),
+            Key::Char('=') => self.modify_step(|s| s.chance = (s.chance + 10).min(100), false),
+            Key::Char('/') => self.modify_step(|s| s.ratchet = s.ratchet % MAX_RATCHET + 1, true),
             _ => {}
         }
     }
@@ -504,18 +695,13 @@ impl App {
         f(&mut s);
         self.brushes[self.track] = s;
         if current.is_some() {
-            self.edit(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: Some(s) });
+            self.edit_with(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: Some(s) }, true);
         }
         if audition {
             self.audition(s.note, s.velocity);
         }
         if current.is_none() {
-            self.set_status(format!(
-                "New steps: {} vel {} len {}",
-                note_name(s.note),
-                s.velocity,
-                s.length
-            ));
+            self.set_status(format!("New steps: {}", step_summary(&s)));
         }
     }
 
@@ -530,11 +716,11 @@ impl App {
                 let coarse = matches!(key, Key::PageUp | Key::PageDown);
                 let spec = self.param_spec(i);
                 let v = spec.nudge(self.param_value(i), dir, coarse);
-                self.set_param_value(i, v);
+                self.set_param_value(i, v, true);
             }
             Key::Char('0') => {
                 let d = self.param_spec(i).default;
-                self.set_param_value(i, d);
+                self.set_param_value(i, d, false);
             }
             _ => {}
         }
@@ -609,9 +795,15 @@ impl App {
             ("■ STOP ", bar)
         };
         x += s.put(x, 0, txt, st);
-        let file = self.path.as_ref().and_then(|p| p.file_name()).map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
+        let file = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
+        let swing =
+            if self.project.swing > MIN_SWING { format!("swing {:.0}%  ", self.project.swing) } else { String::new() };
         let info = format!(
-            " {:.0} BPM  {} steps  {}{} ",
+            " {:.0} BPM  {swing}{} steps  {}{} ",
             self.project.tempo,
             self.project.pattern_len,
             file,
@@ -666,28 +858,29 @@ impl App {
             let name_style = if selected { Style::fg(Color::BrightWhite).bold() } else { Style::DEFAULT };
             s.put(0, y, if selected { "▸" } else { " " }, Style::fg(Color::BrightYellow));
             s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, t.name, t.kind.label()), name_style);
-            s.put(
-                26,
-                y,
-                "M",
-                if t.mute { Style::fg(Color::Black).on(Color::Red) } else { Style::fg(Color::Gray) },
-            );
-            s.put(
-                28,
-                y,
-                "S",
-                if t.solo { Style::fg(Color::Black).on(Color::Yellow) } else { Style::fg(Color::Gray) },
-            );
+            s.put(26, y, "M", if t.mute { Style::fg(Color::Black).on(Color::Red) } else { Style::fg(Color::Gray) });
+            s.put(28, y, "S", if t.solo { Style::fg(Color::Black).on(Color::Yellow) } else { Style::fg(Color::Gray) });
             draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
             s.put(LEFT - 1, y, "│", dim);
 
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
                 let (text, mut st) = match t.steps[i] {
-                    Some(step) if t.kind.is_drum() => {
-                        (format!(" {} ", velocity_glyph(step.velocity)), Style::fg(Color::BrightCyan))
+                    Some(step) => {
+                        // Drum cells have room for a ratchet digit; note names fill all three.
+                        let text = if t.kind.is_drum() {
+                            let r = if step.ratchet > 1 { char::from(b'0' + step.ratchet) } else { ' ' };
+                            format!(" {}{r}", velocity_glyph(step.velocity))
+                        } else {
+                            format!("{:<3}", note_name(step.note))
+                        };
+                        let color = match (step.chance < 100, t.kind.is_drum()) {
+                            (true, _) => Color::Yellow,
+                            (false, true) => Color::BrightCyan,
+                            (false, false) => Color::BrightMagenta,
+                        };
+                        (text, Style::fg(color))
                     }
-                    Some(step) => (format!("{:<3}", note_name(step.note)), Style::fg(Color::BrightMagenta)),
                     None if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
                     None => (" · ".to_string(), dim),
                 };
@@ -722,8 +915,10 @@ impl App {
         let title_style =
             if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
         s.put(2, y, &title, title_style);
-        let b = self.brushes[self.track];
-        let brush = format!(" new step: {} v{} len{} ", note_name(b.note), b.velocity, b.length);
+        let brush = match t.steps.get(self.step).copied().flatten() {
+            Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
+            None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
+        };
         s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
         let cols = (w / PARAM_COL).max(1) as usize;
         for i in 0..self.param_count() {
@@ -773,16 +968,17 @@ impl App {
                 s.put(0, y, "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  (Esc cancels)", prompt);
             }
             _ => {
-                let recent = self
-                    .status
-                    .as_ref()
-                    .filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
+                let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
                 let (text, st) = match recent {
                     Some((m, _)) => (m.as_str(), Style::fg(Color::BrightYellow).on(Color::Black)),
                     None => (
                         match self.focus {
-                            Focus::Grid => "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  Space play  Tab params  a add  ? help",
-                            Focus::Params => "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  m mute  s solo  Tab grid  ? help",
+                            Focus::Grid => {
+                                "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  - = chance  / ratchet  u undo  Space play  ? help"
+                            }
+                            Focus::Params => {
+                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  m mute  s solo  u undo  Tab grid  ? help"
+                            }
                         },
                         Style::fg(Color::Gray).on(Color::Black),
                     ),
@@ -807,10 +1003,14 @@ fn draw_help(s: &mut Screen) {
         ("< >", "step pitch down / up an octave"),
         ("[ ]", "step velocity down / up"),
         ("{ }", "step length down / up"),
+        ("- =", "step chance down / up (yellow: below 100 %)"),
+        ("/", "step ratchet: 1-4 hits per step"),
+        ("u U", "undo / redo (also Ctrl+Z / Ctrl+Y)"),
         ("p", "preview the track's note"),
         ("PgUp PgDn", "coarse parameter change; 0 resets to default"),
         ("m s", "mute / solo track"),
         ("t T", "tempo down / up"),
+        ("g G", "swing down / up (50-75 %)"),
         ("l L", "pattern length down / up"),
         ("a D r", "add / delete / rename track"),
         ("w  Ctrl+S", "save (W: save as)"),
@@ -838,6 +1038,17 @@ fn draw_meter(s: &mut Screen, x: u16, y: u16, width: u16, level: f32, bg: Color)
     };
     s.fill(x, y, filled, '█', Style::fg(color).on(bg));
     s.fill(x + filled, y, width - filled, '·', Style::fg(Color::Gray).on(bg));
+}
+
+fn step_summary(s: &Step) -> String {
+    let mut t = format!("{} v{} len{}", note_name(s.note), s.velocity, s.length);
+    if s.chance < 100 {
+        t += &format!(" {}%", s.chance);
+    }
+    if s.ratchet > 1 {
+        t += &format!(" x{}", s.ratchet);
+    }
+    t
 }
 
 fn velocity_glyph(v: u8) -> char {
@@ -1061,6 +1272,138 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_restore_every_kind_of_change() {
+        let original = Project::demo();
+        let mut a = app();
+        a.track = 0;
+        let script = [
+            Key::Enter,
+            Key::Right,
+            Key::Enter,
+            Key::Char('/'),
+            Key::Char('-'),
+            Key::Char('m'),
+            Key::Char('s'),
+            Key::Char('T'),
+            Key::Char('G'),
+            Key::Char('l'),
+            Key::Char('a'),
+            Key::Char('2'),
+            Key::Tab,
+            Key::Right,
+            Key::Char('0'),
+            Key::Up,
+            Key::Char('D'),
+            Key::Char('y'),
+        ];
+        let mut states = vec![a.project.clone()];
+        for k in script {
+            a.handle_key(k);
+            if states.last() != Some(&a.project) {
+                // Break coalescing so every change is its own undo step.
+                if let Some(c) = a.undo.back_mut() {
+                    c.at -= COALESCE_WINDOW;
+                }
+                states.push(a.project.clone());
+            }
+        }
+        assert_eq!(a.undo.len(), states.len() - 1);
+        for want in states.iter().rev().skip(1) {
+            keys(&mut a, &[Key::Char('u')]);
+            assert_eq!(&a.project, want);
+        }
+        assert_eq!(a.project, original);
+        assert_eq!(a.brushes.len(), a.project.tracks.len());
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.status_text(), Some("Nothing to undo"));
+        for want in states.iter().skip(1) {
+            keys(&mut a, &[Key::Ctrl('y')]);
+            assert_eq!(&a.project, want);
+        }
+        assert_eq!(a.brushes.len(), a.project.tracks.len());
+    }
+
+    #[test]
+    fn deleted_track_comes_back_with_name_and_steps() {
+        let mut a = app();
+        a.track = 1;
+        keys(&mut a, &[Key::Char('r'), Key::Char('!'), Key::Enter]);
+        let renamed = a.project.clone();
+        assert!(renamed.tracks[1].name.ends_with('!'));
+        keys(&mut a, &[Key::Char('D'), Key::Char('y')]);
+        assert_ne!(a.project, renamed);
+        keys(&mut a, &[Key::Ctrl('z')]);
+        assert_eq!(a.project, renamed);
+        keys(&mut a, &[Key::Ctrl('z')]);
+        assert_eq!(a.project, Project::demo());
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(a.project, renamed);
+    }
+
+    #[test]
+    fn nudges_coalesce_and_new_edits_clear_redo() {
+        let mut a = app();
+        a.track = 0;
+        let tempo = a.project.tempo;
+        keys(&mut a, &[Key::Char('T'), Key::Char('T'), Key::Char('T')]);
+        assert_eq!(a.project.tempo, tempo + 3.0);
+        assert_eq!(a.undo.len(), 1);
+        // A different value starts a new step.
+        keys(&mut a, &[Key::Char('G')]);
+        assert_eq!(a.undo.len(), 2);
+        keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
+        assert_eq!(a.project.tempo, tempo);
+        assert_eq!(a.redo.len(), 2);
+        // An undone change is sealed: the next nudge does not merge into it.
+        keys(&mut a, &[Key::Char('t')]);
+        assert!(a.redo.is_empty());
+        assert_eq!(a.undo.len(), 1);
+        // Toggles never coalesce.
+        keys(&mut a, &[Key::Char('m'), Key::Char('m')]);
+        assert_eq!(a.undo.len(), 3);
+        // A change that changes nothing is not recorded.
+        a.project.tempo = crate::engine::MAX_TEMPO;
+        keys(&mut a, &[Key::Char('T')]);
+        assert_eq!(a.undo.len(), 3);
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut a = app();
+        a.track = 0;
+        for i in 0..HISTORY_LIMIT + 10 {
+            let mute = i % 2 == 0;
+            a.edit(Edit::SetMute { track: 0, mute });
+        }
+        assert_eq!(a.undo.len(), HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn chance_and_ratchet_keys() {
+        let mut a = app();
+        a.track = 0;
+        a.step = 0;
+        let ratchets: Vec<u8> = (0..5)
+            .map(|_| {
+                a.handle_key(Key::Char('/'));
+                a.project.tracks[0].steps[0].unwrap().ratchet
+            })
+            .collect();
+        assert_eq!(ratchets, [2, 3, 4, 1, 2]);
+        for _ in 0..12 {
+            a.handle_key(Key::Char('-'));
+        }
+        assert_eq!(a.project.tracks[0].steps[0].unwrap().chance, 1);
+        for _ in 0..12 {
+            a.handle_key(Key::Char('='));
+        }
+        assert_eq!(a.project.tracks[0].steps[0].unwrap().chance, 100);
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!(s.row_text(2).contains("█2"), "{}", s.row_text(2));
+    }
+
+    #[test]
     fn quit_asks_when_dirty() {
         let mut a = app();
         keys(&mut a, &[Key::Char('q')]);
@@ -1081,9 +1424,37 @@ mod tests {
         let mut a = App::new(initial.clone(), None, Some(link), 48_000, "test".into());
         // More commands than the queue holds, to exercise the backlog.
         let script = [
-            Key::Enter, Key::Right, Key::Enter, Key::Char('.'), Key::Char('m'), Key::Down, Key::Char('s'),
-            Key::Tab, Key::Right, Key::Right, Key::Down, Key::Left, Key::Char('T'), Key::Char('l'),
-            Key::Char('a'), Key::Char('2'), Key::Down, Key::Right, Key::Tab, Key::Enter, Key::Char(' '),
+            Key::Enter,
+            Key::Right,
+            Key::Enter,
+            Key::Char('.'),
+            Key::Char('m'),
+            Key::Down,
+            Key::Char('s'),
+            Key::Tab,
+            Key::Right,
+            Key::Right,
+            Key::Down,
+            Key::Left,
+            Key::Char('T'),
+            Key::Char('l'),
+            Key::Char('a'),
+            Key::Char('2'),
+            Key::Down,
+            Key::Right,
+            Key::Tab,
+            Key::Enter,
+            Key::Char(' '),
+            Key::Char('D'),
+            Key::Char('y'),
+            Key::Char('u'),
+            Key::Char('u'),
+            Key::Char('U'),
+            Key::Char('/'),
+            Key::Char('G'),
+            Key::Char('u'),
+            Key::Char('u'),
+            Key::Char('u'),
         ];
         let mut mirror = initial;
         let drain = |rx: &mut spsc::Consumer<Command>, mirror: &mut Project| {

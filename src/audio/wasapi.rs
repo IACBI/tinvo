@@ -31,10 +31,8 @@ const IID_IAUDIO_CLIENT: Guid =
     Guid { d1: 0x1CB9_AD4C, d2: 0xDBFA, d3: 0x4C32, d4: [0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2] };
 const IID_IAUDIO_RENDER_CLIENT: Guid =
     Guid { d1: 0xF294_ACFC, d2: 0x3146, d3: 0x4483, d4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2] };
-const SUBTYPE_PCM: Guid =
-    Guid { d1: 1, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
-const SUBTYPE_IEEE_FLOAT: Guid =
-    Guid { d1: 3, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
+const SUBTYPE_PCM: Guid = Guid { d1: 1, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
+const SUBTYPE_IEEE_FLOAT: Guid = Guid { d1: 3, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 
 const COINIT_MULTITHREADED: u32 = 0;
 const CLSCTX_ALL: u32 = 0x17;
@@ -256,21 +254,38 @@ where
 
         let mut p = ptr::null_mut();
         check(
-            CoCreateInstance(&CLSID_MM_DEVICE_ENUMERATOR, ptr::null_mut(), CLSCTX_ALL, &IID_IMM_DEVICE_ENUMERATOR, &mut p),
+            CoCreateInstance(
+                &CLSID_MM_DEVICE_ENUMERATOR,
+                ptr::null_mut(),
+                CLSCTX_ALL,
+                &IID_IMM_DEVICE_ENUMERATOR,
+                &mut p,
+            ),
             "creating the device enumerator",
         )?;
         let enumerator = Com(p);
 
         let mut p = ptr::null_mut();
         check(
-            (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(enumerator.0, E_RENDER, E_CONSOLE, &mut p),
+            (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(
+                enumerator.0,
+                E_RENDER,
+                E_CONSOLE,
+                &mut p,
+            ),
             "finding the default output device",
         )?;
         let device = Com(p);
 
         let mut p = ptr::null_mut();
         check(
-            (device.vtbl::<IMMDeviceVtbl>().activate)(device.0, &IID_IAUDIO_CLIENT, CLSCTX_ALL, ptr::null_mut(), &mut p),
+            (device.vtbl::<IMMDeviceVtbl>().activate)(
+                device.0,
+                &IID_IAUDIO_CLIENT,
+                CLSCTX_ALL,
+                ptr::null_mut(),
+                &mut p,
+            ),
             "activating the audio client",
         )?;
         let client = Com(p);

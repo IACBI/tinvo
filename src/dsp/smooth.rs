@@ -12,11 +12,7 @@ impl Smoother {
     /// `time` is the time constant in seconds (63 % of a step is covered in
     /// that time, 99 % in about 4.6× that time).
     pub fn new(value: f32, time: f32, sample_rate: f32) -> Self {
-        Self {
-            current: value,
-            target: value,
-            coef: (-1.0 / (time.max(1.0e-5) * sample_rate)).exp(),
-        }
+        Self { current: value, target: value, coef: (-1.0 / (time.max(1.0e-5) * sample_rate)).exp() }
     }
 
     pub fn set_target(&mut self, target: f32) {
@@ -35,11 +31,7 @@ impl Smoother {
             let next = self.target + (self.current - self.target) * self.coef;
             // Near the target, f32 rounding can make the step round back to
             // the same value forever; finish exactly instead of stalling.
-            self.current = if next == self.current || (next - self.target).abs() < 1.0e-7 {
-                self.target
-            } else {
-                next
-            };
+            self.current = if next == self.current || (next - self.target).abs() < 1.0e-7 { self.target } else { next };
         }
         self.current
     }

@@ -47,14 +47,7 @@ impl Default for Adsr {
 
 impl Adsr {
     pub const fn new() -> Self {
-        Self {
-            stage: Stage::Idle,
-            level: 0.0,
-            attack_step: 1.0,
-            decay_coef: 0.0,
-            release_coef: 0.0,
-            sustain: 1.0,
-        }
+        Self { stage: Stage::Idle, level: 0.0, attack_step: 1.0, decay_coef: 0.0, release_coef: 0.0, sustain: 1.0 }
     }
 
     pub fn set_params(&mut self, p: &AdsrParams, sample_rate: f32) {
@@ -92,8 +85,7 @@ impl Adsr {
                 }
             }
             Stage::Decay => {
-                self.level =
-                    self.sustain + flush_denormal((self.level - self.sustain) * self.decay_coef);
+                self.level = self.sustain + flush_denormal((self.level - self.sustain) * self.decay_coef);
             }
             Stage::Release => {
                 self.level *= self.release_coef;

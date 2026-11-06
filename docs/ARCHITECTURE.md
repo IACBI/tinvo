@@ -51,7 +51,9 @@ Each layer depends only on the ones below it.
 ## Engine
 
 - **Tracks**: up to 16 slots, each with an `Instrument`, a 64-step pattern, fader/pan/mute/solo, and smoothed left/right gains (5 ms time constant, so changes never click).
-- **Transport**: 16th-note steps. The frame of step *n* is `origin + round((n − origin_step) × samples_per_step)`. A tempo change moves the origin to the current position, so the playhead stays continuous.
+- **Transport**: 16th-note steps. The frame of step *n* is `origin + round((n + swing(n) − origin_step) × samples_per_step)`, where `swing(n)` is `percent/50 − 1` for odd *n* and 0 otherwise. A tempo change moves the origin to the current position, so the playhead stays continuous.
+- **Step options**: chance is rolled for every track before any track plays, from a seeded generator that restarts on Play, so playback and export always produce the same sequence of hits from the start. Ratchets split the (swung) step span evenly; the later hits are queued per track as pending note-ons and fire sample-accurately like any other event.
+- **Choke**: when a closed hat fires, open hats on all tracks fade out over 12 ms.
 - **Sample-accurate events**: each 64-frame block is split at every step boundary and note-off inside it. Note-offs fire before note-ons that land on the same frame.
 - **Voice identity**: `note_on` returns a `VoiceId`, and note-offs target that exact voice, so retriggering a pitch never cuts off the wrong note.
 - **Pan law**: constant power, −3 dB at centre. The bottom of the fader range (−60 dB) means silence.
@@ -63,6 +65,7 @@ Each layer depends only on the ones below it.
 | Oscillators | Saw and square with PolyBLEP, triangle with PolyBLAMP, sine; phase kept in f64 |
 | Filter | TPT/ZDF state-variable filter (LP, unity-peak BP, HP); stable under per-sample modulation |
 | Envelopes | Linear attack, exponential decay/release (times are to −60 dB); retriggers start from the current level |
+| Synth modulation | One free-running LFO per synth, computed per 64-sample chunk; glide is exponential in pitch (99 % of the interval in the glide time); pitch is recomputed per sample only while gliding or under LFO pitch modulation |
 | Drums | Kick (pitch-swept sine plus click), snare (two tones plus filtered noise), hats (six band-limited squares, metallic), clap (three bursts plus tail); retriggers cross-fade the old tail over 1 ms |
 | Export | TPDF dither (±1 LSB) for 16/24-bit; clipped samples are counted and reported |
 
@@ -76,9 +79,13 @@ Each layer depends only on the ones below it.
 
 ## Project file (`.tvo`)
 
-Line-based UTF-8 text with a version header (`tinvo 1`). Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
+Line-based UTF-8 text with a version header (`tinvo 2`). Format 2 adds `swing` and per-step chance and ratchet. Format 1 files still load, with swing off and every step at 100 % chance and one hit. Parameters are stored by a stable `id`, not by index, so instruments can gain parameters later without breaking old files. Floats use Rust's shortest round-trip formatting, so save → load is lossless. Loading validates every value; it reports errors with line numbers instead of silently clamping. Saves are atomic: the file is written to a temporary file and then renamed over the target.
+
+## Undo
+
+`Project::inverse` returns, for any valid edit, the edits that restore the state before it. The UI records each change as an (undo, redo) pair of edit lists, and replays them through the same path as normal edits, so the engine stays in sync. Deleting a track inverts to inserting it back at its index and restoring every parameter and step. Track names are not edits, so each history entry stores the names before and after.
 
 ## Verification
 
-- 96 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, and UI behaviour (including that the engine receives exactly the edits the project applied).
+- 114 unit tests cover: DSP accuracy (pitch, Butterworth −3 dB point, roll-off, measured alias reduction via FFT), envelope timing, queue ordering under a 1M-item two-thread stress test, sample-accurate step timing, render invariance across buffer sizes (1 to 4096 frames), mute/solo/pan, note lengths, smoothing, lossless file round trips, WAV round trips, key decoding, screen diffing, swing/chance/ratchet/choke timing, glide and LFO, reading format 1 files, edit inversion for every edit kind, undo/redo, and UI behaviour (including that the engine receives exactly the edits the project applied, through undo and redo).
 - `tinvo probe` exercises the real device. `tinvo bench` measures rendering cost.

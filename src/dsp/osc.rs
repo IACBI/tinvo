@@ -128,7 +128,13 @@ mod tests {
                     osc.next(wave, inc, 0.5);
                     match wave {
                         Waveform::Saw => (2.0 * p - 1.0) as f32,
-                        Waveform::Square => if p < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Square => {
+                            if p < 0.5 {
+                                1.0
+                            } else {
+                                -1.0
+                            }
+                        }
                         Waveform::Triangle => (1.0 - 4.0 * (p - 0.5).abs()) as f32,
                         Waveform::Sine => (TAU * p).sin() as f32,
                     }
@@ -180,17 +186,10 @@ mod tests {
         // A high, non-harmonic-aligned pitch makes aliasing easy to measure.
         let freq = 2793.7;
         let n = 8192;
-        for (wave, min_gain_db) in [
-            (Waveform::Saw, 10.0),
-            (Waveform::Square, 10.0),
-            (Waveform::Triangle, 10.0),
-        ] {
+        for (wave, min_gain_db) in [(Waveform::Saw, 10.0), (Waveform::Square, 10.0), (Waveform::Triangle, 10.0)] {
             let naive = alias_db(&render(wave, freq, n, false), freq);
             let bl = alias_db(&render(wave, freq, n, true), freq);
-            assert!(
-                naive - bl >= min_gain_db,
-                "{wave:?}: naive {naive:.1} dB, band-limited {bl:.1} dB"
-            );
+            assert!(naive - bl >= min_gain_db, "{wave:?}: naive {naive:.1} dB, band-limited {bl:.1} dB");
         }
     }
 }

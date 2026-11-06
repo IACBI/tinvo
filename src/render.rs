@@ -106,7 +106,7 @@ mod tests {
         p.apply(crate::engine::Edit::AddTrack(crate::instrument::InstrumentKind::Synth)).unwrap();
         // Ten-second release on a note held to the end of the pattern.
         p.tracks[0].params[16] = 10.0;
-        p.tracks[0].steps[0] = Some(crate::engine::Step { note: 48, velocity: 127, length: 16 });
+        p.tracks[0].steps[0] = Some(crate::engine::Step::new(48, 127, 16));
         let opts = RenderOptions { loops: 1, max_tail_seconds: 1.0, ..Default::default() };
         let out = render(&p, &opts);
         assert_eq!(out.len() / 2, pattern_frames(&p, 48_000, 1) as usize + 48_000);

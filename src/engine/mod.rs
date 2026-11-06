@@ -11,6 +11,7 @@
 
 pub mod transport;
 
+use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, SILENT_DB, VoiceId};
@@ -32,21 +33,40 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 const MAX_PENDING_OFFS: usize = MAX_STEPS + 16;
 const SMOOTHING_TIME: f32 = 0.005;
 
-/// One programmed step: a note with velocity and length (in steps).
+/// Most repeats a single step can be divided into.
+pub const MAX_RATCHET: u8 = 4;
+/// Swing range, as the position of the off-beat 16th within its 8th note
+/// (50 % = straight, 66.7 % = triplet feel, 75 % = dotted).
+pub const MIN_SWING: f32 = 50.0;
+pub const MAX_SWING: f32 = 75.0;
+
+/// One programmed step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Step {
     pub note: u8,
     pub velocity: u8,
+    /// Length in steps (ignored by drums and by ratcheted steps).
     pub length: u8,
+    /// Probability of playing, in percent (1–100).
+    pub chance: u8,
+    /// Number of evenly spaced hits inside the step (1–`MAX_RATCHET`).
+    pub ratchet: u8,
 }
 
 impl Step {
+    /// A step that always plays once.
+    pub const fn new(note: u8, velocity: u8, length: u8) -> Self {
+        Self { note, velocity, length, chance: 100, ratchet: 1 }
+    }
+
     /// Clamps every field into its valid range.
     pub fn sanitized(self) -> Self {
         Self {
             note: self.note.min(127),
             velocity: self.velocity.clamp(1, 127),
             length: self.length.clamp(1, MAX_STEPS as u8),
+            chance: self.chance.clamp(1, 100),
+            ratchet: self.ratchet.clamp(1, MAX_RATCHET),
         }
     }
 }
@@ -59,14 +79,41 @@ pub enum Edit {
     SetTempo(f32),
     SetPatternLength(u8),
     SetMasterGain(f32),
+    /// Swing in percent (`MIN_SWING..=MAX_SWING`).
+    SetSwing(f32),
     AddTrack(InstrumentKind),
+    /// Inserts a track at `index` (at most the current track count).
+    InsertTrack {
+        index: u8,
+        kind: InstrumentKind,
+    },
     RemoveTrack(u8),
-    SetStep { track: u8, step: u8, value: Option<Step> },
-    SetParam { track: u8, index: u8, value: f32 },
-    SetGain { track: u8, db: f32 },
-    SetPan { track: u8, pan: f32 },
-    SetMute { track: u8, mute: bool },
-    SetSolo { track: u8, solo: bool },
+    SetStep {
+        track: u8,
+        step: u8,
+        value: Option<Step>,
+    },
+    SetParam {
+        track: u8,
+        index: u8,
+        value: f32,
+    },
+    SetGain {
+        track: u8,
+        db: f32,
+    },
+    SetPan {
+        track: u8,
+        pan: f32,
+    },
+    SetMute {
+        track: u8,
+        mute: bool,
+    },
+    SetSolo {
+        track: u8,
+        solo: bool,
+    },
 }
 
 /// Messages from the UI to the audio thread.
@@ -78,7 +125,12 @@ pub enum Command {
     /// Stop playback and release all notes.
     Stop,
     /// Play a single note on a track for `frames` samples.
-    Audition { track: u8, note: u8, velocity: u8, frames: u32 },
+    Audition {
+        track: u8,
+        note: u8,
+        velocity: u8,
+        frames: u32,
+    },
 }
 
 /// State published by the audio thread for the UI.
@@ -123,6 +175,20 @@ struct PendingOff {
     voice: VoiceId,
 }
 
+/// A ratchet repeat waiting to be played later inside its step.
+#[derive(Clone, Copy)]
+struct PendingOn {
+    frame: u64,
+    note: u8,
+    velocity: u8,
+    /// Gate length in frames.
+    gate: u64,
+}
+
+/// A step has at most `MAX_RATCHET - 1` deferred hits; a little headroom
+/// covers the instant when one step's last hit and the next step overlap.
+const MAX_PENDING_ONS: usize = 2 * MAX_RATCHET as usize;
+
 struct Track {
     instrument: Instrument,
     steps: [Option<Step>; MAX_STEPS],
@@ -134,6 +200,8 @@ struct Track {
     gain_r: Smoother,
     offs: [PendingOff; MAX_PENDING_OFFS],
     off_count: usize,
+    ons: [PendingOn; MAX_PENDING_ONS],
+    on_count: usize,
     peak: f32,
 }
 
@@ -150,8 +218,46 @@ impl Track {
             gain_r: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             offs: [PendingOff { frame: 0, voice: VoiceId::NONE }; MAX_PENDING_OFFS],
             off_count: 0,
+            ons: [PendingOn { frame: 0, note: 0, velocity: 0, gate: 0 }; MAX_PENDING_ONS],
+            on_count: 0,
             peak: 0.0,
         }
+    }
+
+    /// Starts a note now and schedules its release `gate` frames later.
+    fn hit(&mut self, now: u64, note: u8, velocity: u8, gate: u64) {
+        let id = self.instrument.note_on(note, velocity);
+        if self.instrument.uses_note_off() {
+            self.schedule_off(now + gate.max(1), id);
+        }
+    }
+
+    fn schedule_on(&mut self, on: PendingOn) {
+        // Capacity is sized for the worst case; dropping a repeat is the
+        // safe fallback if that reasoning is ever wrong.
+        if self.on_count < MAX_PENDING_ONS {
+            self.ons[self.on_count] = on;
+            self.on_count += 1;
+        }
+    }
+
+    /// Plays deferred hits due at or before `frame`.
+    fn fire_ons(&mut self, frame: u64) {
+        let mut i = 0;
+        while i < self.on_count {
+            let on = self.ons[i];
+            if on.frame <= frame {
+                self.ons[i] = self.ons[self.on_count - 1];
+                self.on_count -= 1;
+                self.hit(frame, on.note, on.velocity, on.gate);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn earliest_on(&self) -> Option<u64> {
+        self.ons[..self.on_count].iter().map(|o| o.frame).min()
     }
 
     fn schedule_off(&mut self, frame: u64, voice: VoiceId) {
@@ -187,6 +293,16 @@ impl Track {
     fn release_all(&mut self) {
         self.instrument.release_all();
         self.off_count = 0;
+        self.on_count = 0;
+    }
+}
+
+/// A closed hi-hat cuts off any ringing open hi-hat, as on classic machines.
+fn choke_open_hats(tracks: &mut [Track]) {
+    for t in tracks {
+        if t.instrument.kind() == InstrumentKind::HatOpen {
+            t.instrument.choke();
+        }
     }
 }
 
@@ -207,14 +323,18 @@ pub struct Engine {
     scratch: [f32; BLOCK],
     commands: Option<Consumer<Command>>,
     shared: Arc<Shared>,
+    /// Decides step chances. Re-seeded on every Play so a pattern with
+    /// chance steps plays (and exports) identically each time from the start.
+    rng: Rng,
 }
+
+const CHANCE_SEED: u64 = 0x5EED_C4A2_CE00_0001;
 
 impl Engine {
     /// Creates an empty engine (120 BPM, 16 steps, no tracks). All memory the
     /// engine will ever use is allocated here.
     pub fn new(sample_rate: f32, shared: Arc<Shared>, commands: Option<Consumer<Command>>) -> Box<Self> {
-        let tracks: Vec<Track> =
-            (0..MAX_TRACKS).map(|_| Track::new(InstrumentKind::Synth, sample_rate)).collect();
+        let tracks: Vec<Track> = (0..MAX_TRACKS).map(|_| Track::new(InstrumentKind::Synth, sample_rate)).collect();
         Box::new(Self {
             sample_rate,
             now: 0,
@@ -231,6 +351,7 @@ impl Engine {
             scratch: [0.0; BLOCK],
             commands,
             shared,
+            rng: Rng::new(CHANCE_SEED),
         })
     }
 
@@ -278,6 +399,7 @@ impl Engine {
             Command::Edit(e) => self.apply(e),
             Command::Play => {
                 if !self.transport.is_playing() {
+                    self.rng = Rng::new(CHANCE_SEED);
                     self.transport.start(self.now);
                 }
             }
@@ -289,12 +411,13 @@ impl Engine {
                 }
             }
             Command::Audition { track, note, velocity, frames } => {
-                let now = self.now;
-                if let Some(t) = self.tracks[..self.track_count].get_mut(usize::from(track)) {
-                    let id = t.instrument.note_on(note.min(127), velocity.clamp(1, 127));
-                    if t.instrument.uses_note_off() {
-                        t.schedule_off(now + u64::from(frames.max(1)), id);
+                let (now, n) = (self.now, self.track_count);
+                let i = usize::from(track);
+                if i < n {
+                    if self.tracks[i].instrument.kind() == InstrumentKind::HatClosed {
+                        choke_open_hats(&mut self.tracks[..n]);
                     }
+                    self.tracks[i].hit(now, note.min(127), velocity.clamp(1, 127), u64::from(frames));
                 }
             }
         }
@@ -310,6 +433,16 @@ impl Engine {
                 self.transport.set_tempo(self.tempo, self.sample_rate, self.now);
             }
             Edit::SetPatternLength(len) => self.pattern_len = len.clamp(1, MAX_STEPS as u8),
+            Edit::SetSwing(percent) => self.transport.set_swing(percent),
+            Edit::InsertTrack { index, kind } => {
+                let i = usize::from(index);
+                if n < MAX_TRACKS && i <= n {
+                    self.tracks[n] = Track::new(kind, self.sample_rate);
+                    self.tracks[i..=n].rotate_right(1);
+                    self.track_count += 1;
+                    self.update_gains();
+                }
+            }
             Edit::SetMasterGain(db) => {
                 self.master_db = db;
                 self.master.set_target(fader_gain(db));
@@ -402,31 +535,70 @@ impl Engine {
         }
     }
 
-    /// Fires every note-off and step due at or before `frame`. Note-offs fire
-    /// before note-ons at the same frame so a voice ending exactly when the
-    /// next note starts is free for reuse.
+    /// Fires every note-off, ratchet repeat and step due at or before
+    /// `frame`. Note-offs fire before note-ons at the same frame so a voice
+    /// ending exactly when the next note starts is free for reuse.
     fn fire_due(&mut self, frame: u64) {
         loop {
-            for t in &mut self.tracks[..self.track_count] {
+            let tracks = &mut self.tracks[..self.track_count];
+            for t in tracks.iter_mut() {
                 t.fire_offs(frame);
             }
+            let closed_hat_due = tracks.iter().any(|t| {
+                t.instrument.kind() == InstrumentKind::HatClosed && t.earliest_on().is_some_and(|f| f <= frame)
+            });
+            if closed_hat_due {
+                choke_open_hats(tracks);
+            }
+            for t in tracks.iter_mut() {
+                t.fire_ons(frame);
+            }
             match self.transport.next_step_frame() {
-                Some(f) if f <= frame => self.fire_step(),
+                Some(f) if f <= frame => self.fire_step(frame),
                 _ => break,
             }
         }
     }
 
-    fn fire_step(&mut self) {
+    fn fire_step(&mut self, frame: u64) {
         let abs = self.transport.advance();
         let idx = (abs % u64::from(self.pattern_len)) as usize;
         self.current_step = Some(idx as u8);
-        for t in &mut self.tracks[..self.track_count] {
+        let start = self.transport.frame_of_step(abs);
+        let span = self.transport.frame_of_step(abs + 1).saturating_sub(start).max(1);
+        let n = self.track_count;
+
+        // Decide every track's chance roll first so that chokes are applied
+        // before any hit of this step, independent of track order.
+        let mut plays = [false; MAX_TRACKS];
+        let mut closed_hat = false;
+        for (i, t) in self.tracks[..n].iter().enumerate() {
             if let Some(step) = t.steps[idx] {
-                let id = t.instrument.note_on(step.note, step.velocity);
-                if t.instrument.uses_note_off() {
-                    let off = self.transport.frame_of_step(abs + u64::from(step.length));
-                    t.schedule_off(off, id);
+                let p = step.chance >= 100 || self.rng.next_f32() * 100.0 < f32::from(step.chance);
+                plays[i] = p;
+                closed_hat |= p && t.instrument.kind() == InstrumentKind::HatClosed;
+            }
+        }
+        if closed_hat {
+            choke_open_hats(&mut self.tracks[..n]);
+        }
+
+        for (i, t) in self.tracks[..n].iter_mut().enumerate() {
+            let Some(step) = t.steps[idx].filter(|_| plays[i]) else { continue };
+            if step.ratchet <= 1 {
+                let off = self.transport.frame_of_step(abs + u64::from(step.length));
+                t.hit(frame, step.note, step.velocity, off.saturating_sub(frame));
+            } else {
+                let r = u64::from(step.ratchet);
+                let gate = (span / r).max(1);
+                t.hit(frame, step.note, step.velocity, gate);
+                for k in 1..r {
+                    t.schedule_on(PendingOn {
+                        frame: start + span * k / r,
+                        note: step.note,
+                        velocity: step.velocity,
+                        gate,
+                    });
                 }
             }
         }
@@ -447,7 +619,7 @@ impl Engine {
                 next = next.min(f);
             }
             for t in &self.tracks[..self.track_count] {
-                if let Some(f) = t.earliest_off() {
+                for f in [t.earliest_off(), t.earliest_on()].into_iter().flatten() {
                     next = next.min(f);
                 }
             }
@@ -507,7 +679,7 @@ mod tests {
     }
 
     fn step(note: u8) -> Option<Step> {
-        Some(Step { note, velocity: 127, length: 1 })
+        Some(Step::new(note, 127, 1))
     }
 
     fn run(e: &mut Engine, frames: usize) -> Vec<f32> {
@@ -531,10 +703,8 @@ mod tests {
     fn steps_fire_sample_accurately() {
         // At 120 BPM / 48 kHz a step is exactly 6000 frames. Step 5 starts
         // at frame 30000, which is not a multiple of the 64-frame block.
-        let mut e = engine(&[
-            Edit::AddTrack(InstrumentKind::Snare),
-            Edit::SetStep { track: 0, step: 5, value: step(60) },
-        ]);
+        let mut e =
+            engine(&[Edit::AddTrack(InstrumentKind::Snare), Edit::SetStep { track: 0, step: 5, value: step(60) }]);
         e.handle(Command::Play);
         let out = run(&mut e, 40_000);
         assert_eq!(first_sound(&out), Some(30_000));
@@ -546,8 +716,8 @@ mod tests {
             Edit::SetTempo(133.0),
             Edit::AddTrack(InstrumentKind::Synth),
             Edit::AddTrack(InstrumentKind::HatClosed),
-            Edit::SetStep { track: 0, step: 0, value: Some(Step { note: 40, velocity: 100, length: 3 }) },
-            Edit::SetStep { track: 0, step: 7, value: Some(Step { note: 47, velocity: 90, length: 2 }) },
+            Edit::SetStep { track: 0, step: 0, value: Some(Step::new(40, 100, 3)) },
+            Edit::SetStep { track: 0, step: 7, value: Some(Step::new(47, 90, 2)) },
             Edit::SetStep { track: 1, step: 2, value: step(60) },
             Edit::SetStep { track: 1, step: 9, value: step(64) },
         ];
@@ -613,7 +783,7 @@ mod tests {
             let mut e = engine(&[
                 Edit::AddTrack(InstrumentKind::Synth),
                 Edit::SetParam { track: 0, index: 16, value: 0.001 }, // fast release
-                Edit::SetStep { track: 0, step: 0, value: Some(Step { note: 48, velocity: 127, length: len }) },
+                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(48, 127, len)) },
             ]);
             e.handle(Command::Play);
             let out = run(&mut e, 6000 * 4);
@@ -646,7 +816,10 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut e = Engine::with_edits(
             SR,
-            &[Edit::AddTrack(InstrumentKind::Synth), Edit::SetStep { track: 0, step: 0, value: Some(Step { note: 48, velocity: 127, length: 64 }) }],
+            &[
+                Edit::AddTrack(InstrumentKind::Synth),
+                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(48, 127, 64)) },
+            ],
             shared.clone(),
             None,
         );
@@ -708,15 +881,130 @@ mod tests {
         run(&mut e, 4800);
         e.apply(Edit::SetGain { track: 0, db: SILENT_DB });
         let out = run(&mut e, 4800);
-        let max_jump = out
-            .chunks(2)
-            .collect::<Vec<_>>()
-            .windows(2)
-            .map(|w| (w[1][0] - w[0][0]).abs())
-            .fold(0.0f32, f32::max);
+        let max_jump =
+            out.chunks(2).collect::<Vec<_>>().windows(2).map(|w| (w[1][0] - w[0][0]).abs()).fold(0.0f32, f32::max);
         // A 220 Hz sine at this level moves < 0.01 per sample; an unsmoothed
         // cut would jump by the full amplitude.
         assert!(max_jump < 0.01, "{max_jump}");
         assert!(out[out.len() - 200..].iter().all(|x| x.abs() < 1e-6));
+    }
+
+    /// Frames at which sound starts after silence (at least `gap` frames).
+    fn onsets(out: &[f32], gap: usize) -> Vec<usize> {
+        let mut v = Vec::new();
+        let mut quiet = gap;
+        for (i, f) in out.chunks(2).enumerate() {
+            if f[0].abs() > 1e-9 || f[1].abs() > 1e-9 {
+                if quiet >= gap {
+                    v.push(i);
+                }
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn swing_moves_odd_steps() {
+        let mut e = engine(&[
+            Edit::SetSwing(75.0),
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetParam { track: 0, index: 1, value: 0.01 },
+            Edit::SetStep { track: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
+            Edit::SetStep { track: 0, step: 1, value: Some(Step::new(60, 127, 1)) },
+        ]);
+        e.handle(Command::Play);
+        let out = run(&mut e, 12_000);
+        // Step 1 is delayed by half a step: 6000 + 3000.
+        assert_eq!(onsets(&out, 500), vec![0, 9000]);
+    }
+
+    #[test]
+    fn ratchets_split_the_step_evenly() {
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetParam { track: 0, index: 1, value: 0.01 },
+            Edit::SetStep { track: 0, step: 0, value: Some(Step { ratchet: 4, ..Step::new(60, 127, 1) }) },
+        ]);
+        e.handle(Command::Play);
+        let out = run(&mut e, 6000);
+        assert_eq!(onsets(&out, 200), vec![0, 1500, 3000, 4500]);
+    }
+
+    #[test]
+    fn ratchets_follow_swing() {
+        let mut e = engine(&[
+            Edit::SetSwing(75.0),
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetParam { track: 0, index: 1, value: 0.01 },
+            Edit::SetStep { track: 0, step: 1, value: Some(Step { ratchet: 2, ..Step::new(60, 127, 1) }) },
+        ]);
+        e.handle(Command::Play);
+        let out = run(&mut e, 12_000);
+        // Step 1 spans 9000..12000 with swing, so its halves start 1500 apart.
+        assert_eq!(onsets(&out, 600), vec![9000, 10_500]);
+    }
+
+    #[test]
+    fn chance_is_random_but_reproducible() {
+        let edits = [
+            Edit::SetPatternLength(1),
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetParam { track: 0, index: 1, value: 0.01 },
+            Edit::SetStep { track: 0, step: 0, value: Some(Step { chance: 50, ..Step::new(60, 127, 1) }) },
+        ];
+        let play = || {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let out = run(&mut e, 6000 * 200);
+            onsets(&out, 1000).len()
+        };
+        let hits = play();
+        // 200 trials at p = 0.5: far outside 70..=130 is (much) less than 1e-5.
+        assert!((70..=130).contains(&hits), "{hits}");
+        assert_eq!(play(), hits, "replaying must give the same pattern");
+    }
+
+    #[test]
+    fn closed_hat_chokes_open_hat() {
+        let render = |with_closed: bool| {
+            let mut edits = vec![
+                Edit::AddTrack(InstrumentKind::HatOpen),
+                Edit::AddTrack(InstrumentKind::HatClosed),
+                Edit::SetMute { track: 1, mute: true }, // hear only the open hat
+                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
+            ];
+            if with_closed {
+                edits.push(Edit::SetStep { track: 1, step: 1, value: Some(Step::new(60, 127, 1)) });
+            }
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let out = run(&mut e, 12_000);
+            out[2 * 9000..].iter().fold(0.0f32, |m, x| m.max(x.abs()))
+        };
+        let ringing = render(false);
+        let choked = render(true);
+        assert!(ringing > 0.01, "{ringing}");
+        assert!(choked < ringing * 1e-3, "{choked} vs {ringing}");
+    }
+
+    #[test]
+    fn insert_track_places_it_at_the_index() {
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::AddTrack(InstrumentKind::Clap),
+            Edit::InsertTrack { index: 1, kind: InstrumentKind::Snare },
+            Edit::InsertTrack { index: 3, kind: InstrumentKind::HatOpen },
+            Edit::InsertTrack { index: 9, kind: InstrumentKind::Synth }, // invalid: ignored
+        ]);
+        let kinds: Vec<_> = e.tracks[..e.track_count()].iter().map(|t| t.instrument.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![InstrumentKind::Kick, InstrumentKind::Snare, InstrumentKind::Clap, InstrumentKind::HatOpen]
+        );
+        e.apply(Edit::RemoveTrack(0));
+        assert_eq!(e.track_count(), 3);
     }
 }

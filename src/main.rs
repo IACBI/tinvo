@@ -64,7 +64,11 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 format = SampleFormat::from_id(&v).ok_or(format!("unknown format '{v}' (use 16, 24 or 32f)"))?;
             }
             "--loops" => {
-                opts.loops = value("--loops")?.parse().ok().filter(|n| (1..=1000).contains(n)).ok_or("--loops must be 1..=1000")?;
+                opts.loops = value("--loops")?
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .ok_or("--loops must be 1..=1000")?;
             }
             "--rate" => {
                 opts.sample_rate = value("--rate")?

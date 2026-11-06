@@ -25,11 +25,7 @@ pub fn db_to_gain(db: f32) -> f32 {
 /// Converts linear amplitude to decibels (`-inf` for zero or negative input).
 #[inline]
 pub fn gain_to_db(gain: f32) -> f32 {
-    if gain > 0.0 {
-        20.0 * gain.log10()
-    } else {
-        f32::NEG_INFINITY
-    }
+    if gain > 0.0 { 20.0 * gain.log10() } else { f32::NEG_INFINITY }
 }
 
 /// Frequency in Hz of a (possibly fractional) MIDI note number. A4 = 69 = 440 Hz.

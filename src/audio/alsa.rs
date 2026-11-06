@@ -88,9 +88,8 @@ where
             let mut offset = 0usize;
             while offset < period {
                 // SAFETY: `buf` holds `period` interleaved stereo frames.
-                let n = unsafe {
-                    snd_pcm_writei(pcm.0, buf[offset * 2..].as_ptr().cast(), (period - offset) as c_ulong)
-                };
+                let n =
+                    unsafe { snd_pcm_writei(pcm.0, buf[offset * 2..].as_ptr().cast(), (period - offset) as c_ulong) };
                 if n >= 0 {
                     offset += n as usize;
                     continue;

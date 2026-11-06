@@ -108,7 +108,11 @@ where
     C: AudioCallback,
 {
     spawn_audio_thread(move |report| {
-        let state = Box::into_raw(Box::new(State { callback: factory(SAMPLE_RATE as u32), stopping: AtomicBool::new(false), health }));
+        let state = Box::into_raw(Box::new(State {
+            callback: factory(SAMPLE_RATE as u32),
+            stopping: AtomicBool::new(false),
+            health,
+        }));
         let format = AudioStreamBasicDescription {
             sample_rate: SAMPLE_RATE,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,

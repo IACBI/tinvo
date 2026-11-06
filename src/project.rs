@@ -3,8 +3,9 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 1
+//! tinvo 2
 //! tempo 92
+//! swing 50
 //! pattern_length 16
 //! master_gain_db 0
 //!
@@ -15,25 +16,27 @@
 //! mute false
 //! solo false
 //! param decay 0.45
-//! step 0 60 120 1        # step-index note velocity length
+//! step 0 60 120 1 100 1  # index note velocity length chance ratchet
 //! end
 //! ```
 //!
-//! Floats are written with Rust's shortest round-trip formatting, so saving
-//! and loading is lossless.
+//! Version 1 files (no swing, four-field steps) are still read. Floats are
+//! written with Rust's shortest round-trip formatting, so saving and loading
+//! is lossless.
 
-use crate::engine::{Edit, MAX_GAIN_DB, MAX_STEPS, MAX_TEMPO, MAX_TRACKS, MIN_TEMPO, Step};
+use crate::engine::{Edit, MAX_GAIN_DB, MAX_STEPS, MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step};
 use crate::instrument::{InstrumentKind, ParamSpec, SILENT_DB, Unit};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+/// Oldest format version this build can read.
+pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
 const MAX_NAME_CHARS: usize = 32;
 
 /// Mixer parameters presented alongside instrument parameters.
-pub static VOLUME: ParamSpec =
-    ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
+pub static VOLUME: ParamSpec = ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
 pub static PAN: ParamSpec = ParamSpec::linear("pan", "Pan", -1.0, 1.0, 0.0, 0.05, Unit::Pan);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +70,8 @@ impl TrackData {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     pub tempo: f32,
+    /// Swing in percent (50 = straight).
+    pub swing: f32,
     pub pattern_len: u8,
     pub master_gain_db: f32,
     pub tracks: Vec<TrackData>,
@@ -118,7 +123,7 @@ impl std::error::Error for ParseError {}
 impl Project {
     /// An empty project at 120 BPM with a one-bar pattern.
     pub fn new() -> Self {
-        Self { tempo: 120.0, pattern_len: 16, master_gain_db: 0.0, tracks: Vec::new() }
+        Self { tempo: 120.0, swing: MIN_SWING, pattern_len: 16, master_gain_db: 0.0, tracks: Vec::new() }
     }
 
     /// A ready-to-play beat used when TINVO starts without a file.
@@ -131,7 +136,7 @@ impl Project {
             t.gain_db = gain_db;
             t.pan = pan;
             for &(i, note, velocity, length) in steps {
-                t.steps[usize::from(i)] = Some(Step { note, velocity, length });
+                t.steps[usize::from(i)] = Some(Step::new(note, velocity, length));
             }
             p.tracks.push(t);
             p.tracks.len() - 1
@@ -183,11 +188,26 @@ impl Project {
                 self.master_gain_db = db;
                 Edit::SetMasterGain(db)
             }
+            Edit::SetSwing(percent) => {
+                let percent = if percent.is_finite() { percent.clamp(MIN_SWING, MAX_SWING) } else { self.swing };
+                self.swing = percent;
+                Edit::SetSwing(percent)
+            }
             Edit::AddTrack(kind) => {
                 if self.tracks.len() >= MAX_TRACKS {
                     return Err(EditError::TooManyTracks);
                 }
                 self.tracks.push(TrackData::new(kind));
+                edit
+            }
+            Edit::InsertTrack { index, kind } => {
+                if usize::from(index) > self.tracks.len() {
+                    return Err(EditError::NoSuchTrack(index));
+                }
+                if self.tracks.len() >= MAX_TRACKS {
+                    return Err(EditError::TooManyTracks);
+                }
+                self.tracks.insert(usize::from(index), TrackData::new(kind));
                 edit
             }
             Edit::RemoveTrack(t) => {
@@ -244,26 +264,60 @@ impl Project {
     pub fn to_edits(&self) -> Vec<Edit> {
         let mut e = vec![
             Edit::SetTempo(self.tempo),
+            Edit::SetSwing(self.swing),
             Edit::SetPatternLength(self.pattern_len),
             Edit::SetMasterGain(self.master_gain_db),
         ];
         for (i, t) in self.tracks.iter().enumerate() {
-            let track = i as u8;
             e.push(Edit::AddTrack(t.kind));
-            for (index, &value) in t.params.iter().enumerate() {
-                e.push(Edit::SetParam { track, index: index as u8, value });
-            }
-            e.push(Edit::SetGain { track, db: t.gain_db });
-            e.push(Edit::SetPan { track, pan: t.pan });
-            e.push(Edit::SetMute { track, mute: t.mute });
-            e.push(Edit::SetSolo { track, solo: t.solo });
-            for (s, step) in t.steps.iter().enumerate() {
-                if step.is_some() {
-                    e.push(Edit::SetStep { track, step: s as u8, value: *step });
-                }
-            }
+            push_track_state(&mut e, i as u8, t);
         }
         e
+    }
+
+    /// Edits that undo `edit` when applied after it, computed from the state
+    /// *before* `edit` is applied. Fails exactly when `apply` would fail.
+    pub fn inverse(&self, edit: &Edit) -> Result<Vec<Edit>, EditError> {
+        let inv = match *edit {
+            Edit::SetTempo(_) => vec![Edit::SetTempo(self.tempo)],
+            Edit::SetSwing(_) => vec![Edit::SetSwing(self.swing)],
+            Edit::SetPatternLength(_) => vec![Edit::SetPatternLength(self.pattern_len)],
+            Edit::SetMasterGain(_) => vec![Edit::SetMasterGain(self.master_gain_db)],
+            Edit::AddTrack(_) => {
+                if self.tracks.len() >= MAX_TRACKS {
+                    return Err(EditError::TooManyTracks);
+                }
+                vec![Edit::RemoveTrack(self.tracks.len() as u8)]
+            }
+            Edit::InsertTrack { index, .. } => {
+                if usize::from(index) > self.tracks.len() {
+                    return Err(EditError::NoSuchTrack(index));
+                }
+                if self.tracks.len() >= MAX_TRACKS {
+                    return Err(EditError::TooManyTracks);
+                }
+                vec![Edit::RemoveTrack(index)]
+            }
+            Edit::RemoveTrack(t) => {
+                let tr = self.track(t)?;
+                let mut e = vec![Edit::InsertTrack { index: t, kind: tr.kind }];
+                push_track_state(&mut e, t, tr);
+                e
+            }
+            Edit::SetStep { track, step, .. } => {
+                let old = *self.track(track)?.steps.get(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
+                vec![Edit::SetStep { track, step, value: old }]
+            }
+            Edit::SetParam { track, index, .. } => {
+                let old = *self.track(track)?.params.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                vec![Edit::SetParam { track, index, value: old }]
+            }
+            Edit::SetGain { track, .. } => vec![Edit::SetGain { track, db: self.track(track)?.gain_db }],
+            Edit::SetPan { track, .. } => vec![Edit::SetPan { track, pan: self.track(track)?.pan }],
+            Edit::SetMute { track, .. } => vec![Edit::SetMute { track, mute: self.track(track)?.mute }],
+            Edit::SetSolo { track, .. } => vec![Edit::SetSolo { track, solo: self.track(track)?.solo }],
+        };
+        Ok(inv)
     }
 
     /// Serializes to the text format.
@@ -272,6 +326,7 @@ impl Project {
         // `write!` into a String cannot fail.
         let _ = writeln!(s, "tinvo {FORMAT_VERSION}");
         let _ = writeln!(s, "tempo {}", self.tempo);
+        let _ = writeln!(s, "swing {}", self.swing);
         let _ = writeln!(s, "pattern_length {}", self.pattern_len);
         let _ = writeln!(s, "master_gain_db {}", self.master_gain_db);
         for t in &self.tracks {
@@ -286,7 +341,8 @@ impl Project {
             }
             for (i, step) in t.steps.iter().enumerate() {
                 if let Some(st) = step {
-                    let _ = writeln!(s, "step {i} {} {} {}", st.note, st.velocity, st.length);
+                    let _ =
+                        writeln!(s, "step {i} {} {} {} {} {}", st.note, st.velocity, st.length, st.chance, st.ratchet);
                 }
             }
             let _ = writeln!(s, "end");
@@ -298,7 +354,7 @@ impl Project {
     /// a file that is out of range is reported as an error.
     pub fn from_text(text: &str) -> Result<Self, ParseError> {
         let mut p = Project::new();
-        let mut version_seen = false;
+        let mut version: Option<u32> = None;
         let mut current: Option<TrackData> = None;
 
         for (idx, raw) in text.lines().enumerate() {
@@ -311,17 +367,19 @@ impl Project {
             let (key, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
             let rest = rest.trim();
 
-            if !version_seen {
+            let Some(ver) = version else {
                 if key != "tinvo" {
                     return Err(err("not a TINVO project (missing 'tinvo' header)".into()));
                 }
                 let v: u32 = parse_num(rest).map_err(err)?;
-                if v != FORMAT_VERSION {
-                    return Err(err(format!("unsupported format version {v}")));
+                if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&v) {
+                    return Err(err(format!(
+                        "unsupported format version {v} (this build reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})"
+                    )));
                 }
-                version_seen = true;
+                version = Some(v);
                 continue;
-            }
+            };
 
             if let Some(t) = current.as_mut() {
                 match key {
@@ -343,19 +401,26 @@ impl Project {
                     }
                     "step" => {
                         let f: Vec<&str> = rest.split_whitespace().collect();
-                        if f.len() != 4 {
-                            return Err(err("expected 'step <index> <note> <velocity> <length>'".into()));
+                        let expected = if ver == 1 { 4 } else { 6 };
+                        if f.len() != expected {
+                            return Err(err(if ver == 1 {
+                                "expected 'step <index> <note> <velocity> <length>'".into()
+                            } else {
+                                "expected 'step <index> <note> <velocity> <length> <chance> <ratchet>'".into()
+                            }));
                         }
+                        let n: Vec<u8> = f[1..].iter().map(|s| parse_num(s)).collect::<Result<_, _>>().map_err(err)?;
                         let i: usize = parse_num(f[0]).map_err(err)?;
-                        let note: u8 = parse_num(f[1]).map_err(err)?;
-                        let velocity: u8 = parse_num(f[2]).map_err(err)?;
-                        let length: u8 = parse_num(f[3]).map_err(err)?;
                         if i >= MAX_STEPS {
                             return Err(err(format!("step index {i} out of range")));
                         }
-                        let st = Step { note, velocity, length };
+                        let mut st = Step::new(n[0], n[1], n[2]);
+                        if ver >= 2 {
+                            st.chance = n[3];
+                            st.ratchet = n[4];
+                        }
                         if st.sanitized() != st {
-                            return Err(err("step note/velocity/length out of range".into()));
+                            return Err(err("step value out of range".into()));
                         }
                         t.steps[i] = Some(st);
                     }
@@ -378,6 +443,13 @@ impl Project {
                     }
                     p.tempo = v;
                 }
+                "swing" if ver >= 2 => {
+                    let v: f32 = parse_num(rest).map_err(err)?;
+                    if !(MIN_SWING..=MAX_SWING).contains(&v) {
+                        return Err(err(format!("swing must be {MIN_SWING}..={MAX_SWING}")));
+                    }
+                    p.swing = v;
+                }
                 "pattern_length" => {
                     let v: u8 = parse_num(rest).map_err(err)?;
                     if v == 0 || usize::from(v) > MAX_STEPS {
@@ -387,15 +459,15 @@ impl Project {
                 }
                 "master_gain_db" => p.master_gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                 "track" => {
-                    let kind = InstrumentKind::from_id(rest)
-                        .ok_or_else(|| err(format!("unknown instrument '{rest}'")))?;
+                    let kind =
+                        InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?;
                     current = Some(TrackData::new(kind));
                 }
                 _ => return Err(err(format!("unknown key '{key}'"))),
             }
         }
 
-        if !version_seen {
+        if version.is_none() {
             return Err(ParseError { line: 1, message: "empty file".into() });
         }
         if current.is_some() {
@@ -419,13 +491,26 @@ impl Project {
     }
 }
 
+/// Appends the edits that give track `track` (already created with the right
+/// kind and default state) the settings and steps of `t`.
+fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
+    for (index, &value) in t.params.iter().enumerate() {
+        e.push(Edit::SetParam { track, index: index as u8, value });
+    }
+    e.push(Edit::SetGain { track, db: t.gain_db });
+    e.push(Edit::SetPan { track, pan: t.pan });
+    e.push(Edit::SetMute { track, mute: t.mute });
+    e.push(Edit::SetSolo { track, solo: t.solo });
+    for (s, step) in t.steps.iter().enumerate() {
+        if step.is_some() {
+            e.push(Edit::SetStep { track, step: s as u8, value: *step });
+        }
+    }
+}
+
 /// Track names are single-line, printable and bounded in length.
 pub fn sanitize_name(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NAME_CHARS)
-        .collect();
+    let s: String = name.chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
     let s = s.trim().to_string();
     if s.is_empty() { "Track".to_string() } else { s }
 }
@@ -462,8 +547,70 @@ mod tests {
         p.tracks[2].solo = true;
         p.tracks[5].params[5] = 1_234.567_9;
         p.tempo = 97.31;
+        p.swing = 61.5;
+        p.tracks[2].steps[3] = Some(Step { chance: 35, ratchet: 3, ..Step::new(60, 90, 1) });
         let text = p.to_text();
+        assert!(text.starts_with("tinvo 2\n"));
         assert_eq!(Project::from_text(&text).unwrap(), p);
+    }
+
+    #[test]
+    fn reads_version_1_files() {
+        let v1 = "tinvo 1\ntempo 100\npattern_length 8\nmaster_gain_db 0\n\ntrack kick\nname K\n\
+                  gain_db 0\npan 0\nmute false\nsolo false\nstep 2 60 99 1\nend\n";
+        let p = Project::from_text(v1).unwrap();
+        assert_eq!(p.swing, MIN_SWING);
+        assert_eq!(p.tracks[0].steps[2], Some(Step::new(60, 99, 1)));
+        // v1 has no swing key and only four-field steps.
+        assert!(Project::from_text("tinvo 1\nswing 60").is_err());
+        assert!(Project::from_text("tinvo 1\ntrack kick\nstep 0 60 99 1 100 1\nend").is_err());
+        assert!(Project::from_text("tinvo 2\ntrack kick\nstep 0 60 99 1\nend").is_err());
+    }
+
+    /// Applying any edit and then its inverse restores the project exactly.
+    #[test]
+    fn inverse_undoes_every_kind_of_edit() {
+        let base = Project::demo();
+        let s = Some(Step { chance: 40, ratchet: 2, ..Step::new(50, 80, 3) });
+        let edits = [
+            Edit::SetTempo(140.0),
+            Edit::SetSwing(66.0),
+            Edit::SetPatternLength(7),
+            Edit::SetMasterGain(-6.0),
+            Edit::AddTrack(InstrumentKind::Clap),
+            Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth },
+            Edit::InsertTrack { index: 6, kind: InstrumentKind::Kick },
+            Edit::RemoveTrack(0),
+            Edit::RemoveTrack(5),
+            Edit::SetStep { track: 1, step: 4, value: None },
+            Edit::SetStep { track: 1, step: 5, value: s },
+            Edit::SetParam { track: 5, index: 5, value: 5000.0 },
+            Edit::SetGain { track: 2, db: 3.0 },
+            Edit::SetPan { track: 2, pan: -0.7 },
+            Edit::SetMute { track: 3, mute: true },
+            Edit::SetSolo { track: 4, solo: true },
+        ];
+        for e in edits {
+            let mut p = base.clone();
+            let inv = p.inverse(&e).unwrap();
+            p.apply(e).unwrap();
+            assert_ne!(p, base, "{e:?} changed nothing");
+            for i in inv {
+                p.apply(i).unwrap();
+            }
+            // Names are UI data restored by the history, not by edits.
+            for (a, b) in p.tracks.iter_mut().zip(&base.tracks) {
+                a.name = b.name.clone();
+            }
+            assert_eq!(p, base, "{e:?}");
+        }
+        // Inverse fails exactly where apply fails.
+        let p = Project::new();
+        assert_eq!(p.inverse(&Edit::RemoveTrack(0)), Err(EditError::NoSuchTrack(0)));
+        assert_eq!(
+            p.inverse(&Edit::InsertTrack { index: 1, kind: InstrumentKind::Kick }),
+            Err(EditError::NoSuchTrack(1))
+        );
     }
 
     #[test]
@@ -487,22 +634,11 @@ mod tests {
         p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
         let got = p.apply(Edit::SetParam { track: 0, index: 5, value: 1.0e9 }).unwrap();
         assert_eq!(got, Edit::SetParam { track: 0, index: 5, value: 20_000.0 });
-        let got = p
-            .apply(Edit::SetStep { track: 0, step: 3, value: Some(Step { note: 200, velocity: 0, length: 99 }) })
-            .unwrap();
-        assert_eq!(
-            got,
-            Edit::SetStep { track: 0, step: 3, value: Some(Step { note: 127, velocity: 1, length: 64 }) }
-        );
+        let got = p.apply(Edit::SetStep { track: 0, step: 3, value: Some(Step::new(200, 0, 99)) }).unwrap();
+        assert_eq!(got, Edit::SetStep { track: 0, step: 3, value: Some(Step::new(127, 1, 64)) });
         assert_eq!(p.apply(Edit::SetMute { track: 4, mute: true }), Err(EditError::NoSuchTrack(4)));
-        assert_eq!(
-            p.apply(Edit::SetStep { track: 0, step: 64, value: None }),
-            Err(EditError::NoSuchStep(64))
-        );
-        assert_eq!(
-            p.apply(Edit::SetParam { track: 0, index: 99, value: 0.0 }),
-            Err(EditError::NoSuchParam(99))
-        );
+        assert_eq!(p.apply(Edit::SetStep { track: 0, step: 64, value: None }), Err(EditError::NoSuchStep(64)));
+        assert_eq!(p.apply(Edit::SetParam { track: 0, index: 99, value: 0.0 }), Err(EditError::NoSuchParam(99)));
         for _ in 1..MAX_TRACKS {
             p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
         }
@@ -516,7 +652,11 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 2", 1, "version"),
+            ("tinvo 3", 1, "version"),
+            ("tinvo 0", 1, "version"),
+            ("tinvo 2\nswing 90", 2, "swing"),
+            ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 5\nend", 3, "out of range"),
+            ("tinvo 2\ntrack kick\nstep 0 60 100 1 0 1\nend", 3, "out of range"),
             ("tinvo 1\ntempo fast", 2, "invalid number"),
             ("tinvo 1\ntempo 500", 2, "tempo"),
             ("tinvo 1\ntrack drum", 2, "unknown instrument"),

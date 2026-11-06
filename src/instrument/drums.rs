@@ -15,6 +15,8 @@ const TIME_STEP: f32 = 1.1;
 const MAX_PARAMS: usize = 4;
 /// Envelope level below which a hit is considered finished (-100 dB).
 const END_LEVEL: f32 = 1.0e-5;
+/// A choked open hat falls by 60 dB in this time.
+const CHOKE_TIME: f32 = 0.012;
 
 const TUNE: ParamSpec = ParamSpec::linear("tune", "Tune", -12.0, 12.0, 0.0, 1.0, Unit::Semitones);
 
@@ -208,6 +210,13 @@ impl Drum {
         }
     }
 
+    /// Cuts an open hi-hat short with a fast (but click-free) fade.
+    pub fn choke(&mut self) {
+        if self.kind == InstrumentKind::HatOpen && self.active {
+            self.amp_coef = self.amp_coef.min(decay_coef(CHOKE_TIME, self.sample_rate));
+        }
+    }
+
     pub fn render(&mut self, out: &mut [f32]) {
         if !self.active && self.declick == 0.0 {
             return;
@@ -354,6 +363,32 @@ mod tests {
         d.render(&mut next);
         // The first new sample continues from the previous output.
         assert!((next[0] - before).abs() < 0.05, "{before} -> {}", next[0]);
+    }
+
+    #[test]
+    fn choke_shortens_only_the_open_hat() {
+        let ring = |kind, choke: bool| {
+            let mut d = Drum::new(kind, SR);
+            d.trigger(60, 127);
+            let mut buf = vec![0.0; 480];
+            d.render(&mut buf);
+            if choke {
+                d.choke();
+            }
+            let mut n = 0;
+            while d.active {
+                let mut b = [0.0f32; 1];
+                d.render(&mut b);
+                n += 1;
+            }
+            n
+        };
+        let open = ring(InstrumentKind::HatOpen, false);
+        let choked = ring(InstrumentKind::HatOpen, true);
+        assert!(open > 20_000, "{open}");
+        // -100 dB at 5/3 of the 12 ms choke time, plus margin.
+        assert!(choked < (SR * 0.012 * 5.0 / 3.0) as usize + 10, "{choked}");
+        assert_eq!(ring(InstrumentKind::Kick, true), ring(InstrumentKind::Kick, false));
     }
 
     #[test]

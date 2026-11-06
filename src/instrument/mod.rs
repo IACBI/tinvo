@@ -144,12 +144,7 @@ impl ParamSpec {
         Self { id, label, min, max, default, scale: ParamScale::Log { ratio }, unit }
     }
 
-    pub const fn stepped(
-        id: &'static str,
-        label: &'static str,
-        names: &'static [&'static str],
-        default: f32,
-    ) -> Self {
+    pub const fn stepped(id: &'static str, label: &'static str, names: &'static [&'static str], default: f32) -> Self {
         Self {
             id,
             label,
@@ -199,13 +194,15 @@ impl ParamSpec {
         match self.unit {
             Unit::None => format!("{value:.2}"),
             Unit::Hz if value >= 1000.0 => format!("{:.2} kHz", value / 1000.0),
+            Unit::Hz if value < 10.0 => format!("{value:.2} Hz"),
             Unit::Hz => format!("{value:.0} Hz"),
             Unit::Seconds if value < 0.01 => format!("{:.1} ms", value * 1000.0),
             Unit::Seconds if value < 1.0 => format!("{:.0} ms", value * 1000.0),
             Unit::Seconds => format!("{value:.2} s"),
-            Unit::Semitones => format!("{value:+.0} st"),
+            Unit::Semitones if value.fract().abs() < 1.0e-4 => format!("{value:+.0} st"),
+            Unit::Semitones => format!("{value:+.2} st"),
             Unit::Cents => format!("{value:+.0} ct"),
-            Unit::Octaves => format!("{value:+.1} oct"),
+            Unit::Octaves => format!("{value:+.2} oct"),
             Unit::Decibels if value <= SILENT_DB => "-inf dB".to_string(),
             Unit::Decibels => format!("{value:+.1} dB"),
             Unit::Pan if value.abs() < 0.005 => "C".to_string(),
@@ -281,6 +278,14 @@ impl Instrument {
     pub fn release_all(&mut self) {
         if let Instrument::Synth(s) = self {
             s.release_all();
+        }
+    }
+
+    /// Fades a ringing open hi-hat out within a few milliseconds (other
+    /// instruments ignore it).
+    pub fn choke(&mut self) {
+        if let Instrument::Drum(d) = self {
+            d.choke();
         }
     }
 
@@ -377,7 +382,13 @@ mod tests {
                     let v = match corner {
                         0 => s.min,
                         1 => s.max,
-                        _ => if i % 2 == 0 { s.min } else { s.max },
+                        _ => {
+                            if i % 2 == 0 {
+                                s.min
+                            } else {
+                                s.max
+                            }
+                        }
                     };
                     inst.set_param(i, v);
                 }

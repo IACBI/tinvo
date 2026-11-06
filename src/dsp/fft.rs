@@ -55,8 +55,7 @@ pub fn power_spectrum(signal: &[f32]) -> Vec<f64> {
         .enumerate()
         .map(|(i, &x)| {
             let t = 2.0 * PI * i as f64 / n as f64;
-            let w = 0.35875 - 0.48829 * t.cos() + 0.14128 * (2.0 * t).cos()
-                - 0.01168 * (3.0 * t).cos();
+            let w = 0.35875 - 0.48829 * t.cos() + 0.14128 * (2.0 * t).cos() - 0.01168 * (3.0 * t).cos();
             f64::from(x) * w
         })
         .collect();
@@ -90,16 +89,9 @@ mod tests {
     #[test]
     fn sine_peak_lands_in_expected_bin() {
         let n = 1024;
-        let sig: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 64.0 * i as f32 / n as f32).sin())
-            .collect();
+        let sig: Vec<f32> = (0..n).map(|i| (2.0 * std::f32::consts::PI * 64.0 * i as f32 / n as f32).sin()).collect();
         let p = power_spectrum(&sig);
-        let peak = p
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .unwrap();
+        let peak = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap();
         assert_eq!(peak, 64);
     }
 }

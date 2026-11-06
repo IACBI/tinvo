@@ -4,7 +4,7 @@ Each phase ends with a usable, tested program. No phase adds a dependency.
 
 Author: 𝓐.𝓒.𝓑
 
-## Phase 0: Foundation ✅ (this release)
+## Phase 0: Foundation ✅
 
 - Real-time engine: wait-free command queue, sample-accurate 16th-note step sequencer, up to 16 tracks, smoothed fader/pan/mute/solo, master bus, meters.
 - Instruments: 8-voice subtractive synth (2 band-limited oscillators, SVF, 2 ADSRs) and five synthesized drums.
@@ -13,13 +13,23 @@ Author: 𝓐.𝓒.𝓑
 - Lossless `.tvo` project format, atomic saves; WAV export at 16/24-bit (dithered) or 32-bit float.
 - CLI: `render`, `demo`, `probe`, `bench`.
 
-## Phase 1: Sound and feel
+## Phase 1: Sound and feel ✅ (this release)
 
-- Swing/shuffle and per-step micro-timing; per-step probability and ratchets.
+- Swing 50–75 % (delays odd 16ths, sample-accurate, ratchets follow it).
+- Per-step chance (1–100 %, reproducible: the random sequence restarts on every Play) and ratchets (1–4 evenly spaced hits).
+- Synth: glide, an LFO (sine, triangle, saw, square, sample & hold) to pitch, cutoff and level, and velocity → cutoff.
+- Closed hat chokes open hat (12 ms fade, no click).
+- Undo/redo with a 1000-step history. Each edit is stored with its inverse; quick repeats of the same nudge merge into one step.
+- Project format 2 (swing, chance, ratchet); format 1 files still load.
+- CI on Windows, Linux and macOS: format, clippy, tests in debug and release, CLI smoke test, minimum Rust version.
+
+## Phase 1b: Notes (moved from Phase 1)
+
 - Polyphonic steps (chords) and a piano-roll view with ticks finer than a step.
-- Synth: glide, LFOs, pulse-width modulation, noise oscillator, unison/detune spread, velocity → filter.
-- Drum choke groups (closed hat chokes open hat).
-- Undo/redo (the `Edit` stream already has the shape: store each edit with its inverse).
+- Per-step micro-timing.
+- Synth: pulse-width modulation, noise oscillator, unison/detune spread.
+
+These need a step to hold more than one note, which changes the pattern data structure. They were split out so that change gets its own release.
 
 ## Phase 2: Sampler
 
@@ -49,12 +59,13 @@ Author: 𝓐.𝓒.𝓑
 
 - Mouse support, themes, configurable keymaps.
 - Crash-safe autosave and recovery.
-- CI on all three operating systems, plus fuzzing of the project and WAV parsers.
+- Fuzzing of the project and WAV parsers.
 - Performance budgets enforced in CI via `tinvo bench`.
 
 ## Known limitations of the foundation
 
 - Linux and macOS backends compile and pass lint, but have not yet been run on real hardware.
 - ALSA and CoreAudio open at a fixed 48 kHz (the OS resamples). WASAPI uses the device's mix rate.
-- Removing a track while it is sounding cuts it off immediately, with no fade.
+- Removing a track while it is sounding cuts it off immediately, with no fade. The same applies to undoing an added track.
+- The CI workflow is written but has not run yet: the repository has no remote.
 - Drum tone parameters apply from the next hit, not to a hit that is still ringing.

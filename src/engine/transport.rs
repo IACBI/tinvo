@@ -15,6 +15,8 @@ pub struct Transport {
     origin_step: f64,
     /// Absolute index (since play) of the next step to fire.
     next_step: u64,
+    /// Delay of odd steps as a fraction of a step, in `[0, 0.5]`.
+    swing_delay: f64,
 }
 
 impl Transport {
@@ -25,7 +27,16 @@ impl Transport {
             origin_frame: 0,
             origin_step: 0.0,
             next_step: 0,
+            swing_delay: 0.0,
         }
+    }
+
+    /// Sets swing in percent (50 = straight, 75 = maximum). The off-beat 16th
+    /// of each 8th lands at `percent` of the 8th, i.e. odd steps are delayed
+    /// by `(percent / 50 - 1)` of a step.
+    pub fn set_swing(&mut self, percent: f32) {
+        let p = f64::from(percent.clamp(super::MIN_SWING, super::MAX_SWING));
+        self.swing_delay = p / 50.0 - 1.0;
     }
 
     pub fn samples_per_step(bpm: f32, sample_rate: f32) -> f64 {
@@ -61,9 +72,10 @@ impl Transport {
         self.origin_step + frame.saturating_sub(self.origin_frame) as f64 / self.samples_per_step
     }
 
-    /// Frame at which absolute step `step` starts.
+    /// Frame at which absolute step `step` starts (including swing).
     pub fn frame_of_step(&self, step: u64) -> u64 {
-        let offset = ((step as f64 - self.origin_step) * self.samples_per_step).round();
+        let swing = if step % 2 == 1 { self.swing_delay } else { 0.0 };
+        let offset = ((step as f64 + swing - self.origin_step) * self.samples_per_step).round();
         self.origin_frame + offset.max(0.0) as u64
     }
 
@@ -123,6 +135,28 @@ mod tests {
         assert_eq!(t.next_step_frame(), Some(4500));
         t.advance();
         assert_eq!(t.next_step_frame(), Some(7500));
+    }
+
+    #[test]
+    fn swing_delays_odd_steps_only() {
+        let mut t = Transport::new(120.0, 48_000.0);
+        t.set_swing(75.0); // odd steps half a step late
+        t.start(0);
+        let frames: Vec<u64> = (0..6)
+            .map(|_| {
+                let f = t.next_step_frame().unwrap();
+                t.advance();
+                f
+            })
+            .collect();
+        assert_eq!(frames, vec![0, 9000, 12_000, 21_000, 24_000, 33_000]);
+        // Triplet feel: the off-beat sits at 2/3 of the 8th note.
+        let mut t = Transport::new(120.0, 48_000.0);
+        t.set_swing(200.0 / 3.0);
+        t.start(0);
+        assert_eq!(t.frame_of_step(1), 8000);
+        t.set_swing(10.0); // clamped to straight
+        assert_eq!(t.frame_of_step(1), 6000);
     }
 
     #[test]
