@@ -20,6 +20,7 @@ use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILEN
 use crate::rt::AtomicF32;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
+use crate::strip::{self, Strip, track_param};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
@@ -48,7 +49,7 @@ pub fn target_spec(kind: InstrumentKind, target: u8) -> Option<&'static ParamSpe
     match target {
         0 => Some(&VOLUME),
         1 => Some(&PAN),
-        t => kind.params().get(usize::from(t) - 2),
+        t => track_param(kind, usize::from(t) - 2),
     }
 }
 /// Internal processing block. Events inside a block are still sample-accurate.
@@ -311,6 +312,20 @@ pub enum Command {
     },
 }
 
+/// Work one audio callback spends on commands, in units of a simple edit.
+/// Measured in a release build: 4096 step or parameter edits take about
+/// 0.05-0.25 ms, and adding, inserting or removing a track (which moves
+/// whole track slots) about 30 us each.
+const COMMAND_BUDGET: u32 = 4096;
+
+/// Cost of a command in [`COMMAND_BUDGET`] units.
+fn command_cost(cmd: &Command) -> u32 {
+    match cmd {
+        Command::Edit(Edit::AddTrack(_) | Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) => 512,
+        _ => 1,
+    }
+}
+
 /// Capacity of the queue that returns released samples to the UI thread.
 pub const RETIRE_QUEUE: usize = 64;
 
@@ -465,7 +480,8 @@ struct Track {
     lanes: [Lane; MAX_LANES],
     /// Parameter values set by edits; automation overrides them while a
     /// point is in force and returns to them afterwards.
-    base: [f32; MAX_PARAMS],
+    base: [f32; MAX_TRACK_PARAMS],
+    strip: Strip,
     gain_db: f32,
     pan: f32,
     /// Automated volume and pan, overriding `gain_db` and `pan`.
@@ -489,6 +505,7 @@ impl Track {
             steps: [[None; MAX_STEPS]; MAX_PATTERNS],
             lanes: [Lane::EMPTY; MAX_LANES],
             base: base_params(kind),
+            strip: Strip::new(sample_rate),
             gain_db: 0.0,
             pan: 0.0,
             auto_gain: None,
@@ -514,6 +531,7 @@ impl Track {
         }
         self.lanes.fill(Lane::EMPTY);
         self.base = base_params(kind);
+        self.strip = Strip::new(sample_rate);
         self.gain_db = 0.0;
         self.pan = 0.0;
         self.auto_gain = None;
@@ -536,12 +554,23 @@ impl Track {
             t => {
                 let i = usize::from(t) - 2;
                 if let Some(&base) = self.base.get(i) {
-                    self.instrument.set_param(i, value.unwrap_or(base));
+                    self.set_param(i, value.unwrap_or(base));
                 }
                 return false;
             }
         }
         true
+    }
+
+    /// Sets track parameter `i` (see [`track_param`]): the instrument's
+    /// first, then the strip's.
+    fn set_param(&mut self, i: usize, value: f32) {
+        let n = self.instrument.kind().params().len();
+        if i < n {
+            self.instrument.set_param(i, value);
+        } else {
+            self.strip.set_param(i - n, value);
+        }
     }
 
     /// Whether a lane currently overrides `target`.
@@ -625,10 +654,13 @@ impl Track {
     }
 }
 
-fn base_params(kind: InstrumentKind) -> [f32; MAX_PARAMS] {
-    let mut b = [0.0; MAX_PARAMS];
-    for (v, s) in b.iter_mut().zip(kind.params()) {
-        *v = s.default;
+/// Most parameters a track has: its instrument's and its strip's.
+const MAX_TRACK_PARAMS: usize = MAX_PARAMS + strip::sp::COUNT;
+
+fn base_params(kind: InstrumentKind) -> [f32; MAX_TRACK_PARAMS] {
+    let mut b = [0.0; MAX_TRACK_PARAMS];
+    for (i, v) in b.iter_mut().enumerate() {
+        *v = track_param(kind, i).map_or(0.0, |s| s.default);
     }
     b
 }
@@ -939,10 +971,10 @@ impl Engine {
             Edit::SetParam { track, index, value } => {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
                     let i = usize::from(index);
-                    if let Some(spec) = t.instrument.kind().params().get(i) {
+                    if let Some(spec) = track_param(t.instrument.kind(), i) {
                         t.base[i] = spec.clamp(value);
                         if !t.automated(index.saturating_add(2)) {
-                            t.instrument.set_param(i, value);
+                            t.set_param(i, value);
                         }
                     }
                 }
@@ -1016,11 +1048,13 @@ impl Engine {
     /// commands. Real-time safe.
     pub fn process(&mut self, out: &mut [f32]) {
         if let Some(mut rx) = self.commands.take() {
-            // The UI may keep pushing while this drains; taking at most one
-            // queue's worth keeps a callback's work bounded. The rest waits,
-            // in order, for the next callback.
-            for _ in 0..rx.capacity() {
+            // A callback handles commands up to a work budget; the rest wait,
+            // in order, for the next one. The UI may keep pushing while this
+            // drains, so draining until empty would not be bounded.
+            let mut budget = COMMAND_BUDGET;
+            while budget > 0 {
                 let Some(cmd) = rx.pop() else { break };
+                budget = budget.saturating_sub(command_cost(&cmd));
                 self.handle(cmd);
             }
             self.commands = Some(rx);
@@ -1222,6 +1256,7 @@ impl Engine {
             let buf = &mut scratch[a..b];
             buf.fill(0.0);
             t.instrument.render(buf);
+            t.strip.process(buf);
             let mut peak = t.peak;
             for (i, &s) in buf.iter().enumerate() {
                 let l = s * t.gain_l.tick();
@@ -1517,6 +1552,29 @@ mod tests {
         let out = run(&mut e, 12_000);
         // Step 1 spans 9000..12000 with swing, so its halves start 1500 apart.
         assert_eq!(onsets(&out, 600), vec![9000, 10_500]);
+    }
+
+    #[test]
+    fn a_callback_spends_a_bounded_budget_on_commands() {
+        let (mut tx, rx) = spsc::channel(8192);
+        let mut e = Engine::with_edits(SR, &[], Arc::new(Shared::new()), Some(rx));
+        for _ in 0..16 {
+            tx.push(Command::Edit(Edit::AddTrack(InstrumentKind::Kick))).unwrap();
+        }
+        for i in 0..5000u32 {
+            let edit = Edit::SetStep { track: 0, pattern: 0, step: (i % 16) as u8, value: step(60) };
+            tx.push(Command::Edit(edit)).unwrap();
+        }
+        let mut out = vec![0.0; 128];
+        e.process(&mut out);
+        // Eight track additions use up the budget; the rest wait, in order.
+        assert_eq!(e.track_count(), 8);
+        e.process(&mut out);
+        assert_eq!(e.track_count(), 16);
+        // Then plain edits, at most a budget's worth per callback.
+        e.process(&mut out);
+        e.process(&mut out);
+        assert!(e.commands.as_mut().unwrap().pop().is_none());
     }
 
     #[test]
@@ -1825,6 +1883,38 @@ mod tests {
             point(0, 6, 4000.0),
             point(2, 1, -12.0),
         ]
+    }
+
+    #[test]
+    fn the_strip_is_set_and_automated_like_any_parameter() {
+        let n = InstrumentKind::Kick.params().len();
+        let makeup = (n + strip::sp::COMP_MAKEUP) as u8;
+        let edits =
+            [Edit::AddTrack(InstrumentKind::Kick), Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) }];
+        let render = |extra: &[Edit]| {
+            let mut e = engine(&[&edits[..], extra].concat());
+            e.handle(Command::Play);
+            run(&mut e, 12_000)
+        };
+        let plain = render(&[]);
+        let loud = render(&[Edit::SetParam { track: 0, index: makeup, value: 6.0 }]);
+        // Makeup glides in (20 ms time constant) and lands exactly on its
+        // value after about 7500 frames; from then on the kick is exactly
+        // 6 dB louder. Buffers are interleaved stereo: frames 8000..12000.
+        let (a, b) = (&plain[16_000..24_000], &loud[16_000..24_000]);
+        let ratio = b.iter().zip(a).filter(|(_, x)| x.abs() > 1e-3).map(|(y, x)| y / x).fold(0.0f32, f32::max);
+        assert!((ratio - db_to_gain(6.0)).abs() < 1e-3, "{ratio}");
+
+        // A hold point on the makeup sets the strip from its step on, and
+        // stop returns it to the knob.
+        let mut e = engine(&edits);
+        e.apply(Edit::SetLane { track: 0, lane: 0, target: Some(2 + makeup), ramp: false });
+        e.apply(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 1, value: Some(12.0) });
+        e.handle(Command::Play);
+        run(&mut e, 6001);
+        assert_eq!(e.tracks[0].strip.param(strip::sp::COMP_MAKEUP), Some(12.0));
+        e.handle(Command::Stop);
+        assert_eq!(e.tracks[0].strip.param(strip::sp::COMP_MAKEUP), Some(0.0));
     }
 
     #[test]

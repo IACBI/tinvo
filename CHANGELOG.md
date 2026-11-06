@@ -6,16 +6,24 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-11-06
+## [0.7.0] - 2026-11-06
 
-### Fixed
-- Changing samples faster than the UI collected the released ones could overflow the queue that returns them, and the engine then leaked them on purpose. The UI now keeps at most as many samples in flight as that queue holds, so nothing is leaked; a sample change past that waits for the next screen frame.
-- The audio callback handles at most one queue's worth of commands per call, so a UI that keeps sending while the callback drains cannot stretch it.
+### Added
+- A channel strip on every track, between the instrument and the fader: high-pass (12 dB/octave), low shelf, mid bell and high shelf (±18 dB), a compressor (threshold, ratio, attack, release, makeup, 6 dB soft knee) and drive (antialiased `tanh` saturation). At its defaults the strip is bypassed bit-exactly and costs nothing.
+- `f` switches the parameter panel between the instrument and the strip. Strip parameters can be automated like any other.
+- Strip parameter changes glide over about 20 ms, so turning a knob or a hold point does not click.
+- The demo uses the strip: high-passed hats, snare and clap, a low shelf on the kick, a compressed and driven bass.
 
 ### Changed
+- Project files are now format 7, which adds the strip's `param` lines; only settings away from the neutral defaults are written. Formats 1–6 still load.
 - Export streams to disk: memory use no longer grows with the length of the export. A 17-minute song took 771 MB to export before and takes 7 MB now; the files are byte-for-byte the same. Stems are written the same way.
-- An export that fails part-way leaves no temporary file behind and does not touch an existing file of the same name.
-- Loading a sample reads the WAV header first and refuses a file that is too long before reading its audio, which is then mixed to mono a block at a time instead of being held twice in memory.
+- Exports and saves write to a uniquely named temporary file created with `create_new` (it never opens an existing file or link) and rename it over the target. A failed export leaves nothing behind and does not touch an existing file.
+- Loading a sample reads the WAV header first and refuses a file that is too long before reading its audio, which is then read in blocks of at most 64 KiB and mixed to mono as it goes.
+- The audio callback spends a fixed work budget on commands; adding or removing a track (which moves whole track slots, about 30 µs) counts as 512 simple edits. The rest wait, in order, for the next callback.
+- Samples that no track uses and no undo or redo step can bring back are freed.
+
+### Fixed
+- Changing samples faster than the UI collected the released ones could overflow the queue that returns them, and the engine then leaked them on purpose. The UI now counts every sample it has handed to the engine, including those of the project it opened with, and keeps at most as many in flight as that queue holds.
 
 ## [0.6.0] - 2026-11-06
 
@@ -92,8 +100,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.6.1
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/IACBI/tinvo/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/IACBI/tinvo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/IACBI/tinvo/compare/v0.3.0...v0.4.0

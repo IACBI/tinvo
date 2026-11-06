@@ -6,6 +6,9 @@
 //! changing the floating-point environment behind the compiler's back is not
 //! sound in Rust.
 
+pub mod biquad;
+pub mod drive;
+pub mod dynamics;
 pub mod env;
 pub mod fft;
 pub mod filter;

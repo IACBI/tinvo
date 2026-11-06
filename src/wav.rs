@@ -86,6 +86,9 @@ impl std::error::Error for WavError {}
 /// use does not depend on the length of the audio.
 pub struct Writer<W: Write + Seek> {
     out: W,
+    /// Stream position of the header, so the sizes can be patched in a
+    /// stream that did not start at zero.
+    start: u64,
     channels: u16,
     format: SampleFormat,
     rng: Rng,
@@ -113,14 +116,19 @@ impl<W: Write + Seek> Writer<W> {
         assert!(channels > 0, "channel count must be positive");
         let is_float = format == SampleFormat::Float32;
         let bytes_per_sample = u32::from(format.bits() / 8);
+        let block_align = u32::from(channels) * bytes_per_sample;
+        let Some(byte_rate) = sample_rate.checked_mul(block_align).filter(|_| block_align <= u32::from(u16::MAX))
+        else {
+            return Err(WavError::Unsupported(format!("{channels} channels at {sample_rate} Hz")));
+        };
+        let start = out.stream_position().map_err(io_error)?;
         let mut h = Vec::with_capacity(header_len(format) as usize);
         h.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
         h.extend_from_slice(&(if is_float { 18u32 } else { 16 }).to_le_bytes());
         h.extend_from_slice(&(if is_float { TAG_FLOAT } else { TAG_PCM }).to_le_bytes());
         h.extend_from_slice(&channels.to_le_bytes());
         h.extend_from_slice(&sample_rate.to_le_bytes());
-        let block_align = u32::from(channels) * bytes_per_sample;
-        h.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
+        h.extend_from_slice(&byte_rate.to_le_bytes());
         h.extend_from_slice(&(block_align as u16).to_le_bytes());
         h.extend_from_slice(&format.bits().to_le_bytes());
         if is_float {
@@ -133,6 +141,7 @@ impl<W: Write + Seek> Writer<W> {
         out.write_all(&h).map_err(io_error)?;
         Ok(Self {
             out,
+            start,
             channels,
             format,
             rng: Rng::new(dither_seed),
@@ -191,8 +200,9 @@ impl<W: Write + Seek> Writer<W> {
         }
         let riff_len = (header_len(self.format) - 8 + data_len + pad) as u32;
         let frames = self.frames() as u32;
+        let (start, end) = (self.start, self.out.stream_position().map_err(io_error)?);
         let mut patch = |at: u64, v: u32| -> Result<(), WavError> {
-            self.out.seek(SeekFrom::Start(at)).map_err(io_error)?;
+            self.out.seek(SeekFrom::Start(start + at)).map_err(io_error)?;
             self.out.write_all(&v.to_le_bytes()).map_err(io_error)
         };
         patch(4, riff_len)?;
@@ -200,7 +210,7 @@ impl<W: Write + Seek> Writer<W> {
             patch(46, frames)?;
         }
         patch(header_len(self.format) - 4, data_len as u32)?;
-        self.out.seek(SeekFrom::End(0)).map_err(io_error)?;
+        self.out.seek(SeekFrom::Start(end)).map_err(io_error)?;
         self.out.flush().map_err(io_error)?;
         Ok((self.out, self.stats))
     }
@@ -228,10 +238,10 @@ pub fn encode(
 /// The seed every file export uses, so exports are reproducible.
 const FILE_DITHER_SEED: u64 = 0x7153_0d1f;
 
-/// A WAV file being written. The audio goes to `<path>.tmp`, which
-/// [`FileWriter::finish`] renames over `path`; if the writer is dropped
-/// unfinished (an error, a cancelled export) the temporary file is removed
-/// and `path` is left untouched.
+/// A WAV file being written. The audio goes to a fresh temporary file next
+/// to `path` (see [`crate::fsutil`]), which [`FileWriter::finish`] renames
+/// over `path`; if the writer is dropped unfinished (an error, a cancelled
+/// export) the temporary file is removed and `path` is left untouched.
 pub struct FileWriter {
     inner: Option<Writer<BufWriter<File>>>,
     tmp: PathBuf,
@@ -240,10 +250,7 @@ pub struct FileWriter {
 
 impl FileWriter {
     pub fn create(path: &Path, channels: u16, sample_rate: u32, format: SampleFormat) -> Result<Self, String> {
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let file = File::create(&tmp).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (file, tmp) = crate::fsutil::create_temp_beside(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut w = Self { inner: None, tmp, path: path.to_path_buf() };
         let writer =
             Writer::new(BufWriter::with_capacity(1 << 16, file), channels, sample_rate, format, FILE_DITHER_SEED);
@@ -334,6 +341,9 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
     }
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    // Chunks are scanned to the physical end of the file rather than the
+    // size in the RIFF header: recorders that stream often leave that size
+    // at 0 or wrong, and every chunk is still bounded by the file.
     let mut pos = 12u64;
     let mut fmt: Option<(u16, u16, u32, u16, u16)> = None; // tag, ch, rate, align, bits
     let mut data: Option<(u64, u64)> = None;
@@ -391,14 +401,18 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
 /// Reads the `info.frames` frames of audio from `r`, a block at a time, and
 /// hands each block to `sink` as interleaved samples in `[-1, 1)`.
 pub fn read_samples<R: Read + Seek>(r: &mut R, info: &Info, mut sink: impl FnMut(&[f32])) -> Result<(), WavError> {
-    const BLOCK_FRAMES: usize = 4096;
+    // Blocks are sized in bytes, not frames: one frame may be up to 64 KiB
+    // (the block-align field's limit), and 4096 such frames are 256 MiB.
+    const BLOCK_BYTES: usize = 1 << 16;
     let (width, align) = (info.width(), info.block_align());
+    let block_frames = (BLOCK_BYTES / align).max(1) as u64;
+    let block_frames = block_frames.min(info.frames) as usize;
     r.seek(SeekFrom::Start(info.data_offset)).map_err(io_error)?;
-    let mut bytes = vec![0u8; BLOCK_FRAMES * align];
-    let mut out = Vec::with_capacity(BLOCK_FRAMES * usize::from(info.channels));
+    let mut bytes = vec![0u8; block_frames * align];
+    let mut out = Vec::with_capacity(block_frames * usize::from(info.channels));
     let mut left = info.frames;
     while left > 0 {
-        let n = left.min(BLOCK_FRAMES as u64) as usize;
+        let n = left.min(block_frames as u64) as usize;
         let b = &mut bytes[..n * align];
         r.read_exact(b).map_err(io_error)?;
         out.clear();
@@ -574,21 +588,37 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.wav");
         std::fs::write(&path, b"previous").unwrap();
-        let tmp = dir.join("out.wav.tmp");
+        let files = || std::fs::read_dir(&dir).unwrap().count();
         // Dropped unfinished: the old file stays and the temporary is gone.
         let mut w = FileWriter::create(&path, 1, 8000, SampleFormat::Pcm16).unwrap();
         w.write(&[0.5; 100]).unwrap();
-        assert!(tmp.exists());
+        assert_eq!(files(), 2);
         drop(w);
-        assert!(!tmp.exists());
+        assert_eq!(files(), 1);
         assert_eq!(std::fs::read(&path).unwrap(), b"previous");
         let mut w = FileWriter::create(&path, 1, 8000, SampleFormat::Float32).unwrap();
         w.write(&[0.5; 100]).unwrap();
         w.finish().unwrap();
-        assert!(!tmp.exists());
+        assert_eq!(files(), 1);
         let d = decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(d.samples, vec![0.5; 100]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writer_works_mid_stream_and_rejects_impossible_headers() {
+        let mut c = Cursor::new(b"prefix".to_vec());
+        c.seek(SeekFrom::End(0)).unwrap();
+        let mut w = Writer::new(c, 1, 8000, SampleFormat::Float32, 0).unwrap();
+        w.write(&[0.25; 3]).unwrap();
+        let (c, _) = w.finish().unwrap();
+        let bytes = c.into_inner();
+        assert_eq!(&bytes[..6], b"prefix");
+        assert_eq!(decode(&bytes[6..]).unwrap().samples, vec![0.25; 3]);
+        let too_wide = Writer::new(Cursor::new(Vec::new()), 30_000, 8000, SampleFormat::Pcm24, 0);
+        assert!(matches!(too_wide, Err(WavError::Unsupported(_))));
+        let too_fast = Writer::new(Cursor::new(Vec::new()), 2, u32::MAX, SampleFormat::Float32, 0);
+        assert!(matches!(too_fast, Err(WavError::Unsupported(_))));
     }
 
     #[test]
@@ -601,6 +631,43 @@ mod tests {
         let mut big = b.clone();
         big[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(read_info(&mut Cursor::new(&big)), Err(WavError::Malformed("chunk extends past end of file")));
+    }
+
+    #[test]
+    fn many_channels_read_in_small_blocks() {
+        // 65535 channels of 64-bit float: one frame is 512 KiB.
+        let ch = u16::MAX;
+        let align = usize::from(ch) * 8;
+        let mut b = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&TAG_FLOAT.to_le_bytes());
+        b.extend_from_slice(&ch.to_le_bytes());
+        b.extend_from_slice(&8000u32.to_le_bytes());
+        b.extend_from_slice(&(8000 * align as u32).to_le_bytes());
+        b.extend_from_slice(&(align as u16).to_le_bytes()); // truncated: inconsistent
+        b.extend_from_slice(&64u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(align as u32).to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, align));
+        // A 16-bit block-align field cannot describe this frame, so it is refused.
+        assert_eq!(read_info(&mut Cursor::new(&b)), Err(WavError::Malformed("inconsistent block alignment")));
+        // The largest consistent frame (8191 channels of 8 bytes) still reads;
+        // the data chunk holds 8 of them.
+        let ch = 8191u16;
+        let align = usize::from(ch) * 8;
+        b[22..24].copy_from_slice(&ch.to_le_bytes());
+        b[32..34].copy_from_slice(&(align as u16).to_le_bytes());
+        let info = read_info(&mut Cursor::new(&b)).unwrap();
+        assert_eq!((info.channels, info.frames), (ch, 8));
+        let (mut got, mut calls) = (0, 0);
+        read_samples(&mut Cursor::new(&b), &info, |s| {
+            got += s.len();
+            calls += 1;
+        })
+        .unwrap();
+        assert_eq!(got, 8 * usize::from(ch));
+        // One 64 KiB block holds a single such frame.
+        assert_eq!(calls, 8);
     }
 
     #[test]

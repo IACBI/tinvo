@@ -55,7 +55,7 @@ Known limits, planned for later phases:
 - Copy, paste and clear a pattern, each one undo step.
 - Project format 5; formats 1–4 load into pattern A.
 
-## Phase 3b: Automation ✅ (0.6.0, this release)
+## Phase 3b: Automation ✅ (0.6.0)
 
 - Up to 4 automation lanes per track, for volume, pan or any instrument parameter, with points per pattern and step.
 - Hold lanes change value exactly at the step's frame, before that step's notes start. Ramp lanes glide in the parameter's own scale and are evaluated every 32 frames on the absolute sample clock, so a render is identical at any buffer size.
@@ -67,11 +67,23 @@ Known limits, planned for later phases:
 - Song-position markers and export ranges between them.
 - Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
 
-## Phase 4: Mixing and effects
+## Phase 4a: Channel strip ✅ (0.7.0, this release)
 
-- Per-track insert chain: parametric EQ (RBJ biquads), compressor, saturation, delay, algorithmic reverb, chorus.
-- Send/return buses, sidechain input for compressors.
+- Every track: high-pass, low shelf, mid bell, high shelf (RBJ cookbook biquads in `f64`), a feed-forward compressor with a soft knee, and `tanh` drive with first-order antiderivative antialiasing (measured on a driven 4.5 kHz sine: folded-back energy −34 dB against −25 dB for a plain `tanh`).
+- Parameters glide over about 20 ms on a 32-frame tick kept in the strip's state, so output does not depend on buffer size; neutral settings bypass the strip bit-exactly.
+- Strip parameters share the panel (`f` switches pages) and the automation lanes with the instrument's.
+- Project format 7.
+
+Known limits:
+- There is no gain-reduction meter yet.
+- Switching the high-pass off (down to 20 Hz) or drive off (to 0 dB) takes the stage out of the chain at once; at those settings the stage is nearly transparent, but not exactly.
+
+## Phase 4b: Effects and buses
+
+- Send/return buses with delay (tempo-synced), algorithmic reverb and chorus.
+- Sidechain input for the compressor.
 - Master chain: true-peak limiter, LUFS loudness metering (ITU-R BS.1770), oversampled processing where it reduces aliasing.
+- Gain-reduction and output meters for the strip.
 
 ## Phase 5: Devices and I/O
 

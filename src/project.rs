@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 5
+//! tinvo 7
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -18,6 +18,7 @@
 //! mute false
 //! solo false
 //! param decay 0.45
+//! param eq_mid_gain -3       # channel strip; only values off their default
 //! lane 0 decay ramp          # lane, parameter id (or volume, pan), hold or ramp
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! point 0 0 0.2              # lane step value
@@ -32,8 +33,8 @@
 //! (`4,7` is a major triad). A sampler track may have a `sample <path>`
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
-//! samples), 4 (one pattern, `pattern_length <n>`) and 5 (no automation)
-//! are still read.
+//! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
+//! 6 (no channel strip) are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
@@ -42,10 +43,11 @@ use crate::engine::{
     MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::strip::{sp, track_param, track_param_count};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -58,7 +60,7 @@ pub use crate::engine::{PAN, VOLUME};
 pub struct TrackData {
     pub name: String,
     pub kind: InstrumentKind,
-    /// One value per entry in `kind.params()`.
+    /// One value per [`track_param`]: the instrument's, then the strip's.
     pub params: Vec<f32>,
     pub gain_db: f32,
     pub pan: f32,
@@ -112,7 +114,7 @@ impl TrackData {
         Self {
             name: kind.label().to_string(),
             kind,
-            params: kind.params().iter().map(|p| p.default).collect(),
+            params: (0..track_param_count(kind)).filter_map(|i| track_param(kind, i)).map(|p| p.default).collect(),
             gain_db: 0.0,
             pan: 0.0,
             mute: false,
@@ -269,6 +271,29 @@ impl Project {
         *lane = LaneData::new(Some(7), true);
         lane.points[1][0] = Some(380.0);
         lane.points[1][15] = Some(2400.0);
+        // Channel strips: cut the lows under the hats, snare and clap, round
+        // out the kick, and compress and drive the bass.
+        let mut strip = |t: usize, settings: &[(usize, f32)]| {
+            let n = p.tracks[t].kind.params().len();
+            for &(i, v) in settings {
+                p.tracks[t].params[n + i] = v;
+            }
+        };
+        strip(0, &[(sp::LOW_FREQ, 70.0), (sp::LOW_GAIN, 3.0)]);
+        strip(1, &[(sp::HP_FREQ, 120.0)]);
+        strip(2, &[(sp::HP_FREQ, 600.0)]);
+        strip(3, &[(sp::HP_FREQ, 500.0)]);
+        strip(4, &[(sp::HP_FREQ, 250.0)]);
+        strip(
+            b,
+            &[
+                (sp::COMP_THRESHOLD, -20.0),
+                (sp::COMP_RATIO, 3.0),
+                (sp::COMP_ATTACK, 0.005),
+                (sp::COMP_MAKEUP, 3.0),
+                (sp::DRIVE, 4.0),
+            ],
+        );
         p.song = vec![0, 0, 0, 1];
         p
     }
@@ -378,7 +403,7 @@ impl Project {
             }
             Edit::SetParam { track, index, value } => {
                 let tr = self.track_mut(track)?;
-                let spec = tr.kind.params().get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                let spec = track_param(tr.kind, usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
                 let value = spec.clamp(value);
                 tr.params[usize::from(index)] = value;
                 Edit::SetParam { track, index, value }
@@ -595,8 +620,13 @@ impl Project {
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
             let _ = writeln!(s, "solo {}", t.solo);
-            for (spec, v) in t.kind.params().iter().zip(&t.params) {
-                let _ = writeln!(s, "param {} {}", spec.id, v);
+            let n = t.kind.params().len();
+            for (i, v) in t.params.iter().enumerate() {
+                let spec = track_param(t.kind, i).expect("one value per parameter");
+                // The strip is neutral by default; only settings are written.
+                if i < n || *v != spec.default {
+                    let _ = writeln!(s, "param {} {}", spec.id, v);
+                }
             }
             for (k, l) in t.lanes.iter().enumerate() {
                 if let Some(spec) = l.target.and_then(|x| target_spec(t.kind, x)) {
@@ -695,7 +725,7 @@ impl Project {
                         if k >= MAX_LANES {
                             return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
                         }
-                        let target = (0..2 + t.kind.params().len() as u8)
+                        let target = (0..2 + track_param_count(t.kind) as u8)
                             .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
                         let ramp = match mode {
@@ -727,12 +757,13 @@ impl Project {
                         let (id, value) = rest
                             .split_once(char::is_whitespace)
                             .ok_or_else(|| err("expected 'param <id> <value>'".into()))?;
-                        let specs = t.kind.params();
-                        let i = specs
-                            .iter()
-                            .position(|s| s.id == id)
+                        // Strip parameters exist from format 7 on.
+                        let count = if ver >= 7 { track_param_count(t.kind) } else { t.kind.params().len() };
+                        let (i, spec) = (0..count)
+                            .filter_map(|i| track_param(t.kind, i).map(|s| (i, s)))
+                            .find(|(_, s)| s.id == id)
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
-                        t.params[i] = parse_in(value.trim(), &specs[i]).map_err(err)?;
+                        t.params[i] = parse_in(value.trim(), spec).map_err(err)?;
                     }
                     "step" => {
                         let f: Vec<&str> = rest.split_whitespace().collect();
@@ -846,10 +877,7 @@ impl Project {
     /// Saves atomically: writes a temporary file, then renames it over the
     /// target so a crash can never leave a half-written project.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        std::fs::write(&tmp, self.to_text_in(project_dir(path).as_deref()))?;
-        std::fs::rename(&tmp, path)
+        crate::fsutil::write_atomic(path, self.to_text_in(project_dir(path).as_deref()).as_bytes())
     }
 
     /// Loads every track's sample file. Returns one entry per track (`None`
@@ -1009,7 +1037,7 @@ mod tests {
         p.song = vec![0, 15, 2, 2, 1];
         p.loop_region = Some((1, 3));
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 6\n"));
+        assert!(text.starts_with("tinvo 7\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
         assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
@@ -1018,6 +1046,25 @@ mod tests {
         // A project without a song or loop writes neither line.
         let plain = Project::new().to_text();
         assert!(!plain.contains("song") && !plain.contains("loop") && !plain.contains("pattern"), "{plain}");
+    }
+
+    #[test]
+    fn strip_settings_round_trip_and_only_settings_are_written() {
+        let p = Project::demo();
+        let text = p.to_text();
+        assert!(text.contains("param hp_freq 600\n") && text.contains("param drive 4\n"), "{text}");
+        // Neutral strip parameters are not written: one drive line (the bass).
+        assert_eq!(text.matches("param drive ").count(), 1);
+        assert_eq!(text.matches("param eq_mid_gain ").count(), 0);
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        let mut q = p.clone();
+        let n = q.tracks[0].kind.params().len();
+        q.apply(Edit::SetParam { track: 0, index: (n + sp::MID_GAIN) as u8, value: 99.0 }).unwrap();
+        assert_eq!(q.tracks[0].params[n + sp::MID_GAIN], 18.0);
+        assert_eq!(
+            q.apply(Edit::SetParam { track: 0, index: (n + sp::COUNT) as u8, value: 0.0 }),
+            Err(EditError::NoSuchParam((n + sp::COUNT) as u8))
+        );
     }
 
     #[test]
@@ -1081,8 +1128,10 @@ mod tests {
         let mut p = Project::demo();
         let lane = |lane, target| Edit::SetLane { track: 0, lane, target, ramp: false };
         assert_eq!(p.apply(lane(4, Some(0))), Err(EditError::NoSuchLane(4)));
-        // The kick has 4 parameters: panel indices 0..6.
-        assert_eq!(p.apply(lane(0, Some(6))), Err(EditError::NoSuchTarget(6)));
+        // The kick has 4 instrument and 14 strip parameters: indices 0..20,
+        // so 6 is the strip's first.
+        assert_eq!(p.apply(lane(0, Some(20))), Err(EditError::NoSuchTarget(20)));
+        assert_eq!(target_spec(p.tracks[0].kind, 6).map(|s| s.id), Some("hp_freq"));
         p.apply(lane(0, Some(3))).unwrap();
         assert_eq!(p.apply(lane(1, Some(3))), Err(EditError::DuplicateLane));
         assert_eq!(p.inverse(&lane(1, Some(3))), Err(EditError::DuplicateLane));
@@ -1296,7 +1345,8 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 7", 1, "version"),
+            ("tinvo 8", 1, "version"),
+            ("tinvo 6\ntrack kick\nparam eq_mid_gain 3\nend", 3, "unknown parameter"),
             ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),
             ("tinvo 6\ntrack kick\nlane 0 cutoff hold\nend", 3, "unknown parameter 'cutoff'"),
             ("tinvo 6\ntrack kick\nlane 4 decay hold\nend", 3, "out of range"),

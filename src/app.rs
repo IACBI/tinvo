@@ -17,6 +17,7 @@ use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
+use crate::strip::{self, track_param};
 use crate::tui::{Color, Event, Key, Screen, Style, Terminal};
 use crate::wav::{self, SampleFormat};
 use std::collections::HashMap;
@@ -71,8 +72,11 @@ impl EngineLink {
     }
 
     /// Takes over the receiving end of the engine's retirement queue.
-    pub fn with_retirement(mut self, retired: Consumer<Arc<Sample>>) -> Self {
+    /// `held` is the number of samples the engine was given before this
+    /// link existed; they come back through the queue like any other.
+    pub fn with_retirement(mut self, retired: Consumer<Arc<Sample>>, held: usize) -> Self {
         self.retired = Some(retired);
+        self.in_flight = held;
         self
     }
 
@@ -256,6 +260,8 @@ pub struct App {
     pub auto_view: bool,
     /// Lane under the cursor in the automation view.
     pub lane: usize,
+    /// The parameter panel shows the channel strip instead of the instrument.
+    pub strip_page: bool,
     pub export_format: SampleFormat,
     pub export_loops: u32,
     /// What export plays; `Pattern` means the pattern being edited.
@@ -315,6 +321,7 @@ impl App {
             song_cursor: 0,
             auto_view: false,
             lane: 0,
+            strip_page: false,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
             export_source: Source::Auto,
@@ -429,6 +436,24 @@ impl App {
         if self.undo.len() > HISTORY_LIMIT {
             self.undo.pop_front();
         }
+        self.prune_bank();
+    }
+
+    /// Drops loaded samples nothing can bring back: no track uses them and
+    /// no step of the undo or redo history refers to them.
+    fn prune_bank(&mut self) {
+        let Self { bank, project, undo, redo, .. } = self;
+        if bank.is_empty() {
+            return;
+        }
+        let history = undo.iter().chain(redo.iter()).flat_map(|c| c.meta_before.iter().chain(&c.meta_after));
+        let used: std::collections::HashSet<&str> = project
+            .tracks
+            .iter()
+            .filter_map(|t| t.sample.as_deref())
+            .chain(history.filter_map(|m| m.sample.as_deref()))
+            .collect();
+        bank.retain(|path, _| used.contains(path.as_str()));
     }
 
     /// Applies an edit to the project and mirrors it to the engine, without
@@ -714,19 +739,28 @@ impl App {
         self.step = self.step.min(self.pattern_len() - 1);
         self.song_cursor = self.song_cursor.min(self.project.song.len().saturating_sub(1));
         self.lane = self.lane.min(MAX_LANES - 1);
-        self.param = self.param.min(self.param_count().saturating_sub(1));
+        let page = self.page_params();
+        if !page.contains(&self.param) {
+            self.param = if self.param < 2 { self.param } else { page.get(2).copied().unwrap_or(0) };
+        }
     }
 
-    /// Mixer parameters (volume, pan) followed by the instrument's.
-    fn param_count(&self) -> usize {
-        self.project.tracks.get(self.track).map_or(0, |t| 2 + t.kind.params().len())
+    /// The parameters on the panel's current page: volume and pan, then
+    /// the instrument's or the strip's. Parameter indices run over volume,
+    /// pan, the instrument's and the strip's, and are also automation
+    /// targets.
+    fn page_params(&self) -> Vec<usize> {
+        let Some(t) = self.project.tracks.get(self.track) else { return Vec::new() };
+        let n = t.kind.params().len();
+        let rest = if self.strip_page { 2 + n..2 + n + strip::sp::COUNT } else { 2..2 + n };
+        [0, 1].into_iter().chain(rest).collect()
     }
 
     fn param_spec(&self, i: usize) -> &'static ParamSpec {
         match i {
             0 => &VOLUME,
             1 => &PAN,
-            _ => &self.project.tracks[self.track].kind.params()[i - 2],
+            _ => track_param(self.project.tracks[self.track].kind, i - 2).expect("parameter index in range"),
         }
     }
 
@@ -865,6 +899,17 @@ impl App {
                 self.focus = if self.focus == Focus::Grid { Focus::Params } else { Focus::Grid };
             }
             Key::Char('?') | Key::F(1) => self.mode = Mode::Help,
+            Key::Char('f') => {
+                self.strip_page = !self.strip_page;
+                if self.param >= 2 {
+                    self.param = self.page_params().get(2).copied().unwrap_or(0);
+                }
+                self.set_status(if self.strip_page {
+                    "Channel strip: high-pass, EQ, compressor, drive (f: instrument)"
+                } else {
+                    "Instrument parameters (f: channel strip)"
+                });
+            }
             Key::Char('q') | Key::Ctrl('c') | Key::Ctrl('q') => {
                 if self.dirty {
                     self.mode = Mode::Confirm(Confirm::Quit);
@@ -1231,11 +1276,12 @@ impl App {
     }
 
     fn key_params(&mut self, key: Key) {
-        let n = self.param_count();
         let i = self.param;
+        let page = self.page_params();
+        let at = page.iter().position(|&p| p == i).unwrap_or(0);
         match key {
-            Key::Up => self.param = i.saturating_sub(1),
-            Key::Down => self.param = (i + 1).min(n.saturating_sub(1)),
+            Key::Up => self.param = page[at.saturating_sub(1)],
+            Key::Down => self.param = page[(at + 1).min(page.len() - 1)],
             Key::Left | Key::Right | Key::PageUp | Key::PageDown => {
                 let dir = if matches!(key, Key::Left | Key::PageDown) { -1 } else { 1 };
                 let coarse = matches!(key, Key::PageUp | Key::PageDown);
@@ -1649,21 +1695,22 @@ impl App {
 
     fn params_rows(&self, w: u16) -> u16 {
         let cols = (w / PARAM_COL).max(1) as usize;
-        (self.param_count().div_ceil(cols)) as u16 + 1
+        (self.page_params().len().div_ceil(cols)) as u16 + 1
     }
 
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
         let dim = Style::fg(Color::Gray);
         s.fill(0, y, w, '─', dim);
         let Some(t) = self.project.tracks.get(self.track) else { return };
+        let page = if self.strip_page { " · channel strip" } else { "" };
         let title = match (&t.sample, t.kind) {
             (Some(path), _) => {
                 let file = Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
                 let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
-                format!(" {} · {} · {file}{missing} ", t.name, t.kind.label())
+                format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
             }
-            (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o ", t.name),
-            (None, kind) => format!(" {} · {} ", t.name, kind.label()),
+            (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o{page} ", t.name),
+            (None, kind) => format!(" {} · {}{page} ", t.name, kind.label()),
         };
         let title_style =
             if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
@@ -1674,8 +1721,8 @@ impl App {
         };
         s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
         let cols = (w / PARAM_COL).max(1) as usize;
-        for i in 0..self.param_count() {
-            let (row, col) = (i / cols, i % cols);
+        for (slot, i) in self.page_params().into_iter().enumerate() {
+            let (row, col) = (slot / cols, slot % cols);
             let x = col as u16 * PARAM_COL + 1;
             let yy = y + 1 + row as u16;
             let spec = self.param_spec(i);
@@ -1739,7 +1786,7 @@ impl App {
                                 "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  - = chance  / ratchet  u undo  Space play  ? help"
                             }
                             Focus::Params => {
-                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  A automate  m mute  s solo  u undo  Tab grid  ? help"
+                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  f strip  A automate  m mute  s solo  Tab grid  ? help"
                             }
                         },
                         Style::fg(Color::Gray).on(Color::Black),
@@ -1782,6 +1829,7 @@ fn draw_help(s: &mut Screen) {
         ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
+        ("f", "parameter panel: instrument or channel strip (high-pass, EQ, compressor, drive)"),
         ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
         ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
         ("w  Ctrl+S", "save (W: save as)"),
@@ -1861,6 +1909,7 @@ pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result
     let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
     let edits = project.to_edits();
     let samples = samples.to_vec();
+    let held = samples.iter().flatten().count();
     let cb_shared = shared.clone();
     let stream = audio::open(move |sample_rate| {
         let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
@@ -1871,7 +1920,7 @@ pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result
         EngineCallback { engine, shared: cb_shared, sample_rate: sample_rate as f32, load: 0.0 }
     })?;
     let sr = stream.info().sample_rate;
-    Ok((stream, EngineLink::new(tx, shared).with_retirement(retire_rx), sr))
+    Ok((stream, EngineLink::new(tx, shared).with_retirement(retire_rx, held), sr))
 }
 
 /// Runs the interactive session until the user quits.
@@ -2035,11 +2084,50 @@ mod tests {
         assert!((a.project.tracks[0].params[1] - 0.45 * 1.1).abs() < 1e-5);
         keys(&mut a, &[Key::Char('0')]);
         assert_eq!(a.project.tracks[0].params[1], 0.45);
-        // Cannot move past the last parameter.
+        // Cannot move past the last parameter of the page.
         for _ in 0..20 {
             a.handle_key(Key::Down);
         }
-        assert_eq!(a.param, a.param_count() - 1);
+        let n = a.project.tracks[0].kind.params().len();
+        assert_eq!(a.param, 2 + n - 1);
+    }
+
+    #[test]
+    fn the_channel_strip_page() {
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a =
+            App::new(Project::demo(), None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "t".into());
+        let kind = a.project.tracks[0].kind;
+        let n = kind.params().len();
+        keys(&mut a, &[Key::Tab, Key::Down, Key::Down, Key::Char('f')]);
+        assert!(a.strip_page);
+        // The page starts at the strip's first parameter, after volume and pan.
+        assert_eq!(a.param, 2 + n);
+        assert_eq!(a.param_spec(a.param).id, "hp_freq");
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("channel strip") && text.contains("Mid gain") && !text.contains("Decay"), "{text}");
+        while rx.pop().is_some() {}
+        // Mid gain is strip parameter 4.
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Right]);
+        let index = n + strip::sp::MID_GAIN;
+        assert_eq!(a.project.tracks[0].params[index], 0.5);
+        let mut got = None;
+        while let Some(cmd) = rx.pop() {
+            if let Command::Edit(e) = cmd {
+                got = Some(e);
+            }
+        }
+        assert_eq!(got, Some(Edit::SetParam { track: 0, index: index as u8, value: 0.5 }));
+        // Strip parameters can be automated like any other.
+        keys(&mut a, &[Key::Char('A')]);
+        assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == Some(2 + index as u8)).count(), 1);
+        // Back to the instrument page; the cursor follows.
+        keys(&mut a, &[Key::Tab, Key::Char('f')]);
+        assert!(!a.strip_page && a.param == 2);
+        keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
+        assert_eq!(a.project.tracks[0].params[index], 0.0);
     }
 
     #[test]
@@ -2268,9 +2356,16 @@ mod tests {
         let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
         let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
         let shared = Arc::new(Shared::new());
-        let mut e = Engine::with_edits(48_000.0, &[Edit::AddTrack(InstrumentKind::Sampler)], shared.clone(), Some(rx));
+        let tracks = [Edit::AddTrack(InstrumentKind::Sampler); MAX_TRACKS];
+        let mut e = Engine::with_edits(48_000.0, &tracks, shared.clone(), Some(rx));
         e.attach_retirement(retire_tx);
-        let mut link = EngineLink::new(tx, shared).with_retirement(retire_rx);
+        // Every track starts with a sample, as after opening a project.
+        for t in 0..MAX_TRACKS {
+            e.set_sample(t, Some(s.clone()));
+        }
+        let mut link = EngineLink::new(tx, shared).with_retirement(retire_rx, MAX_TRACKS);
+        // The samples held so far count as in flight.
+        assert_eq!(link.in_flight, Arc::strong_count(&s) - 1);
         let mut out = vec![0.0f32; 128];
         // Far more sample changes than the queue holds, between two callbacks.
         for round in 0..10 {
@@ -2286,9 +2381,49 @@ mod tests {
         }
         e.process(&mut out);
         link.flush();
-        // Ours plus the one the track holds: nothing was leaked.
-        assert_eq!(Arc::strong_count(&s), 2);
-        assert_eq!(link.in_flight, 1);
+        // Ours plus the ones the tracks hold: nothing was leaked, and the
+        // count matches what is really outside the UI.
+        assert_eq!(Arc::strong_count(&s), 1 + MAX_TRACKS);
+        assert_eq!(link.in_flight, MAX_TRACKS);
+        // Removing every track returns all of them (over two callbacks: track
+        // removals are expensive, so one callback takes at most eight).
+        for _ in 0..MAX_TRACKS {
+            link.send(Command::Edit(Edit::RemoveTrack(0)));
+        }
+        for _ in 0..2 {
+            e.process(&mut out);
+            link.flush();
+        }
+        assert_eq!((Arc::strong_count(&s), link.in_flight), (1, 0));
+    }
+
+    #[test]
+    fn samples_nothing_can_bring_back_are_freed() {
+        let dir = std::env::temp_dir().join(format!("tinvo-bank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone: Vec<f32> = (0..480).map(|i| (i as f32 * 0.06).sin() * 0.5).collect();
+        let (a_path, b_path) = (dir.join("a.wav"), dir.join("b.wav"));
+        wav::write_file(&a_path, &tone, 1, 48_000, SampleFormat::Float32).unwrap();
+        wav::write_file(&b_path, &tone, 1, 44_100, SampleFormat::Float32).unwrap();
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('7')]);
+        for path in [&a_path, &b_path] {
+            a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+            keys(&mut a, &[Key::Enter]);
+        }
+        // A is gone from the track but undo can still bring it back.
+        assert_eq!(a.bank.len(), 2);
+        keys(&mut a, &[Key::Char('u')]);
+        assert!(a.project.tracks[0].sample.as_deref().unwrap().ends_with("a.wav"));
+        keys(&mut a, &[Key::Char('U')]);
+        // Once the history no longer reaches the load of A, it is freed.
+        for _ in 0..HISTORY_LIMIT {
+            keys(&mut a, &[Key::Enter]);
+        }
+        assert_eq!(a.bank.len(), 1);
+        assert!(a.bank.keys().all(|k| k.ends_with("b.wav")));
+        assert!(a.track_samples()[0].is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
