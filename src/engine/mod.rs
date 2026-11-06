@@ -1,7 +1,9 @@
 //! The real-time audio engine.
 //!
 //! The engine owns a fixed number of track slots, each holding an instrument,
-//! a step pattern and a channel strip. It is driven by [`Command`]s that
+//! its steps in every pattern and a channel strip. It plays either one
+//! pattern on repeat (switching to a cued pattern at the end of the current
+//! one) or the song: a chain of patterns with an optional loop region. It is driven by [`Command`]s that
 //! arrive through a wait-free queue and it publishes meters and the playhead
 //! through atomics in [`Shared`].
 //!
@@ -24,6 +26,12 @@ use transport::Transport;
 
 pub const MAX_TRACKS: usize = 16;
 pub const MAX_STEPS: usize = 64;
+/// Patterns per project, named A to P.
+pub const MAX_PATTERNS: usize = 16;
+/// Entries in the song chain.
+pub const MAX_SONG: usize = 256;
+/// Length of a new pattern.
+pub const DEFAULT_PATTERN_LEN: u8 = 16;
 /// Internal processing block. Events inside a block are still sample-accurate.
 pub const BLOCK: usize = 64;
 pub const MIN_TEMPO: f32 = 20.0;
@@ -177,7 +185,10 @@ impl Step {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Edit {
     SetTempo(f32),
-    SetPatternLength(u8),
+    SetPatternLength {
+        pattern: u8,
+        len: u8,
+    },
     SetMasterGain(f32),
     /// Swing in percent (`MIN_SWING..=MAX_SWING`).
     SetSwing(f32),
@@ -190,9 +201,25 @@ pub enum Edit {
     RemoveTrack(u8),
     SetStep {
         track: u8,
+        pattern: u8,
         step: u8,
         value: Option<Step>,
     },
+    /// Inserts `pattern` into the song before entry `index` (at most the
+    /// current song length).
+    InsertSongEntry {
+        index: u16,
+        pattern: u8,
+    },
+    RemoveSongEntry(u16),
+    SetSongEntry {
+        index: u16,
+        pattern: u8,
+    },
+    /// Song entries `start..=end` repeat while the song plays. A region that
+    /// reaches past the end of the song is ignored until the song is long
+    /// enough again.
+    SetLoop(Option<(u16, u16)>),
     SetParam {
         track: u8,
         index: u8,
@@ -220,8 +247,18 @@ pub enum Edit {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Edit(Edit),
-    /// Start playback from the first step.
+    /// Start playing the cued pattern on repeat, from its first step.
     Play,
+    /// Start playing the song from `entry` (the cued pattern if the song is
+    /// empty).
+    PlaySong {
+        entry: u16,
+    },
+    /// The pattern `Play` starts with. While a pattern plays, the cued one
+    /// takes over when the current one ends; a cue that arrives during the
+    /// last step of a pattern takes effect one pattern later, because the
+    /// next step's early hits are already queued by then.
+    Cue(u8),
     /// Stop playback and release all notes.
     Stop,
     /// Play a step's notes (ignoring its timing options) for `frames` samples.
@@ -253,12 +290,37 @@ fn retire(queue: &mut Option<Producer<Arc<Sample>>>, sample: Option<Arc<Sample>>
     }
 }
 
+/// Where playback is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayPosition {
+    /// The song entry, when the song is playing.
+    pub entry: Option<u16>,
+    pub pattern: u8,
+    pub step: u8,
+}
+
+impl PlayPosition {
+    /// One word, so the UI never sees a half-updated position.
+    fn pack(self) -> u32 {
+        let entry = self.entry.map_or(0, |e| u32::from(e) + 1);
+        entry << 16 | u32::from(self.pattern) << 8 | u32::from(self.step)
+    }
+
+    fn unpack(v: u32) -> Option<Self> {
+        (v != u32::MAX).then(|| Self {
+            entry: (v >> 16).checked_sub(1).map(|e| e as u16),
+            pattern: (v >> 8) as u8,
+            step: v as u8,
+        })
+    }
+}
+
 /// State published by the audio thread for the UI.
 #[derive(Debug)]
 pub struct Shared {
     pub playing: AtomicBool,
-    /// Current pattern step, or `u32::MAX` when stopped.
-    pub step: AtomicU32,
+    /// Packed [`PlayPosition`], or `u32::MAX` when stopped.
+    position: AtomicU32,
     /// Post-fader peak per track since the UI last took it.
     pub track_peaks: [AtomicF32; MAX_TRACKS],
     pub master_peaks: [AtomicF32; 2],
@@ -276,11 +338,18 @@ impl Shared {
     pub fn new() -> Self {
         Self {
             playing: AtomicBool::new(false),
-            step: AtomicU32::new(u32::MAX),
+            position: AtomicU32::new(u32::MAX),
             track_peaks: std::array::from_fn(|_| AtomicF32::new(0.0)),
             master_peaks: [AtomicF32::new(0.0), AtomicF32::new(0.0)],
             load: AtomicF32::new(0.0),
         }
+    }
+}
+
+impl Shared {
+    /// The step playing now, or `None` when stopped.
+    pub fn position(&self) -> Option<PlayPosition> {
+        PlayPosition::unpack(self.position.load(Ordering::Relaxed))
     }
 }
 
@@ -310,7 +379,7 @@ const MAX_PENDING_ONS: usize = 4 * MAX_RATCHET as usize;
 
 struct Track {
     instrument: Instrument,
-    steps: [Option<Step>; MAX_STEPS],
+    steps: [[Option<Step>; MAX_STEPS]; MAX_PATTERNS],
     gain_db: f32,
     pan: f32,
     mute: bool,
@@ -328,7 +397,7 @@ impl Track {
     fn new(kind: InstrumentKind, sample_rate: f32) -> Self {
         Self {
             instrument: Instrument::new(kind, sample_rate),
-            steps: [None; MAX_STEPS],
+            steps: [[None; MAX_STEPS]; MAX_PATTERNS],
             gain_db: 0.0,
             pan: 0.0,
             mute: false,
@@ -419,6 +488,12 @@ impl Track {
     }
 }
 
+/// A loop region in canonical order, or `None` if it cannot exist.
+pub fn loop_region((a, b): (u16, u16)) -> Option<(u16, u16)> {
+    let (a, b) = (a.min(b), a.max(b));
+    (usize::from(b) < MAX_SONG).then_some((a, b))
+}
+
 /// A closed hi-hat cuts off any ringing open hi-hat, as on classic machines.
 fn choke_open_hats(tracks: &mut [Track]) {
     for t in tracks {
@@ -434,8 +509,16 @@ pub struct Engine {
     now: u64,
     transport: Transport,
     tempo: f32,
-    pattern_len: u8,
-    current_step: Option<u8>,
+    pattern_lens: [u8; MAX_PATTERNS],
+    song: [u8; MAX_SONG],
+    song_len: usize,
+    loop_region: Option<(u16, u16)>,
+    /// Pattern that `Play` starts with and that follows the current one.
+    cue: u8,
+    song_mode: bool,
+    /// The step the next transport step plays.
+    next_pos: PlayPosition,
+    current: Option<PlayPosition>,
     tracks: Box<[Track]>,
     track_count: usize,
     master: Smoother,
@@ -467,8 +550,14 @@ impl Engine {
             now: 0,
             transport: Transport::new(120.0, sample_rate),
             tempo: 120.0,
-            pattern_len: 16,
-            current_step: None,
+            pattern_lens: [DEFAULT_PATTERN_LEN; MAX_PATTERNS],
+            song: [0; MAX_SONG],
+            song_len: 0,
+            loop_region: None,
+            cue: 0,
+            song_mode: false,
+            next_pos: PlayPosition { entry: None, pattern: 0, step: 0 },
+            current: None,
             tracks: tracks.into_boxed_slice(),
             track_count: 0,
             master: Smoother::new(1.0, SMOOTHING_TIME, sample_rate),
@@ -540,16 +629,12 @@ impl Engine {
     pub fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Edit(e) => self.apply(e),
-            Command::Play => {
-                if !self.transport.is_playing() {
-                    self.rng = Rng::new(CHANCE_SEED);
-                    self.early_queued = None;
-                    self.transport.start(self.now);
-                }
-            }
+            Command::Play => self.start(None),
+            Command::PlaySong { entry } => self.start(Some(entry)),
+            Command::Cue(p) => self.cue = p.min(MAX_PATTERNS as u8 - 1),
             Command::Stop => {
                 self.transport.stop();
-                self.current_step = None;
+                self.current = None;
                 for t in &mut self.tracks[..self.track_count] {
                     t.release_all();
                 }
@@ -568,6 +653,55 @@ impl Engine {
         }
     }
 
+    /// Starts the pattern loop (`None`) or the song at an entry. Ignored
+    /// while already playing.
+    fn start(&mut self, entry: Option<u16>) {
+        if self.transport.is_playing() {
+            return;
+        }
+        self.song_mode = entry.is_some() && self.song_len > 0;
+        let entry = entry.map_or(0, |e| usize::from(e).min(self.song_len.saturating_sub(1)));
+        self.next_pos = if self.song_mode {
+            PlayPosition { entry: Some(entry as u16), pattern: self.song[entry], step: 0 }
+        } else {
+            PlayPosition { entry: None, pattern: self.cue, step: 0 }
+        };
+        self.rng = Rng::new(CHANCE_SEED);
+        self.early_queued = None;
+        self.transport.start(self.now);
+    }
+
+    /// `pos`, corrected for edits made since it was computed (a shorter
+    /// pattern or song, a changed song entry).
+    fn checked(&self, pos: PlayPosition) -> PlayPosition {
+        let pattern = match pos.entry {
+            Some(e) if self.song_mode => self.song[usize::from(e).min(self.song_len.saturating_sub(1))],
+            _ => pos.pattern,
+        };
+        let entry = pos.entry.filter(|_| self.song_mode).map(|e| e.min(self.song_len.saturating_sub(1) as u16));
+        let step = if pos.step < self.pattern_lens[usize::from(pattern)] { pos.step } else { 0 };
+        PlayPosition { entry, pattern, step }
+    }
+
+    /// The step that follows `pos`.
+    fn following(&self, pos: PlayPosition) -> PlayPosition {
+        if pos.step + 1 < self.pattern_lens[usize::from(pos.pattern)] {
+            return PlayPosition { step: pos.step + 1, ..pos };
+        }
+        match pos.entry {
+            Some(e) if self.song_mode => {
+                let e = usize::from(e);
+                let next = match self.loop_region {
+                    Some((a, b)) if usize::from(b) == e && usize::from(b) < self.song_len => usize::from(a),
+                    _ if e + 1 < self.song_len => e + 1,
+                    _ => 0,
+                };
+                PlayPosition { entry: Some(next as u16), pattern: self.song[next], step: 0 }
+            }
+            _ => PlayPosition { entry: None, pattern: self.cue, step: 0 },
+        }
+    }
+
     /// Applies an edit. Invalid track/step indices are ignored and values are
     /// clamped exactly as `Project::apply` clamps them.
     pub fn apply(&mut self, edit: Edit) {
@@ -577,7 +711,34 @@ impl Engine {
                 self.tempo = bpm.clamp(MIN_TEMPO, MAX_TEMPO);
                 self.transport.set_tempo(self.tempo, self.sample_rate, self.now);
             }
-            Edit::SetPatternLength(len) => self.pattern_len = len.clamp(1, MAX_STEPS as u8),
+            Edit::SetPatternLength { pattern, len } => {
+                if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
+                    *l = len.clamp(1, MAX_STEPS as u8);
+                }
+            }
+            Edit::InsertSongEntry { index, pattern } => {
+                let i = usize::from(index);
+                if self.song_len < MAX_SONG && i <= self.song_len && usize::from(pattern) < MAX_PATTERNS {
+                    self.song.copy_within(i..self.song_len, i + 1);
+                    self.song[i] = pattern;
+                    self.song_len += 1;
+                }
+            }
+            Edit::RemoveSongEntry(index) => {
+                let i = usize::from(index);
+                if i < self.song_len {
+                    self.song.copy_within(i + 1..self.song_len, i);
+                    self.song_len -= 1;
+                    // Nothing left to chain: the cued pattern follows.
+                    self.song_mode &= self.song_len > 0;
+                }
+            }
+            Edit::SetSongEntry { index, pattern } => {
+                if usize::from(index) < self.song_len && usize::from(pattern) < MAX_PATTERNS {
+                    self.song[usize::from(index)] = pattern;
+                }
+            }
+            Edit::SetLoop(region) => self.loop_region = region.and_then(loop_region),
             Edit::SetSwing(percent) => self.transport.set_swing(percent),
             Edit::InsertTrack { index, kind } => {
                 let i = usize::from(index);
@@ -613,9 +774,10 @@ impl Engine {
                     self.update_gains();
                 }
             }
-            Edit::SetStep { track, step, value } => {
+            Edit::SetStep { track, pattern, step, value } => {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
-                    if let Some(slot) = t.steps.get_mut(usize::from(step)) {
+                    if let Some(slot) = t.steps.get_mut(usize::from(pattern)).and_then(|p| p.get_mut(usize::from(step)))
+                    {
                         *slot = value.map(Step::sanitized);
                     }
                 }
@@ -679,7 +841,7 @@ impl Engine {
         }
         let s = &self.shared;
         s.playing.store(self.transport.is_playing(), Ordering::Relaxed);
-        s.step.store(self.current_step.map_or(u32::MAX, u32::from), Ordering::Relaxed);
+        s.position.store(self.current.map_or(u32::MAX, PlayPosition::pack), Ordering::Relaxed);
         for (i, t) in self.tracks[..self.track_count].iter_mut().enumerate() {
             s.track_peaks[i].fetch_max_non_negative(t.peak);
             t.peak = 0.0;
@@ -719,18 +881,21 @@ impl Engine {
     /// played early, so they play at once.
     fn fire_step(&mut self) {
         let abs = self.transport.advance();
-        let len = u64::from(self.pattern_len);
-        self.current_step = Some((abs % len) as u8);
+        let pos = self.checked(self.next_pos);
+        self.current = Some(pos);
         let first = self.early_queued != Some(abs);
-        self.queue_hits(abs, if first { None } else { Some(false) });
-        self.queue_hits(abs + 1, Some(true));
+        self.queue_hits(abs, pos, if first { None } else { Some(false) });
+        let next = self.following(pos);
+        self.queue_hits(abs + 1, next, Some(true));
         self.early_queued = Some(abs + 1);
+        self.next_pos = next;
     }
 
-    /// Queues the hits of absolute step `abs` on every track: all of them
-    /// (`early` is `None`), only the early ones, or only the others.
-    fn queue_hits(&mut self, abs: u64, early: Option<bool>) {
-        let idx = (abs % u64::from(self.pattern_len)) as usize;
+    /// Queues the hits of absolute step `abs`, which plays `pos`, on every
+    /// track: all of them (`early` is `None`), only the early ones, or only
+    /// the others.
+    fn queue_hits(&mut self, abs: u64, pos: PlayPosition, early: Option<bool>) {
+        let (pattern, idx) = (usize::from(pos.pattern), usize::from(pos.step));
         let start = self.transport.frame_of_step(abs);
         let span = self.transport.frame_of_step(abs + 1).saturating_sub(start).max(1);
         // Ticks are a fraction of a straight step, so the earliest offset
@@ -738,7 +903,7 @@ impl Engine {
         let tick = self.transport.step_frames() / f64::from(TICKS_PER_STEP);
         let now = self.now;
         for t in &mut self.tracks[..self.track_count] {
-            let Some(step) = t.steps[idx] else { continue };
+            let Some(step) = t.steps[pattern][idx] else { continue };
             if early.is_some_and(|e| e != (step.offset < 0)) {
                 continue;
             }
@@ -858,8 +1023,10 @@ mod tests {
     fn steps_fire_sample_accurately() {
         // At 120 BPM / 48 kHz a step is exactly 6000 frames. Step 5 starts
         // at frame 30000, which is not a multiple of the 64-frame block.
-        let mut e =
-            engine(&[Edit::AddTrack(InstrumentKind::Snare), Edit::SetStep { track: 0, step: 5, value: step(60) }]);
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::SetStep { track: 0, pattern: 0, step: 5, value: step(60) },
+        ]);
         e.handle(Command::Play);
         let out = run(&mut e, 40_000);
         assert_eq!(first_sound(&out), Some(30_000));
@@ -871,10 +1038,10 @@ mod tests {
             Edit::SetTempo(133.0),
             Edit::AddTrack(InstrumentKind::Synth),
             Edit::AddTrack(InstrumentKind::HatClosed),
-            Edit::SetStep { track: 0, step: 0, value: Some(Step::new(40, 100, 3)) },
-            Edit::SetStep { track: 0, step: 7, value: Some(Step::new(47, 90, 2)) },
-            Edit::SetStep { track: 1, step: 2, value: step(60) },
-            Edit::SetStep { track: 1, step: 9, value: step(64) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(40, 100, 3)) },
+            Edit::SetStep { track: 0, pattern: 0, step: 7, value: Some(Step::new(47, 90, 2)) },
+            Edit::SetStep { track: 1, pattern: 0, step: 2, value: step(60) },
+            Edit::SetStep { track: 1, pattern: 0, step: 9, value: step(64) },
         ];
         let reference = {
             let mut e = engine(&edits);
@@ -900,8 +1067,8 @@ mod tests {
         let base = [
             Edit::AddTrack(InstrumentKind::Kick),
             Edit::AddTrack(InstrumentKind::Snare),
-            Edit::SetStep { track: 0, step: 0, value: step(60) },
-            Edit::SetStep { track: 1, step: 0, value: step(60) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::SetStep { track: 1, pattern: 0, step: 0, value: step(60) },
         ];
         let render = |extra: &[Edit]| {
             let mut edits = base.to_vec();
@@ -924,7 +1091,7 @@ mod tests {
         let mut e = engine(&[
             Edit::AddTrack(InstrumentKind::Kick),
             Edit::SetPan { track: 0, pan: -1.0 },
-            Edit::SetStep { track: 0, step: 0, value: step(60) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 4800);
@@ -938,7 +1105,7 @@ mod tests {
             let mut e = engine(&[
                 Edit::AddTrack(InstrumentKind::Synth),
                 Edit::SetParam { track: 0, index: 16, value: 0.001 }, // fast release
-                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(48, 127, len)) },
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 127, len)) },
             ]);
             e.handle(Command::Play);
             let out = run(&mut e, 6000 * 4);
@@ -953,9 +1120,9 @@ mod tests {
     #[test]
     fn pattern_loops() {
         let mut e = engine(&[
-            Edit::SetPatternLength(4),
+            Edit::SetPatternLength { pattern: 0, len: 4 },
             Edit::AddTrack(InstrumentKind::HatClosed),
-            Edit::SetStep { track: 0, step: 0, value: step(60) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 6000 * 4 * 3);
@@ -973,7 +1140,7 @@ mod tests {
             SR,
             &[
                 Edit::AddTrack(InstrumentKind::Synth),
-                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(48, 127, 64)) },
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 127, 64)) },
             ],
             shared.clone(),
             None,
@@ -981,7 +1148,7 @@ mod tests {
         e.handle(Command::Play);
         run(&mut e, 1000);
         assert!(shared.playing.load(Ordering::Relaxed));
-        assert_eq!(shared.step.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0 }));
         assert!(shared.track_peaks[0].take() > 0.0);
         e.handle(Command::Stop);
         // Default release is 120 ms; after 1 s everything is silent.
@@ -989,7 +1156,7 @@ mod tests {
         let tail = run(&mut e, 1000);
         assert!(tail.iter().all(|&x| x == 0.0));
         assert!(!shared.playing.load(Ordering::Relaxed));
-        assert_eq!(shared.step.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(shared.position(), None);
     }
 
     #[test]
@@ -1067,8 +1234,8 @@ mod tests {
             Edit::SetSwing(75.0),
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
-            Edit::SetStep { track: 0, step: 1, value: Some(Step::new(60, 127, 1)) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(Step::new(60, 127, 1)) },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 12_000);
@@ -1081,7 +1248,7 @@ mod tests {
         let mut e = engine(&[
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 0, value: Some(Step { ratchet: 4, ..Step::new(60, 127, 1) }) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step { ratchet: 4, ..Step::new(60, 127, 1) }) },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 6000);
@@ -1094,7 +1261,7 @@ mod tests {
             Edit::SetSwing(75.0),
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 1, value: Some(Step { ratchet: 2, ..Step::new(60, 127, 1) }) },
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(Step { ratchet: 2, ..Step::new(60, 127, 1) }) },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 12_000);
@@ -1163,7 +1330,12 @@ mod tests {
     fn chords_play_every_note() {
         let mut e = engine(&[
             Edit::AddTrack(InstrumentKind::Synth),
-            Edit::SetStep { track: 0, step: 0, value: Some(Step { chord: [3, 7, 10], ..Step::new(48, 100, 2) }) },
+            Edit::SetStep {
+                track: 0,
+                pattern: 0,
+                step: 0,
+                value: Some(Step { chord: [3, 7, 10], ..Step::new(48, 100, 2) }),
+            },
         ]);
         e.handle(Command::Play);
         run(&mut e, 64);
@@ -1175,11 +1347,12 @@ mod tests {
     fn micro_timing_moves_hits_both_ways() {
         let hat = |step: u8, offset: i8| Edit::SetStep {
             track: 0,
+            pattern: 0,
             step,
             value: Some(Step { offset, ..Step::new(60, 127, 1) }),
         };
         let mut e = engine(&[
-            Edit::SetPatternLength(4),
+            Edit::SetPatternLength { pattern: 0, len: 4 },
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
             hat(0, -MAX_OFFSET),
@@ -1199,7 +1372,12 @@ mod tests {
             Edit::SetSwing(75.0),
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 2, value: Some(Step { offset: -MAX_OFFSET, ..Step::new(60, 127, 1) }) },
+            Edit::SetStep {
+                track: 0,
+                pattern: 0,
+                step: 2,
+                value: Some(Step { offset: -MAX_OFFSET, ..Step::new(60, 127, 1) }),
+            },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 12_000);
@@ -1209,7 +1387,12 @@ mod tests {
         let mut e = engine(&[
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 0, value: Some(Step { offset: 6, ratchet: 2, ..Step::new(60, 127, 1) }) },
+            Edit::SetStep {
+                track: 0,
+                pattern: 0,
+                step: 0,
+                value: Some(Step { offset: 6, ratchet: 2, ..Step::new(60, 127, 1) }),
+            },
         ]);
         e.handle(Command::Play);
         let out = run(&mut e, 6000);
@@ -1219,10 +1402,10 @@ mod tests {
     #[test]
     fn chance_is_random_but_reproducible() {
         let edits = [
-            Edit::SetPatternLength(1),
+            Edit::SetPatternLength { pattern: 0, len: 1 },
             Edit::AddTrack(InstrumentKind::HatClosed),
             Edit::SetParam { track: 0, index: 1, value: 0.01 },
-            Edit::SetStep { track: 0, step: 0, value: Some(Step { chance: 50, ..Step::new(60, 127, 1) }) },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step { chance: 50, ..Step::new(60, 127, 1) }) },
         ];
         let play = || {
             let mut e = engine(&edits);
@@ -1243,10 +1426,10 @@ mod tests {
                 Edit::AddTrack(InstrumentKind::HatOpen),
                 Edit::AddTrack(InstrumentKind::HatClosed),
                 Edit::SetMute { track: 1, mute: true }, // hear only the open hat
-                Edit::SetStep { track: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(60, 127, 1)) },
             ];
             if with_closed {
-                edits.push(Edit::SetStep { track: 1, step: 1, value: Some(Step::new(60, 127, 1)) });
+                edits.push(Edit::SetStep { track: 1, pattern: 0, step: 1, value: Some(Step::new(60, 127, 1)) });
             }
             let mut e = engine(&edits);
             e.handle(Command::Play);
@@ -1275,5 +1458,117 @@ mod tests {
         );
         e.apply(Edit::RemoveTrack(0));
         assert_eq!(e.track_count(), 3);
+    }
+
+    /// A closed hat (track 0); patterns A and B are 4 steps long, B with
+    /// a hit on `b_step` at `b_offset` ticks.
+    fn two_patterns(b_step: u8, b_offset: i8) -> Vec<Edit> {
+        vec![
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetPatternLength { pattern: 0, len: 4 },
+            Edit::SetPatternLength { pattern: 1, len: 4 },
+            Edit::SetStep {
+                track: 0,
+                pattern: 1,
+                step: b_step,
+                value: Some(Step { offset: b_offset, ..Step::new(60, 127, 1) }),
+            },
+        ]
+    }
+
+    #[test]
+    fn cued_pattern_takes_over_at_the_end_of_the_current_one() {
+        let mut edits = two_patterns(2, 0);
+        edits.push(Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) });
+        // Cued during step 0: B follows the first pass of A (steps are 6000
+        // frames, so B's step 2 is absolute step 6).
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        let mut out = run(&mut e, 1000);
+        e.handle(Command::Cue(1));
+        out.extend(run(&mut e, 71_000));
+        assert_eq!(onsets(&out, 1000), [0, 36_000, 60_000]);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 3 }));
+        // Cued during the last step: the next step's early hits are already
+        // queued, so A plays once more first.
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        let mut out = run(&mut e, 18_100);
+        e.handle(Command::Cue(1));
+        out.extend(run(&mut e, 53_900));
+        assert_eq!(onsets(&out, 1000), [0, 24_000, 60_000]);
+    }
+
+    #[test]
+    fn song_follows_entries_and_loop_region_with_early_hits() {
+        // B's first step is 6 ticks (1500 frames) early, so it is queued
+        // during the last step of the entry before it.
+        let mut edits = two_patterns(0, -6);
+        for (index, pattern) in [0, 1, 0, 1].into_iter().enumerate() {
+            edits.push(Edit::InsertSongEntry { index: index as u16, pattern });
+        }
+        edits.push(Edit::SetLoop(Some((2, 3))));
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        let first = run(&mut e, 1);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 0, step: 0 }));
+        let mut out = first;
+        out.extend(run(&mut e, 129_999));
+        // Entries: A 0-3, B 4-7, A 8-11, B 12-15, then the region again.
+        assert_eq!(onsets(&out, 1000), [22_500, 70_500, 118_500]);
+        assert_eq!(e.shared.position().map(|p| p.entry), Some(Some(3)));
+
+        // Starting on an entry plays it at once; the very first step cannot
+        // be early. After the last entry the region repeats.
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 3 });
+        assert_eq!(onsets(&run(&mut e, 60_000), 1000), [0, 46_500]);
+    }
+
+    #[test]
+    fn playback_survives_song_edits() {
+        let mut edits = two_patterns(0, 0);
+        for index in 0..3 {
+            edits.push(Edit::InsertSongEntry { index, pattern: 1 });
+        }
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 9 }); // clamped to the last entry
+        run(&mut e, 3000);
+        assert_eq!(e.shared.position().map(|p| p.entry), Some(Some(2)));
+        for edit in [
+            Edit::RemoveSongEntry(2),
+            Edit::RemoveSongEntry(1),
+            Edit::SetPatternLength { pattern: 1, len: 1 },
+            Edit::SetLoop(Some((0, 200))),
+        ] {
+            e.apply(edit);
+            run(&mut e, 7000);
+        }
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 1, step: 0 }));
+        // Emptying the song while it plays falls back to the cued pattern
+        // (A). The step after the edit was already queued, so it still plays.
+        e.apply(Edit::RemoveSongEntry(0));
+        run(&mut e, 6000);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0 }));
+        run(&mut e, 6000);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0 }));
+        // Song mode on an empty song plays the cued pattern instead.
+        e.handle(Command::Stop);
+        e.handle(Command::Cue(1));
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 10);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0 }));
+    }
+
+    #[test]
+    fn positions_pack_losslessly() {
+        for pos in [
+            PlayPosition { entry: None, pattern: 0, step: 0 },
+            PlayPosition { entry: Some(0), pattern: 15, step: 63 },
+            PlayPosition { entry: Some(MAX_SONG as u16 - 1), pattern: 7, step: 1 },
+        ] {
+            assert_eq!(PlayPosition::unpack(pos.pack()), Some(pos));
+        }
+        assert_eq!(PlayPosition::unpack(u32::MAX), None);
     }
 }

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use tinvo::audio::{self, AudioCallback};
 use tinvo::engine::{Edit, Step};
 use tinvo::instrument::InstrumentKind;
-use tinvo::project::Project;
-use tinvo::render::{self, RenderOptions};
+use tinvo::project::{Project, pattern_name};
+use tinvo::render::{self, RenderOptions, Source};
 use tinvo::wav::{self, SampleFormat};
 
 const USAGE: &str = "\
@@ -18,6 +18,9 @@ TINVO - terminal digital audio workstation
 USAGE:
     tinvo [PROJECT.tvo]                 open the editor (demo beat if no file)
     tinvo render PROJECT OUT.wav [--format 16|24|32f] [--loops N] [--rate HZ]
+                 [--song | --region | --pattern A-P] [--stems]
+                                        export WAV (the song if it has entries, else
+                                        pattern A); --stems also writes one file per track
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo probe [SECONDS]               open the audio device, output silence, report timing
     tinvo bench                         measure rendering speed against real time
@@ -57,6 +60,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut positional = Vec::new();
     let mut format = SampleFormat::Pcm24;
     let mut opts = RenderOptions::default();
+    let mut stems = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
@@ -72,6 +76,17 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     .filter(|n| (1..=1000).contains(n))
                     .ok_or("--loops must be 1..=1000")?;
             }
+            "--song" => opts.source = Source::Song,
+            "--region" => opts.source = Source::Region,
+            "--pattern" => {
+                let v = value("--pattern")?;
+                let p = match v.as_bytes() {
+                    [c @ b'A'..=b'P'] => c - b'A',
+                    _ => return Err(format!("--pattern takes a letter A-P, not '{v}'")),
+                };
+                opts.source = Source::Pattern(p);
+            }
+            "--stems" => stems = true,
             "--rate" => {
                 opts.sample_rate = value("--rate")?
                     .parse()
@@ -91,19 +106,41 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
     }
+    match (opts.source, render::resolve(&project, opts.source)) {
+        (Source::Song, Source::Pattern(_)) => return Err("the song is empty".into()),
+        (Source::Region, Source::Pattern(_)) => return Err("the project has no loop region inside the song".into()),
+        _ => {}
+    }
+    let what = match render::resolve(&project, opts.source) {
+        Source::Song => "the song".to_string(),
+        Source::Region => "the loop region".to_string(),
+        Source::Pattern(p) => format!("pattern {}", pattern_name(p)),
+        Source::Auto => unreachable!("resolved"),
+    };
     let start = Instant::now();
     let samples = render::render(&project, &track_samples, &opts);
     let elapsed = start.elapsed();
     let stats = wav::write_file(out.as_ref(), &samples, 2, opts.sample_rate, format)?;
     let secs = samples.len() as f64 / 2.0 / f64::from(opts.sample_rate);
     println!(
-        "Rendered {secs:.2} s ({}, {} Hz) to {out} in {:.3} s; peak {:.2} dBFS; {} clipped samples",
+        "Rendered {what}, {secs:.2} s ({}, {} Hz), to {out} in {:.3} s; peak {:.2} dBFS; {} clipped samples",
         format.label(),
         opts.sample_rate,
         elapsed.as_secs_f64(),
         tinvo::dsp::gain_to_db(stats.peak),
         stats.clipped
     );
+    if stems {
+        let out_path = std::path::Path::new(out);
+        let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
+        for (i, audio) in render::render_stems(&project, &track_samples, &opts) {
+            let name: String =
+                project.tracks[i].name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+            let path = out_path.with_file_name(format!("{stem}-{:02}-{name}.wav", i + 1));
+            let st = wav::write_file(&path, &audio, 2, opts.sample_rate, format)?;
+            println!("  stem {}: peak {:.2} dBFS", path.display(), tinvo::dsp::gain_to_db(st.peak));
+        }
+    }
     Ok(())
 }
 
@@ -169,7 +206,7 @@ fn cmd_bench() -> Result<(), String> {
 }
 
 fn bench(label: &str, project: &Project) -> Result<(), String> {
-    let opts = RenderOptions { sample_rate: 48_000, loops: 16, max_tail_seconds: 0.0 };
+    let opts = RenderOptions { sample_rate: 48_000, loops: 16, max_tail_seconds: 0.0, source: Source::Pattern(0) };
     // Warm up caches and the allocator before timing.
     render::render(project, &[], &RenderOptions { loops: 1, ..opts });
     let start = Instant::now();
@@ -200,7 +237,7 @@ fn synth_stress_project() -> Result<Project, String> {
     // Two overlapping four-note chords keep all eight voices sounding.
     let chord = Step { chord: [3, 7, 10], ..Step::new(48, 100, 2) };
     for step in 0..16 {
-        p.apply(Edit::SetStep { track: 0, step, value: Some(chord) }).map_err(|e| e.to_string())?;
+        p.apply(Edit::SetStep { track: 0, pattern: 0, step, value: Some(chord) }).map_err(|e| e.to_string())?;
     }
     Ok(p)
 }

@@ -7,13 +7,14 @@
 
 use crate::audio::{self, AudioCallback, Stream};
 use crate::dsp::gain_to_db;
+use crate::engine::transport::Transport;
 use crate::engine::{
-    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING, RETIRE_QUEUE, Shared,
-    Step,
+    Command, Edit, Engine, MAX_CHORD, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIN_SWING,
+    PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
-use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME};
-use crate::render::{self, RenderOptions};
+use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
+use crate::render::{self, RenderOptions, Source};
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
 use crate::tui::{Color, Event, Key, Screen, Style, Terminal};
@@ -131,21 +132,22 @@ struct Change {
     meta_after: Vec<TrackMeta>,
     what: &'static str,
     /// Set when later nudges of the same value may merge into this change.
-    key: Option<(u8, u8, u8)>,
+    key: Option<(u8, u8, u8, u8)>,
     at: Instant,
 }
 
 /// Identifies the value an edit sets, for coalescing repeated nudges.
-fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8)> {
+fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
     Some(match *e {
-        Edit::SetTempo(_) => (0, 0, 0),
-        Edit::SetSwing(_) => (1, 0, 0),
-        Edit::SetMasterGain(_) => (2, 0, 0),
-        Edit::SetPatternLength(_) => (3, 0, 0),
-        Edit::SetStep { track, step, .. } => (4, track, step),
-        Edit::SetParam { track, index, .. } => (5, track, index),
-        Edit::SetGain { track, .. } => (6, track, 0),
-        Edit::SetPan { track, .. } => (7, track, 0),
+        Edit::SetTempo(_) => (0, 0, 0, 0),
+        Edit::SetSwing(_) => (1, 0, 0, 0),
+        Edit::SetMasterGain(_) => (2, 0, 0, 0),
+        Edit::SetPatternLength { pattern, .. } => (3, pattern, 0, 0),
+        Edit::SetStep { track, pattern, step, .. } => (4, track, pattern, step),
+        Edit::SetParam { track, index, .. } => (5, track, index, 0),
+        Edit::SetGain { track, .. } => (6, track, 0, 0),
+        Edit::SetPan { track, .. } => (7, track, 0, 0),
+        Edit::SetSongEntry { index, .. } => (8, (index >> 8) as u8, index as u8, 0),
         _ => return None,
     })
 }
@@ -155,7 +157,11 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetTempo(_) => "tempo",
         Edit::SetSwing(_) => "swing",
         Edit::SetMasterGain(_) => "master level",
-        Edit::SetPatternLength(_) => "pattern length",
+        Edit::SetPatternLength { .. } => "pattern length",
+        Edit::InsertSongEntry { .. } => "add song entry",
+        Edit::RemoveSongEntry(_) => "remove song entry",
+        Edit::SetSongEntry { .. } => "song entry",
+        Edit::SetLoop(_) => "loop region",
         Edit::AddTrack(_) | Edit::InsertTrack { .. } => "add track",
         Edit::RemoveTrack(_) => "delete track",
         Edit::SetStep { .. } => "step",
@@ -209,11 +215,20 @@ pub struct App {
     /// Pitch under the piano-roll cursor.
     pub roll_note: u8,
     pub mode: Mode,
+    /// The pattern being edited; also the one `Play` starts with.
+    pub pattern: usize,
+    /// Song view instead of the step grid.
+    pub song_view: bool,
+    pub song_cursor: usize,
     pub export_format: SampleFormat,
     pub export_loops: u32,
+    /// What export plays; `Pattern` means the pattern being edited.
+    pub export_source: Source,
     pub quit: bool,
     /// Per-track template for newly placed steps, parallel to `project.tracks`.
     brushes: Vec<Step>,
+    /// A copied pattern: its length and each track's steps.
+    clipboard: Option<(u8, Vec<[Option<Step>; MAX_STEPS]>)>,
     /// Every sample loaded this session, by absolute path. Undo can bring a
     /// sample back without reading the disk again.
     bank: HashMap<String, Arc<Sample>>,
@@ -229,7 +244,7 @@ pub struct App {
     master_meter: [f32; 2],
     cpu: f32,
     playing: bool,
-    play_step: Option<usize>,
+    play_pos: Option<PlayPosition>,
 }
 
 impl App {
@@ -245,7 +260,7 @@ impl App {
             .iter()
             .map(|t| {
                 // Start from the first programmed step so new steps match.
-                t.steps.iter().flatten().next().copied().unwrap_or(Step::new(t.kind.default_note(), 100, 1))
+                t.steps.iter().flatten().flatten().next().copied().unwrap_or(Step::new(t.kind.default_note(), 100, 1))
             })
             .collect();
         Self {
@@ -259,10 +274,15 @@ impl App {
             roll: false,
             roll_note: 48,
             mode: Mode::Normal,
+            pattern: 0,
+            song_view: false,
+            song_cursor: 0,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
+            export_source: Source::Auto,
             quit: false,
             brushes,
+            clipboard: None,
             bank: HashMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
@@ -275,7 +295,7 @@ impl App {
             master_meter: [0.0; 2],
             cpu: 0.0,
             playing: false,
-            play_step: None,
+            play_pos: None,
         }
     }
 
@@ -292,7 +312,7 @@ impl App {
         if self.link.take().is_some() {
             self.audio_label = "audio offline".into();
             self.playing = false;
-            self.play_step = None;
+            self.play_pos = None;
             self.set_status(format!("Audio stopped: {err}. Save your work; export still works."));
         }
     }
@@ -340,6 +360,29 @@ impl App {
             at: now,
         });
         true
+    }
+
+    /// Applies several edits as one undo step. Invalid or no-op edits are
+    /// skipped.
+    fn edit_group(&mut self, edits: Vec<Edit>, what: &'static str) {
+        let meta_before = self.track_meta();
+        let (mut undo, mut redo) = (Vec::new(), Vec::new());
+        for e in edits {
+            let Ok(inverse) = self.project.inverse(&e) else { continue };
+            let Some(applied) = self.apply_raw(e) else { continue };
+            if inverse != [applied] {
+                // Undo runs the inverses in reverse order of the edits.
+                undo.splice(0..0, inverse);
+                redo.push(applied);
+            }
+        }
+        if redo.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        self.redo.clear();
+        let meta_after = self.track_meta();
+        self.push_change(Change { undo, redo, meta_before, meta_after, what, key: None, at: Instant::now() });
     }
 
     fn push_change(&mut self, c: Change) {
@@ -485,10 +528,15 @@ impl App {
         self.sealed = true;
         // Move the cursor to where the change happened.
         match c.redo.first() {
-            Some(Edit::SetStep { track, step, .. }) => {
+            Some(Edit::SetStep { track, pattern, step, .. }) => {
                 self.track = usize::from(*track);
+                self.pattern = usize::from(*pattern);
                 self.step = usize::from(*step);
             }
+            Some(Edit::SetPatternLength { pattern, .. }) => self.pattern = usize::from(*pattern),
+            Some(
+                Edit::InsertSongEntry { index, .. } | Edit::RemoveSongEntry(index) | Edit::SetSongEntry { index, .. },
+            ) => self.song_cursor = usize::from(*index),
             Some(
                 Edit::SetParam { track, .. }
                 | Edit::SetGain { track, .. }
@@ -519,14 +567,67 @@ impl App {
         self.roll && self.project.tracks.get(self.track).is_some_and(|t| !t.kind.is_drum())
     }
 
+    /// Starts or stops playback: the song from the song cursor in the song
+    /// view, otherwise the pattern being edited.
     pub fn toggle_play(&mut self) {
         if self.link.is_none() {
             self.set_status("No audio output. Use 'e' to export a WAV instead.");
             return;
         }
-        let cmd = if self.playing { Command::Stop } else { Command::Play };
+        let cmd = if self.playing {
+            Command::Stop
+        } else if self.song_view && !self.project.song.is_empty() {
+            Command::PlaySong { entry: self.song_cursor as u16 }
+        } else {
+            self.send(Command::Cue(self.pattern as u8));
+            Command::Play
+        };
         self.playing = !self.playing;
         self.send(cmd);
+    }
+
+    /// The playing step, if the pattern being edited is the one playing.
+    fn play_step(&self) -> Option<usize> {
+        self.play_pos.filter(|p| usize::from(p.pattern) == self.pattern).map(|p| usize::from(p.step))
+    }
+
+    fn pattern_len(&self) -> usize {
+        usize::from(self.project.pattern_lens[self.pattern])
+    }
+
+    /// Selects the pattern to edit. It is also cued, so it plays next.
+    fn select_pattern(&mut self, p: usize) {
+        self.pattern = p % MAX_PATTERNS;
+        self.send(Command::Cue(self.pattern as u8));
+        let next = if self.playing && self.play_pos.is_some_and(|p| p.entry.is_none()) { ", plays next" } else { "" };
+        self.set_status(format!("Pattern {} ({} steps){next}", pattern_name(self.pattern as u8), self.pattern_len()));
+    }
+
+    fn copy_pattern(&mut self) {
+        let steps = self.project.tracks.iter().map(|t| t.steps[self.pattern]).collect();
+        self.clipboard = Some((self.project.pattern_lens[self.pattern], steps));
+        self.set_status(format!("Copied pattern {}", pattern_name(self.pattern as u8)));
+    }
+
+    /// Replaces the edited pattern with the copied one (or clears it), as one
+    /// undo step. Tracks are matched by position.
+    fn replace_pattern(&mut self, with: Option<(u8, Vec<[Option<Step>; MAX_STEPS]>)>, what: &'static str) {
+        let pattern = self.pattern as u8;
+        let (len, steps) = with.unwrap_or((self.project.pattern_lens[self.pattern], Vec::new()));
+        let mut edits = vec![Edit::SetPatternLength { pattern, len }];
+        for (t, track) in self.project.tracks.iter().enumerate() {
+            for (i, &value) in steps.get(t).unwrap_or(&[None; MAX_STEPS]).iter().enumerate() {
+                if track.steps[self.pattern][i] != value {
+                    edits.push(Edit::SetStep { track: t as u8, pattern, step: i as u8, value });
+                }
+            }
+        }
+        self.edit_group(edits, what);
+        self.set_status(format!(
+            "{} pattern {}",
+            if what == "paste" { "Pasted into" } else { "Cleared" },
+            pattern_name(pattern)
+        ));
     }
 
     /// Pulls playhead, meters and load from the audio thread.
@@ -535,8 +636,7 @@ impl App {
         link.flush();
         let s = &link.shared;
         self.playing = s.playing.load(Ordering::Relaxed);
-        let step = s.step.load(Ordering::Relaxed);
-        self.play_step = (step != u32::MAX).then_some(step as usize);
+        self.play_pos = s.position();
         for (m, p) in self.meters.iter_mut().zip(&s.track_peaks) {
             *m = p.take().max(*m * 0.85);
         }
@@ -553,7 +653,8 @@ impl App {
     fn clamp_cursor(&mut self) {
         let n = self.track_count();
         self.track = if n == 0 { 0 } else { self.track.min(n - 1) };
-        self.step = self.step.min(usize::from(self.project.pattern_len) - 1);
+        self.step = self.step.min(self.pattern_len() - 1);
+        self.song_cursor = self.song_cursor.min(self.project.song.len().saturating_sub(1));
         self.param = self.param.min(self.param_count().saturating_sub(1));
     }
 
@@ -656,6 +757,16 @@ impl App {
                 let i = SampleFormat::ALL.iter().position(|f| *f == self.export_format).unwrap_or(0);
                 self.export_format = SampleFormat::ALL[(i + 1) % SampleFormat::ALL.len()];
             }
+            Key::Left | Key::Right if kind == PromptKind::Export => {
+                let order = [Source::Song, Source::Pattern(0), Source::Region];
+                let current = match render::resolve(&self.project, self.export_source) {
+                    Source::Pattern(_) => 1,
+                    Source::Region => 2,
+                    _ => 0,
+                };
+                let d = if key == Key::Right { 1 } else { order.len() - 1 };
+                self.export_source = order[(current + d) % order.len()];
+            }
             Key::Up if kind == PromptKind::Export => self.export_loops = (self.export_loops + 1).min(64),
             Key::Down if kind == PromptKind::Export => self.export_loops = (self.export_loops - 1).max(1),
             Key::Char(c) if text.chars().count() < 200 => text.push(c),
@@ -686,6 +797,9 @@ impl App {
     }
 
     fn key_normal(&mut self, key: Key) {
+        if self.song_view && self.key_song(key) {
+            return;
+        }
         match key {
             Key::Char(' ') => self.toggle_play(),
             Key::Tab | Key::BackTab => {
@@ -730,13 +844,22 @@ impl App {
             Key::Char('G') => {
                 self.edit_with(Edit::SetSwing(self.project.swing.round() + 1.0), true);
             }
-            Key::Char('l') => {
-                self.edit_with(Edit::SetPatternLength(self.project.pattern_len.saturating_sub(1)), true);
+            Key::Char('l' | 'L') => {
+                let len = self.project.pattern_lens[self.pattern];
+                let len = if key == Key::Char('l') { len.saturating_sub(1) } else { len.saturating_add(1) };
+                self.edit_with(Edit::SetPatternLength { pattern: self.pattern as u8, len }, true);
             }
-            Key::Char('L') => {
-                self.edit_with(Edit::SetPatternLength(self.project.pattern_len.saturating_add(1)), true);
-            }
-            _ if self.track_count() == 0 => {}
+            Key::Char('n') => self.select_pattern(self.pattern + 1),
+            Key::Char('N') => self.select_pattern(self.pattern + MAX_PATTERNS - 1),
+            Key::Char('S') => self.song_view = !self.song_view,
+            Key::Char('y') => self.copy_pattern(),
+            Key::Char('Y') => match self.clipboard.clone() {
+                Some(clip) => self.replace_pattern(Some(clip), "paste"),
+                None => self.set_status("Nothing copied yet (y copies a pattern)"),
+            },
+            Key::Char('X') => self.replace_pattern(None, "clear pattern"),
+            // The rest acts on the selected track, which the song view hides.
+            _ if self.track_count() == 0 || self.song_view => {}
             Key::Char('D') => self.mode = Mode::Confirm(Confirm::DeleteTrack),
             Key::Char('r') => {
                 let name = self.project.tracks[self.track].name.clone();
@@ -769,7 +892,8 @@ impl App {
                     self.roll = !self.roll;
                     if self.roll {
                         let t = &self.project.tracks[self.track];
-                        self.roll_note = t.steps[self.step].map_or(self.brushes[self.track].note, |s| s.note);
+                        let step = t.steps[self.pattern][self.step];
+                        self.roll_note = step.map_or(self.brushes[self.track].note, |s| s.note);
                         self.focus = Focus::Grid;
                     }
                 }
@@ -782,8 +906,51 @@ impl App {
         }
     }
 
+    /// Song view keys. Returns whether the key was used.
+    fn key_song(&mut self, key: Key) -> bool {
+        let n = self.project.song.len();
+        let c = self.song_cursor;
+        let index = c as u16;
+        match key {
+            Key::Left => self.song_cursor = c.saturating_sub(1),
+            Key::Right => self.song_cursor = (c + 1).min(n.saturating_sub(1)),
+            Key::Home => self.song_cursor = 0,
+            Key::End => self.song_cursor = n.saturating_sub(1),
+            Key::Up | Key::Down if n > 0 => {
+                let d = if key == Key::Up { 1 } else { MAX_PATTERNS - 1 };
+                let pattern = ((usize::from(self.project.song[c]) + d) % MAX_PATTERNS) as u8;
+                self.edit_with(Edit::SetSongEntry { index, pattern }, true);
+            }
+            Key::Enter | Key::Char('x') => {
+                // Repeat the entry under the cursor, or start with the
+                // pattern being edited.
+                let (at, pattern) = if n == 0 { (0, self.pattern as u8) } else { (c + 1, self.project.song[c]) };
+                if self.edit(Edit::InsertSongEntry { index: at as u16, pattern }) {
+                    self.song_cursor = at;
+                }
+            }
+            Key::Delete | Key::Backspace if n > 0 => {
+                self.edit(Edit::RemoveSongEntry(index));
+            }
+            Key::Char('[') if n > 0 => {
+                let end = self.project.loop_region.map_or(index, |(_, b)| b.max(index));
+                self.edit(Edit::SetLoop(Some((index, end))));
+            }
+            Key::Char(']') if n > 0 => {
+                let start = self.project.loop_region.map_or(index, |(a, _)| a.min(index));
+                self.edit(Edit::SetLoop(Some((start, index))));
+            }
+            Key::Char('-') => {
+                self.edit(Edit::SetLoop(None));
+            }
+            Key::Char('v') => self.set_status("The song view has no piano roll (S returns to the grid)"),
+            _ => return false,
+        }
+        true
+    }
+
     fn key_grid(&mut self, key: Key) {
-        let len = usize::from(self.project.pattern_len);
+        let len = self.pattern_len();
         match key {
             Key::Left => self.step = (self.step + len - 1) % len,
             Key::Right => self.step = (self.step + 1) % len,
@@ -793,7 +960,12 @@ impl App {
             Key::Down => self.track += 1,
             Key::Enter | Key::Char('x') => self.toggle_step(),
             Key::Delete | Key::Backspace => {
-                self.edit(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: None });
+                self.edit(Edit::SetStep {
+                    track: self.track as u8,
+                    pattern: self.pattern as u8,
+                    step: self.step as u8,
+                    value: None,
+                });
             }
             _ => self.key_step_options(key),
         }
@@ -830,7 +1002,7 @@ impl App {
     }
 
     fn key_roll(&mut self, key: Key) {
-        let len = usize::from(self.project.pattern_len);
+        let len = self.pattern_len();
         match key {
             Key::Left => self.step = (self.step + len - 1) % len,
             Key::Right => self.step = (self.step + 1) % len,
@@ -842,7 +1014,12 @@ impl App {
             Key::PageDown => self.roll_note = self.roll_note.saturating_sub(12),
             Key::Enter | Key::Char('x') => self.toggle_roll_note(),
             Key::Delete | Key::Backspace => {
-                self.edit(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: None });
+                self.edit(Edit::SetStep {
+                    track: self.track as u8,
+                    pattern: self.pattern as u8,
+                    step: self.step as u8,
+                    value: None,
+                });
             }
             _ => self.key_step_options(key),
         }
@@ -850,9 +1027,9 @@ impl App {
 
     /// Adds or removes the cursor pitch in the cursor step's chord.
     fn toggle_roll_note(&mut self) {
-        let (track, step, note) = (self.track as u8, self.step as u8, self.roll_note);
+        let (track, pattern, step, note) = (self.track as u8, self.pattern as u8, self.step as u8, self.roll_note);
         let brush = self.brushes[self.track];
-        let value = match self.project.tracks[self.track].steps[self.step] {
+        let value = match self.project.tracks[self.track].steps[self.pattern][self.step] {
             None => Some(Step { note, chord: [0; MAX_CHORD - 1], ..brush }.sanitized()),
             Some(s) if s.has_note(note) => s.without_note(note),
             Some(s) => match s.with_note(note) {
@@ -864,18 +1041,18 @@ impl App {
             },
         };
         let adding = value.is_some_and(|v| v.has_note(note));
-        if self.edit(Edit::SetStep { track, step, value }) && adding {
+        if self.edit(Edit::SetStep { track, pattern, step, value }) && adding {
             self.audition(Step::new(note, brush.velocity, 1));
         }
     }
 
     fn toggle_step(&mut self) {
-        let (track, step) = (self.track as u8, self.step as u8);
-        let value = match self.project.tracks[self.track].steps[self.step] {
+        let (track, pattern, step) = (self.track as u8, self.pattern as u8, self.step as u8);
+        let value = match self.project.tracks[self.track].steps[self.pattern][self.step] {
             Some(_) => None,
             None => Some(self.brushes[self.track]),
         };
-        if self.edit(Edit::SetStep { track, step, value }) {
+        if self.edit(Edit::SetStep { track, pattern, step, value }) {
             if let Some(s) = value {
                 self.audition(s);
             }
@@ -884,12 +1061,13 @@ impl App {
 
     /// Changes the step under the cursor, or the brush if the step is empty.
     fn modify_step(&mut self, f: impl Fn(&mut Step), audition: bool) {
-        let current = self.project.tracks[self.track].steps[self.step];
+        let current = self.project.tracks[self.track].steps[self.pattern][self.step];
         let mut s = current.unwrap_or(self.brushes[self.track]);
         f(&mut s);
         self.brushes[self.track] = s;
         if current.is_some() {
-            self.edit_with(Edit::SetStep { track: self.track as u8, step: self.step as u8, value: Some(s) }, true);
+            let (track, pattern, step) = (self.track as u8, self.pattern as u8, self.step as u8);
+            self.edit_with(Edit::SetStep { track, pattern, step, value: Some(s) }, true);
         }
         if audition {
             self.audition(s);
@@ -931,8 +1109,30 @@ impl App {
         }
     }
 
+    /// The export source, with `Pattern` meaning the pattern being edited.
+    fn export_render_source(&self) -> Source {
+        match self.export_source {
+            Source::Pattern(_) => Source::Pattern(self.pattern as u8),
+            s => s,
+        }
+    }
+
+    fn export_source_label(&self) -> String {
+        match render::resolve(&self.project, self.export_render_source()) {
+            Source::Song => "song".into(),
+            Source::Region => "loop region".into(),
+            Source::Pattern(p) => format!("pattern {}", pattern_name(p)),
+            Source::Auto => unreachable!("resolved"),
+        }
+    }
+
     pub fn export_to(&mut self, path: &Path) {
-        let opts = RenderOptions { sample_rate: self.sample_rate, loops: self.export_loops, ..Default::default() };
+        let opts = RenderOptions {
+            sample_rate: self.sample_rate,
+            loops: self.export_loops,
+            source: self.export_render_source(),
+            ..Default::default()
+        };
         let started = Instant::now();
         let samples = render::render(&self.project, &self.track_samples(), &opts);
         let secs = samples.len() as f32 / 2.0 / self.sample_rate as f32;
@@ -973,7 +1173,9 @@ impl App {
         let params_rows = self.params_rows(w);
         // header, ruler, separator, params block, status line
         let track_rows = h.saturating_sub(2 + 1 + params_rows + 1).max(1);
-        if self.roll_active() {
+        if self.song_view {
+            self.draw_song(s, w, track_rows);
+        } else if self.roll_active() {
             self.draw_roll(s, w, track_rows);
         } else {
             self.draw_grid(s, w, track_rows);
@@ -1000,10 +1202,18 @@ impl App {
             .map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
         let swing =
             if self.project.swing > MIN_SWING { format!("swing {:.0}%  ", self.project.swing) } else { String::new() };
+        let playing = match self.play_pos {
+            Some(PlayPosition { entry: Some(e), pattern, .. }) => {
+                format!("song {}/{} ({})  ", e + 1, self.project.song.len(), pattern_name(pattern))
+            }
+            Some(p) if usize::from(p.pattern) != self.pattern => format!("playing {}  ", pattern_name(p.pattern)),
+            _ => String::new(),
+        };
         let info = format!(
-            " {:.0} BPM  {swing}{} steps  {}{} ",
+            " {:.0} BPM  {swing}pattern {} · {} steps  {playing}{}{} ",
             self.project.tempo,
-            self.project.pattern_len,
+            pattern_name(self.pattern as u8),
+            self.pattern_len(),
             file,
             if self.dirty { "*" } else { "" }
         );
@@ -1017,7 +1227,7 @@ impl App {
     }
 
     fn visible_steps(&self, w: u16) -> (usize, usize) {
-        let len = usize::from(self.project.pattern_len);
+        let len = self.pattern_len();
         let cap = usize::from((w - LEFT) / CELL).max(1);
         let first = (self.step / cap) * cap;
         (first, (first + cap).min(len))
@@ -1033,7 +1243,7 @@ impl App {
                 let label = format!("{}.{}", i / 16 + 1, (i % 16) / 4 + 1);
                 s.put(x, 1, &label, Style::fg(Color::White));
             }
-            if self.play_step == Some(i) {
+            if self.play_step() == Some(i) {
                 s.put(x + 2, 1, "▼", Style::fg(Color::BrightGreen));
             }
         }
@@ -1047,7 +1257,7 @@ impl App {
         let (first, last) = self.visible_steps(w);
         // Pitches sounding at each step because an earlier note is still held.
         let mut held = [0u128; MAX_STEPS];
-        for (j, step) in t.steps.iter().enumerate() {
+        for (j, step) in t.steps[self.pattern].iter().enumerate() {
             let Some(st) = step.filter(|st| st.ratchet == 1) else { continue };
             let mask = st.notes().fold(0u128, |m, n| m | 1 << n);
             for h in held.iter_mut().take((j + usize::from(st.length)).min(MAX_STEPS)).skip(j + 1) {
@@ -1072,7 +1282,7 @@ impl App {
             s.put(LEFT - 1, y, if black { "▌" } else { "│" }, dim);
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
-                let step = t.steps[i];
+                let step = t.steps[self.pattern][i];
                 let (text, mut st) = match step {
                     Some(sp) if sp.has_note(pitch) => {
                         let r = if sp.ratchet > 1 { char::from(b'0' + sp.ratchet) } else { '■' };
@@ -1084,7 +1294,7 @@ impl App {
                     _ if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
                     _ => (" · ".to_string(), dim),
                 };
-                if self.play_step == Some(i) {
+                if self.play_step() == Some(i) {
                     st.bg = Color::Blue;
                 }
                 if i == self.step && pitch == self.roll_note {
@@ -1094,6 +1304,59 @@ impl App {
                 }
                 s.put(x, y, &text, st);
             }
+        }
+    }
+
+    /// The song: one cell per entry, wrapped to the width. `[` and `]` mark
+    /// the loop region.
+    fn draw_song(&self, s: &mut Screen, w: u16, rows: u16) {
+        let p = &self.project;
+        let secs = p.song_steps() as f64 * Transport::samples_per_step(p.tempo, 1.0);
+        let lp = match p.loop_region {
+            Some((a, b)) if p.active_loop().is_some() => format!("loop {}-{}", a + 1, b + 1),
+            Some(_) => "loop region past the end".into(),
+            None => "no loop".into(),
+        };
+        let title = format!(
+            "Song · {} entries · {}:{:02} · {lp}",
+            p.song.len(),
+            (secs / 60.0).floor() as u64,
+            (secs % 60.0).floor() as u64
+        );
+        s.put(1, 1, &title, Style::fg(Color::BrightWhite).bold());
+        let keys = "↑↓ pattern  Enter repeat  Del remove  [ ] loop  - no loop  Space play  S grid";
+        if rows > 2 {
+            s.put(1, 1 + rows, keys, Style::fg(Color::Gray));
+        }
+        if p.song.is_empty() {
+            let hint = format!("The song is empty. Enter adds pattern {}.", pattern_name(self.pattern as u8));
+            s.put(2, 3, &hint, Style::fg(Color::Yellow));
+            return;
+        }
+        let per_row = usize::from((w - 2) / 4).max(1);
+        let visible = usize::from(rows.saturating_sub(1)).max(1);
+        let cursor_row = self.song_cursor / per_row;
+        let first_row = cursor_row.saturating_sub(visible - 1);
+        let loop_region = p.active_loop();
+        let playing = self.play_pos.and_then(|q| q.entry).map(usize::from);
+        for (i, &pat) in p.song.iter().enumerate() {
+            let row = i / per_row;
+            if row < first_row || row >= first_row + visible {
+                continue;
+            }
+            let x = 1 + (i % per_row) as u16 * 4;
+            let y = 2 + (row - first_row) as u16;
+            let inside = loop_region.is_some_and(|(a, b)| (usize::from(a)..=usize::from(b)).contains(&i));
+            let open = if loop_region.is_some_and(|(a, _)| usize::from(a) == i) { '[' } else { ' ' };
+            let close = if loop_region.is_some_and(|(_, b)| usize::from(b) == i) { ']' } else { ' ' };
+            let mut st = Style::fg(if inside { Color::BrightGreen } else { Color::BrightCyan });
+            if playing == Some(i) {
+                st.bg = Color::Blue;
+            }
+            if i == self.song_cursor {
+                st = Style::fg(Color::Black).on(Color::BrightWhite);
+            }
+            s.put(x, y, &format!("{open}{}{close}", pattern_name(pat)), st);
         }
     }
 
@@ -1127,7 +1390,7 @@ impl App {
 
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
-                let (text, mut st) = match t.steps[i] {
+                let (text, mut st) = match t.steps[self.pattern][i] {
                     Some(step) => {
                         // Drum cells have room for a ratchet digit; note names fill all three.
                         let text = if t.kind.is_drum() {
@@ -1147,10 +1410,10 @@ impl App {
                     None if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
                     None => (" · ".to_string(), dim),
                 };
-                if t.mute && t.steps[i].is_some() {
+                if t.mute && t.steps[self.pattern][i].is_some() {
                     st.fg = Color::Gray;
                 }
-                if self.play_step == Some(i) {
+                if self.play_step() == Some(i) {
                     st.bg = Color::Blue;
                 }
                 if selected && i == self.step {
@@ -1186,7 +1449,7 @@ impl App {
         let title_style =
             if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
         s.put(2, y, &title, title_style);
-        let brush = match t.steps.get(self.step).copied().flatten() {
+        let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
             Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
             None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
         };
@@ -1219,10 +1482,10 @@ impl App {
                     PromptKind::Rename => "Track name: ".to_string(),
                     PromptKind::LoadSample => "Load WAV sample: ".to_string(),
                     PromptKind::Export => format!(
-                        "Export [{}, {} loop{}] (Tab format, ↑↓ loops) file: ",
+                        "Export [{}, {} ×{}] (←→ what, Tab format, ↑↓ repeats) file: ",
                         self.export_format.label(),
+                        self.export_source_label(),
                         self.export_loops,
-                        if self.export_loops == 1 { "" } else { "s" }
                     ),
                 };
                 let x = s.put(0, y, &label, prompt);
@@ -1292,10 +1555,13 @@ fn draw_help(s: &mut Screen) {
         ("t T", "tempo down / up"),
         ("g G", "swing down / up (50-75 %)"),
         ("l L", "pattern length down / up"),
+        ("n N", "next / previous pattern (A-P); while a pattern plays, it plays next"),
+        ("y Y X", "copy / paste / clear the pattern"),
+        ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
         ("w  Ctrl+S", "save (W: save as)"),
-        ("e", "export WAV (Tab picks format, ↑↓ loop count)"),
+        ("e", "export WAV (←→ song / pattern / loop region, Tab format, ↑↓ repeats)"),
         ("q  Ctrl+C", "quit"),
     ];
     for (i, (k, d)) in lines.iter().enumerate() {
@@ -1478,14 +1744,14 @@ mod tests {
     fn toggling_steps() {
         let mut a = app();
         a.track = 0; // kick, step 0 is set in the demo
-        assert!(a.project.tracks[0].steps[0].is_some());
+        assert!(a.project.tracks[0].steps[0][0].is_some());
         keys(&mut a, &[Key::Enter]);
-        assert!(a.project.tracks[0].steps[0].is_none());
+        assert!(a.project.tracks[0].steps[0][0].is_none());
         assert!(a.dirty);
         keys(&mut a, &[Key::Right, Key::Char('x')]);
-        assert!(a.project.tracks[0].steps[1].is_some());
+        assert!(a.project.tracks[0].steps[0][1].is_some());
         keys(&mut a, &[Key::Delete]);
-        assert!(a.project.tracks[0].steps[1].is_none());
+        assert!(a.project.tracks[0].steps[0][1].is_none());
     }
 
     #[test]
@@ -1502,7 +1768,7 @@ mod tests {
         // Shrinking the pattern pulls the cursor back inside it.
         a.step = 15;
         keys(&mut a, &[Key::Char('l')]);
-        assert_eq!(a.project.pattern_len, 15);
+        assert_eq!(a.project.pattern_lens[0], 15);
         assert_eq!(a.step, 14);
     }
 
@@ -1512,20 +1778,20 @@ mod tests {
         let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
         a.track = bass;
         a.step = 0;
-        let before = a.project.tracks[bass].steps[0].unwrap();
+        let before = a.project.tracks[bass].steps[0][0].unwrap();
         keys(&mut a, &[Key::Char('.'), Key::Char('>'), Key::Char(']'), Key::Char('}')]);
-        let after = a.project.tracks[bass].steps[0].unwrap();
+        let after = a.project.tracks[bass].steps[0][0].unwrap();
         assert_eq!(after.note, before.note + 13);
         assert_eq!(after.velocity, (before.velocity + 8).min(127));
         assert_eq!(after.length, before.length + 1);
         // A new step uses the edited values.
         a.step = 1;
         keys(&mut a, &[Key::Enter]);
-        assert_eq!(a.project.tracks[bass].steps[1], Some(after));
+        assert_eq!(a.project.tracks[bass].steps[0][1], Some(after));
         // Editing an empty step only changes the brush.
         a.step = 2;
         keys(&mut a, &[Key::Char(',')]);
-        assert!(a.project.tracks[bass].steps[2].is_none());
+        assert!(a.project.tracks[bass].steps[0][2].is_none());
         assert_eq!(a.brushes[bass].note, after.note - 1);
     }
 
@@ -1686,18 +1952,18 @@ mod tests {
         let ratchets: Vec<u8> = (0..5)
             .map(|_| {
                 a.handle_key(Key::Char('/'));
-                a.project.tracks[0].steps[0].unwrap().ratchet
+                a.project.tracks[0].steps[0][0].unwrap().ratchet
             })
             .collect();
         assert_eq!(ratchets, [2, 3, 4, 1, 2]);
         for _ in 0..12 {
             a.handle_key(Key::Char('-'));
         }
-        assert_eq!(a.project.tracks[0].steps[0].unwrap().chance, 1);
+        assert_eq!(a.project.tracks[0].steps[0][0].unwrap().chance, 1);
         for _ in 0..12 {
             a.handle_key(Key::Char('='));
         }
-        assert_eq!(a.project.tracks[0].steps[0].unwrap().chance, 100);
+        assert_eq!(a.project.tracks[0].steps[0][0].unwrap().chance, 100);
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);
         assert!(s.row_text(2).contains("█2"), "{}", s.row_text(2));
@@ -1717,24 +1983,24 @@ mod tests {
             &mut a,
             &[Key::Enter, Key::Up, Key::Up, Key::Up, Key::Up, Key::Enter, Key::Up, Key::Up, Key::Up, Key::Enter],
         );
-        let st = a.project.tracks[1].steps[0].unwrap();
+        let st = a.project.tracks[1].steps[0][0].unwrap();
         assert_eq!(st.notes().collect::<Vec<_>>(), [48, 52, 55]);
         // A fourth note fits, a fifth does not.
         keys(&mut a, &[Key::PageUp, Key::Enter, Key::Down, Key::Enter]);
-        assert_eq!(a.project.tracks[1].steps[0].unwrap().note_count(), 4);
+        assert_eq!(a.project.tracks[1].steps[0][0].unwrap().note_count(), 4);
         assert!(a.status_text().unwrap().contains("at most"));
         // Removing notes one by one finally clears the step.
-        assert_eq!(a.project.tracks[1].steps[0].unwrap().top(), 67);
+        assert_eq!(a.project.tracks[1].steps[0][0].unwrap().top(), 67);
         for n in [67, 55, 52, 48] {
             a.roll_note = n;
             keys(&mut a, &[Key::Enter]);
         }
-        assert_eq!(a.project.tracks[1].steps[0], None);
+        assert_eq!(a.project.tracks[1].steps[0][0], None);
         // Each toggle was its own undo step.
         for _ in 0..4 {
             a.handle_key(Key::Char('u'));
         }
-        assert_eq!(a.project.tracks[1].steps[0].unwrap().note_count(), 4);
+        assert_eq!(a.project.tracks[1].steps[0][0].unwrap().note_count(), 4);
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);
         assert!(s.row_text(1).contains("Piano roll"));
@@ -1751,23 +2017,23 @@ mod tests {
         let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
         a.track = bass;
         a.step = 0;
-        let root = a.project.tracks[bass].steps[0].unwrap().note;
+        let root = a.project.tracks[bass].steps[0][0].unwrap().note;
         keys(&mut a, &[Key::Char('c')]);
-        assert_eq!(a.project.tracks[bass].steps[0].unwrap().chord, [4, 7, 0]);
+        assert_eq!(a.project.tracks[bass].steps[0][0].unwrap().chord, [4, 7, 0]);
         keys(&mut a, &[Key::Char('c'), Key::Char('.')]);
-        let st = a.project.tracks[bass].steps[0].unwrap();
+        let st = a.project.tracks[bass].steps[0][0].unwrap();
         assert_eq!((st.note, st.chord), (root + 1, [3, 7, 0]));
         keys(&mut a, &[Key::Char(')'), Key::Char(')'), Key::Char('(')]);
-        assert_eq!(a.project.tracks[bass].steps[0].unwrap().offset, 1);
+        assert_eq!(a.project.tracks[bass].steps[0][0].unwrap().offset, 1);
         for _ in 0..20 {
             a.handle_key(Key::Char('('));
         }
-        assert_eq!(a.project.tracks[bass].steps[0].unwrap().offset, -MAX_OFFSET);
+        assert_eq!(a.project.tracks[bass].steps[0][0].unwrap().offset, -MAX_OFFSET);
         assert!(a.status_text().is_none_or(|t| !t.starts_with("Cannot")));
         // Drums have no chords.
         a.track = 0;
         keys(&mut a, &[Key::Char('c')]);
-        assert_eq!(a.project.tracks[0].steps[0].unwrap().chord, [0; MAX_CHORD - 1]);
+        assert_eq!(a.project.tracks[0].steps[0][0].unwrap().chord, [0; MAX_CHORD - 1]);
         assert_eq!(step_summary(&Step { chord: [3, 7, 0], offset: -2, ..Step::new(57, 90, 1) }), "A3min v90 len1 -2t");
     }
 
@@ -1833,6 +2099,118 @@ mod tests {
         a.draw(&mut s);
         assert!((0..30).any(|y| s.row_text(y).contains("tone.wav")));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn patterns_are_edited_independently() {
+        let mut a = app();
+        a.track = 0;
+        keys(&mut a, &[Key::Char('n')]);
+        assert_eq!(a.pattern, 1);
+        assert_eq!(a.status_text(), Some("Pattern B (16 steps)"));
+        keys(&mut a, &[Key::Right, Key::Enter, Key::Char('l')]);
+        assert!(a.project.tracks[0].steps[1][1].is_some());
+        assert!(a.project.tracks[0].steps[0][1].is_none());
+        assert_eq!((a.project.pattern_lens[0], a.project.pattern_lens[1]), (16, 15));
+        keys(&mut a, &[Key::Char('N'), Key::Char('N')]);
+        assert_eq!(a.pattern, MAX_PATTERNS - 1);
+        let mut s = Screen::new(120, 30);
+        a.draw(&mut s);
+        assert!(s.row_text(0).contains("pattern P · 16 steps"), "{}", s.row_text(0));
+        // Undo returns to the pattern where the change happened.
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!((a.pattern, a.project.pattern_lens[1]), (1, 16));
+    }
+
+    #[test]
+    fn copy_paste_and_clear_are_single_undo_steps() {
+        let mut a = app();
+        let before = a.project.clone();
+        keys(&mut a, &[Key::Char('Y')]);
+        assert!(a.status_text().unwrap().starts_with("Nothing copied"));
+        keys(&mut a, &[Key::Char('l'), Key::Char('y'), Key::Char('n'), Key::Char('n'), Key::Char('Y')]);
+        let undo_len = a.undo.len();
+        for t in &a.project.tracks {
+            assert_eq!(t.steps[2], t.steps[0]);
+        }
+        assert_eq!(a.project.pattern_lens[2], 15);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.undo.len(), undo_len - 1);
+        assert!(a.project.tracks.iter().all(|t| t.steps[2].iter().all(Option::is_none)));
+        assert_eq!(a.project.pattern_lens[2], 16);
+        // Clearing pattern A, then undoing, restores it.
+        keys(&mut a, &[Key::Char('N'), Key::Char('N'), Key::Char('X')]);
+        assert!(a.project.tracks.iter().all(|t| t.steps[0].iter().all(Option::is_none)));
+        keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
+        assert_eq!(a.project, before);
+        keys(&mut a, &[Key::Char('X'), Key::Char('X')]);
+        assert_eq!(a.undo.len(), 1, "clearing an empty pattern is not an undo step");
+    }
+
+    #[test]
+    fn song_view_builds_the_song() {
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(Project::new(), None, Some(link), 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('2'), Key::Char('n'), Key::Char('S')]);
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!((0..30).any(|y| s.row_text(y).contains("Enter adds pattern B")));
+        keys(&mut a, &[Key::Enter, Key::Enter, Key::Up, Key::Up, Key::Enter]);
+        assert_eq!(a.project.song, [1, 3, 3]);
+        assert_eq!(a.song_cursor, 2);
+        keys(&mut a, &[Key::Char(']'), Key::Left, Key::Char('[')]);
+        assert_eq!(a.project.loop_region, Some((1, 2)));
+        keys(&mut a, &[Key::Home, Key::Delete]);
+        assert_eq!((a.project.song.as_slice(), a.project.loop_region), ([3, 3].as_slice(), Some((1, 2))));
+        assert_eq!(a.project.active_loop(), None, "the region now reaches past the end");
+        a.draw(&mut s);
+        assert!((0..30).any(|y| s.row_text(y).contains("loop region past the end")));
+        keys(&mut a, &[Key::Char('-')]);
+        assert_eq!(a.project.loop_region, None);
+        // Track keys do nothing to the hidden tracks; x repeats an entry.
+        let steps = a.project.tracks[0].steps.clone();
+        keys(&mut a, &[Key::Char('m'), Key::Char('x')]);
+        assert!(!a.project.tracks[0].mute);
+        assert_eq!(a.project.tracks[0].steps, steps);
+        assert_eq!(a.project.song, [3, 3, 3]);
+        // Undo walks back through the nine song edits (the two Up presses
+        // merged), leaving the track.
+        for _ in 0..9 {
+            keys(&mut a, &[Key::Char('u')]);
+        }
+        assert!(a.project.song.is_empty() && a.project.loop_region.is_none());
+        assert_eq!(a.project.tracks.len(), 1);
+
+        // Space plays the song from the cursor in the song view and the
+        // pattern being edited in the grid.
+        keys(&mut a, &[Key::Enter, Key::Enter, Key::Right]);
+        while rx.pop().is_some() {}
+        keys(&mut a, &[Key::Char(' '), Key::Char(' '), Key::Char('S'), Key::Char(' ')]);
+        let sent: Vec<Command> = std::iter::from_fn(|| rx.pop()).collect();
+        assert_eq!(sent, [Command::PlaySong { entry: 1 }, Command::Stop, Command::Cue(1), Command::Play], "{sent:?}");
+    }
+
+    #[test]
+    fn export_source_cycles() {
+        let mut a = app();
+        assert_eq!(a.export_source_label(), "song");
+        a.mode = Mode::Prompt(PromptKind::Export, "x.wav".into());
+        keys(&mut a, &[Key::Right]);
+        assert_eq!(a.export_source_label(), "pattern A");
+        keys(&mut a, &[Key::Right]);
+        // No loop region yet: the region falls back to pattern A.
+        assert_eq!(a.export_source, Source::Region);
+        assert_eq!(a.export_source_label(), "pattern A");
+        a.project.loop_region = Some((3, 3));
+        assert_eq!(a.export_source_label(), "loop region");
+        keys(&mut a, &[Key::Right, Key::Left, Key::Left]);
+        assert_eq!(a.export_source_label(), "pattern A");
+        a.pattern = 1;
+        assert_eq!(a.export_source_label(), "pattern B");
+        let mut s = Screen::new(120, 30);
+        a.draw(&mut s);
+        assert!(s.row_text(29).contains("pattern B"), "{}", s.row_text(29));
     }
 
     #[test]
@@ -1924,7 +2302,10 @@ mod tests {
         a.export_to(&path);
         let d = wav::decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!((d.channels, d.bits, d.sample_rate), (2, 16, 48_000));
-        assert!(d.samples.len() / 2 >= render::pattern_frames(&a.project, 48_000, 1) as usize);
+        assert!(
+            d.samples.len() / 2
+                >= render::main_frames(&a.project, &RenderOptions { loops: 1, ..Default::default() }) as usize
+        );
         assert!(a.status_text().unwrap().starts_with("Exported"), "{:?}", a.status_text());
         std::fs::remove_dir_all(&dir).unwrap();
     }

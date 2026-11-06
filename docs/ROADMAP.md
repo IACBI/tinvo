@@ -32,7 +32,7 @@ Author: 𝓐.𝓒.𝓑
 - Project format 3; formats 1 and 2 still load.
 - `tinvo bench` also measures a worst-case synth (8 voices, unison 4, noise, LFO).
 
-## Phase 2: Sampler ✅ (0.4.0, this release)
+## Phase 2: Sampler ✅ (0.4.0)
 
 - Sampler track: 8 voices playing a WAV file in memory, pitched from a root note (±24 semitones of tune plus fine tune), following the file's own sample rate.
 - 8-tap polyphase windowed-sinc interpolation (Blackman window, 256 interpolated phases) or linear. The sinc kernel is exact at integer positions, so the root pitch plays the file back unchanged.
@@ -46,11 +46,20 @@ Known limits, planned for later phases:
 - One sample per track; there are no multi-sample key maps yet.
 - The interpolation kernel does not lower its cutoff when pitching up, so a sample transposed far upwards can alias.
 
-## Phase 3: Arrangement
+## Phase 3a: Arrangement ✅ (0.5.0, this release)
 
-- Multiple patterns per track, a song timeline (pattern chain) and a loop region.
-- Arrangement-wide export, rendering of individual stems, and marker-based export ranges.
-- Automation lanes for any parameter (sample-accurate ramps).
+- 16 patterns per project, each with its own length (1–64 steps); every track has steps in every pattern.
+- Pattern switching while playing: the chosen pattern takes over at the end of the current one, sample-accurately. A switch made during the last step of a pattern lands one pattern later, because that step has already queued the next step's early hits.
+- Song: a chain of up to 256 patterns, plus a loop region over song entries. Song edits made during playback take effect from the next step.
+- Export of the song, one pattern or the loop region; per-track stems that add up to the mix.
+- Copy, paste and clear a pattern, each one undo step.
+- Project format 5; formats 1–4 load into pattern A.
+
+## Phase 3b: Automation
+
+- Automation lanes for any parameter, with sample-accurate ramps, per pattern.
+- Song-position markers and export ranges between them.
+- Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
 
 ## Phase 4: Mixing and effects
 

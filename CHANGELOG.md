@@ -6,6 +6,19 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-06
+
+### Added
+- 16 patterns (A–P) per project, each with its own length. `n`/`N` picks the pattern to edit; while a pattern plays, the picked one takes over when the current one ends.
+- `y`, `Y` and `X` copy, paste and clear a pattern. A paste or a clear is one undo step.
+- Song view (`S`): a chain of up to 256 patterns with a loop region (`[` `]`, `-` removes it). `Space` in the song view plays the song from the cursor.
+- Export of the song, the pattern being edited or the loop region (`←`/`→` in the export prompt). `tinvo render` takes `--song`, `--region` and `--pattern A-P`, and by default renders the song if it has entries.
+- `tinvo render --stems` also writes one WAV per audible track. The stems are the same length and add up to the mix.
+- The demo now has a fill pattern and a song (A A A B).
+
+### Changed
+- Project files are now format 5, which adds patterns, `song` and `loop` lines. Formats 1–4 still load, into pattern A.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added
@@ -55,7 +68,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/IACBI/tinvo/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/IACBI/tinvo/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/IACBI/tinvo/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/IACBI/tinvo/compare/v0.1.0...v0.2.0

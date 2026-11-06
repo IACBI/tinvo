@@ -26,13 +26,14 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
 - Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–4 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
+- 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region. Patterns switch at the end of the bar while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
 - An 8-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
-- WAV export at 16 or 24 bit (dithered) or 32-bit float, with clipping reported.
+- WAV export at 16 or 24 bit (dithered) or 32-bit float, with clipping reported: the song, one pattern or the loop region, optionally as per-track stems.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -59,6 +60,7 @@ To build without installing, run `cargo build --release`; the binary is `target/
 tinvo                     # open the editor with the demo beat
 tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
+tinvo render song.tvo beat.wav --pattern B --stems
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo bench               # measure rendering speed
@@ -80,6 +82,9 @@ The main keys in the editor (press `?` for the full list):
 | `v` | piano roll for the track (`↑` `↓` pitch, `Enter` adds or removes a note) |
 | `u` `U` | undo / redo (also `Ctrl+Z` / `Ctrl+Y`) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
+| `n` `N` | next / previous pattern |
+| `y` `Y` `X` | copy / paste / clear the pattern |
+| `S` | song view (`←` `→` entry, `↑` `↓` its pattern, `Enter` repeat, `Del` remove, `[` `]` loop) |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
 | `w` `W` `e` | save, save as, export WAV |
@@ -110,13 +115,14 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 16 kanal, 64'e kadar 16'lık adım, 20–300 BPM tempo, %50–75 swing.
 - Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–4 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
+- 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
 - WAV dosyalarını windowed-sinc interpolasyonla çalan 8 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
-- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma; clipping olursa raporlanır.
+- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma; clipping olursa raporlanır. Şarkının tamamı, tek bir pattern ya da döngü bölgesi aktarılabilir, istenirse her kanal ayrı dosyaya (stem).
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
 
@@ -143,6 +149,7 @@ Kurmadan derlemek için `cargo build --release` yeterli; binary `target/release/
 tinvo                     # open the editor with the demo beat
 tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
+tinvo render song.tvo beat.wav --pattern B --stems
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo bench               # measure rendering speed
@@ -164,6 +171,9 @@ Editördeki temel tuşlar (tam liste için `?`):
 | `v` | kanalın piyano rulosu (`↑` `↓` perde, `Enter` nota ekler ya da siler) |
 | `u` `U` | geri al / yinele (`Ctrl+Z` / `Ctrl+Y` de olur) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
+| `n` `N` | sonraki / önceki pattern |
+| `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
+| `S` | şarkı görünümü (`←` `→` giriş, `↑` `↓` pattern'i, `Enter` tekrarla, `Del` sil, `[` `]` döngü) |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |

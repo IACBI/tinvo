@@ -3,11 +3,13 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 4
+//! tinvo 5
 //! tempo 92
 //! swing 50
-//! pattern_length 16
+//! pattern_length B 32        # only patterns that are not 16 steps long
 //! master_gain_db 0
+//! song A A A B               # only when the song is not empty
+//! loop 2 3                   # song entries, 0-based; only when set
 //!
 //! track kick
 //! name Kick
@@ -17,24 +19,29 @@
 //! solo false
 //! param decay 0.45
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
+//! pattern B                  # the following steps belong to pattern B
+//! step 0 60 120 1 100 1 0 -
 //! end
 //! ```
 //!
-//! `chord` is `-` or the extra notes as comma-separated semitones above
-//! `note`, ascending (`4,7` is a major triad). A sampler track may have a
-//! `sample <path>` line; relative paths are relative to the project file.
-//! Versions 1 (no swing, `index note velocity length`), 2 (`... chance
-//! ratchet`) and 3 (no samples) are still read. Floats are written with Rust's shortest round-trip formatting, so
-//! saving and loading is lossless.
+//! Steps before any `pattern` line belong to pattern A. `chord` is `-` or
+//! the extra notes as comma-separated semitones above `note`, ascending
+//! (`4,7` is a major triad). A sampler track may have a `sample <path>`
+//! line; relative paths are relative to the project file. Versions 1 (no
+//! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
+//! samples) and 4 (one pattern, `pattern_length <n>`) are still read.
+//! Floats are written with Rust's shortest round-trip formatting, so saving
+//! and loading is lossless.
 
 use crate::engine::{
-    Edit, MAX_CHORD, MAX_GAIN_DB, MAX_STEPS, MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step,
+    DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_GAIN_DB, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region,
 };
 use crate::instrument::{InstrumentKind, ParamSpec, SILENT_DB, Unit};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -54,7 +61,8 @@ pub struct TrackData {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
-    pub steps: [Option<Step>; MAX_STEPS],
+    /// `steps[pattern][step]`.
+    pub steps: Box<[[Option<Step>; MAX_STEPS]; MAX_PATTERNS]>,
     /// Sampler tracks: the sample file. Absolute in memory; written relative
     /// to the project file when it sits inside the project's directory.
     pub sample: Option<String>,
@@ -70,7 +78,7 @@ impl TrackData {
             pan: 0.0,
             mute: false,
             solo: false,
-            steps: [None; MAX_STEPS],
+            steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
         }
     }
@@ -81,9 +89,13 @@ pub struct Project {
     pub tempo: f32,
     /// Swing in percent (50 = straight).
     pub swing: f32,
-    pub pattern_len: u8,
+    pub pattern_lens: [u8; MAX_PATTERNS],
     pub master_gain_db: f32,
     pub tracks: Vec<TrackData>,
+    /// Pattern numbers in playing order.
+    pub song: Vec<u8>,
+    /// Song entries `start..=end` that repeat while the song plays.
+    pub loop_region: Option<(u16, u16)>,
 }
 
 impl Default for Project {
@@ -98,7 +110,11 @@ pub enum EditError {
     NoSuchTrack(u8),
     NoSuchStep(u8),
     NoSuchParam(u8),
+    NoSuchPattern(u8),
+    NoSuchEntry(u16),
     TooManyTracks,
+    SongFull,
+    BadLoop,
 }
 
 impl fmt::Display for EditError {
@@ -107,7 +123,11 @@ impl fmt::Display for EditError {
             EditError::NoSuchTrack(t) => write!(f, "no track {}", u32::from(*t) + 1),
             EditError::NoSuchStep(s) => write!(f, "no step {}", u32::from(*s) + 1),
             EditError::NoSuchParam(p) => write!(f, "no parameter {p}"),
+            EditError::NoSuchPattern(p) => write!(f, "no pattern {}", u32::from(*p) + 1),
+            EditError::NoSuchEntry(e) => write!(f, "no song entry {}", u32::from(*e) + 1),
             EditError::TooManyTracks => write!(f, "track limit ({MAX_TRACKS}) reached"),
+            EditError::SongFull => write!(f, "the song is full ({MAX_SONG} entries)"),
+            EditError::BadLoop => write!(f, "loop region out of range"),
         }
     }
 }
@@ -132,7 +152,15 @@ impl std::error::Error for ParseError {}
 impl Project {
     /// An empty project at 120 BPM with a one-bar pattern.
     pub fn new() -> Self {
-        Self { tempo: 120.0, swing: MIN_SWING, pattern_len: 16, master_gain_db: 0.0, tracks: Vec::new() }
+        Self {
+            tempo: 120.0,
+            swing: MIN_SWING,
+            pattern_lens: [DEFAULT_PATTERN_LEN; MAX_PATTERNS],
+            master_gain_db: 0.0,
+            tracks: Vec::new(),
+            song: Vec::new(),
+            loop_region: None,
+        }
     }
 
     /// A ready-to-play beat used when TINVO starts without a file.
@@ -145,7 +173,7 @@ impl Project {
             t.gain_db = gain_db;
             t.pan = pan;
             for &(i, note, velocity, length) in steps {
-                t.steps[usize::from(i)] = Some(Step::new(note, velocity, length));
+                t.steps[0][usize::from(i)] = Some(Step::new(note, velocity, length));
             }
             p.tracks.push(t);
             p.tracks.len() - 1
@@ -175,6 +203,17 @@ impl Project {
         bass[11] = 0.1; // filter sustain
         bass[15] = 0.8; // amp sustain
         bass[16] = 0.08; // amp release
+        // Pattern B: the same groove ending in a snare fill, played every
+        // fourth bar.
+        for t in &mut p.tracks {
+            t.steps[1] = t.steps[0];
+        }
+        for (i, v) in [(13, 70), (14, 90), (15, 115)] {
+            p.tracks[1].steps[1][i] = Some(Step::new(60, v, 1));
+        }
+        p.tracks[3].steps[1][14] = None;
+        p.tracks[b].steps[1][14] = Some(Step::new(34, 110, 2));
+        p.song = vec![0, 0, 0, 1];
         p
     }
 
@@ -187,10 +226,41 @@ impl Project {
                 self.tempo = bpm;
                 Edit::SetTempo(bpm)
             }
-            Edit::SetPatternLength(len) => {
+            Edit::SetPatternLength { pattern, len } => {
+                let slot = self.pattern_lens.get_mut(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
                 let len = len.clamp(1, MAX_STEPS as u8);
-                self.pattern_len = len;
-                Edit::SetPatternLength(len)
+                *slot = len;
+                Edit::SetPatternLength { pattern, len }
+            }
+            Edit::InsertSongEntry { index, pattern } => {
+                check_pattern(pattern)?;
+                if usize::from(index) > self.song.len() {
+                    return Err(EditError::NoSuchEntry(index));
+                }
+                if self.song.len() >= MAX_SONG {
+                    return Err(EditError::SongFull);
+                }
+                self.song.insert(usize::from(index), pattern);
+                edit
+            }
+            Edit::RemoveSongEntry(index) => {
+                self.entry(index)?;
+                self.song.remove(usize::from(index));
+                edit
+            }
+            Edit::SetSongEntry { index, pattern } => {
+                check_pattern(pattern)?;
+                self.entry(index)?;
+                self.song[usize::from(index)] = pattern;
+                edit
+            }
+            Edit::SetLoop(region) => {
+                let region = match region {
+                    Some(r) => Some(loop_region(r).ok_or(EditError::BadLoop)?),
+                    None => None,
+                };
+                self.loop_region = region;
+                Edit::SetLoop(region)
             }
             Edit::SetMasterGain(db) => {
                 let db = VOLUME.clamp(db);
@@ -224,12 +294,14 @@ impl Project {
                 self.tracks.remove(usize::from(t));
                 edit
             }
-            Edit::SetStep { track, step, value } => {
+            Edit::SetStep { track, pattern, step, value } => {
+                check_pattern(pattern)?;
                 let tr = self.track_mut(track)?;
-                let slot = tr.steps.get_mut(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
+                let slot =
+                    tr.steps[usize::from(pattern)].get_mut(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
                 let value = value.map(Step::sanitized);
                 *slot = value;
-                Edit::SetStep { track, step, value }
+                Edit::SetStep { track, pattern, step, value }
             }
             Edit::SetParam { track, index, value } => {
                 let tr = self.track_mut(track)?;
@@ -268,15 +340,32 @@ impl Project {
         self.tracks.get_mut(usize::from(t)).ok_or(EditError::NoSuchTrack(t))
     }
 
+    fn entry(&self, index: u16) -> Result<u8, EditError> {
+        self.song.get(usize::from(index)).copied().ok_or(EditError::NoSuchEntry(index))
+    }
+
+    /// Steps in one pass through the song (0 if it is empty).
+    pub fn song_steps(&self) -> u64 {
+        self.song.iter().map(|&p| u64::from(self.pattern_lens[usize::from(p)])).sum()
+    }
+
+    /// The loop region, if it lies inside the song.
+    pub fn active_loop(&self) -> Option<(u16, u16)> {
+        self.loop_region.filter(|&(_, b)| usize::from(b) < self.song.len())
+    }
+
     /// The sequence of edits that rebuilds this project (except track names,
     /// which the engine does not need) from `Project::new()`.
     pub fn to_edits(&self) -> Vec<Edit> {
-        let mut e = vec![
-            Edit::SetTempo(self.tempo),
-            Edit::SetSwing(self.swing),
-            Edit::SetPatternLength(self.pattern_len),
-            Edit::SetMasterGain(self.master_gain_db),
-        ];
+        let mut e =
+            vec![Edit::SetTempo(self.tempo), Edit::SetSwing(self.swing), Edit::SetMasterGain(self.master_gain_db)];
+        for (p, &len) in self.pattern_lens.iter().enumerate() {
+            e.push(Edit::SetPatternLength { pattern: p as u8, len });
+        }
+        for (i, &pattern) in self.song.iter().enumerate() {
+            e.push(Edit::InsertSongEntry { index: i as u16, pattern });
+        }
+        e.push(Edit::SetLoop(self.loop_region));
         for (i, t) in self.tracks.iter().enumerate() {
             e.push(Edit::AddTrack(t.kind));
             push_track_state(&mut e, i as u8, t);
@@ -290,7 +379,31 @@ impl Project {
         let inv = match *edit {
             Edit::SetTempo(_) => vec![Edit::SetTempo(self.tempo)],
             Edit::SetSwing(_) => vec![Edit::SetSwing(self.swing)],
-            Edit::SetPatternLength(_) => vec![Edit::SetPatternLength(self.pattern_len)],
+            Edit::SetPatternLength { pattern, .. } => {
+                let len = *self.pattern_lens.get(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
+                vec![Edit::SetPatternLength { pattern, len }]
+            }
+            Edit::InsertSongEntry { index, pattern } => {
+                check_pattern(pattern)?;
+                if usize::from(index) > self.song.len() {
+                    return Err(EditError::NoSuchEntry(index));
+                }
+                if self.song.len() >= MAX_SONG {
+                    return Err(EditError::SongFull);
+                }
+                vec![Edit::RemoveSongEntry(index)]
+            }
+            Edit::RemoveSongEntry(index) => vec![Edit::InsertSongEntry { index, pattern: self.entry(index)? }],
+            Edit::SetSongEntry { index, pattern } => {
+                check_pattern(pattern)?;
+                vec![Edit::SetSongEntry { index, pattern: self.entry(index)? }]
+            }
+            Edit::SetLoop(region) => {
+                if region.is_some_and(|r| loop_region(r).is_none()) {
+                    return Err(EditError::BadLoop);
+                }
+                vec![Edit::SetLoop(self.loop_region)]
+            }
             Edit::SetMasterGain(_) => vec![Edit::SetMasterGain(self.master_gain_db)],
             Edit::AddTrack(_) => {
                 if self.tracks.len() >= MAX_TRACKS {
@@ -313,9 +426,11 @@ impl Project {
                 push_track_state(&mut e, t, tr);
                 e
             }
-            Edit::SetStep { track, step, .. } => {
-                let old = *self.track(track)?.steps.get(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
-                vec![Edit::SetStep { track, step, value: old }]
+            Edit::SetStep { track, pattern, step, .. } => {
+                check_pattern(pattern)?;
+                let steps = &self.track(track)?.steps[usize::from(pattern)];
+                let old = *steps.get(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
+                vec![Edit::SetStep { track, pattern, step, value: old }]
             }
             Edit::SetParam { track, index, .. } => {
                 let old = *self.track(track)?.params.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
@@ -342,8 +457,19 @@ impl Project {
         let _ = writeln!(s, "tinvo {FORMAT_VERSION}");
         let _ = writeln!(s, "tempo {}", self.tempo);
         let _ = writeln!(s, "swing {}", self.swing);
-        let _ = writeln!(s, "pattern_length {}", self.pattern_len);
+        for (p, &len) in self.pattern_lens.iter().enumerate() {
+            if len != DEFAULT_PATTERN_LEN {
+                let _ = writeln!(s, "pattern_length {} {len}", pattern_name(p as u8));
+            }
+        }
         let _ = writeln!(s, "master_gain_db {}", self.master_gain_db);
+        if !self.song.is_empty() {
+            let names: Vec<String> = self.song.iter().map(|&p| pattern_name(p).to_string()).collect();
+            let _ = writeln!(s, "song {}", names.join(" "));
+        }
+        if let Some((a, b)) = self.loop_region {
+            let _ = writeln!(s, "loop {a} {b}");
+        }
         for t in &self.tracks {
             let _ = writeln!(s, "\ntrack {}", t.kind.id());
             let _ = writeln!(s, "name {}", sanitize_name(&t.name));
@@ -357,19 +483,24 @@ impl Project {
             for (spec, v) in t.kind.params().iter().zip(&t.params) {
                 let _ = writeln!(s, "param {} {}", spec.id, v);
             }
-            for (i, step) in t.steps.iter().enumerate() {
-                if let Some(st) = step {
-                    let _ = writeln!(
-                        s,
-                        "step {i} {} {} {} {} {} {} {}",
-                        st.note,
-                        st.velocity,
-                        st.length,
-                        st.chance,
-                        st.ratchet,
-                        st.offset,
-                        chord_text(st)
-                    );
+            for (p, steps) in t.steps.iter().enumerate() {
+                if p > 0 && steps.iter().any(Option::is_some) {
+                    let _ = writeln!(s, "pattern {}", pattern_name(p as u8));
+                }
+                for (i, step) in steps.iter().enumerate() {
+                    if let Some(st) = step {
+                        let _ = writeln!(
+                            s,
+                            "step {i} {} {} {} {} {} {} {}",
+                            st.note,
+                            st.velocity,
+                            st.length,
+                            st.chance,
+                            st.ratchet,
+                            st.offset,
+                            chord_text(st)
+                        );
+                    }
                 }
             }
             let _ = writeln!(s, "end");
@@ -383,6 +514,8 @@ impl Project {
         let mut p = Project::new();
         let mut version: Option<u32> = None;
         let mut current: Option<TrackData> = None;
+        // The pattern that `step` lines in the current track block fill.
+        let mut pattern = 0usize;
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -424,6 +557,7 @@ impl Project {
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
                     "mute" => t.mute = parse_bool(rest).map_err(err)?,
                     "solo" => t.solo = parse_bool(rest).map_err(err)?,
+                    "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
                     "param" => {
                         let (id, value) = rest
                             .split_once(char::is_whitespace)
@@ -466,7 +600,7 @@ impl Project {
                         if st.sanitized() != st {
                             return Err(err("step value out of range".into()));
                         }
-                        t.steps[i] = Some(st);
+                        t.steps[pattern][i] = Some(st);
                     }
                     "end" => {
                         if p.tracks.len() >= MAX_TRACKS {
@@ -495,17 +629,41 @@ impl Project {
                     p.swing = v;
                 }
                 "pattern_length" => {
-                    let v: u8 = parse_num(rest).map_err(err)?;
+                    let (which, len) = if ver >= 5 {
+                        let (name, len) = rest
+                            .split_once(' ')
+                            .ok_or_else(|| err("expected 'pattern_length <pattern> <steps>'".into()))?;
+                        (parse_pattern(name).map_err(err)?, len.trim())
+                    } else {
+                        (0, rest)
+                    };
+                    let v: u8 = parse_num(len).map_err(err)?;
                     if v == 0 || usize::from(v) > MAX_STEPS {
                         return Err(err(format!("pattern length must be 1..={MAX_STEPS}")));
                     }
-                    p.pattern_len = v;
+                    p.pattern_lens[usize::from(which)] = v;
+                }
+                "song" if ver >= 5 => {
+                    p.song = rest.split_whitespace().map(parse_pattern).collect::<Result<_, _>>().map_err(err)?;
+                    if p.song.len() > MAX_SONG {
+                        return Err(err(format!("a song has at most {MAX_SONG} entries")));
+                    }
+                }
+                "loop" if ver >= 5 => {
+                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    let [a, b] = f[..] else { return Err(err("expected 'loop <start> <end>'".into())) };
+                    let r = (parse_num(a).map_err(err)?, parse_num(b).map_err(err)?);
+                    if loop_region(r) != Some(r) {
+                        return Err(err("loop region out of range".into()));
+                    }
+                    p.loop_region = Some(r);
                 }
                 "master_gain_db" => p.master_gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                 "track" => {
                     let kind =
                         InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?;
                     current = Some(TrackData::new(kind));
+                    pattern = 0;
                 }
                 _ => return Err(err(format!("unknown key '{key}'"))),
             }
@@ -558,6 +716,22 @@ impl Project {
     }
 }
 
+/// The letter of pattern `p` (A for 0).
+pub fn pattern_name(p: u8) -> char {
+    char::from(b'A' + p.min(MAX_PATTERNS as u8 - 1))
+}
+
+fn parse_pattern(s: &str) -> Result<u8, String> {
+    match s.as_bytes() {
+        [c @ b'A'..=b'Z'] if usize::from(c - b'A') < MAX_PATTERNS => Ok(c - b'A'),
+        _ => Err(format!("unknown pattern '{s}' (A..={})", pattern_name(MAX_PATTERNS as u8 - 1))),
+    }
+}
+
+fn check_pattern(p: u8) -> Result<(), EditError> {
+    if usize::from(p) < MAX_PATTERNS { Ok(()) } else { Err(EditError::NoSuchPattern(p)) }
+}
+
 /// The absolute directory holding a project file.
 fn project_dir(path: &Path) -> Option<std::path::PathBuf> {
     crate::sample::absolute(&path.to_string_lossy()).parent().map(Path::to_path_buf)
@@ -596,9 +770,11 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     e.push(Edit::SetPan { track, pan: t.pan });
     e.push(Edit::SetMute { track, mute: t.mute });
     e.push(Edit::SetSolo { track, solo: t.solo });
-    for (s, step) in t.steps.iter().enumerate() {
-        if step.is_some() {
-            e.push(Edit::SetStep { track, step: s as u8, value: *step });
+    for (p, steps) in t.steps.iter().enumerate() {
+        for (s, step) in steps.iter().enumerate() {
+            if step.is_some() {
+                e.push(Edit::SetStep { track, pattern: p as u8, step: s as u8, value: *step });
+            }
         }
     }
 }
@@ -643,12 +819,56 @@ mod tests {
         p.tracks[5].params[5] = 1_234.567_9;
         p.tempo = 97.31;
         p.swing = 61.5;
-        p.tracks[2].steps[3] = Some(Step { chance: 35, ratchet: 3, offset: -7, ..Step::new(60, 90, 1) });
-        p.tracks[5].steps[1] = Some(Step { chord: [3, 7, 10], offset: 12, ..Step::new(45, 100, 3) });
+        p.tracks[2].steps[0][3] = Some(Step { chance: 35, ratchet: 3, offset: -7, ..Step::new(60, 90, 1) });
+        p.tracks[5].steps[0][1] = Some(Step { chord: [3, 7, 10], offset: 12, ..Step::new(45, 100, 3) });
+        p.tracks[0].steps[15][63] = Some(Step::new(61, 1, 1));
+        p.pattern_lens[2] = 7;
+        p.pattern_lens[15] = 64;
+        p.song = vec![0, 15, 2, 2, 1];
+        p.loop_region = Some((1, 3));
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 4\n"));
+        assert!(text.starts_with("tinvo 5\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
+        assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
+        assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
+        assert!(text.contains("\npattern P\nstep 63 61 1 1 100 1 0 -\nend\n"), "{text}");
         assert_eq!(Project::from_text(&text).unwrap(), p);
+        // A project without a song or loop writes neither line.
+        let plain = Project::new().to_text();
+        assert!(!plain.contains("song") && !plain.contains("loop") && !plain.contains("pattern"), "{plain}");
+    }
+
+    #[test]
+    fn reads_version_4_files_into_pattern_a() {
+        let v4 = "tinvo 4\ntempo 100\nswing 50\npattern_length 12\nmaster_gain_db 0\n\ntrack synth\n\
+                  step 3 48 90 2 100 1 0 -\nend\n";
+        let p = Project::from_text(v4).unwrap();
+        assert_eq!(p.pattern_lens[0], 12);
+        assert!(p.pattern_lens[1..].iter().all(|&l| l == DEFAULT_PATTERN_LEN));
+        assert_eq!(p.tracks[0].steps[0][3], Some(Step::new(48, 90, 2)));
+        assert!(p.tracks[0].steps[1..].iter().flatten().all(Option::is_none));
+        assert!(p.song.is_empty() && p.loop_region.is_none());
+    }
+
+    #[test]
+    fn song_edits_are_validated() {
+        let mut p = Project::new();
+        assert_eq!(p.apply(Edit::InsertSongEntry { index: 1, pattern: 0 }), Err(EditError::NoSuchEntry(1)));
+        assert_eq!(p.apply(Edit::InsertSongEntry { index: 0, pattern: 16 }), Err(EditError::NoSuchPattern(16)));
+        assert_eq!(p.apply(Edit::RemoveSongEntry(0)), Err(EditError::NoSuchEntry(0)));
+        assert_eq!(p.apply(Edit::SetPatternLength { pattern: 16, len: 4 }), Err(EditError::NoSuchPattern(16)));
+        assert_eq!(p.apply(Edit::SetLoop(Some((0, MAX_SONG as u16)))), Err(EditError::BadLoop));
+        // A reversed region is put in order.
+        assert_eq!(p.apply(Edit::SetLoop(Some((5, 2)))), Ok(Edit::SetLoop(Some((2, 5)))));
+        assert_eq!(p.active_loop(), None, "the region lies past the end of the empty song");
+        for i in 0..MAX_SONG {
+            p.apply(Edit::InsertSongEntry { index: i as u16, pattern: (i % MAX_PATTERNS) as u8 }).unwrap();
+        }
+        assert_eq!(p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }), Err(EditError::SongFull));
+        assert_eq!(p.active_loop(), Some((2, 5)));
+        p.apply(Edit::RemoveSongEntry(0)).unwrap();
+        assert_eq!(&p.song[..3], &[1, 2, 3]);
+        assert_eq!(p.song_steps(), (MAX_SONG as u64 - 1) * 16);
     }
 
     #[test]
@@ -687,7 +907,7 @@ mod tests {
                   step 3 48 90 2 50 2\nend\n";
         let p = Project::from_text(v2).unwrap();
         assert_eq!(p.swing, 60.0);
-        assert_eq!(p.tracks[0].steps[3], Some(Step { chance: 50, ratchet: 2, ..Step::new(48, 90, 2) }));
+        assert_eq!(p.tracks[0].steps[0][3], Some(Step { chance: 50, ratchet: 2, ..Step::new(48, 90, 2) }));
     }
 
     #[test]
@@ -696,7 +916,7 @@ mod tests {
                   gain_db 0\npan 0\nmute false\nsolo false\nstep 2 60 99 1\nend\n";
         let p = Project::from_text(v1).unwrap();
         assert_eq!(p.swing, MIN_SWING);
-        assert_eq!(p.tracks[0].steps[2], Some(Step::new(60, 99, 1)));
+        assert_eq!(p.tracks[0].steps[0][2], Some(Step::new(60, 99, 1)));
         // v1 has no swing key and only four-field steps.
         assert!(Project::from_text("tinvo 1\nswing 60").is_err());
         assert!(Project::from_text("tinvo 1\ntrack kick\nstep 0 60 99 1 100 1\nend").is_err());
@@ -711,20 +931,28 @@ mod tests {
         let edits = [
             Edit::SetTempo(140.0),
             Edit::SetSwing(66.0),
-            Edit::SetPatternLength(7),
+            Edit::SetPatternLength { pattern: 0, len: 7 },
             Edit::SetMasterGain(-6.0),
             Edit::AddTrack(InstrumentKind::Clap),
             Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth },
             Edit::InsertTrack { index: 6, kind: InstrumentKind::Kick },
             Edit::RemoveTrack(0),
             Edit::RemoveTrack(5),
-            Edit::SetStep { track: 1, step: 4, value: None },
-            Edit::SetStep { track: 1, step: 5, value: s },
+            Edit::SetStep { track: 1, pattern: 0, step: 4, value: None },
+            Edit::SetStep { track: 1, pattern: 0, step: 5, value: s },
             Edit::SetParam { track: 5, index: 5, value: 5000.0 },
             Edit::SetGain { track: 2, db: 3.0 },
             Edit::SetPan { track: 2, pan: -0.7 },
             Edit::SetMute { track: 3, mute: true },
             Edit::SetSolo { track: 4, solo: true },
+            Edit::SetStep { track: 2, pattern: 9, step: 63, value: s },
+            Edit::SetStep { track: 1, pattern: 1, step: 13, value: None },
+            Edit::SetPatternLength { pattern: 1, len: 32 },
+            Edit::InsertSongEntry { index: 0, pattern: 5 },
+            Edit::InsertSongEntry { index: 4, pattern: 2 },
+            Edit::RemoveSongEntry(3),
+            Edit::SetSongEntry { index: 1, pattern: 7 },
+            Edit::SetLoop(Some((1, 2))),
         ];
         for e in edits {
             let mut p = base.clone();
@@ -770,10 +998,13 @@ mod tests {
         p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
         let got = p.apply(Edit::SetParam { track: 0, index: 5, value: 1.0e9 }).unwrap();
         assert_eq!(got, Edit::SetParam { track: 0, index: 5, value: 20_000.0 });
-        let got = p.apply(Edit::SetStep { track: 0, step: 3, value: Some(Step::new(200, 0, 99)) }).unwrap();
-        assert_eq!(got, Edit::SetStep { track: 0, step: 3, value: Some(Step::new(127, 1, 64)) });
+        let got = p.apply(Edit::SetStep { track: 0, pattern: 0, step: 3, value: Some(Step::new(200, 0, 99)) }).unwrap();
+        assert_eq!(got, Edit::SetStep { track: 0, pattern: 0, step: 3, value: Some(Step::new(127, 1, 64)) });
         assert_eq!(p.apply(Edit::SetMute { track: 4, mute: true }), Err(EditError::NoSuchTrack(4)));
-        assert_eq!(p.apply(Edit::SetStep { track: 0, step: 64, value: None }), Err(EditError::NoSuchStep(64)));
+        assert_eq!(
+            p.apply(Edit::SetStep { track: 0, pattern: 0, step: 64, value: None }),
+            Err(EditError::NoSuchStep(64))
+        );
         assert_eq!(p.apply(Edit::SetParam { track: 0, index: 99, value: 0.0 }), Err(EditError::NoSuchParam(99)));
         for _ in 1..MAX_TRACKS {
             p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
@@ -788,7 +1019,17 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 5", 1, "version"),
+            ("tinvo 6", 1, "version"),
+            ("tinvo 5\nsong A Q", 2, "unknown pattern 'Q'"),
+            ("tinvo 5\nsong A b", 2, "unknown pattern 'b'"),
+            ("tinvo 5\nloop 3 1", 2, "loop region"),
+            ("tinvo 5\nloop 3", 2, "expected 'loop"),
+            ("tinvo 5\npattern_length 16", 2, "expected 'pattern_length"),
+            ("tinvo 5\npattern_length Z 16", 2, "unknown pattern"),
+            ("tinvo 5\npattern_length B 65", 2, "pattern length"),
+            ("tinvo 5\ntrack kick\npattern AB\nend", 3, "unknown pattern"),
+            ("tinvo 4\nsong A", 2, "unknown key"),
+            ("tinvo 4\ntrack kick\npattern B\nend", 3, "unknown track key"),
             ("tinvo 4\ntrack kick\nsample a.wav\nend", 3, "has no sample"),
             ("tinvo 3\ntrack sampler\nsample a.wav\nend", 3, "unknown track key"),
             ("tinvo 4\ntrack sampler\nsample\nend", 3, "expected 'sample"),
