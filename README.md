@@ -29,7 +29,8 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region. Patterns switch at the end of the bar while playing.
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
-- Sends from every track to a tempo-synced delay and an algorithmic reverb, and a true-peak limiter on the master.
+- Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
+- Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
 - An 8-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter.
@@ -124,7 +125,8 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
-- Her kanaldan tempoya bağlı bir delay'e ve algoritmik bir reverb'e send, master'da true-peak limiter.
+- Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
+- Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
 - WAV dosyalarını windowed-sinc interpolasyonla çalan 8 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre.

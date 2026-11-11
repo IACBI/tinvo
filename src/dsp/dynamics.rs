@@ -73,7 +73,13 @@ impl Compressor {
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
-        let a = x.abs();
+        self.process_keyed(x, x)
+    }
+
+    /// Compresses `x` by the level of `key` (sidechain compression).
+    #[inline]
+    pub fn process_keyed(&mut self, x: f32, key: f32) -> f32 {
+        let a = key.abs();
         let target =
             if self.ratio == 1.0 || a <= self.knee_floor { 0.0 } else { self.static_gain_db(20.0 * a.log10()) };
         if target == 0.0 && self.gr_db > -1e-4 {
@@ -140,6 +146,24 @@ mod tests {
         }
         let reached = c.gain_reduction_db() / target;
         assert!((reached - (1.0 - (-1.0f32).exp())).abs() < 0.01, "{reached}");
+    }
+
+    #[test]
+    fn a_key_sets_the_reduction() {
+        let mut c = Compressor::new(SR);
+        c.set(-20.0, 4.0, 0.001, 0.05, 0.0);
+        // A quiet signal ducked by a loud key, and a loud one left alone
+        // by a silent key.
+        for _ in 0..4800 {
+            c.process_keyed(0.01, 0.5);
+        }
+        let expected = c.static_gain_db(gain_to_db(0.5));
+        assert!((c.gain_reduction_db() - expected).abs() < 0.01, "{}", c.gain_reduction_db());
+        assert!((c.process_keyed(0.01, 0.5) - 0.01 * db_to_gain(expected)).abs() < 1e-6);
+        for _ in 0..48_000 {
+            c.process_keyed(0.9, 0.0);
+        }
+        assert_eq!(c.process_keyed(0.9, 0.0), 0.9);
     }
 
     #[test]

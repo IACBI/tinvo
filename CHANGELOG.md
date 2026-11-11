@@ -6,6 +6,23 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-12
+
+### Added
+- A third effect bus, a stereo chorus (two swept taps per side, a quarter cycle apart between the sides, with rate and depth), fed by a new chorus send on every track.
+- Sidechain compression: every track has a key send into a key bus, taken from the instrument before the strip and the fader (so a muted track still keys), and each compressor can listen to the key bus instead of its own input.
+- Bus and master settings can be automated: `A` on the buses and master page gives the setting a lane on the current track. One lane in the project can hold each setting; removing the track or stopping playback returns it to its knob value.
+- Meters in the editor: compressor gain reduction on the channel-strip page, the limiter's gain reduction and momentary, short-term and integrated loudness (since playback started) on the buses and master page, and short-term loudness in the header.
+- The demo ducks its bass under the kick through the key bus and puts chorus on the open hat.
+
+### Changed
+- The drive runs at twice the sample rate (polyphase IIR half-band filters, 99 dB stopband) on top of its antiderivative antialiasing: aliasing of a hard-driven 4.5 kHz sine falls from -25 dB (plain waveshaper) to -73 dB, and the top end is kept (-1.1 dB at 15 kHz, was -5.1 dB). Projects that use drive sound slightly different; everything else renders exactly as in 0.8.0.
+- The reverb pre-delay glides to a new setting instead of jumping.
+- Project files are now format 9 (`comp_key`, `send_chorus` and `send_key` parameters, chorus `mix` lines, lanes on bus and master settings). Formats 1–8 still load.
+
+### Fixed
+- Long delay-time glides stalled up to about 37 frames short of the new time (f32 rounding at the slowest tempos) and then kept interpolating; they now land exactly.
+
 ## [0.8.0] - 2026-11-06
 
 ### Added
@@ -114,7 +131,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/IACBI/tinvo/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/IACBI/tinvo/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/IACBI/tinvo/compare/v0.5.0...v0.6.0

@@ -1,13 +1,14 @@
-//! The mix bus: two effect returns, fed by every track's sends, and the
+//! The mix bus: three effect returns, fed by every track's sends, and the
 //! master limiter.
 //!
 //! Sends are taken after the fader and pan (so muting, soloing and fader
-//! moves apply to them too) and summed into a delay bus and a reverb bus,
-//! whose outputs return to the mix. A bus that receives nothing and whose
+//! moves apply to them too) and summed into a delay bus, a reverb bus and a
+//! chorus bus, whose outputs return to the mix. A bus that receives nothing and whose
 //! tail has died away is not processed at all; with every send at its
 //! default (off) and the limiter off, the mix is bit-exactly what it was
 //! without buses.
 
+use crate::dsp::chorus::{self, Chorus};
 use crate::dsp::db_to_gain;
 use crate::dsp::echo::{Echo, OPEN_TONE_HZ};
 use crate::dsp::limiter::Limiter;
@@ -26,10 +27,13 @@ pub mod mp {
     pub const REVERB_DAMPING: usize = 6;
     pub const REVERB_PREDELAY: usize = 7;
     pub const REVERB_RETURN: usize = 8;
-    pub const LIMITER: usize = 9;
-    pub const LIMITER_CEILING: usize = 10;
-    pub const LIMITER_RELEASE: usize = 11;
-    pub const COUNT: usize = 12;
+    pub const CHORUS_RATE: usize = 9;
+    pub const CHORUS_DEPTH: usize = 10;
+    pub const CHORUS_RETURN: usize = 11;
+    pub const LIMITER: usize = 12;
+    pub const LIMITER_CEILING: usize = 13;
+    pub const LIMITER_RELEASE: usize = 14;
+    pub const COUNT: usize = 15;
 }
 
 /// Delay times as note values, and their length in beats.
@@ -52,23 +56,45 @@ pub static MIX_PARAMS: [ParamSpec; mp::COUNT] = [
     ParamSpec::log("reverb_damping", "Reverb damping", 1000.0, OPEN_DAMPING_HZ, 7000.0, HZ_STEP, Unit::Hz),
     ParamSpec::linear("reverb_predelay", "Reverb predelay", 0.0, 0.2, 0.02, 0.005, Unit::Seconds),
     ParamSpec::linear("reverb_return", "Reverb return", SILENT_DB, 6.0, 0.0, 0.5, Unit::Decibels),
+    ParamSpec::log("chorus_rate", "Chorus rate", 0.05, 5.0, 0.8, TIME_STEP, Unit::Hz),
+    ParamSpec::linear("chorus_depth", "Chorus depth", 0.0, chorus::MAX_DEPTH, 0.003, 0.0005, Unit::Seconds),
+    ParamSpec::linear("chorus_return", "Chorus return", SILENT_DB, 6.0, 0.0, 0.5, Unit::Decibels),
     ParamSpec::stepped("limiter", "Limiter", &["off", "on"], 0.0),
     ParamSpec::linear("limiter_ceiling", "Ceiling", -12.0, 0.0, -1.0, 0.1, Unit::Decibels),
     ParamSpec::log("limiter_release", "Lim. release", 0.01, 1.0, 0.1, TIME_STEP, Unit::Seconds),
 ];
 
-/// Send indices: the buses a track can send to.
+/// Send indices: the buses a track can send to (`..BUSES`), then the
+/// sidechain key.
 pub mod send {
     pub const DELAY: usize = 0;
     pub const REVERB: usize = 1;
-    pub const COUNT: usize = 2;
+    pub const CHORUS: usize = 2;
+    /// Buses with a return.
+    pub const BUSES: usize = 3;
+    /// The key bus, which compressors can listen to instead of their own
+    /// input. It is fed from the instrument, before the strip and the
+    /// fader (so a muted track still keys), and never heard.
+    pub const KEY: usize = 3;
+    pub const COUNT: usize = 4;
 }
 
 /// A track's send levels; at the lowest setting a send is off.
 pub static SEND_PARAMS: [ParamSpec; send::COUNT] = [
     ParamSpec::linear("send_delay", "Send delay", SILENT_DB, 6.0, SILENT_DB, 0.5, Unit::Decibels),
     ParamSpec::linear("send_reverb", "Send reverb", SILENT_DB, 6.0, SILENT_DB, 0.5, Unit::Decibels),
+    ParamSpec::linear("send_chorus", "Send chorus", SILENT_DB, 6.0, SILENT_DB, 0.5, Unit::Decibels),
+    ParamSpec::linear("send_key", "Key send", SILENT_DB, 6.0, SILENT_DB, 0.5, Unit::Decibels),
 ];
+
+/// The project file format that introduced mix parameter `index`: the
+/// chorus arrived in format 9, the rest in 8.
+pub fn mix_param_since(index: usize) -> u32 {
+    match index {
+        mp::CHORUS_RATE | mp::CHORUS_DEPTH | mp::CHORUS_RETURN => 9,
+        _ => 8,
+    }
+}
 
 /// Linear gain of a send or return level (exactly zero at the lowest).
 pub fn level_gain(db: f32) -> f32 {
@@ -86,31 +112,36 @@ const LEVEL_SMOOTHING: f32 = 0.01;
 /// The buses and the master limiter. `frames` is the most a block holds.
 #[derive(Clone, Debug)]
 pub struct Mix {
-    values: [f32; mp::COUNT],
+    /// Values set by edits.
+    base: [f32; mp::COUNT],
+    /// Automation overriding `base` while a point is in force.
+    auto: [Option<f32>; mp::COUNT],
     tempo: f32,
     echo: Echo,
     reverb: Reverb,
+    chorus: Chorus,
     limiter: Limiter,
-    returns: [Smoother; send::COUNT],
+    returns: [Smoother; send::BUSES],
     /// Interleaved stereo send sums for the current block, per bus.
-    inputs: [Vec<f32>; send::COUNT],
-    fed: [bool; send::COUNT],
+    inputs: [Vec<f32>; send::BUSES],
+    fed: [bool; send::BUSES],
     wet: Vec<f32>,
     sample_rate: f32,
 }
 
 impl Mix {
     pub fn new(sample_rate: f32, tempo: f32, frames: usize) -> Self {
-        let values = MIX_PARAMS.map(|p| p.default);
         let mut m = Self {
-            values,
+            base: MIX_PARAMS.map(|p| p.default),
+            auto: [None; mp::COUNT],
             tempo,
             echo: Echo::new(sample_rate, max_delay_seconds()),
             reverb: Reverb::new(sample_rate),
+            chorus: Chorus::new(sample_rate),
             limiter: Limiter::new(sample_rate),
-            returns: [Smoother::new(0.0, LEVEL_SMOOTHING, sample_rate); send::COUNT],
-            inputs: [vec![0.0; 2 * frames], vec![0.0; 2 * frames]],
-            fed: [false; send::COUNT],
+            returns: [Smoother::new(0.0, LEVEL_SMOOTHING, sample_rate); send::BUSES],
+            inputs: std::array::from_fn(|_| vec![0.0; 2 * frames]),
+            fed: [false; send::BUSES],
             wet: vec![0.0; 2 * frames],
             sample_rate,
         };
@@ -119,15 +150,31 @@ impl Mix {
         m
     }
 
+    /// The value set by edits (automation aside).
     pub fn param(&self, index: usize) -> Option<f32> {
-        self.values.get(index).copied()
+        self.base.get(index).copied()
     }
 
     pub fn set_param(&mut self, index: usize, value: f32) {
         if let Some(spec) = MIX_PARAMS.get(index) {
-            self.values[index] = spec.clamp(value);
+            self.base[index] = spec.clamp(value);
+            if self.auto[index].is_none() {
+                self.apply();
+            }
+        }
+    }
+
+    /// Overrides parameter `index` with an automation value, or (`None`)
+    /// returns it to the value set by edits.
+    pub fn automate(&mut self, index: usize, value: Option<f32>) {
+        if let Some(spec) = MIX_PARAMS.get(index) {
+            self.auto[index] = value.map(|v| spec.clamp(v));
             self.apply();
         }
+    }
+
+    fn value(&self, index: usize) -> f32 {
+        self.auto[index].unwrap_or(self.base[index])
     }
 
     pub fn set_tempo(&mut self, tempo: f32) {
@@ -138,6 +185,8 @@ impl Mix {
     /// Jumps glides to their targets, as for a project that is opened.
     pub fn snap(&mut self) {
         self.echo.snap();
+        self.reverb.snap();
+        self.chorus.snap();
         self.limiter.snap();
         for r in &mut self.returns {
             let t = r.target();
@@ -146,7 +195,7 @@ impl Mix {
     }
 
     fn apply(&mut self) {
-        let v = &self.values;
+        let v: [f32; mp::COUNT] = std::array::from_fn(|i| self.value(i));
         let beats = DIVISION_BEATS[(v[mp::DELAY_TIME] as usize).min(DIVISIONS.len() - 1)];
         let frames = beats * 60.0 / self.tempo * self.sample_rate;
         // Whole frames: a settled delay then reads without interpolation.
@@ -154,6 +203,8 @@ impl Mix {
         self.reverb.set(v[mp::REVERB_DECAY], v[mp::REVERB_DAMPING], v[mp::REVERB_PREDELAY]);
         self.returns[send::DELAY].set_target(level_gain(v[mp::DELAY_RETURN]));
         self.returns[send::REVERB].set_target(level_gain(v[mp::REVERB_RETURN]));
+        self.chorus.set(v[mp::CHORUS_RATE], v[mp::CHORUS_DEPTH]);
+        self.returns[send::CHORUS].set_target(level_gain(v[mp::CHORUS_RETURN]));
         self.limiter.set(v[mp::LIMITER_CEILING], v[mp::LIMITER_RELEASE]);
         self.limiter.set_enabled(v[mp::LIMITER] >= 1.0);
     }
@@ -175,21 +226,22 @@ impl Mix {
         &mut self.inputs[bus]
     }
 
-    /// Both send sums at once; the buses flagged in `used` are marked fed.
-    pub fn inputs(&mut self, used: [bool; send::COUNT]) -> [&mut [f32]; send::COUNT] {
+    /// All send sums at once; the buses flagged in `used` are marked fed.
+    pub fn inputs(&mut self, used: [bool; send::BUSES]) -> [&mut [f32]; send::BUSES] {
         for (fed, u) in self.fed.iter_mut().zip(used) {
             *fed |= u;
         }
-        let [delay, reverb] = &mut self.inputs;
-        [delay.as_mut_slice(), reverb.as_mut_slice()]
+        let [delay, reverb, chorus] = &mut self.inputs;
+        [delay.as_mut_slice(), reverb.as_mut_slice(), chorus.as_mut_slice()]
     }
 
     /// Adds the returns of the first `frames` frames to the mix.
     pub fn add_returns(&mut self, mix_l: &mut [f32], mix_r: &mut [f32], frames: usize) {
-        for bus in 0..send::COUNT {
+        for bus in 0..send::BUSES {
             let idle = match bus {
                 send::DELAY => self.echo.is_idle(),
-                _ => self.reverb.is_idle(),
+                send::REVERB => self.reverb.is_idle(),
+                _ => self.chorus.is_idle(),
             };
             if !self.fed[bus] && idle {
                 continue;
@@ -199,7 +251,8 @@ impl Mix {
             wet.fill(0.0);
             match bus {
                 send::DELAY => self.echo.process(input, wet),
-                _ => self.reverb.process(input, wet),
+                send::REVERB => self.reverb.process(input, wet),
+                _ => self.chorus.process(input, wet),
             }
             let ret = &mut self.returns[bus];
             for (i, f) in wet.chunks_exact(2).enumerate() {
@@ -218,7 +271,7 @@ impl Mix {
     /// Frames by which the master output lags: the limiter's look-ahead
     /// while it is on.
     pub fn latency(&self) -> usize {
-        if self.values[mp::LIMITER] >= 1.0 { self.limiter.latency() } else { 0 }
+        if self.value(mp::LIMITER) >= 1.0 { self.limiter.latency() } else { 0 }
     }
 
     /// Current gain reduction of the limiter in dB.

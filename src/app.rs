@@ -11,7 +11,7 @@ use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
 use crate::engine::{
     Command, Edit, Engine, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS,
-    MIN_SWING, PlayPosition, RETIRE_QUEUE, Shared, Step,
+    MIN_SWING, MIX_TARGET, PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix;
@@ -228,6 +228,16 @@ pub enum Page {
 /// volume, pan and the track's parameters.
 const MIX_INDEX: usize = 1 << 10;
 
+/// The lane target of panel parameter `i`.
+fn target_of_param(i: usize) -> u8 {
+    if i >= MIX_INDEX { MIX_TARGET + (i - MIX_INDEX) as u8 } else { i as u8 }
+}
+
+/// The panel parameter a lane target controls.
+fn param_of_target(t: u8) -> usize {
+    if t >= MIX_TARGET { MIX_INDEX + usize::from(t - MIX_TARGET) } else { usize::from(t) }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Grid,
@@ -303,6 +313,12 @@ pub struct App {
     status: Option<(String, Instant)>,
     meters: [f32; MAX_TRACKS],
     master_meter: [f32; 2],
+    /// Compressor gain reduction per track and the limiter's, in dB (>= 0),
+    /// falling back slowly like the level meters.
+    reduction: [f32; MAX_TRACKS],
+    limiter_reduction: f32,
+    /// Momentary, short-term and integrated loudness in LUFS (NaN: none).
+    loudness: [f32; 3],
     cpu: f32,
     playing: bool,
     play_pos: Option<PlayPosition>,
@@ -357,6 +373,9 @@ impl App {
             status: None,
             meters: [0.0; MAX_TRACKS],
             master_meter: [0.0; 2],
+            reduction: [0.0; MAX_TRACKS],
+            limiter_reduction: 0.0,
+            loudness: [f32::NAN; 3],
             cpu: 0.0,
             playing: false,
             play_pos: None,
@@ -745,6 +764,13 @@ impl App {
         for (m, p) in self.master_meter.iter_mut().zip(&s.master_peaks) {
             *m = p.take().max(*m * 0.85);
         }
+        for (m, r) in self.reduction.iter_mut().zip(&s.track_reduction) {
+            *m = r.take().max(*m * 0.85);
+        }
+        self.limiter_reduction = s.limiter_reduction.take().max(self.limiter_reduction * 0.85);
+        for (m, l) in self.loudness.iter_mut().zip(&s.loudness) {
+            *m = l.load();
+        }
         self.cpu = s.load.load();
     }
 
@@ -1030,9 +1056,6 @@ impl App {
                     self.set_status("Samples load into sampler tracks (a, 7 adds one)");
                 }
             }
-            Key::Char('A') if self.focus == Focus::Params && self.param >= MIX_INDEX => {
-                self.set_status("Bus and master settings cannot be automated yet");
-            }
             Key::Char('A') if self.focus == Focus::Params => self.automate_param(self.param),
             Key::Char('A') => {
                 self.auto_view = !self.auto_view;
@@ -1064,10 +1087,25 @@ impl App {
 
     /// Opens the lane for panel parameter `target`, giving it a free lane if
     /// it has none.
-    fn automate_param(&mut self, target: usize) {
-        let t = &self.project.tracks[self.track];
-        let label = self.param_spec(target).label;
-        let target = target as u8;
+    fn automate_param(&mut self, param: usize) {
+        let label = self.param_spec(param).label;
+        let target = target_of_param(param);
+        let Some(t) = self.project.tracks.get(self.track) else {
+            self.set_status("Automation lives on a track's lanes: add a track first (a)");
+            return;
+        };
+        // A bus or master setting has at most one lane, on whichever track.
+        let owner = self
+            .project
+            .tracks
+            .iter()
+            .position(|o| o.lanes.iter().any(|l| l.target == Some(target)))
+            .filter(|&o| param >= MIX_INDEX && o != self.track);
+        if let Some(o) = owner {
+            let name = &self.project.tracks[o].name;
+            self.set_status(format!("{label} is automated on a lane of track {} ({name})", o + 1));
+            return;
+        }
         if let Some(k) = t.lanes.iter().position(|l| l.target == Some(target)) {
             self.lane = k;
         } else if let Some(k) = t.lanes.iter().position(|l| l.target.is_none()) {
@@ -1107,7 +1145,7 @@ impl App {
                     Some(_) => None,
                     None => Some(
                         self.lane_value(self.lane, self.step)
-                            .unwrap_or(self.param_value(usize::from(target.unwrap_or(0)))),
+                            .unwrap_or(self.param_value(param_of_target(target.unwrap_or(0)))),
                     ),
                 };
                 self.edit(Edit::SetPoint { track, lane, pattern, step, value });
@@ -1117,7 +1155,7 @@ impl App {
             }
             Key::Char(c @ ('[' | ']' | '{' | '}')) => match point {
                 Some(v) => {
-                    let spec = self.param_spec(usize::from(target.unwrap_or(0)));
+                    let spec = self.param_spec(param_of_target(target.unwrap_or(0)));
                     let value = spec.nudge(v, if matches!(c, '[' | '{') { -1 } else { 1 }, matches!(c, '{' | '}'));
                     self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
                 }
@@ -1471,7 +1509,9 @@ impl App {
             if self.dirty { "*" } else { "" }
         );
         s.put(x, 0, &info, bar);
-        let right = format!(" {}  CPU {:4.1}%  ", self.audio_label, self.cpu * 100.0);
+        let short_term = self.loudness[1];
+        let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
+        let right = format!(" {lufs}{}  CPU {:4.1}%  ", self.audio_label, self.cpu * 100.0);
         let meter_w = 10u16;
         let rx = w.saturating_sub(right.chars().count() as u16 + meter_w + 1);
         s.put(rx, 0, &right, bar);
@@ -1611,7 +1651,7 @@ impl App {
                         (None, Some(v)) => format!("{at}{} ({})", sp.format(v), if l.ramp { "ramp" } else { "held" }),
                         (None, None) => format!(
                             "{at}knob value {}",
-                            sp.format(self.param_value(usize::from(l.target.unwrap_or(0))))
+                            sp.format(self.param_value(param_of_target(l.target.unwrap_or(0))))
                         ),
                     }
                 }
@@ -1752,10 +1792,24 @@ impl App {
         let track = self.project.tracks.get(self.track);
         let title = match (self.page, track) {
             // Shared by all tracks, so shown with or without one.
-            (Page::Mix, _) => " Buses & master (all tracks) ".to_string(),
+            (Page::Mix, _) => {
+                let lufs = |v: f32| if v.is_nan() { "  -  ".to_string() } else { format!("{v:5.1}") };
+                let [m, st, i] = self.loudness;
+                format!(
+                    " Buses & master (all tracks) · limiter {} · M {} S {} I {} LUFS ",
+                    reduction_text(self.limiter_reduction),
+                    lufs(m),
+                    lufs(st),
+                    lufs(i)
+                )
+            }
             (_, None) => return,
             (page, Some(t)) => {
-                let page = if page == Page::Strip { " · channel strip" } else { "" };
+                let page = if page == Page::Strip {
+                    format!(" · channel strip · comp {}", reduction_text(self.reduction[self.track]))
+                } else {
+                    String::new()
+                };
                 match (&t.sample, t.kind) {
                     (Some(path), _) => {
                         let file =
@@ -1899,6 +1953,11 @@ fn draw_help(s: &mut Screen) {
         s.put(2, y, k, Style::fg(Color::BrightYellow).bold());
         s.put(16, y, d, Style::DEFAULT);
     }
+}
+
+/// A gain reduction for display: "GR -3.2 dB", or "GR  0.0 dB" when idle.
+fn reduction_text(db: f32) -> String {
+    if db >= 0.05 { format!("GR {:4.1} dB", -db) } else { "GR  0.0 dB".to_string() }
 }
 
 /// Level meter on a -48..0 dBFS scale.
@@ -2189,6 +2248,38 @@ mod tests {
     }
 
     #[test]
+    fn meters_show_reduction_and_loudness() {
+        let shared = Arc::new(Shared::new());
+        let project = Project::demo();
+        let mut e = Engine::with_edits(48_000.0, &project.to_edits(), shared.clone(), None);
+        e.handle(Command::Play);
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..(4 * 48_000 / 512) {
+            e.process(&mut out);
+        }
+        let (tx, _rx) = spsc::channel(256);
+        let mut a = App::new(project, None, Some(EngineLink::new(tx, shared)), 48_000, "t".into());
+        a.tick();
+        let text = |a: &App| {
+            let mut s = Screen::new(140, 40);
+            a.draw(&mut s);
+            (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n")
+        };
+        // The demo runs 3 dB hot into the limiter.
+        keys(&mut a, &[Key::Char('f'), Key::Char('f')]);
+        let t = text(&a);
+        assert!(t.contains("limiter GR -") && !t.contains("I   -   LUFS"), "{t}");
+        assert!(t.contains(" LUFS  t  CPU"), "{t}");
+        // The bass compresses.
+        a.track = 5;
+        keys(&mut a, &[Key::Char('f')]);
+        assert_eq!(a.page, Page::Instrument);
+        keys(&mut a, &[Key::Char('f')]);
+        let t = text(&a);
+        assert!(t.contains("channel strip · comp GR -"), "{t}");
+    }
+
+    #[test]
     fn the_buses_and_master_page() {
         let (tx, mut rx) = spsc::channel(256);
         let mut a =
@@ -2211,13 +2302,25 @@ mod tests {
             }
         }
         assert_eq!(got, Some(Edit::SetMixParam { index: mix::mp::DELAY_TIME as u8, value: 7.0 }));
-        // Shared settings have no automation lanes.
-        let lanes = a.project.tracks[0].lanes.clone();
+        // A shared setting is automated on a lane of the current track, and
+        // only one lane in the project can hold it.
+        let delay_time = Some(MIX_TARGET + mix::mp::DELAY_TIME as u8);
         keys(&mut a, &[Key::Char('A')]);
-        assert_eq!(a.project.tracks[0].lanes, lanes);
-        assert!(a.status_text().is_some_and(|t| t.contains("cannot be automated")));
-        keys(&mut a, &[Key::Tab, Key::Char('u')]);
+        assert!(a.auto_view);
+        assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == delay_time).count(), 1);
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Delay time at step 1: knob value 1/4T"), "{text}");
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.project.tracks[0].lanes.iter().any(|l| l.target == delay_time && l.points[0][0] == Some(7.0)));
+        keys(&mut a, &[Key::Char('A'), Key::Char(']'), Key::Down, Key::Char('A'), Key::Tab, Key::Char('A')]);
+        assert_eq!(a.track, 1);
+        assert!(a.project.tracks[1].lanes.iter().all(|l| l.target != delay_time));
+        assert!(a.status_text().is_some_and(|t| t.contains("automated on a lane of track 1")), "{:?}", a.status_text());
+        keys(&mut a, &[Key::Up, Key::Char('u'), Key::Char('u'), Key::Char('u')]);
         assert_eq!(a.project.mix[mix::mp::DELAY_TIME], 6.0);
+        assert!(a.project.tracks[0].lanes.iter().all(|l| l.target != delay_time));
         // The page works on a project without tracks too.
         let mut b = App::new(Project::new(), None, None, 48_000, "t".into());
         keys(&mut b, &[Key::Char('f'), Key::Char('f'), Key::Tab, Key::Right]);

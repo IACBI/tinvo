@@ -2,6 +2,8 @@
 //! its fader.
 //!
 //! Order: high-pass, low shelf, mid bell, high shelf, compressor, drive.
+//! The compressor listens to its own input or, switched to the key bus, to
+//! the sum of every track's key send (sidechain compression).
 //! All parameters glide to new values over about 20 ms, updated every
 //! [`TICK`] frames; the countdown to the next update is part of the strip's
 //! state, so the output does not depend on how the audio is split into
@@ -29,8 +31,9 @@ pub mod sp {
     pub const COMP_ATTACK: usize = 10;
     pub const COMP_RELEASE: usize = 11;
     pub const COMP_MAKEUP: usize = 12;
-    pub const DRIVE: usize = 13;
-    pub const COUNT: usize = 14;
+    pub const COMP_KEY: usize = 13;
+    pub const DRIVE: usize = 14;
+    pub const COUNT: usize = 15;
 }
 
 const HZ_STEP: f32 = 1.059_463_1;
@@ -53,6 +56,7 @@ pub static PARAMS: [ParamSpec; sp::COUNT] = [
     ParamSpec::log("comp_attack", "Comp attack", 0.0001, 0.1, 0.01, TIME_STEP, Unit::Seconds),
     ParamSpec::log("comp_release", "Comp release", 0.01, 1.0, 0.12, TIME_STEP, Unit::Seconds),
     ParamSpec::linear("comp_makeup", "Makeup", 0.0, 24.0, 0.0, 0.5, Unit::Decibels),
+    ParamSpec::stepped("comp_key", "Comp key", &["own", "key bus"], 0.0),
     ParamSpec::linear("drive", "Drive", 0.0, 24.0, 0.0, 0.5, Unit::Decibels),
 ];
 
@@ -72,6 +76,23 @@ pub fn track_param(kind: InstrumentKind, index: usize) -> Option<&'static ParamS
 /// Number of [`track_param`]s of a track of `kind`.
 pub fn track_param_count(kind: InstrumentKind) -> usize {
     kind.params().len() + sp::COUNT + send::COUNT
+}
+
+/// The project file format that introduced track parameter `index`: the
+/// strip arrived in format 7, the delay and reverb sends in 8, the
+/// compressor key and the chorus and key sends in 9.
+pub fn track_param_since(kind: InstrumentKind, index: usize) -> u32 {
+    let n = kind.params().len();
+    if index < n {
+        1
+    } else if index < n + sp::COUNT {
+        if index - n == sp::COMP_KEY { 9 } else { 7 }
+    } else {
+        match index - n - sp::COUNT {
+            send::DELAY | send::REVERB => 8,
+            _ => 9,
+        }
+    }
 }
 
 /// Frames between parameter updates.
@@ -260,8 +281,15 @@ impl Strip {
         self.current[sp::COMP_RATIO] > 1.0 || self.current[sp::COMP_MAKEUP] != 0.0
     }
 
-    /// Processes `buf` in place.
-    pub fn process(&mut self, buf: &mut [f32]) {
+    /// Whether the compressor listens to the key bus.
+    pub fn keyed(&self) -> bool {
+        self.target[sp::COMP_KEY] >= 1.0
+    }
+
+    /// Processes `buf` in place. `key` is the key bus for the same frames;
+    /// the compressor listens to it when switched to the key bus.
+    pub fn process(&mut self, buf: &mut [f32], key: &[f32]) {
+        debug_assert!(key.len() >= buf.len());
         let mut i = 0;
         while i < buf.len() {
             if self.countdown == 0 {
@@ -272,7 +300,8 @@ impl Strip {
             self.countdown -= n as u32;
             if self.is_active() {
                 let on = self.on;
-                for x in &mut buf[i..i + n] {
+                let keyed = self.keyed();
+                for (x, &k) in buf[i..i + n].iter_mut().zip(&key[i..i + n]) {
                     let mut y = *x;
                     if on[0] {
                         let w = self.hp.process(y);
@@ -288,7 +317,7 @@ impl Strip {
                         y = self.high.process(y);
                     }
                     if on[4] {
-                        y = self.comp.process(y);
+                        y = if keyed { self.comp.process_keyed(y, k) } else { self.comp.process(y) };
                     }
                     if on[5] {
                         let w = self.drive.process(y);
@@ -336,6 +365,11 @@ mod tests {
         (0..n).map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / SR).sin()).collect()
     }
 
+    /// Runs `s` over `buf` with a silent key bus.
+    fn run(s: &mut Strip, buf: &mut [f32]) {
+        s.process(buf, &vec![0.0; buf.len()]);
+    }
+
     fn rms_db(x: &[f32]) -> f32 {
         let p: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / x.len() as f64;
         10.0 * p.log10() as f32
@@ -355,6 +389,12 @@ mod tests {
         assert_eq!(track_param(k, k.params().len()).unwrap().id, "hp_freq");
         assert_eq!(track_param(k, k.params().len() + sp::COUNT).unwrap().id, "send_delay");
         assert!(track_param(k, track_param_count(k)).is_none());
+        let since: Vec<u32> = (0..track_param_count(k)).map(|i| track_param_since(k, i)).collect();
+        let n = k.params().len();
+        assert!(since[..n].iter().all(|&v| v == 1));
+        assert_eq!(since[n + sp::COMP_KEY], 9);
+        assert_eq!(since[n + sp::DRIVE], 7);
+        assert_eq!(since[n + sp::COUNT..], [8, 8, 9, 9]);
     }
 
     #[test]
@@ -362,27 +402,27 @@ mod tests {
         let mut s = Strip::new(SR);
         let x = sine(440.0, 0.9, 4096);
         let mut y = x.clone();
-        s.process(&mut y);
+        run(&mut s, &mut y);
         assert_eq!(x, y);
         assert!(!s.is_active());
         // A setting that returns to neutral bypasses again once it has rung out.
         s.set_param(sp::MID_GAIN, 6.0);
-        s.process(&mut y);
+        run(&mut s, &mut y);
         s.set_param(sp::MID_GAIN, 0.0);
         let mut quiet = vec![0.0; 48_000];
-        s.process(&mut quiet);
+        run(&mut s, &mut quiet);
         assert!(!s.is_active());
         // The same while signal keeps flowing as the band settles flat: its
         // filter still holds state then and must be switched out later.
         s.set_param(sp::MID_GAIN, 6.0);
         let mut y = sine(440.0, 0.9, 48_000);
-        s.process(&mut y);
+        run(&mut s, &mut y);
         s.set_param(sp::MID_GAIN, 0.0);
         let mut y = sine(440.0, 0.9, 48_000);
-        s.process(&mut y);
+        run(&mut s, &mut y);
         let x = sine(440.0, 0.9, 4096);
         let mut y = x.clone();
-        s.process(&mut y);
+        run(&mut s, &mut y);
         assert!(!s.is_active());
         assert_eq!(x, y);
     }
@@ -394,11 +434,11 @@ mod tests {
         s.set_param(sp::MID_GAIN, 9.0);
         s.set_param(sp::HP_FREQ, 200.0);
         let mut settle = vec![0.0; 9600];
-        s.process(&mut settle);
+        run(&mut s, &mut settle);
         let mut at = |f: f32| {
             let x = sine(f, 0.1, 24_000);
             let mut y = x.clone();
-            s.process(&mut y);
+            run(&mut s, &mut y);
             rms_db(&y[12_000..]) - rms_db(&x[12_000..])
         };
         assert!((at(2000.0) - 9.0).abs() < 0.1, "{}", at(2000.0));
@@ -412,7 +452,7 @@ mod tests {
         let mut s = Strip::new(SR);
         s.set_param(sp::COMP_MAKEUP, 12.0);
         let mut y = vec![0.5f32; 9600];
-        s.process(&mut y);
+        run(&mut s, &mut y);
         // About 20 ms to 63 %: no jump on the first tick, full gain later.
         assert!(y[0] < 0.5 * 1.1, "{}", y[0]);
         let mid = gain_to_db(y[(0.02 * SR) as usize] / 0.5);
@@ -423,7 +463,7 @@ mod tests {
 
     #[test]
     fn output_does_not_depend_on_buffer_size() {
-        let run = |chunk: usize| {
+        let chunked = |chunk: usize| {
             let mut s = Strip::new(SR);
             s.set_param(sp::LOW_GAIN, 6.0);
             s.set_param(sp::COMP_THRESHOLD, -20.0);
@@ -434,12 +474,12 @@ mod tests {
                 if k == 3 {
                     s.set_param(sp::MID_GAIN, -6.0);
                 }
-                s.process(c);
+                run(&mut s, c);
             }
             x
         };
         // The change lands on a chunk boundary: frame 288 in both runs.
-        let a = run(96);
+        let a = chunked(96);
         let mut s = Strip::new(SR);
         s.set_param(sp::LOW_GAIN, 6.0);
         s.set_param(sp::COMP_THRESHOLD, -20.0);
@@ -448,11 +488,11 @@ mod tests {
         let mut b = sine(110.0, 0.8, 9000);
         let (head, rest) = b.split_at_mut(288);
         for c in head.chunks_mut(7) {
-            s.process(c);
+            run(&mut s, c);
         }
         s.set_param(sp::MID_GAIN, -6.0);
         for c in rest.chunks_mut(1000) {
-            s.process(c);
+            run(&mut s, c);
         }
         assert_eq!(a, b);
     }
@@ -465,7 +505,7 @@ mod tests {
     /// Runs `s` on a constant `level` for `seconds` and returns the output.
     fn hold(s: &mut Strip, level: f32, seconds: f32) -> Vec<f32> {
         let mut y = vec![level; (seconds * SR) as usize];
-        s.process(&mut y);
+        run(s, &mut y);
         y
     }
 
@@ -542,8 +582,8 @@ mod tests {
         hold(&mut settled, 0.0, 1.0);
         let x = sine(440.0, 0.5, 4800);
         let (mut a, mut b) = (x.clone(), x);
-        snapped.process(&mut a);
-        settled.process(&mut b);
+        run(&mut snapped, &mut a);
+        run(&mut settled, &mut b);
         assert_eq!(a, b);
     }
 }

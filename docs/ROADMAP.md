@@ -80,7 +80,7 @@ Known limits:
 - There is no gain-reduction meter yet.
 - Drive's antialiasing averages neighbouring samples in its linear region, a high-frequency roll-off of −3 dB at a quarter of the sample rate (12 kHz at 48 kHz); oversampled drive would avoid it.
 
-## Phase 4b: Effect buses and master ✅ (0.8.0, this release)
+## Phase 4b: Effect buses and master ✅ (0.8.0)
 
 - Post-fader sends on every track to a delay bus and a reverb bus.
 - Delay: tempo-synced note values, feedback with a low-pass in the loop, stereo or ping-pong; time changes glide instead of jumping.
@@ -92,15 +92,22 @@ Known limits:
 - Project format 8.
 
 Known limits:
-- Bus and master settings cannot be automated yet, and change at once rather than gliding (except the delay time and the return levels).
+- Bus and master settings could not be automated (done in 4c).
 - The true-peak estimate is a 4× interpolation with a 12-tap kernel: within 0.15 dB up to 12 kHz, but up to 0.5 dB low around 18 kHz (at 48 kHz), so material with strong content up there can peak slightly above the ceiling.
 
-## Phase 4c: More mixing
+## Phase 4c: More mixing ✅ (0.9.0, this release)
 
-- Chorus on a third bus, sidechain input for the compressor.
-- Gain-reduction and loudness meters in the editor.
-- Automation of bus and master settings.
-- Oversampled drive.
+- Chorus on a third bus: two taps per side swept in opposite directions around 12 ms, the right side a quarter cycle behind the left, read with Hermite interpolation.
+- Sidechain compression through a key bus: a pre-strip, pre-fader key send on every track, and a key switch on each compressor.
+- Automation of bus and master settings on any one track's lanes; the reverb pre-delay now glides like the delay time.
+- Gain-reduction meters for the compressors and the limiter, and live loudness (momentary, short-term, integrated, the last as a 0.1 LU histogram, within 0.05 LU of the exact meter).
+- Drive at twice the sample rate with polyphase IIR half-band filters: aliasing of a hard-driven 4.5 kHz sine at -73 dB, against -25 dB for a plain waveshaper.
+- Project format 9; projects without drive render bit-exactly as in 0.8.0.
+
+Known limits:
+- The oversampling filters are not linear phase: a driven track is delayed by about 3.3 frames at low frequencies (more towards the top), and while drive is switched in or out its 10 ms crossfade briefly mixes the two.
+- Drive costs about 0.7 % of one core per track (`tinvo bench`): every strip stage on all six demo tracks takes about twice what it did in 0.8.0 on the same machine.
+- Bus and master settings other than the delay time, the pre-delay, the chorus depth and the return levels change at once; automated ramps move them in 32-frame steps.
 
 ## Phase 5: Devices and I/O
 

@@ -20,9 +20,12 @@ pub struct Echo {
     buf: Vec<f32>,
     frames: usize,
     write: usize,
-    time: f32,
-    target: f32,
-    glide: f32,
+    /// Delay in frames, gliding to `target`. Kept in f64: in f32, near
+    /// the longest delays one glide step rounds back to the same value
+    /// and the glide stalls tens of frames short of the target.
+    time: f64,
+    target: f64,
+    glide: f64,
     feedback: f32,
     tone: [Biquad; 2],
     filtered: bool,
@@ -42,7 +45,7 @@ impl Echo {
             write: 0,
             time: 1.0,
             target: 1.0,
-            glide: (-1.0 / (GLIDE_SECONDS * sample_rate)).exp(),
+            glide: (-1.0 / (f64::from(GLIDE_SECONDS) * f64::from(sample_rate))).exp(),
             feedback: 0.0,
             tone: [Biquad::default(); 2],
             filtered: false,
@@ -56,7 +59,7 @@ impl Echo {
     /// the feedback low-pass corner. Ping-pong feeds the input to the left
     /// and alternates the repeats between the sides.
     pub fn set(&mut self, time: f32, feedback: f32, tone: f32, ping_pong: bool) {
-        self.target = time.clamp(1.0, (self.frames - 2) as f32);
+        self.target = f64::from(time.clamp(1.0, (self.frames - 2) as f32));
         self.feedback = feedback.clamp(0.0, 0.99);
         self.filtered = tone < OPEN_TONE_HZ;
         if self.filtered {
@@ -91,7 +94,7 @@ impl Echo {
                 self.time = if (t - self.target).abs() < 1e-3 { self.target } else { t };
             }
             let whole = self.time.floor();
-            let frac = self.time - whole;
+            let frac = (self.time - whole) as f32;
             let newer = (self.write + self.frames - whole as usize) % self.frames;
             let (mut l, mut r) = (self.buf[2 * newer], self.buf[2 * newer + 1]);
             if frac > 0.0 {
@@ -192,6 +195,19 @@ mod tests {
         let y = run(&mut e, &impulse(6000, 1.0, 1.0));
         let energy = |a: usize| y[2 * a..2 * (a + 2000)].iter().map(|v| v * v).sum::<f32>();
         assert!(energy(4000) < 0.2 * energy(2000), "{} {}", energy(4000), energy(2000));
+    }
+
+    #[test]
+    fn long_glides_land_exactly() {
+        let mut e = Echo::new(SR, 6.0);
+        e.set(1000.0, 0.0, OPEN_TONE_HZ, false);
+        e.snap();
+        e.set(287_000.0, 0.0, OPEN_TONE_HZ, false);
+        run(&mut e, &vec![0.0; 2 * 48_000]);
+        assert_eq!(e.time, 287_000.0);
+        e.set(1000.0, 0.0, OPEN_TONE_HZ, false);
+        run(&mut e, &vec![0.0; 2 * 48_000]);
+        assert_eq!(e.time, 1000.0);
     }
 
     #[test]

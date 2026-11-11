@@ -18,6 +18,8 @@ const DIFFUSION: f32 = 0.6;
 /// Longest pre-delay.
 pub const MAX_PREDELAY: f32 = 0.25;
 const QUIET: f32 = 1e-9;
+/// Time constant of the pre-delay's glide.
+const PREDELAY_GLIDE_SECONDS: f64 = 0.05;
 /// Scales the output to roughly the level of the input for a medium room.
 const OUTPUT_GAIN: f32 = 0.35;
 
@@ -52,7 +54,12 @@ impl Line {
 #[derive(Clone, Debug)]
 pub struct Reverb {
     predelay: Line,
-    predelay_frames: usize,
+    /// Pre-delay in frames, gliding to `predelay_target`; whole numbers
+    /// read exactly, others interpolate linearly. In f64 so the glide does
+    /// not stall short of the target (see the delay's time).
+    predelay_frames: f64,
+    predelay_target: f64,
+    predelay_glide: f64,
     diffusers: [Line; 4],
     lines: [Line; 8],
     gains: [f32; 8],
@@ -80,7 +87,9 @@ impl Reverb {
         let idle_after = predelay_len + diffusers.iter().chain(&lines).map(|l| l.buf.len()).sum::<usize>();
         let mut r = Self {
             predelay: Line::new(predelay_len),
-            predelay_frames: 0,
+            predelay_frames: 0.0,
+            predelay_target: 0.0,
+            predelay_glide: (-1.0 / (PREDELAY_GLIDE_SECONDS * f64::from(sample_rate))).exp(),
             diffusers,
             lines,
             gains: [0.0; 8],
@@ -91,7 +100,14 @@ impl Reverb {
             sample_rate,
         };
         r.set(1.5, OPEN_DAMPING_HZ, 0.0);
+        r.snap();
         r
+    }
+
+    /// Jumps to the set pre-delay, for a reverb that starts rather than
+    /// changes.
+    pub fn snap(&mut self) {
+        self.predelay_frames = self.predelay_target;
     }
 
     /// `decay` is the time in seconds to fall by 60 dB, `damping` the corner
@@ -106,8 +122,10 @@ impl Reverb {
         } else {
             (-2.0 * std::f32::consts::PI * damping / self.sample_rate).exp()
         };
-        self.predelay_frames =
-            ((predelay.clamp(0.0, MAX_PREDELAY) * self.sample_rate).round() as usize).min(self.predelay.buf.len() - 1);
+        // Whole frames: a settled pre-delay reads without interpolation.
+        self.predelay_target = f64::from(
+            (predelay.clamp(0.0, MAX_PREDELAY) * self.sample_rate).round().min((self.predelay.buf.len() - 2) as f32),
+        );
     }
 
     /// Whether the tail has died away, so with silent input the output is
@@ -124,7 +142,17 @@ impl Reverb {
             let pd = &mut self.predelay;
             let n = pd.buf.len();
             pd.buf[pd.pos] = mono;
-            let mut u = pd.buf[(pd.pos + n - self.predelay_frames) % n];
+            if self.predelay_frames != self.predelay_target {
+                let t = self.predelay_target + (self.predelay_frames - self.predelay_target) * self.predelay_glide;
+                self.predelay_frames = if (t - self.predelay_target).abs() < 1e-3 { self.predelay_target } else { t };
+            }
+            let whole = self.predelay_frames.floor();
+            let frac = (self.predelay_frames - whole) as f32;
+            let newer = (pd.pos + n - whole as usize) % n;
+            let mut u = pd.buf[newer];
+            if frac > 0.0 {
+                u += frac * (pd.buf[(newer + n - 1) % n] - u);
+            }
             pd.pos = (pd.pos + 1) % n;
             for d in &mut self.diffusers {
                 let delayed = d.read();
@@ -266,6 +294,7 @@ mod tests {
     fn sides_are_decorrelated_and_predelay_delays() {
         let mut r = Reverb::new(SR);
         r.set(1.5, 8000.0, 0.05);
+        r.snap();
         let y = impulse_response(&mut r, 1.0);
         let first = y.iter().position(|v| v.abs() > 1e-6).unwrap() / 2;
         assert!(first >= 2400, "{first}");
@@ -279,6 +308,23 @@ mod tests {
         let corr = lr / (ll * rr).sqrt();
         assert!(corr.abs() < 0.3, "{corr}");
         assert!((10.0 * (ll / rr).log10()).abs() < 1.5);
+    }
+
+    #[test]
+    fn predelay_changes_glide_and_settle_on_whole_frames() {
+        let mut r = Reverb::new(SR);
+        r.set(1.0, OPEN_DAMPING_HZ, 0.01);
+        r.snap();
+        assert_eq!(r.predelay_frames, 480.0);
+        r.set(1.0, OPEN_DAMPING_HZ, 0.1);
+        let mut out = vec![0.0; 2 * 64];
+        r.process(&[0.0; 2 * 64], &mut out);
+        // 64 frames into a 50 ms glide: a little over 2 % of the way.
+        let moved = (r.predelay_frames - 480.0) / (4800.0 - 480.0);
+        assert!(moved > 0.02 && moved < 0.03, "{moved}");
+        let mut out = vec![0.0; 2 * 48_000];
+        r.process(&vec![0.0; 2 * 48_000], &mut out);
+        assert_eq!(r.predelay_frames, 4800.0);
     }
 
     #[test]
@@ -300,6 +346,7 @@ mod tests {
 
         let mut r = Reverb::new(SR);
         r.set(0.5, 6000.0, 0.02);
+        r.snap();
         assert!(r.is_idle());
         impulse_response(&mut r, 0.1);
         assert!(!r.is_idle());

@@ -13,6 +13,7 @@
 
 pub mod transport;
 
+use crate::dsp::loudness::LiveLoudness;
 use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
@@ -44,12 +45,18 @@ const AUTOMATION_TICK: u64 = 32;
 pub static VOLUME: ParamSpec = ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
 pub static PAN: ParamSpec = ParamSpec::linear("pan", "Pan", -1.0, 1.0, 0.0, 0.05, Unit::Pan);
 
-/// What an automation lane controls: 0 is the volume, 1 the pan, and `2 + i`
-/// the instrument's parameter `i` (the order of the parameter panel).
+/// Lane targets from here on are the bus and master settings
+/// ([`mix::MIX_PARAMS`]), which any one track's lane can automate.
+pub const MIX_TARGET: u8 = 128;
+
+/// What an automation lane controls: 0 is the volume, 1 the pan, `2 + i`
+/// the track's parameter `i` (the order of the parameter panel), and
+/// [`MIX_TARGET`]` + i` the bus or master setting `i`.
 pub fn target_spec(kind: InstrumentKind, target: u8) -> Option<&'static ParamSpec> {
     match target {
         0 => Some(&VOLUME),
         1 => Some(&PAN),
+        t if t >= MIX_TARGET => mix::MIX_PARAMS.get(usize::from(t - MIX_TARGET)),
         t => track_param(kind, usize::from(t) - 2),
     }
 }
@@ -384,6 +391,14 @@ pub struct Shared {
     /// Post-fader peak per track since the UI last took it.
     pub track_peaks: [AtomicF32; MAX_TRACKS],
     pub master_peaks: [AtomicF32; 2],
+    /// Deepest compressor gain reduction per track since the UI last took
+    /// it, in dB as a positive number.
+    pub track_reduction: [AtomicF32; MAX_TRACKS],
+    /// The same for the master limiter.
+    pub limiter_reduction: AtomicF32,
+    /// Momentary, short-term and integrated loudness of the output since
+    /// playback started, in LUFS; NaN where there is no value yet.
+    pub loudness: [AtomicF32; 3],
     /// Fraction of the real-time budget spent in the last callbacks.
     pub load: AtomicF32,
 }
@@ -401,6 +416,9 @@ impl Shared {
             position: AtomicU32::new(u32::MAX),
             track_peaks: std::array::from_fn(|_| AtomicF32::new(0.0)),
             master_peaks: [AtomicF32::new(0.0), AtomicF32::new(0.0)],
+            track_reduction: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            limiter_reduction: AtomicF32::new(0.0),
+            loudness: std::array::from_fn(|_| AtomicF32::new(f32::NAN)),
             load: AtomicF32::new(0.0),
         }
     }
@@ -505,6 +523,8 @@ struct Track {
     ons: [PendingOn; MAX_PENDING_ONS],
     on_count: usize,
     peak: f32,
+    /// Deepest compressor gain reduction since last published (dB, >= 0).
+    reduction: f32,
 }
 
 impl Track {
@@ -529,6 +549,7 @@ impl Track {
             ons: [PendingOn { frame: 0, step: Step::new(0, 1, 1), gate: 0 }; MAX_PENDING_ONS],
             on_count: 0,
             peak: 0.0,
+            reduction: 0.0,
         }
     }
 
@@ -554,6 +575,7 @@ impl Track {
         self.off_count = 0;
         self.on_count = 0;
         self.peak = 0.0;
+        self.reduction = 0.0;
     }
 
     /// Writes an automation value (`None`: the base value) to `target`.
@@ -717,7 +739,11 @@ pub struct Engine {
     master_db: f32,
     mix_l: [f32; BLOCK],
     mix_r: [f32; BLOCK],
-    scratch: [f32; BLOCK],
+    /// Each track's signal for the current block: every instrument renders
+    /// before any strip runs, so the key bus is complete when the
+    /// compressors read it.
+    track_bufs: Box<[[f32; BLOCK]]>,
+    key: [f32; BLOCK],
     /// Effect buses and the master limiter.
     mix: Mix,
     commands: Option<Consumer<Command>>,
@@ -729,6 +755,9 @@ pub struct Engine {
     early_queued: Option<u64>,
     /// Where released samples go; `None` when not running in real time.
     retired: Option<Producer<Arc<Sample>>>,
+    /// Loudness of the output since playback started.
+    loudness: LiveLoudness,
+    limiter_reduction: f32,
 }
 
 const CHANCE_SEED: u64 = 0x5EED_C4A2_CE00_0001;
@@ -759,13 +788,16 @@ impl Engine {
             master_db: 0.0,
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
-            scratch: [0.0; BLOCK],
+            track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
+            key: [0.0; BLOCK],
             mix: Mix::new(sample_rate, 120.0, BLOCK),
             commands,
             shared,
             rng: Rng::new(CHANCE_SEED),
             early_queued: None,
             retired: None,
+            loudness: LiveLoudness::new(sample_rate),
+            limiter_reduction: 0.0,
         })
     }
 
@@ -882,6 +914,7 @@ impl Engine {
         };
         self.rng = Rng::new(CHANCE_SEED);
         self.early_queued = None;
+        self.loudness.reset();
         self.transport.start(self.now);
     }
 
@@ -982,6 +1015,13 @@ impl Engine {
             Edit::RemoveTrack(i) => {
                 let i = usize::from(i);
                 if i < n {
+                    for l in &self.tracks[i].lanes {
+                        if let (Some(x), Some(_)) = (l.target, l.applied) {
+                            if x >= MIX_TARGET {
+                                self.mix.automate(usize::from(x - MIX_TARGET), None);
+                            }
+                        }
+                    }
                     self.tracks[i..n].rotate_left(1);
                     let old = self.tracks[n - 1].instrument.set_sample(None);
                     retire(&mut self.retired, old);
@@ -1017,7 +1057,11 @@ impl Engine {
                 let old = t.lanes[usize::from(lane)];
                 if old.target != target {
                     if let (Some(x), Some(_)) = (old.target, old.applied) {
-                        t.write_target(x, None);
+                        if x >= MIX_TARGET {
+                            self.mix.automate(usize::from(x - MIX_TARGET), None);
+                        } else {
+                            t.write_target(x, None);
+                        }
                     }
                     t.lanes[usize::from(lane)] = Lane { target, ..Lane::EMPTY };
                     self.update_gains();
@@ -1097,7 +1141,15 @@ impl Engine {
         s.position.store(self.current.map_or(u32::MAX, PlayPosition::pack), Ordering::Relaxed);
         for (i, t) in self.tracks[..self.track_count].iter_mut().enumerate() {
             s.track_peaks[i].fetch_max_non_negative(t.peak);
+            s.track_reduction[i].fetch_max_non_negative(t.reduction);
             t.peak = 0.0;
+            t.reduction = 0.0;
+        }
+        s.limiter_reduction.fetch_max_non_negative(self.limiter_reduction);
+        self.limiter_reduction = 0.0;
+        let l = &self.loudness;
+        for (slot, v) in s.loudness.iter().zip([l.momentary(), l.short_term(), l.integrated()]) {
+            slot.store(v.map_or(f32::NAN, |v| v as f32));
         }
     }
 
@@ -1184,7 +1236,8 @@ impl Engine {
     fn automate(&mut self, frame: u64) {
         let frame = frame - frame % AUTOMATION_TICK;
         let mut gains = false;
-        for t in &mut self.tracks[..self.track_count] {
+        let Self { tracks, track_count, mix, .. } = self;
+        for t in &mut tracks[..*track_count] {
             let kind = t.instrument.kind();
             for k in 0..MAX_LANES {
                 let l = t.lanes[k];
@@ -1192,7 +1245,11 @@ impl Engine {
                 let want = l.segment.map(|g| g.value_at(spec, frame));
                 if want != l.applied {
                     t.lanes[k].applied = want;
-                    gains |= t.write_target(target, want);
+                    if target >= MIX_TARGET {
+                        mix.automate(usize::from(target - MIX_TARGET), want);
+                    } else {
+                        gains |= t.write_target(target, want);
+                    }
                 }
             }
         }
@@ -1272,6 +1329,19 @@ impl Engine {
             out[2 * i + 1] = self.mix_r[i] * g;
         }
         self.mix.master(out);
+        self.loudness.push(out);
+        // Reductions are read once a block: a meter needs no more. Strict
+        // comparisons keep -0.0, whose bits would win `fetch_max`, out.
+        let r = -self.mix.limiter_reduction_db();
+        if r > self.limiter_reduction {
+            self.limiter_reduction = r;
+        }
+        for t in &mut self.tracks[..self.track_count] {
+            let r = -t.strip.gain_reduction_db();
+            if r > t.reduction {
+                t.reduction = r;
+            }
+        }
         let (mut pl, mut pr) = (0.0f32, 0.0f32);
         for f in out.chunks_exact(2) {
             pl = pl.max(f[0].abs());
@@ -1284,16 +1354,31 @@ impl Engine {
     }
 
     fn render_segment(&mut self, a: usize, b: usize) {
-        let Self { tracks, track_count, scratch, mix_l, mix_r, mix, .. } = self;
-        for t in &mut tracks[..*track_count] {
-            let buf = &mut scratch[a..b];
+        let Self { tracks, track_count, track_bufs, key, mix_l, mix_r, mix, .. } = self;
+        let tracks = &mut tracks[..*track_count];
+        let key = &mut key[a..b];
+        key.fill(0.0);
+        for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
+            let buf = &mut buf[a..b];
             buf.fill(0.0);
             t.instrument.render(buf);
-            t.strip.process(buf);
+            let k = &mut t.sends[send::KEY];
+            if k.current() != 0.0 || k.target() != 0.0 {
+                for (y, &x) in key.iter_mut().zip(buf.iter()) {
+                    *y += x * k.tick();
+                }
+            }
+        }
+        for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
+            let buf = &mut buf[a..b];
+            t.strip.process(buf, key);
             let mut peak = t.peak;
-            let sending = t.sends.map(|s| s.current() != 0.0 || s.target() != 0.0);
+            let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
+                let s = &t.sends[k];
+                s.current() != 0.0 || s.target() != 0.0
+            });
             if sending.contains(&true) {
-                let [delay, reverb] = mix.inputs(sending);
+                let mut inputs = mix.inputs(sending);
                 for (i, &s) in buf.iter().enumerate() {
                     let l = s * t.gain_l.tick();
                     let r = s * t.gain_r.tick();
@@ -1301,15 +1386,12 @@ impl Engine {
                     mix_r[a + i] += r;
                     peak = peak.max(l.abs()).max(r.abs());
                     let j = 2 * (a + i);
-                    if sending[send::DELAY] {
-                        let g = t.sends[send::DELAY].tick();
-                        delay[j] += l * g;
-                        delay[j + 1] += r * g;
-                    }
-                    if sending[send::REVERB] {
-                        let g = t.sends[send::REVERB].tick();
-                        reverb[j] += l * g;
-                        reverb[j + 1] += r * g;
+                    for (bus, input) in inputs.iter_mut().enumerate() {
+                        if sending[bus] {
+                            let g = t.sends[bus].tick();
+                            input[j] += l * g;
+                            input[j + 1] += r * g;
+                        }
                     }
                 }
             } else {
@@ -2026,6 +2108,93 @@ mod tests {
             Edit::SetMute { track: 0, mute: true },
         ]);
         assert!(muted.iter().all(|&v| v == 0.0));
+    }
+
+    fn energy(x: &[f32]) -> f64 {
+        x.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
+    }
+
+    #[test]
+    fn the_key_bus_ducks_a_track_and_is_never_heard() {
+        // A muted kick keys the compressor on a sustained synth note.
+        let nk = InstrumentKind::Kick.params().len();
+        let ns = InstrumentKind::Synth.params().len();
+        let strip = |i: usize, value: f32| Edit::SetParam { track: 1, index: (ns + i) as u8, value };
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step::new(48, 100, 16)) },
+            Edit::SetMute { track: 0, mute: true },
+            strip(strip::sp::COMP_KEY, 1.0),
+            strip(strip::sp::COMP_THRESHOLD, -40.0),
+            strip(strip::sp::COMP_RATIO, 20.0),
+            strip(strip::sp::COMP_ATTACK, 0.0005),
+            strip(strip::sp::COMP_RELEASE, 0.05),
+        ];
+        let render = |extra: &[Edit]| {
+            let mut e = engine(&[&edits[..], extra].concat());
+            e.handle(Command::Play);
+            run(&mut e, 48_000)
+        };
+        let plain = render(&[]);
+        let key_send = (nk + strip::sp::COUNT + send::KEY) as u8;
+        let ducked = render(&[Edit::SetParam { track: 0, index: key_send, value: 0.0 }]);
+        // With nothing sent to the key bus the compressor hears silence and
+        // leaves the synth exactly as it is without compression.
+        let uncompressed = render(&[strip(strip::sp::COMP_RATIO, 1.0)]);
+        assert!(energy(&plain) > 0.0);
+        assert_eq!(plain, uncompressed);
+        // While the kick sounds the synth is pushed down hard...
+        let db = |a: &[f32], b: &[f32]| 10.0 * (energy(a) / energy(b)).log10();
+        let hit = 2 * 1000..2 * 6000;
+        assert!(db(&ducked[hit.clone()], &plain[hit.clone()]) < -10.0, "{}", db(&ducked[hit.clone()], &plain[hit]));
+        // ...and recovers once it has died away, with no kick in the output.
+        let late = 2 * 40_000..2 * 48_000;
+        assert!(db(&ducked[late.clone()], &plain[late.clone()]).abs() < 0.5);
+        assert!(ducked.iter().zip(&plain).all(|(d, p)| d.abs() <= p.abs() + 1e-6));
+    }
+
+    #[test]
+    fn a_lane_automates_a_bus_setting_until_its_track_goes() {
+        use crate::mix::mp;
+        let n = InstrumentKind::Snare.params().len();
+        let return_target = MIX_TARGET + mp::REVERB_RETURN as u8;
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::SetParam { track: 0, index: (n + strip::sp::COUNT + send::REVERB) as u8, value: 0.0 },
+        ];
+        let dry = {
+            let mut e = engine(&edits[..1 + 2]);
+            e.handle(Command::Play);
+            run(&mut e, 24_000)
+        };
+        let lane = [
+            Edit::SetLane { track: 1, lane: 0, target: Some(return_target), ramp: false },
+            Edit::SetPoint { track: 1, lane: 0, pattern: 0, step: 0, value: Some(SILENT_DB) },
+        ];
+        let mut e = engine(&[&edits[..], &lane[..]].concat());
+        e.handle(Command::Play);
+        let muted = run(&mut e, 24_000);
+        let wet = |x: &[f32]| energy(&x.iter().zip(&dry).map(|(a, b)| a - b).collect::<Vec<_>>());
+        // The return glides shut (10 ms time constant) before the reverb's
+        // pre-delay is over: what leaks through is below -60 dB.
+        assert!(wet(&muted) < 1e-6 * energy(&dry), "{}", wet(&muted) / energy(&dry));
+        // Removing the track that holds the lane gives the knob back.
+        e.apply(Edit::RemoveTrack(1));
+        let after = run(&mut e, 24_000);
+        assert!(energy(&after) > 1e-3 * energy(&dry), "{}", energy(&after));
+        // So does stopping.
+        let mut e = engine(&[&edits[..], &lane[..]].concat());
+        e.handle(Command::Play);
+        run(&mut e, 100);
+        e.handle(Command::Stop);
+        assert_eq!(e.mix.latency(), 0);
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 1), frames: 1000 });
+        let auditioned = run(&mut e, 24_000);
+        assert!(wet(&auditioned) > 1e-3 * energy(&dry));
     }
 
     #[test]

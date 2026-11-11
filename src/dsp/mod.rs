@@ -7,6 +7,7 @@
 //! sound in Rust.
 
 pub mod biquad;
+pub mod chorus;
 pub mod drive;
 pub mod dynamics;
 pub mod echo;

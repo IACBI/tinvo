@@ -20,7 +20,7 @@
 //! solo false
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
-//! lane 0 decay ramp          # lane, parameter id (or volume, pan), hold or ramp
+//! lane 0 decay ramp          # lane, parameter id (volume, pan, or a mix id), hold or ramp
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! point 0 0 0.2              # lane step value
 //! point 0 15 0.9
@@ -41,15 +41,15 @@
 
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, Step, loop_region, target_spec,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
-use crate::mix::{MIX_PARAMS, mp, send};
-use crate::strip::{sp, track_param, track_param_count};
+use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
+use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -277,7 +277,8 @@ impl Project {
         lane.points[1][0] = Some(380.0);
         lane.points[1][15] = Some(2400.0);
         // Channel strips: cut the lows under the hats, snare and clap, round
-        // out the kick, and compress and drive the bass.
+        // out the kick, and drive the bass, whose compressor ducks it under
+        // the kick through the key bus.
         let mut strip = |t: usize, settings: &[(usize, f32)]| {
             let n = p.tracks[t].kind.params().len();
             for &(i, v) in settings {
@@ -296,14 +297,17 @@ impl Project {
                 (sp::COMP_RATIO, 3.0),
                 (sp::COMP_ATTACK, 0.005),
                 (sp::COMP_MAKEUP, 3.0),
+                (sp::COMP_KEY, 1.0),
                 (sp::DRIVE, 4.0),
             ],
         );
         // Room on the snare and clap, echoes on the open hat and the clap,
-        // and the limiter on the master.
+        // chorus on the open hat, the kick on the key bus, and the limiter
+        // on the master.
         let sends = sp::COUNT;
         strip(1, &[(sends + send::REVERB, -12.0)]);
-        strip(3, &[(sends + send::DELAY, -14.0)]);
+        strip(3, &[(sends + send::DELAY, -14.0), (sends + send::CHORUS, -10.0)]);
+        strip(0, &[(sends + send::KEY, 0.0)]);
         strip(4, &[(sends + send::REVERB, -9.0), (sends + send::DELAY, -20.0)]);
         p.mix[mp::REVERB_DECAY] = 1.2;
         p.mix[mp::LIMITER] = 1.0;
@@ -468,6 +472,12 @@ impl Project {
         if let Some(x) = target {
             target_spec(t.kind, x).ok_or(EditError::NoSuchTarget(x))?;
             if t.lanes.iter().enumerate().any(|(k, l)| k != usize::from(lane) && l.target == target) {
+                return Err(EditError::DuplicateLane);
+            }
+            // A bus or master setting is shared: one lane in the whole
+            // project may automate it.
+            let elsewhere = self.tracks.iter().enumerate().filter(|&(i, _)| i != usize::from(track));
+            if x >= MIX_TARGET && elsewhere.flat_map(|(_, o)| &o.lanes).any(|l| l.target == target) {
                 return Err(EditError::DuplicateLane);
             }
         }
@@ -759,10 +769,18 @@ impl Project {
                         if k >= MAX_LANES {
                             return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
                         }
-                        let count = params_in_format(t.kind, ver);
-                        let target = (0..2 + count as u8)
+                        let count = track_param_count(t.kind) as u8;
+                        let mix = if ver >= 9 { MIX_TARGET..MIX_TARGET + MIX_PARAMS.len() as u8 } else { 0..0 };
+                        let target = (0..2 + count)
+                            .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
+                            .chain(mix)
                             .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
+                        if target >= MIX_TARGET
+                            && p.tracks.iter().flat_map(|o| &o.lanes).any(|l| l.target == Some(target))
+                        {
+                            return Err(err(format!("'{id}' has a lane on another track already")));
+                        }
                         let ramp = match mode {
                             "hold" => false,
                             "ramp" => true,
@@ -792,8 +810,8 @@ impl Project {
                         let (id, value) = rest
                             .split_once(char::is_whitespace)
                             .ok_or_else(|| err("expected 'param <id> <value>'".into()))?;
-                        let count = params_in_format(t.kind, ver);
-                        let (i, spec) = (0..count)
+                        let (i, spec) = (0..track_param_count(t.kind))
+                            .filter(|&i| track_param_since(t.kind, i) <= ver)
                             .filter_map(|i| track_param(t.kind, i).map(|s| (i, s)))
                             .find(|(_, s)| s.id == id)
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
@@ -895,7 +913,8 @@ impl Project {
                         .ok_or_else(|| err("expected 'mix <id> <value>'".into()))?;
                     let i = MIX_PARAMS
                         .iter()
-                        .position(|s| s.id == id)
+                        .enumerate()
+                        .position(|(i, s)| s.id == id && mix_param_since(i) <= ver)
                         .ok_or_else(|| err(format!("unknown mix parameter '{id}'")))?;
                     p.mix[i] = parse_in(value.trim(), &MIX_PARAMS[i]).map_err(err)?;
                 }
@@ -999,16 +1018,6 @@ fn parse_chord(text: &str) -> Result<[u8; MAX_CHORD - 1], String> {
 
 /// Appends the edits that give track `track` (already created with the right
 /// kind and default state) the settings and steps of `t`.
-/// How many track parameters a file of format `ver` can name: the strip
-/// arrived in format 7, the sends in 8.
-fn params_in_format(kind: InstrumentKind, ver: u32) -> usize {
-    match ver {
-        8.. => track_param_count(kind),
-        7 => kind.params().len() + sp::COUNT,
-        _ => kind.params().len(),
-    }
-}
-
 fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     for (index, &value) in t.params.iter().enumerate() {
         e.push(Edit::SetParam { track, index: index as u8, value });
@@ -1091,7 +1100,7 @@ mod tests {
         p.song = vec![0, 15, 2, 2, 1];
         p.loop_region = Some((1, 3));
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 8\n"));
+        assert!(text.starts_with("tinvo 9\n"));
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
         assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
@@ -1191,15 +1200,67 @@ mod tests {
     }
 
     #[test]
+    fn format_9_adds_the_key_the_chorus_and_bus_lanes() {
+        let mut p = Project::demo();
+        let n = p.tracks[5].kind.params().len();
+        let t = |i: usize| (n + i) as u8;
+        let edits = [
+            Edit::SetParam { track: 5, index: t(sp::COMP_KEY), value: 1.0 },
+            Edit::SetParam {
+                track: 0,
+                index: (p.tracks[0].kind.params().len() + sp::COUNT + send::KEY) as u8,
+                value: -3.0,
+            },
+            Edit::SetParam { track: 5, index: t(sp::COUNT + send::CHORUS), value: -8.0 },
+            Edit::SetMixParam { index: mp::CHORUS_DEPTH as u8, value: 0.005 },
+            Edit::SetLane { track: 2, lane: 1, target: Some(MIX_TARGET + mp::REVERB_DECAY as u8), ramp: true },
+            Edit::SetPoint { track: 2, lane: 1, pattern: 1, step: 4, value: Some(4.0) },
+        ];
+        for e in edits {
+            p.apply(e).unwrap();
+        }
+        let text = p.to_text();
+        for line in ["param comp_key 1\n", "param send_key -3\n", "param send_chorus -8\n", "mix chorus_depth 0.005\n"]
+        {
+            assert!(text.contains(line), "{line}");
+        }
+        assert!(text.contains("lane 1 reverb_decay ramp\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        // Format 8 knew none of them; one lane per bus setting in a file.
+        for bad in [
+            "tinvo 8\ntrack kick\nparam comp_key 1\nend",
+            "tinvo 8\ntrack kick\nparam send_chorus -6\nend",
+            "tinvo 8\ntrack kick\nlane 0 reverb_decay hold\nend",
+            "tinvo 8\nmix chorus_rate 2",
+            "tinvo 9\ntrack kick\nlane 0 reverb_decay hold\nend\ntrack kick\nlane 2 reverb_decay ramp\nend",
+        ] {
+            assert!(Project::from_text(bad).is_err(), "{bad}");
+        }
+        assert!(Project::from_text("tinvo 8\ntrack kick\nparam send_reverb -6\nend").is_ok());
+    }
+
+    #[test]
     fn lane_edits_are_validated() {
         let mut p = Project::demo();
         let lane = |lane, target| Edit::SetLane { track: 0, lane, target, ramp: false };
         assert_eq!(p.apply(lane(4, Some(0))), Err(EditError::NoSuchLane(4)));
-        // The kick has 4 instrument parameters, 14 strip parameters and 2
-        // sends after volume and pan: targets 0..22, so 6 is the strip's first.
-        assert_eq!(p.apply(lane(0, Some(22))), Err(EditError::NoSuchTarget(22)));
-        assert_eq!(target_spec(p.tracks[0].kind, 21).map(|s| s.id), Some("send_reverb"));
+        // The kick has 4 instrument parameters, 15 strip parameters and 4
+        // sends after volume and pan: targets 0..25, so 6 is the strip's
+        // first. The bus and master settings follow from MIX_TARGET.
+        assert_eq!(p.apply(lane(0, Some(25))), Err(EditError::NoSuchTarget(25)));
+        assert_eq!(target_spec(p.tracks[0].kind, 24).map(|s| s.id), Some("send_key"));
         assert_eq!(target_spec(p.tracks[0].kind, 6).map(|s| s.id), Some("hp_freq"));
+        assert_eq!(target_spec(p.tracks[0].kind, MIX_TARGET).map(|s| s.id), Some("delay_time"));
+        let past_mix = MIX_TARGET + mp::COUNT as u8;
+        assert_eq!(p.apply(lane(0, Some(past_mix))), Err(EditError::NoSuchTarget(past_mix)));
+        // One lane in the project for each bus or master setting.
+        let decay = Some(MIX_TARGET + mp::REVERB_DECAY as u8);
+        p.apply(lane(3, decay)).unwrap();
+        let other = Edit::SetLane { track: 1, lane: 0, target: decay, ramp: false };
+        assert_eq!(p.apply(other), Err(EditError::DuplicateLane));
+        p.apply(lane(3, None)).unwrap();
+        p.apply(other).unwrap();
+        p.apply(Edit::SetLane { track: 1, lane: 0, target: None, ramp: false }).unwrap();
         p.apply(lane(0, Some(3))).unwrap();
         assert_eq!(p.apply(lane(1, Some(3))), Err(EditError::DuplicateLane));
         assert_eq!(p.inverse(&lane(1, Some(3))), Err(EditError::DuplicateLane));
@@ -1413,7 +1474,7 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 9", 1, "version"),
+            ("tinvo 10", 1, "version"),
             ("tinvo 6\ntrack kick\nparam eq_mid_gain 3\nend", 3, "unknown parameter"),
             ("tinvo 6\ntrack kick\nlane 0 hp_freq hold\nend", 3, "unknown parameter 'hp_freq'"),
             ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),
