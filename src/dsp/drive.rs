@@ -227,9 +227,12 @@ mod tests {
 
     #[test]
     fn halfband_coefficients_are_the_design() {
+        // Platform math libraries round tan, sin and powf differently in the
+        // last bits (macOS gives 2.6e-15 off on the last coefficient); a
+        // design with other parameters differs around 1e-2.
         let c = halfband_coefficients(8, 0.04);
         for (a, b) in c.iter().zip(HALFBAND) {
-            assert!((a - b).abs() < 1e-15, "{a} {b}");
+            assert!((a - b).abs() < 1e-12, "{a} {b}");
         }
     }
 
