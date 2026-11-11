@@ -1,11 +1,12 @@
 //! Linux output through the ALSA PCM API (libasound).
 //!
-//! Opens the `default` PCM (which routes through PipeWire/PulseAudio when
-//! present) as interleaved stereo float at 48 kHz, letting the ALSA plug
-//! layer convert if the hardware differs.
+//! Opens the chosen PCM, else `default` (which routes through
+//! PipeWire/PulseAudio when present), as interleaved stereo float at 48 kHz,
+//! letting the ALSA plug layer convert if the hardware differs. Devices are
+//! the PCM names ALSA's hints list for output.
 
-use super::{AudioCallback, StreamHealth, StreamInfo, spawn_audio_thread};
-use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
+use super::{AudioCallback, Device, StreamConfig, StreamHealth, StreamInfo, spawn_audio_thread};
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +36,64 @@ unsafe extern "C" {
     fn snd_pcm_drop(pcm: *mut c_void) -> c_int;
     fn snd_pcm_close(pcm: *mut c_void) -> c_int;
     fn snd_strerror(err: c_int) -> *const c_char;
+    fn snd_device_name_hint(card: c_int, iface: *const c_char, hints: *mut *mut *mut c_void) -> c_int;
+    fn snd_device_name_get_hint(hint: *const c_void, id: *const c_char) -> *mut c_char;
+    fn snd_device_name_free_hint(hints: *mut *mut c_void) -> c_int;
+}
+
+unsafe extern "C" {
+    fn free(p: *mut c_void);
+}
+
+const DEFAULT_PCM: &str = "default";
+
+/// Takes ownership of a string libasound allocated.
+unsafe fn take_string(p: *mut c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated string from snd_device_name_get_hint, freed here once.
+    let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    unsafe { free(p.cast()) };
+    Some(s)
+}
+
+/// Lists the PCMs ALSA offers for playback.
+pub fn devices() -> Result<Vec<Device>, String> {
+    let mut hints: *mut *mut c_void = ptr::null_mut();
+    // SAFETY: valid out-pointer; card -1 asks for all cards.
+    let r = unsafe { snd_device_name_hint(-1, c"pcm".as_ptr(), &mut hints) };
+    if r < 0 {
+        return Err(alsa_error("cannot list ALSA devices", r));
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        // SAFETY: `hints` is a NULL-terminated array from snd_device_name_hint.
+        let hint = unsafe { *hints.add(i) };
+        if hint.is_null() {
+            break;
+        }
+        i += 1;
+        // SAFETY: `hint` is a live entry; each returned string is ours to free.
+        let (name, desc, ioid) = unsafe {
+            (
+                take_string(snd_device_name_get_hint(hint, c"NAME".as_ptr())),
+                take_string(snd_device_name_get_hint(hint, c"DESC".as_ptr())),
+                take_string(snd_device_name_get_hint(hint, c"IOID".as_ptr())),
+            )
+        };
+        // No IOID means the PCM does both directions.
+        let (Some(name), false) = (name, ioid.as_deref() == Some("Input")) else { continue };
+        if name == "null" {
+            continue;
+        }
+        let label = desc.map_or_else(|| name.clone(), |d| d.replace('\n', ", "));
+        out.push(Device { is_default: name == DEFAULT_PCM, name: format!("{label} ({name})"), id: name });
+    }
+    // SAFETY: freeing the array snd_device_name_hint allocated, once.
+    unsafe { snd_device_name_free_hint(hints) };
+    Ok(out)
 }
 
 fn alsa_error(what: &str, err: c_int) -> String {
@@ -56,6 +115,7 @@ impl Drop for Pcm {
 }
 
 pub fn open<F, C>(
+    config: StreamConfig,
     factory: F,
     stop: Arc<AtomicBool>,
     health: Arc<StreamHealth>,
@@ -65,19 +125,22 @@ where
     C: AudioCallback,
 {
     spawn_audio_thread(move |report| {
+        let name = config.device.unwrap_or_else(|| DEFAULT_PCM.into());
         // SAFETY: libasound calls with valid handles and buffers.
-        let pcm = match unsafe { open_pcm() } {
+        let (pcm, buffer, period) = match unsafe { open_pcm(&name) } {
             Ok(v) => v,
             Err(e) => return report(Err(e)),
         };
-        let (pcm, period) = pcm;
         let mut callback = factory(SAMPLE_RATE);
         let mut buf = vec![0.0f32; period * 2];
         report(Ok(StreamInfo {
             backend: "ALSA",
+            device: name,
             sample_rate: SAMPLE_RATE,
             device_channels: 2,
-            buffer_frames: period as u32,
+            buffer_frames: buffer as u32,
+            period_frames: period as u32,
+            low_latency: false,
             format: "F32".into(),
         }));
         while !stop.load(Ordering::Acquire) {
@@ -105,13 +168,13 @@ where
     })
 }
 
-unsafe fn open_pcm() -> Result<(Pcm, usize), String> {
+unsafe fn open_pcm(name: &str) -> Result<(Pcm, usize, usize), String> {
     let mut handle = ptr::null_mut();
-    let name = c"default";
+    let c_name = CString::new(name).map_err(|_| format!("bad ALSA device name '{name}'"))?;
     // SAFETY: valid out-pointer and NUL-terminated device name.
-    let r = unsafe { snd_pcm_open(&mut handle, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0) };
+    let r = unsafe { snd_pcm_open(&mut handle, c_name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0) };
     if r < 0 {
-        return Err(alsa_error("cannot open ALSA device 'default'", r));
+        return Err(alsa_error(&format!("cannot open ALSA device '{name}'"), r));
     }
     let pcm = Pcm(handle);
     // SAFETY: `pcm` is an open handle.
@@ -127,5 +190,5 @@ unsafe fn open_pcm() -> Result<(Pcm, usize), String> {
     if r < 0 || period == 0 {
         return Err(alsa_error("cannot query ALSA buffer size", r));
     }
-    Ok((pcm, period as usize))
+    Ok((pcm, buffer as usize, period as usize))
 }

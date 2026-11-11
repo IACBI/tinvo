@@ -67,8 +67,13 @@ tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
+tinvo devices             # list the output devices
+tinvo --device usb song.tvo        # play on the device whose name contains "usb"
+tinvo probe --device realtek --low-latency 3
 tinvo bench               # measure rendering speed
 ```
+
+The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears.
 
 The main keys in the editor (press `?` for the full list):
 
@@ -94,6 +99,7 @@ The main keys in the editor (press `?` for the full list):
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
+| `O` | choose the audio output device (`Tab` toggles low-latency mode) |
 | `w` `W` `e` | save, save as, export WAV |
 | `q` | quit |
 
@@ -163,8 +169,13 @@ tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
+tinvo devices             # list the output devices
+tinvo --device usb song.tvo        # play on the device whose name contains "usb"
+tinvo probe --device realtek --low-latency 3
 tinvo bench               # measure rendering speed
 ```
+
+Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır.
 
 Editördeki temel tuşlar (tam liste için `?`):
 
@@ -190,6 +201,7 @@ Editördeki temel tuşlar (tam liste için `?`):
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
+| `O` | ses çıkış cihazını seç (`Tab` düşük gecikme modunu açıp kapatır) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `q` | çık |
 

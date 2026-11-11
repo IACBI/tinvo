@@ -1,10 +1,12 @@
 //! macOS output through AudioToolbox's AudioQueue.
 //!
 //! The queue calls back on its own internal thread; TINVO's audio thread only
-//! owns the queue's lifetime and waits for the stop request.
+//! owns the queue's lifetime and waits for the stop request. Devices are the
+//! HAL's devices that have output streams, identified by their UID; the queue
+//! plays on the system default unless one is set.
 
-use super::{AudioCallback, StreamHealth, StreamInfo, spawn_audio_thread};
-use std::ffi::c_void;
+use super::{AudioCallback, Device, StreamConfig, StreamHealth, StreamInfo, spawn_audio_thread};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +68,174 @@ unsafe extern "C" {
     fn AudioQueueStart(queue: AudioQueueRef, start_time: *const c_void) -> i32;
     fn AudioQueueStop(queue: AudioQueueRef, immediate: u8) -> i32;
     fn AudioQueueDispose(queue: AudioQueueRef, immediate: u8) -> i32;
+    fn AudioQueueSetProperty(queue: AudioQueueRef, id: u32, data: *const c_void, size: u32) -> i32;
+}
+
+type CFStringRef = *const c_void;
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringGetLength(s: CFStringRef) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(s: CFStringRef, buffer: *mut c_char, size: isize, encoding: u32) -> u8;
+    fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> CFStringRef;
+    fn CFRelease(cf: *const c_void);
+}
+
+#[repr(C)]
+struct PropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {
+    fn AudioObjectGetPropertyDataSize(
+        object: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+    ) -> i32;
+    fn AudioObjectGetPropertyData(
+        object: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+        data: *mut c_void,
+    ) -> i32;
+}
+
+const SYSTEM_OBJECT: u32 = 1;
+const fn fourcc(b: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*b)
+}
+const PROP_DEVICES: u32 = fourcc(b"dev#");
+const PROP_DEFAULT_OUTPUT: u32 = fourcc(b"dOut");
+const PROP_STREAMS: u32 = fourcc(b"stm#");
+const PROP_UID: u32 = fourcc(b"uid ");
+const PROP_NAME: u32 = fourcc(b"lnam");
+const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+const SCOPE_OUTPUT: u32 = fourcc(b"outp");
+const QUEUE_CURRENT_DEVICE: u32 = fourcc(b"aqcd");
+
+fn address(selector: u32, scope: u32) -> PropertyAddress {
+    PropertyAddress { selector, scope, element: 0 }
+}
+
+/// Copies and releases a CFString the HAL handed us.
+unsafe fn take_cf_string(s: CFStringRef) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: `s` is a live CFString we own; released once below.
+    unsafe {
+        let cap = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), K_CF_STRING_ENCODING_UTF8) + 1;
+        let mut buf = vec![0 as c_char; cap.max(1) as usize];
+        let ok = CFStringGetCString(s, buf.as_mut_ptr(), cap, K_CF_STRING_ENCODING_UTF8);
+        CFRelease(s);
+        (ok != 0).then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+    }
+}
+
+fn string_property(device: u32, selector: u32) -> Option<String> {
+    let mut s: CFStringRef = ptr::null();
+    let mut size = size_of::<CFStringRef>() as u32;
+    // SAFETY: the property is a CFStringRef the caller must release.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &address(selector, SCOPE_GLOBAL),
+            0,
+            ptr::null(),
+            &mut size,
+            (&raw mut s).cast(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: a CFString we now own.
+    unsafe { take_cf_string(s) }
+}
+
+fn has_output(device: u32) -> bool {
+    let mut size = 0u32;
+    // SAFETY: valid address and out-pointer.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(device, &address(PROP_STREAMS, SCOPE_OUTPUT), 0, ptr::null(), &mut size)
+    };
+    status == 0 && size > 0
+}
+
+fn default_device() -> Option<u32> {
+    let mut id = 0u32;
+    let mut size = 4u32;
+    // SAFETY: the property is one AudioObjectID.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            SYSTEM_OBJECT,
+            &address(PROP_DEFAULT_OUTPUT, SCOPE_GLOBAL),
+            0,
+            ptr::null(),
+            &mut size,
+            (&raw mut id).cast(),
+        )
+    };
+    (status == 0 && id != 0).then_some(id)
+}
+
+/// Lists the devices with output streams.
+pub fn devices() -> Result<Vec<Device>, String> {
+    let addr = address(PROP_DEVICES, SCOPE_GLOBAL);
+    let mut size = 0u32;
+    // SAFETY: valid address and out-pointer.
+    let status = unsafe { AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &addr, 0, ptr::null(), &mut size) };
+    if status != 0 {
+        return Err(format!("cannot list audio devices (OSStatus {status})"));
+    }
+    let mut ids = vec![0u32; size as usize / 4];
+    // SAFETY: `ids` holds `size` bytes of AudioObjectIDs.
+    let status =
+        unsafe { AudioObjectGetPropertyData(SYSTEM_OBJECT, &addr, 0, ptr::null(), &mut size, ids.as_mut_ptr().cast()) };
+    if status != 0 {
+        return Err(format!("cannot list audio devices (OSStatus {status})"));
+    }
+    ids.truncate(size as usize / 4);
+    let default = default_device();
+    Ok(ids
+        .into_iter()
+        .filter(|&d| has_output(d))
+        .filter_map(|d| {
+            let id = string_property(d, PROP_UID)?;
+            let name = string_property(d, PROP_NAME).unwrap_or_else(|| id.clone());
+            Some(Device { id, name, is_default: Some(d) == default })
+        })
+        .collect())
+}
+
+/// Points the queue at the device with `uid`.
+fn set_queue_device(queue: AudioQueueRef, uid: &str) -> Result<(), String> {
+    let c = CString::new(uid).map_err(|_| format!("bad device id '{uid}'"))?;
+    // SAFETY: a NUL-terminated UTF-8 string; the CFString is released below.
+    let s = unsafe { CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8) };
+    if s.is_null() {
+        return Err(format!("bad device id '{uid}'"));
+    }
+    // SAFETY: the property value is a CFStringRef; the queue retains it.
+    let status = unsafe {
+        let status =
+            AudioQueueSetProperty(queue, QUEUE_CURRENT_DEVICE, (&raw const s).cast(), size_of::<CFStringRef>() as u32);
+        CFRelease(s);
+        status
+    };
+    if status != 0 {
+        return Err(format!("opening the chosen output device (is it still connected?) (OSStatus {status})"));
+    }
+    Ok(())
 }
 
 struct State<C> {
@@ -99,6 +269,7 @@ unsafe extern "C" fn render<C: AudioCallback>(user: *mut c_void, queue: AudioQue
 }
 
 pub fn open<F, C>(
+    config: StreamConfig,
     factory: F,
     stop: Arc<AtomicBool>,
     health: Arc<StreamHealth>,
@@ -144,6 +315,16 @@ where
                 drop(Box::from_raw(state));
             }
         };
+        if let Some(uid) = &config.device {
+            if let Err(e) = set_queue_device(queue, uid) {
+                cleanup(queue);
+                return report(Err(e));
+            }
+        }
+        let device = match &config.device {
+            Some(uid) => devices().ok().and_then(|ds| ds.into_iter().find(|d| &d.id == uid)).map(|d| d.name),
+            None => default_device().and_then(|d| string_property(d, PROP_NAME)),
+        };
         for _ in 0..BUFFER_COUNT {
             let mut buf: *mut AudioQueueBuffer = ptr::null_mut();
             // SAFETY: valid queue and out-pointer.
@@ -164,9 +345,12 @@ where
         }
         report(Ok(StreamInfo {
             backend: "CoreAudio",
+            device: device.unwrap_or_default(),
             sample_rate: SAMPLE_RATE as u32,
             device_channels: 2,
-            buffer_frames: BUFFER_FRAMES,
+            buffer_frames: BUFFER_FRAMES * BUFFER_COUNT as u32,
+            period_frames: BUFFER_FRAMES,
+            low_latency: false,
             format: "F32".into(),
         }));
         while !stop.load(Ordering::Acquire) {

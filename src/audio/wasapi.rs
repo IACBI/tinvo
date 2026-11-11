@@ -2,9 +2,16 @@
 //!
 //! COM interfaces are called through hand-written vtable layouts. Only the
 //! vtable prefix up to the last method used is declared; the order of
-//! methods follows the Windows SDK headers (mmdeviceapi.h, audioclient.h).
+//! methods follows the Windows SDK headers (mmdeviceapi.h, audioclient.h,
+//! propsys.h).
+//!
+//! In low-latency mode the stream asks `IAudioClient3` (Windows 10 and
+//! later) for the engine's smallest shared-mode period; if the interface or
+//! that period is unavailable it falls back to the regular 20 ms buffer.
 
-use super::{AudioCallback, DeviceFormat, StreamHealth, StreamInfo, convert_stereo, spawn_audio_thread};
+use super::{
+    AudioCallback, Device, DeviceFormat, StreamConfig, StreamHealth, StreamInfo, convert_stereo, spawn_audio_thread,
+};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -29,12 +36,25 @@ const IID_IMM_DEVICE_ENUMERATOR: Guid =
     Guid { d1: 0xA956_64D2, d2: 0x9614, d3: 0x4F35, d4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6] };
 const IID_IAUDIO_CLIENT: Guid =
     Guid { d1: 0x1CB9_AD4C, d2: 0xDBFA, d3: 0x4C32, d4: [0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2] };
+const IID_IAUDIO_CLIENT3: Guid =
+    Guid { d1: 0x7ED4_EE07, d2: 0x8E67, d3: 0x4CD4, d4: [0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42] };
+/// PKEY_Device_FriendlyName (functiondiscoverykeys_devpkey.h).
+const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey = PropertyKey {
+    fmtid: Guid { d1: 0xA45C_254E, d2: 0xDF1C, d3: 0x4EFD, d4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0] },
+    pid: 14,
+};
 const IID_IAUDIO_RENDER_CLIENT: Guid =
     Guid { d1: 0xF294_ACFC, d2: 0x3146, d3: 0x4483, d4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2] };
 const SUBTYPE_PCM: Guid = Guid { d1: 1, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 const SUBTYPE_IEEE_FLOAT: Guid = Guid { d1: 3, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 
 const COINIT_MULTITHREADED: u32 = 0;
+/// CoInitializeEx on a thread already in another apartment: COM is usable,
+/// but this call must not be balanced by CoUninitialize.
+const RPC_E_CHANGED_MODE: Hresult = 0x8001_0106_u32 as Hresult;
+const DEVICE_STATE_ACTIVE: u32 = 1;
+const STGM_READ: u32 = 0;
+const VT_LPWSTR: u16 = 31;
 const CLSCTX_ALL: u32 = 0x17;
 const E_RENDER: i32 = 0;
 const E_CONSOLE: i32 = 0;
@@ -60,6 +80,7 @@ unsafe extern "system" {
         out: *mut *mut c_void,
     ) -> Hresult;
     fn CoTaskMemFree(p: *mut c_void);
+    fn PropVariantClear(pv: *mut PropVariant) -> Hresult;
 }
 
 #[link(name = "kernel32")]
@@ -85,14 +106,47 @@ struct IUnknownVtbl {
 #[repr(C)]
 struct IMMDeviceEnumeratorVtbl {
     base: IUnknownVtbl,
-    _enum_audio_endpoints: usize,
+    enum_audio_endpoints: unsafe extern "system" fn(*mut c_void, i32, u32, *mut *mut c_void) -> Hresult,
     get_default_audio_endpoint: unsafe extern "system" fn(*mut c_void, i32, i32, *mut *mut c_void) -> Hresult,
+    get_device: unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> Hresult,
+}
+
+#[repr(C)]
+struct IMMDeviceCollectionVtbl {
+    base: IUnknownVtbl,
+    get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
+    item: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> Hresult,
 }
 
 #[repr(C)]
 struct IMMDeviceVtbl {
     base: IUnknownVtbl,
     activate: unsafe extern "system" fn(*mut c_void, *const Guid, u32, *mut c_void, *mut *mut c_void) -> Hresult,
+    open_property_store: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> Hresult,
+    get_id: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hresult,
+}
+
+#[repr(C)]
+struct IPropertyStoreVtbl {
+    base: IUnknownVtbl,
+    _get_count: usize,
+    _get_at: usize,
+    get_value: unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> Hresult,
+}
+
+#[repr(C)]
+struct PropertyKey {
+    fmtid: Guid,
+    pid: u32,
+}
+
+/// PROPVARIANT: a type tag, three reserved words and a 16-byte (8 on 32-bit
+/// Windows) union, of which only the string pointer is read here.
+#[repr(C)]
+struct PropVariant {
+    vt: u16,
+    _reserved: [u16; 3],
+    data: [usize; 2],
 }
 
 #[repr(C)]
@@ -104,12 +158,26 @@ struct IAudioClientVtbl {
     get_current_padding: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
     _is_format_supported: usize,
     get_mix_format: unsafe extern "system" fn(*mut c_void, *mut *mut WaveFormatEx) -> Hresult,
-    _get_device_period: usize,
+    get_device_period: unsafe extern "system" fn(*mut c_void, *mut i64, *mut i64) -> Hresult,
     start: unsafe extern "system" fn(*mut c_void) -> Hresult,
     stop: unsafe extern "system" fn(*mut c_void) -> Hresult,
     _reset: usize,
     set_event_handle: unsafe extern "system" fn(*mut c_void, Handle) -> Hresult,
     get_service: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Hresult,
+}
+
+/// IAudioClient, then IAudioClient2's three methods, then IAudioClient3's.
+#[repr(C)]
+struct IAudioClient3Vtbl {
+    client: IAudioClientVtbl,
+    _is_offload_capable: usize,
+    _set_client_properties: usize,
+    _get_buffer_size_limits: usize,
+    get_shared_mode_engine_period:
+        unsafe extern "system" fn(*mut c_void, *const WaveFormatEx, *mut u32, *mut u32, *mut u32, *mut u32) -> Hresult,
+    _get_current_shared_mode_engine_period: usize,
+    initialize_shared_audio_stream:
+        unsafe extern "system" fn(*mut c_void, u32, u32, *const WaveFormatEx, *const Guid) -> Hresult,
 }
 
 #[repr(C)]
@@ -177,6 +245,20 @@ impl Drop for Event {
 
 struct ComApartment(bool);
 
+impl ComApartment {
+    /// Joins the multithreaded apartment on this thread for as long as the
+    /// guard lives.
+    fn enter() -> Result<Self, String> {
+        // SAFETY: plain call; balanced by the guard's drop when it succeeds.
+        let hr = unsafe { CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED) };
+        if hr == RPC_E_CHANGED_MODE {
+            return Ok(Self(false));
+        }
+        check(hr, "CoInitializeEx")?;
+        Ok(Self(true))
+    }
+}
+
 impl Drop for ComApartment {
     fn drop(&mut self) {
         if self.0 {
@@ -197,7 +279,123 @@ impl Drop for MmcssTask {
     }
 }
 
+/// NUL-terminated UTF-16.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// Reads a NUL-terminated UTF-16 string.
+///
+/// # Safety
+/// `p` must point at a NUL-terminated UTF-16 string.
+unsafe fn from_wide(p: *const u16) -> String {
+    // SAFETY: the caller guarantees a terminator, so every read is in bounds.
+    unsafe {
+        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+    }
+}
+
+fn enumerator() -> Result<Com, String> {
+    let mut p = ptr::null_mut();
+    // SAFETY: valid GUIDs and out-pointer; COM is initialized by the caller.
+    let hr = unsafe {
+        CoCreateInstance(&CLSID_MM_DEVICE_ENUMERATOR, ptr::null_mut(), CLSCTX_ALL, &IID_IMM_DEVICE_ENUMERATOR, &mut p)
+    };
+    check(hr, "creating the device enumerator")?;
+    Ok(Com(p))
+}
+
+/// The system's default render device.
+fn default_device(enumerator: &Com) -> Result<Com, String> {
+    let mut p = ptr::null_mut();
+    // SAFETY: valid enumerator and out-pointer.
+    let hr = unsafe {
+        (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(
+            enumerator.0,
+            E_RENDER,
+            E_CONSOLE,
+            &mut p,
+        )
+    };
+    check(hr, "finding the default output device")?;
+    Ok(Com(p))
+}
+
+/// The endpoint id of `device`.
+fn device_id(device: &Com) -> Result<String, String> {
+    let mut p: *mut u16 = ptr::null_mut();
+    // SAFETY: valid device and out-pointer; the string is freed with
+    // CoTaskMemFree as documented.
+    unsafe {
+        check((device.vtbl::<IMMDeviceVtbl>().get_id)(device.0, &mut p), "reading a device id")?;
+        let id = from_wide(p);
+        CoTaskMemFree(p.cast());
+        Ok(id)
+    }
+}
+
+/// The friendly name of `device` ("Speakers (Realtek(R) Audio)").
+fn device_name(device: &Com) -> Result<String, String> {
+    let mut p = ptr::null_mut();
+    // SAFETY: valid device, key and out-pointers; the PROPVARIANT is cleared
+    // after its string has been copied.
+    unsafe {
+        check((device.vtbl::<IMMDeviceVtbl>().open_property_store)(device.0, STGM_READ, &mut p), "opening properties")?;
+        let store = Com(p);
+        let mut v = PropVariant { vt: 0, _reserved: [0; 3], data: [0; 2] };
+        check(
+            (store.vtbl::<IPropertyStoreVtbl>().get_value)(store.0, &PKEY_DEVICE_FRIENDLY_NAME, &mut v),
+            "reading a device name",
+        )?;
+        let name = if v.vt == VT_LPWSTR && v.data[0] != 0 { from_wide(v.data[0] as *const u16) } else { String::new() };
+        PropVariantClear(&mut v);
+        Ok(name)
+    }
+}
+
+/// Lists the active render devices.
+pub fn devices() -> Result<Vec<Device>, String> {
+    let _apartment = ComApartment::enter()?;
+    let enumerator = enumerator()?;
+    let default = default_device(&enumerator).and_then(|d| device_id(&d)).ok();
+    let mut p = ptr::null_mut();
+    // SAFETY: valid enumerator and out-pointer.
+    let hr = unsafe {
+        (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().enum_audio_endpoints)(
+            enumerator.0,
+            E_RENDER,
+            DEVICE_STATE_ACTIVE,
+            &mut p,
+        )
+    };
+    check(hr, "listing output devices")?;
+    let collection = Com(p);
+    let vt = unsafe { collection.vtbl::<IMMDeviceCollectionVtbl>() };
+    let mut count = 0u32;
+    // SAFETY: valid collection and out-pointer.
+    check(unsafe { (vt.get_count)(collection.0, &mut count) }, "counting output devices")?;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let mut p = ptr::null_mut();
+        // SAFETY: `i` is below the count; valid out-pointer.
+        check(unsafe { (vt.item)(collection.0, i, &mut p) }, "reading an output device")?;
+        let device = Com(p);
+        let id = device_id(&device)?;
+        let name = device_name(&device)?;
+        out.push(Device { is_default: default.as_deref() == Some(id.as_str()), id, name });
+    }
+    Ok(out)
+}
+
+/// Id of the current default render device.
+pub fn default_id() -> Option<String> {
+    let _apartment = ComApartment::enter().ok()?;
+    default_device(&enumerator().ok()?).and_then(|d| device_id(&d)).ok()
+}
+
 pub fn open<F, C>(
+    config: StreamConfig,
     factory: F,
     stop: Arc<AtomicBool>,
     health: Arc<StreamHealth>,
@@ -209,7 +407,7 @@ where
     spawn_audio_thread(move |report| {
         // SAFETY: all COM calls follow the documented WASAPI contracts; the
         // objects live (and are released) on this thread.
-        if let Err(e) = unsafe { run(factory, &stop, report) } {
+        if let Err(e) = unsafe { run(&config, factory, &stop, report) } {
             health.fail(e);
         }
     })
@@ -219,13 +417,18 @@ where
 ///
 /// Errors before the stream is running are passed to `report`; errors after
 /// that are returned so the caller can record them.
-unsafe fn run<F, C>(factory: F, stop: &AtomicBool, report: &dyn Fn(Result<StreamInfo, String>)) -> Result<(), String>
+unsafe fn run<F, C>(
+    config: &StreamConfig,
+    factory: F,
+    stop: &AtomicBool,
+    report: &dyn Fn(Result<StreamInfo, String>),
+) -> Result<(), String>
 where
     F: FnOnce(u32) -> C,
     C: AudioCallback,
 {
     let mut reported = false;
-    let result = unsafe { run_inner(factory, stop, report, &mut reported) };
+    let result = unsafe { run_inner(config, factory, stop, report, &mut reported) };
     match result {
         Err(e) if !reported => {
             report(Err(e));
@@ -235,7 +438,42 @@ where
     }
 }
 
+/// Activates an audio client of interface `iid` on `device`.
+unsafe fn activate(device: &Com, iid: &Guid) -> Result<Com, String> {
+    let mut p = ptr::null_mut();
+    // SAFETY: valid device, GUID and out-pointer.
+    let hr = unsafe { (device.vtbl::<IMMDeviceVtbl>().activate)(device.0, iid, CLSCTX_ALL, ptr::null_mut(), &mut p) };
+    check(hr, "activating the audio client")?;
+    Ok(Com(p))
+}
+
+/// Initializes an `IAudioClient3` at the engine's smallest period for
+/// `format`. Returns the period in frames.
+unsafe fn init_low_latency(client: &Com, format: *const WaveFormatEx) -> Result<u32, String> {
+    // SAFETY: `client` was activated as IAudioClient3, whose vtable
+    // `IAudioClient3Vtbl` describes; valid out-pointers.
+    unsafe {
+        let vt = client.vtbl::<IAudioClient3Vtbl>();
+        let (mut default, mut fundamental, mut min, mut max) = (0u32, 0u32, 0u32, 0u32);
+        check(
+            (vt.get_shared_mode_engine_period)(client.0, format, &mut default, &mut fundamental, &mut min, &mut max),
+            "querying engine periods",
+        )?;
+        // Drivers without small-buffer support report min == default; such a
+        // stream would be no faster, so it is not called low latency.
+        if min == 0 || min >= default {
+            return Err("the driver offers no period below its default".into());
+        }
+        check(
+            (vt.initialize_shared_audio_stream)(client.0, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, min, format, ptr::null()),
+            "initializing a low-latency stream",
+        )?;
+        Ok(min)
+    }
+}
+
 unsafe fn run_inner<F, C>(
+    config: &StreamConfig,
     factory: F,
     stop: &AtomicBool,
     report: &dyn Fn(Result<StreamInfo, String>),
@@ -248,51 +486,23 @@ where
     // SAFETY (whole function): raw COM/Win32 calls with valid arguments; every
     // out-pointer refers to a live local.
     unsafe {
-        let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
-        check(hr, "CoInitializeEx")?;
-        let _apartment = ComApartment(true);
+        let _apartment = ComApartment::enter()?;
+        let enumerator = enumerator()?;
+        let device = match &config.device {
+            None => default_device(&enumerator)?,
+            Some(id) => {
+                let mut p = ptr::null_mut();
+                let w = wide(id);
+                let hr = (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_device)(enumerator.0, w.as_ptr(), &mut p);
+                check(hr, "opening the chosen output device (is it still connected?)")?;
+                Com(p)
+            }
+        };
+        let device_label = device_name(&device).unwrap_or_default();
 
-        let mut p = ptr::null_mut();
-        check(
-            CoCreateInstance(
-                &CLSID_MM_DEVICE_ENUMERATOR,
-                ptr::null_mut(),
-                CLSCTX_ALL,
-                &IID_IMM_DEVICE_ENUMERATOR,
-                &mut p,
-            ),
-            "creating the device enumerator",
-        )?;
-        let enumerator = Com(p);
-
-        let mut p = ptr::null_mut();
-        check(
-            (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(
-                enumerator.0,
-                E_RENDER,
-                E_CONSOLE,
-                &mut p,
-            ),
-            "finding the default output device",
-        )?;
-        let device = Com(p);
-
-        let mut p = ptr::null_mut();
-        check(
-            (device.vtbl::<IMMDeviceVtbl>().activate)(
-                device.0,
-                &IID_IAUDIO_CLIENT,
-                CLSCTX_ALL,
-                ptr::null_mut(),
-                &mut p,
-            ),
-            "activating the audio client",
-        )?;
-        let client = Com(p);
-        let ac = client.vtbl::<IAudioClientVtbl>();
-
+        let mut client = activate(&device, &IID_IAUDIO_CLIENT)?;
         let mut mix: *mut WaveFormatEx = ptr::null_mut();
-        check((ac.get_mix_format)(client.0, &mut mix), "querying the mix format")?;
+        check((client.vtbl::<IAudioClientVtbl>().get_mix_format)(client.0, &mut mix), "querying the mix format")?;
         let wf = ptr::read_unaligned(mix);
         let (tag, bits) = (wf.tag, wf.bits_per_sample);
         let effective_tag = if tag == WAVE_FORMAT_EXTENSIBLE && wf.cb_size >= 22 {
@@ -317,18 +527,42 @@ where
         };
         let sample_rate = wf.samples_per_sec;
         let channels = wf.channels;
-        let hr = (ac.initialize)(
-            client.0,
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            BUFFER_DURATION,
-            0,
-            mix,
-            ptr::null(),
-        );
+        // A low-latency stream needs its own client; a client whose
+        // initialization failed cannot be initialized again.
+        let mut low_period = None;
+        if config.low_latency && format.is_some() {
+            if let Ok(c3) = activate(&device, &IID_IAUDIO_CLIENT3) {
+                if let Ok(period) = init_low_latency(&c3, mix) {
+                    client = c3;
+                    low_period = Some(period);
+                }
+            }
+        }
+        let hr = if low_period.is_some() {
+            0
+        } else {
+            (client.vtbl::<IAudioClientVtbl>().initialize)(
+                client.0,
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                BUFFER_DURATION,
+                0,
+                mix,
+                ptr::null(),
+            )
+        };
         CoTaskMemFree(mix as *mut c_void);
         let format = format.ok_or_else(|| format!("unsupported device format (tag {effective_tag}, {bits} bits)"))?;
         check(hr, "initializing the audio client")?;
+        let ac = client.vtbl::<IAudioClientVtbl>();
+        let period_frames = match low_period {
+            Some(p) => p,
+            None => {
+                let (mut default, mut min) = (0i64, 0i64);
+                check((ac.get_device_period)(client.0, &mut default, &mut min), "querying the device period")?;
+                (default as f64 * f64::from(sample_rate) / 1e7).round() as u32
+            }
+        };
         if channels == 0 {
             return Err("device reports zero channels".into());
         }
@@ -366,9 +600,12 @@ where
         *reported = true;
         report(Ok(StreamInfo {
             backend: "WASAPI",
+            device: device_label,
             sample_rate,
             device_channels: channels,
             buffer_frames,
+            period_frames,
+            low_latency: low_period.is_some(),
             format: format!("{format:?}"),
         }));
 

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tinvo::audio::{self, AudioCallback};
+use tinvo::audio::{self, AudioCallback, StreamConfig};
 use tinvo::dsp::loudness::ExportMeter;
 use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
 use tinvo::instrument::InstrumentKind;
@@ -18,21 +18,28 @@ const USAGE: &str = "\
 TINVO - terminal digital audio workstation
 
 USAGE:
-    tinvo [PROJECT.tvo]                 open the editor (demo beat if no file)
+    tinvo [AUDIO] [PROJECT.tvo]         open the editor (demo beat if no file)
     tinvo render PROJECT OUT.wav [--format 16|24|32f] [--loops N] [--rate HZ]
                  [--song | --region | --pattern A-P] [--stems]
                                         export WAV (the song if it has entries, else
                                         pattern A); --stems also writes one file per track
     tinvo demo OUT.tvo                  write the demo project to a file
-    tinvo probe [SECONDS]               open the audio device, output silence, report timing
+    tinvo devices                       list the audio output devices
+    tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
     tinvo bench                         measure rendering speed against real time
     tinvo --help | --version
+
+AUDIO:
+    --device NAME                       play on this device (its id, or a unique part of
+                                        its name; default: the system default)
+    --low-latency                       use the device's smallest period where the
+                                        backend supports it (WASAPI)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None => tinvo::app::run(None),
+        None => tinvo::app::run(None, StreamConfig::default()),
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             Ok(())
@@ -44,10 +51,9 @@ fn main() -> ExitCode {
         Some("render") => cmd_render(&args[1..]),
         Some("demo") => cmd_demo(&args[1..]),
         Some("probe") => cmd_probe(&args[1..]),
+        Some("devices") => cmd_devices(),
         Some("bench") => cmd_bench(),
-        Some(s) if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        Some(path) if args.len() == 1 => tinvo::app::run(Some(PathBuf::from(path))),
-        Some(_) => Err(format!("too many arguments\n\n{USAGE}")),
+        Some(_) => cmd_edit(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -173,7 +179,51 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
 }
 
 /// Outputs silence through the real device and reports callback timing.
+/// Takes the audio options out of `args`, returning the rest.
+fn audio_options(args: &[String]) -> Result<(StreamConfig, Vec<String>), String> {
+    let mut config = StreamConfig::default();
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--device" => {
+                let query = it.next().ok_or("--device needs a device name or id")?;
+                let devices = audio::output_devices()?;
+                config.device = Some(audio::find_device(&devices, query)?.id.clone());
+            }
+            "--low-latency" => config.low_latency = true,
+            _ => rest.push(a.clone()),
+        }
+    }
+    Ok((config, rest))
+}
+
+fn cmd_edit(args: &[String]) -> Result<(), String> {
+    let (config, rest) = audio_options(args)?;
+    match &rest[..] {
+        [] => tinvo::app::run(None, config),
+        [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
+        [path] => tinvo::app::run(Some(PathBuf::from(path)), config),
+        _ => Err(format!("too many arguments\n\n{USAGE}")),
+    }
+}
+
+fn cmd_devices() -> Result<(), String> {
+    let devices = audio::output_devices()?;
+    if devices.is_empty() {
+        println!("No output devices.");
+    }
+    for d in &devices {
+        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, d.name, d.id);
+    }
+    if devices.iter().any(|d| d.is_default) {
+        println!("(* is the system default)");
+    }
+    Ok(())
+}
+
 fn cmd_probe(args: &[String]) -> Result<(), String> {
+    let (config, args) = audio_options(args)?;
     let seconds: f64 = match args.first() {
         Some(s) => s.parse().ok().filter(|v| *v > 0.0 && *v <= 60.0).ok_or("SECONDS must be in (0, 60]")?,
         None => 2.0,
@@ -192,16 +242,25 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     let frames = Arc::new(AtomicU64::new(0));
     let calls = Arc::new(AtomicU64::new(0));
     let (f, c) = (frames.clone(), calls.clone());
-    let stream = audio::open(move |_| Silence { frames: f, calls: c })?;
+    let stream = audio::open_with(&config, move |_| Silence { frames: f, calls: c })?;
     let info = stream.info().clone();
+    let ms = |frames: u32| f64::from(frames) * 1000.0 / f64::from(info.sample_rate);
     println!(
-        "Opened {}: {} Hz, {} channels, {} format, {}-frame buffer ({:.1} ms)",
+        "Opened {} on {}: {} Hz, {} channels, {} format, {}-frame buffer ({:.1} ms), {}-frame period ({:.2} ms){}",
         info.backend,
+        if info.device.is_empty() { "the default device" } else { &info.device },
         info.sample_rate,
         info.device_channels,
         info.format,
         info.buffer_frames,
-        f64::from(info.buffer_frames) * 1000.0 / f64::from(info.sample_rate)
+        ms(info.buffer_frames),
+        info.period_frames,
+        ms(info.period_frames),
+        match (config.low_latency, info.low_latency) {
+            (true, true) => ", low latency",
+            (true, false) => ", low latency unavailable",
+            _ => "",
+        }
     );
     let start = Instant::now();
     let f0 = frames.load(Ordering::Relaxed);

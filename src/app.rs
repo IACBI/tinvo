@@ -5,7 +5,7 @@
 //! change goes through [`App::edit`], which records how to undo it, applies
 //! it to the project and forwards the exact applied edit to the engine.
 
-use crate::audio::{self, AudioCallback, Stream};
+use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
@@ -265,6 +265,15 @@ pub enum Mode {
     AddTrack,
     Confirm(Confirm),
     Prompt(PromptKind, String),
+    Devices(DevicePicker),
+}
+
+/// The output device list `O` shows. Entry 0 is the system default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevicePicker {
+    pub devices: Vec<Device>,
+    pub cursor: usize,
+    pub low_latency: bool,
 }
 
 pub struct App {
@@ -310,6 +319,10 @@ pub struct App {
     link: Option<EngineLink>,
     sample_rate: u32,
     audio_label: String,
+    /// The output the user asked for (the run loop keeps it current).
+    pub audio_config: StreamConfig,
+    /// A device change the picker asked for, for the run loop to make.
+    audio_request: Option<StreamConfig>,
     status: Option<(String, Instant)>,
     meters: [f32; MAX_TRACKS],
     master_meter: [f32; 2],
@@ -370,6 +383,8 @@ impl App {
             link,
             sample_rate,
             audio_label,
+            audio_config: StreamConfig::default(),
+            audio_request: None,
             status: None,
             meters: [0.0; MAX_TRACKS],
             master_meter: [0.0; 2],
@@ -390,14 +405,66 @@ impl App {
         self.status.as_ref().map(|(s, _)| s.as_str())
     }
 
-    /// Called when the audio stream dies; the session continues offline.
+    /// Called when the audio stream dies; the session continues offline
+    /// until the run loop reconnects.
     pub fn audio_failed(&mut self, err: String) {
         if self.link.take().is_some() {
             self.audio_label = "audio offline".into();
             self.playing = false;
             self.play_pos = None;
-            self.set_status(format!("Audio stopped: {err}. Save your work; export still works."));
+            self.set_status(format!("Audio stopped: {err}. Reconnecting; editing and export still work."));
         }
+    }
+
+    /// Takes over a new engine after the output was (re)opened. Playback
+    /// stops: the new engine starts from the project, at its start.
+    pub fn reconnect(&mut self, link: EngineLink, sample_rate: u32, label: String) {
+        self.link = Some(link);
+        self.sample_rate = sample_rate;
+        self.audio_label = label;
+        self.playing = false;
+        self.play_pos = None;
+        self.meters = [0.0; MAX_TRACKS];
+        self.master_meter = [0.0; 2];
+        self.reduction = [0.0; MAX_TRACKS];
+        self.limiter_reduction = 0.0;
+        self.loudness = [f32::NAN; 3];
+    }
+
+    /// The output change the user asked for, if any.
+    pub fn take_audio_request(&mut self) -> Option<StreamConfig> {
+        self.audio_request.take()
+    }
+
+    /// Shows the device picker for `devices`, on the device in use.
+    pub fn open_device_picker(&mut self, devices: Vec<Device>) {
+        let cursor = self
+            .audio_config
+            .device
+            .as_ref()
+            .and_then(|id| devices.iter().position(|d| &d.id == id))
+            .map_or(0, |i| i + 1);
+        self.mode = Mode::Devices(DevicePicker { devices, cursor, low_latency: self.audio_config.low_latency });
+    }
+
+    fn key_devices(&mut self, mut p: DevicePicker, key: Key) {
+        match key {
+            Key::Up => p.cursor = p.cursor.saturating_sub(1),
+            Key::Down => p.cursor = (p.cursor + 1).min(p.devices.len()),
+            Key::Tab | Key::BackTab => p.low_latency = !p.low_latency,
+            Key::Enter => {
+                let device = p.cursor.checked_sub(1).map(|i| p.devices[i].id.clone());
+                self.audio_request = Some(StreamConfig { device, low_latency: p.low_latency });
+                self.mode = Mode::Normal;
+                return;
+            }
+            Key::Esc | Key::Char('q' | 'O') => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::Devices(p);
     }
 
     /// Applies a user edit as its own undo step. Returns whether it was valid.
@@ -845,6 +912,7 @@ impl App {
             Mode::AddTrack => self.key_add_track(key),
             Mode::Confirm(c) => self.key_confirm(c, key),
             Mode::Prompt(kind, text) => self.key_prompt(kind, text, key),
+            Mode::Devices(p) => self.key_devices(p, key),
             Mode::Normal => self.key_normal(key),
         }
         self.clamp_cursor();
@@ -955,6 +1023,10 @@ impl App {
                 self.focus = if self.focus == Focus::Grid { Focus::Params } else { Focus::Grid };
             }
             Key::Char('?') | Key::F(1) => self.mode = Mode::Help,
+            Key::Char('O') => match audio::output_devices() {
+                Ok(devices) => self.open_device_picker(devices),
+                Err(e) => self.set_status(format!("Cannot list output devices: {e}")),
+            },
             Key::Char('f') => {
                 let (page, status) = match self.page {
                     Page::Instrument => {
@@ -1458,6 +1530,10 @@ impl App {
             draw_help(s);
             return;
         }
+        if let Mode::Devices(p) = &self.mode {
+            self.draw_devices(s, p);
+            return;
+        }
         self.draw_header(s, w);
         let params_rows = self.params_rows(w);
         // header, ruler, separator, params block, status line
@@ -1910,6 +1986,36 @@ impl App {
     }
 }
 
+impl App {
+    fn draw_devices(&self, s: &mut Screen, p: &DevicePicker) {
+        let h = s.height();
+        s.put(2, 1, "Audio output", Style::fg(Color::BrightWhite).bold());
+        s.put(2, 2, &format!("Now: {}", self.audio_label), Style::fg(Color::Gray));
+        let current = self.audio_config.device.as_deref();
+        let mut entries = vec![("System default (follows changes)".to_string(), current.is_none())];
+        for d in &p.devices {
+            let default = if d.is_default { "  (default)" } else { "" };
+            entries.push((format!("{}{default}", d.name), current == Some(d.id.as_str())));
+        }
+        // Keep the cursor's row on screen; rows 4.. up to the hint line.
+        let rows = usize::from(h.saturating_sub(7)).max(1);
+        let first = p.cursor.saturating_sub(rows - 1);
+        for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
+            let y = 4 + row as u16;
+            let mark = if *chosen { "● " } else { "  " };
+            let st = if i == p.cursor { Style::fg(Color::Black).on(Color::BrightCyan) } else { Style::DEFAULT };
+            s.put(2, y, &format!("{mark}{name}"), st);
+        }
+        let ll = if p.low_latency { "on" } else { "off" };
+        s.put(
+            2,
+            h.saturating_sub(2),
+            &format!("↑↓ choose  Enter switch  Tab low latency: {ll} (WASAPI)  Esc cancel"),
+            Style::fg(Color::Gray),
+        );
+    }
+}
+
 fn draw_help(s: &mut Screen) {
     let lines: &[(&str, &str)] = &[
         ("", "TINVO keyboard reference (any key closes)"),
@@ -1941,6 +2047,7 @@ fn draw_help(s: &mut Screen) {
         ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
+        ("O", "audio output device (and low-latency mode)"),
         ("f", "parameter panel: instrument, channel strip (EQ, compressor, drive, sends), buses and master"),
         ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
         ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
@@ -2020,7 +2127,11 @@ fn with_extension(text: &str, ext: &str) -> PathBuf {
 
 /// Starts the audio engine for `project`. Returns the stream and UI link, or
 /// the reason audio is unavailable.
-pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result<(Stream, EngineLink, u32), String> {
+pub fn start_audio(
+    project: &Project,
+    samples: &[Option<Arc<Sample>>],
+    config: &StreamConfig,
+) -> Result<(Stream, EngineLink, u32), String> {
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
     let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
@@ -2028,7 +2139,7 @@ pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result
     let samples = samples.to_vec();
     let held = samples.iter().flatten().count();
     let cb_shared = shared.clone();
-    let stream = audio::open(move |sample_rate| {
+    let stream = audio::open_with(config, move |sample_rate| {
         let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
         engine.attach_retirement(retire_tx);
         for (track, sample) in samples.into_iter().enumerate() {
@@ -2040,8 +2151,132 @@ pub fn start_audio(project: &Project, samples: &[Option<Arc<Sample>>]) -> Result
     Ok((stream, EngineLink::new(tx, shared).with_retirement(retire_rx, held), sr))
 }
 
+/// How often a lost output is retried, at first and at most.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(8);
+/// How often a working output checks for a better device: the system
+/// default changing, or the chosen device coming back.
+const DEVICE_CHECK: Duration = Duration::from_secs(2);
+
+/// Keeps the output stream alive for the session: opens the device the user
+/// asks for, reopens after the device is lost, follows the system default
+/// (where the backend reports it), and falls back to the default while the
+/// chosen device is missing.
+struct Output {
+    stream: Option<Stream>,
+    /// What the user asked for.
+    config: StreamConfig,
+    /// The stream plays on the default because the chosen device is missing.
+    fallback: bool,
+    /// The default device's id when the stream opened on it.
+    default_id: Option<String>,
+    next_check: Instant,
+    retry: Duration,
+}
+
+impl Output {
+    fn new(config: StreamConfig) -> Self {
+        Self { stream: None, config, fallback: false, default_id: None, next_check: Instant::now(), retry: RETRY_FIRST }
+    }
+
+    /// (Re)opens the output and hands the new engine to `app`. Returns the
+    /// device name, or why it failed (the app is offline then).
+    fn open(&mut self, app: &mut App) -> Result<String, String> {
+        // Release the device before reopening it.
+        self.stream = None;
+        let mut config = self.config.clone();
+        self.fallback = false;
+        if let Some(id) = &self.config.device {
+            if audio::output_devices().is_ok_and(|ds| !ds.iter().any(|d| &d.id == id)) {
+                config.device = None;
+                self.fallback = true;
+            }
+        }
+        app.audio_config = self.config.clone();
+        let (stream, link, sr) = match start_audio(&app.project, &app.track_samples(), &config) {
+            Ok(v) => v,
+            Err(e) => {
+                app.link = None;
+                app.audio_label = "audio offline".into();
+                app.playing = false;
+                app.play_pos = None;
+                return Err(e);
+            }
+        };
+        let info = stream.info();
+        let ll = if info.low_latency { " LL" } else { "" };
+        let label = format!("{} {} Hz{ll}", info.backend, sr);
+        let name = if info.device.is_empty() { "the default device".to_string() } else { info.device.clone() };
+        app.reconnect(link, sr, label);
+        self.default_id = if config.device.is_none() { audio::default_output_id() } else { None };
+        self.stream = Some(stream);
+        self.retry = RETRY_FIRST;
+        Ok(name)
+    }
+
+    /// Opens what the user picked, reporting the result.
+    fn switch(&mut self, app: &mut App, config: StreamConfig) {
+        self.config = config;
+        let wanted_ll = self.config.low_latency;
+        match self.open(app) {
+            Ok(name) => {
+                let ll = match (wanted_ll, app.audio_label.ends_with(" LL")) {
+                    (true, true) => ", low latency",
+                    (true, false) => " (low latency unavailable here)",
+                    _ => "",
+                };
+                let gone = if self.fallback { "chosen device missing; " } else { "" };
+                app.set_status(format!("Audio: {gone}playing on {name}{ll}"));
+            }
+            Err(e) => app.set_status(format!("Cannot open that output: {e}. Retrying.")),
+        }
+        self.next_check = Instant::now() + if self.stream.is_some() { DEVICE_CHECK } else { self.retry };
+    }
+
+    /// Runs once per UI frame.
+    fn poll(&mut self, app: &mut App) {
+        if let Some(config) = app.take_audio_request() {
+            self.switch(app, config);
+            return;
+        }
+        if let Some(err) = self.stream.as_ref().and_then(Stream::error) {
+            self.stream = None;
+            app.audio_failed(err);
+            self.next_check = Instant::now() + self.retry;
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_check {
+            return;
+        }
+        if self.stream.is_none() {
+            match self.open(app) {
+                Ok(name) => app.set_status(format!("Audio back on {name}")),
+                Err(_) => self.retry = (self.retry * 2).min(RETRY_MAX),
+            }
+        } else if self.fallback {
+            let id = self.config.device.clone().unwrap_or_default();
+            if audio::output_devices().is_ok_and(|ds| ds.iter().any(|d| d.id == id)) {
+                match self.open(app) {
+                    Ok(name) => app.set_status(format!("Audio back on {name}")),
+                    Err(e) => app.set_status(format!("Audio stopped: {e}. Reconnecting.")),
+                }
+            }
+        } else if self.config.device.is_none() {
+            let now_default = audio::default_output_id();
+            if now_default.is_some() && now_default != self.default_id {
+                match self.open(app) {
+                    Ok(name) => app.set_status(format!("Default output changed: playing on {name}")),
+                    Err(e) => app.set_status(format!("Audio stopped: {e}. Reconnecting.")),
+                }
+            }
+        }
+        self.next_check = Instant::now() + if self.stream.is_some() { DEVICE_CHECK } else { self.retry };
+    }
+}
+
 /// Runs the interactive session until the user quits.
-pub fn run(path: Option<PathBuf>) -> Result<(), String> {
+pub fn run(path: Option<PathBuf>, config: StreamConfig) -> Result<(), String> {
     let (project, path, mut message) = match path {
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
@@ -2063,17 +2298,14 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
     if let Some(first) = errors.first() {
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
-    let (stream, link, sample_rate, label) = match start_audio(&project, &samples) {
-        Ok((stream, link, sr)) => {
-            let label = format!("{} {} Hz", stream.info().backend, sr);
-            (Some(stream), Some(link), sr, label)
-        }
-        Err(e) => {
-            message = format!("No audio output ({e}). Editing and export still work.");
-            (None, None, 48_000, "no audio".to_string())
-        }
-    };
-    let mut app = App::new(project, path, link, sample_rate, label).with_samples(samples);
+    let mut app = App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples);
+    let mut output = Output::new(config);
+    if let Err(e) = output.open(&mut app) {
+        message = format!("No audio output ({e}). Retrying; editing and export still work.");
+    } else if output.fallback {
+        message = format!("The chosen output device is missing; playing on the default. {message}");
+    }
+    output.next_check = Instant::now() + if output.stream.is_some() { DEVICE_CHECK } else { output.retry };
     app.set_status(message);
 
     crate::tui::term::install_panic_hook();
@@ -2081,7 +2313,6 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
     let (w, h) = term.size();
     let mut screen = Screen::new(w, h);
     let mut out = String::with_capacity(1 << 16);
-    let mut audio_error_seen = false;
 
     loop {
         let mut timeout = Duration::from_millis(16);
@@ -2092,12 +2323,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
             }
             timeout = Duration::ZERO;
         }
-        if !audio_error_seen {
-            if let Some(err) = stream.as_ref().and_then(Stream::error) {
-                audio_error_seen = true;
-                app.audio_failed(err);
-            }
-        }
+        output.poll(&mut app);
         app.tick();
         if app.quit {
             break;
@@ -2112,7 +2338,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), String> {
         }
     }
     drop(term);
-    drop(stream);
+    drop(output);
     Ok(())
 }
 
@@ -2984,6 +3210,77 @@ mod tests {
     }
 
     #[test]
+    fn device_picker_asks_the_run_loop_for_the_chosen_output() {
+        let mut a = app();
+        let d = |id: &str, name: &str| Device { id: id.into(), name: name.into(), is_default: id == "{a}" };
+        let devices = vec![d("{a}", "Speakers"), d("{b}", "Headphones")];
+        a.audio_config = StreamConfig { device: Some("{b}".into()), low_latency: false };
+        a.open_device_picker(devices.clone());
+        let Mode::Devices(p) = &a.mode else { panic!("picker not shown") };
+        assert_eq!(p.cursor, 2, "starts on the device in use");
+        keys(&mut a, &[Key::Up, Key::Up, Key::Up, Key::Tab, Key::Enter]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(a.take_audio_request(), Some(StreamConfig { device: None, low_latency: true }));
+        assert_eq!(a.take_audio_request(), None);
+
+        a.open_device_picker(devices);
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Enter]);
+        assert_eq!(a.take_audio_request(), Some(StreamConfig { device: Some("{b}".into()), low_latency: false }));
+
+        a.open_device_picker(Vec::new());
+        keys(&mut a, &[Key::Down, Key::Esc]);
+        assert_eq!((a.mode.clone(), a.take_audio_request()), (Mode::Normal, None));
+    }
+
+    /// Drives the real output on this machine's devices; skips where there
+    /// is no audio device (as on CI runners).
+    #[test]
+    fn output_opens_switches_and_falls_back_on_real_devices() {
+        let mut a = app();
+        let mut out = Output::new(StreamConfig::default());
+        if out.open(&mut a).is_err() {
+            eprintln!("no audio device; skipping");
+            return;
+        }
+        assert!(a.link.is_some() && out.stream.is_some() && !out.fallback);
+        let devices = audio::output_devices().unwrap();
+        for d in &devices {
+            a.audio_request = Some(StreamConfig { device: Some(d.id.clone()), low_latency: false });
+            out.poll(&mut a);
+            assert_eq!(a.audio_config.device.as_deref(), Some(d.id.as_str()));
+            if let Some(stream) = &out.stream {
+                assert!(!out.fallback);
+                assert_eq!(stream.info().device, d.name);
+                assert!(a.status_text().unwrap().contains(&d.name), "{:?}", a.status_text());
+            }
+        }
+        a.audio_request = Some(StreamConfig { device: Some("{no such device}".into()), low_latency: false });
+        out.poll(&mut a);
+        assert!(out.fallback && out.stream.is_some() && a.link.is_some());
+        assert!(a.status_text().unwrap().contains("chosen device missing"));
+        // Playing on the fallback, the check finds the device still missing.
+        out.next_check = Instant::now();
+        out.poll(&mut a);
+        assert!(out.fallback && out.stream.is_some());
+    }
+
+    #[test]
+    fn reconnecting_resets_playback_and_meters() {
+        let mut a = app();
+        a.playing = true;
+        a.meters[0] = 0.5;
+        a.loudness = [-20.0; 3];
+        let (tx, _rx) = spsc::channel::<Command>(4);
+        a.reconnect(EngineLink::new(tx, Arc::new(Shared::new())), 44_100, "Test 44100 Hz".into());
+        assert!(a.link.is_some() && !a.playing && a.meters[0] == 0.0 && a.loudness[0].is_nan());
+        assert_eq!(a.sample_rate, 44_100);
+        a.audio_failed("unplugged".into());
+        assert!(a.link.is_none());
+        assert_eq!(a.audio_label, "audio offline");
+        assert!(a.status_text().unwrap().contains("Reconnecting"));
+    }
+
+    #[test]
     fn draws_without_panicking_at_any_size() {
         let mut a = app();
         let synth = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
@@ -2991,7 +3288,18 @@ mod tests {
             let mut s = Screen::new(w, h);
             for (roll, note) in [(false, 48), (true, 0), (true, 127), (true, 60)] {
                 (a.roll, a.roll_note, a.track) = (roll, note, if roll { synth } else { 0 });
-                for mode in [Mode::Normal, Mode::Help, Mode::AddTrack, Mode::Prompt(PromptKind::Export, "x".into())] {
+                let picker = DevicePicker {
+                    devices: vec![Device { id: "{x}".into(), name: "Speakers".into(), is_default: true }],
+                    cursor: 1,
+                    low_latency: false,
+                };
+                for mode in [
+                    Mode::Normal,
+                    Mode::Help,
+                    Mode::AddTrack,
+                    Mode::Prompt(PromptKind::Export, "x".into()),
+                    Mode::Devices(picker),
+                ] {
                     a.mode = mode;
                     a.draw(&mut s);
                     let mut out = String::new();

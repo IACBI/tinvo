@@ -6,6 +6,18 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-12
+
+### Added
+- `tinvo devices` lists the output devices (the system default marked), and `--device NAME` plays on one, given by its id or a unique part of its name, in the editor and in `tinvo probe`.
+- `O` in the editor opens the output device list: the system default (which follows changes) or a specific device, switched without leaving the session.
+- The editor keeps the audio going when devices change. A lost stream (device unplugged, driver reset) is reopened, retrying every 1 s and backing off to 8 s. When the system default changes (WASAPI), the editor moves to the new default. While a chosen device is missing it plays on the default and returns to the chosen one when it reappears. Reconnecting stops playback, and nothing is lost.
+- `--low-latency` (and `Tab` in the device list) asks WASAPI for the device's smallest shared-mode period through `IAudioClient3`. Drivers whose smallest period is their default report that low latency is unavailable, and the normal stream is used.
+- `tinvo probe` reports the device, the period and the low-latency state.
+
+### Changed
+- ALSA lists the PCMs its hints offer for playback and opens the chosen one; CoreAudio lists the devices with output streams and plays on the chosen one by its UID. Both still default to the system default.
+
 ## [0.9.0] - 2026-11-12
 
 ### Added
@@ -131,7 +143,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/IACBI/tinvo/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/IACBI/tinvo/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/IACBI/tinvo/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/IACBI/tinvo/compare/v0.6.0...v0.7.0

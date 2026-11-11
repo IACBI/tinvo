@@ -95,7 +95,7 @@ Known limits:
 - Bus and master settings could not be automated (done in 4c).
 - The true-peak estimate is a 4× interpolation with a 12-tap kernel: within 0.15 dB up to 12 kHz, but up to 0.5 dB low around 18 kHz (at 48 kHz), so material with strong content up there can peak slightly above the ceiling.
 
-## Phase 4c: More mixing ✅ (0.9.0, this release)
+## Phase 4c: More mixing ✅ (0.9.0)
 
 - Chorus on a third bus: two taps per side swept in opposite directions around 12 ms, the right side a quarter cycle behind the left, read with Hermite interpolation.
 - Sidechain compression through a key bus: a pre-strip, pre-fader key send on every track, and a key switch on each compressor.
@@ -109,11 +109,23 @@ Known limits:
 - Drive costs about 0.7 % of one core per track (`tinvo bench`): every strip stage on all six demo tracks takes about twice what it did in 0.8.0 on the same machine.
 - Bus and master settings other than the delay time, the pre-delay, the chorus depth and the return levels change at once; automated ramps move them in 32-frame steps.
 
-## Phase 5: Devices and I/O
+## Phase 5a: Output devices ✅ (0.10.0, this release)
 
-- Output device selection and hot-plug recovery; WASAPI `IAudioClient3` low-latency mode; CoreAudio HAL unit; JACK/PipeWire native paths.
-- MIDI input (WinMM / ALSA sequencer / CoreMIDI) for live playing and step entry.
-- Audio input and recording.
+- Output device listing and selection on all three backends (`tinvo devices`, `--device`, `O` in the editor).
+- Recovery: a lost stream is reopened with backoff; the editor follows the system default (WASAPI) and falls back to the default while a chosen device is missing, returning when it reappears.
+- WASAPI `IAudioClient3` low-latency mode at the device's smallest shared-mode period.
+
+Known limits:
+- The low-latency path was only exercised where drivers refuse it: every device on the development machine reports a smallest period equal to its 10 ms default, so `InitializeSharedAudioStream` itself has not run on real hardware.
+- Hot-plug recovery was tested by switching between real devices and by asking for a missing one; actually unplugging a device mid-stream has not been tested.
+- ALSA and CoreAudio device listing compiles and links in CI, but has not run on real hardware. ALSA and CoreAudio cannot report the default device changing; the system routes their default streams itself.
+- Reconnecting rebuilds the engine from the project: playback stops, and ringing notes and effect tails are cut.
+
+## Phase 5b–5d: More I/O
+
+- 5b: MIDI input (WinMM / ALSA sequencer / CoreMIDI) for live playing and step entry.
+- 5c: Audio input and recording.
+- 5d: CoreAudio HAL unit; JACK/PipeWire native paths.
 
 ## Phase 6: Polish and production hardening
 
