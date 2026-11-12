@@ -6,6 +6,16 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-12
+
+### Added
+- Crash-safe autosave. While a project has unsaved edits, TINVO writes it every 5 seconds to `song.tvo.autosave` next to `song.tvo`, or, for a project that was never saved, to `untitled.tvo.autosave` in TINVO's state directory (`%LOCALAPPDATA%\tinvo` on Windows, `~/Library/Application Support/tinvo` on macOS, `$XDG_STATE_HOME/tinvo` or `~/.local/state/tinvo` elsewhere). Each write is atomic, so the autosave is always a whole project. Saving deletes it, and so does quitting normally.
+- Recovery. If TINVO starts and finds an autosave, the last session ended without saving (a crash, a kill, a lost terminal). It asks before anything else: `y` recovers the edits, which stay unsaved until you save; `n` discards them and deletes the autosave; `q` quits and asks again next time. An autosave that cannot be read is renamed to `….autosave.unreadable` and reported, so nothing overwrites it.
+- When the session ends on a terminal error or a panic, the unsaved edits are written to the autosave right away rather than at the next interval.
+
+### Fixed
+- The `Tab` hint in the output list no longer says low latency is WASAPI-only; it works on macOS too since 0.13.0.
+
 ## [0.13.1] - 2026-11-12
 
 A review of the 0.13.0 backends against their documentation and sources (alsa-lib, the kernel's sequencer, `aseqdump`, PipeWire's JACK, Apple's headers and technical notes), with what it found fixed.
@@ -188,7 +198,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/IACBI/tinvo/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/IACBI/tinvo/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/IACBI/tinvo/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/IACBI/tinvo/compare/v0.11.0...v0.12.0

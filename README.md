@@ -37,6 +37,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
+- Autosave every 5 seconds while there are unsaved edits. If TINVO crashes or is killed, the next start offers to recover them.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern or the loop region, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -147,6 +148,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
+- Kaydedilmemiş değişiklik varken 5 saniyede bir otomatik yedek. TINVO çökerse ya da öldürülürse, bir sonraki açılışta bu değişiklikleri geri yüklemeyi önerir.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern ya da döngü bölgesi, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).

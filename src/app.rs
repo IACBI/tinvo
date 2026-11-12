@@ -6,6 +6,7 @@
 //! it to the project and forwards the exact applied edit to the engine.
 
 use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
+use crate::autosave::{self, Autosave};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
@@ -316,6 +317,12 @@ pub struct App {
     pub project: Project,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// Counts edits; the autosave writes when it moves.
+    pub revision: u64,
+    /// Off until [`run`] (or a test) points it somewhere.
+    pub autosave: Autosave,
+    /// A failed autosave was reported; stays quiet until one succeeds.
+    autosave_failed: bool,
     pub track: usize,
     pub step: usize,
     pub param: usize,
@@ -412,6 +419,9 @@ impl App {
             project,
             path,
             dirty: false,
+            revision: 0,
+            autosave: Autosave::default(),
+            autosave_failed: false,
             track: 0,
             step: 0,
             param: 0,
@@ -684,7 +694,7 @@ impl App {
             done
         };
         if written {
-            self.dirty = true;
+            self.touch();
             self.set_status(format!("Step {}: {}", self.step + 1, step_label(&s, kind)));
         }
     }
@@ -762,7 +772,7 @@ impl App {
             // Already in that state (e.g. tempo at its limit): nothing to undo.
             return true;
         }
-        self.dirty = true;
+        self.touch();
         self.redo.clear();
         let now = Instant::now();
         let key = if coalesce { coalesce_key(&applied) } else { None };
@@ -803,7 +813,7 @@ impl App {
         if redo.is_empty() {
             return;
         }
-        self.dirty = true;
+        self.touch();
         self.redo.clear();
         let meta_after = self.track_meta();
         self.push_change(Change { undo, redo, meta_before, meta_after, what, key: None, at: Instant::now() });
@@ -927,7 +937,7 @@ impl App {
         let meta_before = self.track_meta();
         self.project.tracks[self.track].sample = Some(key);
         self.send_sample(self.track);
-        self.dirty = true;
+        self.touch();
         self.redo.clear();
         let meta_after = self.track_meta();
         self.push_change(Change {
@@ -969,7 +979,7 @@ impl App {
     }
 
     fn after_history_move(&mut self, c: &Change, verb: &str) {
-        self.dirty = true;
+        self.touch();
         self.sealed = true;
         // Move the cursor to where the change happened.
         match c.redo.first() {
@@ -1096,7 +1106,41 @@ impl App {
     }
 
     /// Pulls playhead, meters and load from the audio thread.
+    /// Marks the project changed since it was last saved.
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.revision += 1;
+    }
+
+    /// Writes the autosave when unsaved edits are due.
+    fn tick_autosave(&mut self, now: Instant) {
+        if self.dirty && self.autosave.due(self.revision, now) {
+            self.write_autosave(now);
+        }
+    }
+
+    fn write_autosave(&mut self, now: Instant) {
+        match self.autosave.write(&self.project, self.revision, now) {
+            Ok(()) => self.autosave_failed = false,
+            Err(e) if !self.autosave_failed => {
+                self.autosave_failed = true;
+                let path = self.autosave.path().map_or(String::new(), |p| p.display().to_string());
+                self.set_status(format!("Autosave failed: {path}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Writes unsaved edits to the autosave now, whatever the interval; for
+    /// when the session is about to end abnormally.
+    pub fn autosave_now(&mut self) {
+        if self.dirty {
+            self.write_autosave(Instant::now());
+        }
+    }
+
     pub fn tick(&mut self) {
+        self.tick_autosave(Instant::now());
         self.tick_recording();
         if self.link.is_some() && self.live_track_sent != Some(self.track) {
             self.send(Command::SetLiveTrack(self.track.min(usize::from(u8::MAX)) as u8));
@@ -1282,7 +1326,7 @@ impl App {
         }
         let meta_before = self.track_meta();
         self.project.tracks[self.track].name = name;
-        self.dirty = true;
+        self.touch();
         self.redo.clear();
         let meta_after = self.track_meta();
         self.push_change(Change {
@@ -1757,6 +1801,7 @@ impl App {
         match self.project.save(&path) {
             Ok(()) => {
                 self.dirty = false;
+                self.autosave.saved(&path, self.revision);
                 self.set_status(format!("Saved {}", path.display()));
                 self.path = Some(path);
             }
@@ -2750,11 +2795,56 @@ pub fn run(
         None => (Project::demo(), None, "Demo beat loaded. Space plays, ? shows all keys.".to_string()),
     };
 
+    // The terminal comes first: a recovery question is asked in it before
+    // the project the session works on, and so the engine, is chosen.
+    crate::tui::term::install_panic_hook();
+    let mut term = Terminal::enter().map_err(|e| format!("cannot start terminal UI: {e}"))?;
+    let (w, h) = term.size();
+    let mut screen = Screen::new(w, h);
+    let mut out = String::with_capacity(1 << 16);
+
+    // What happened to an autosave; shown ahead of the other start-up news,
+    // which audio or MIDI trouble may replace.
+    let mut notice = None;
+    let (project, recovered) = match autosave::find(path.as_deref()) {
+        None => (project, false),
+        Some(found) => match &found.project {
+            Ok(saved) => match ask_recovery(&mut term, &mut screen, &mut out, &found)? {
+                Some(Recovery::Recover) => {
+                    notice =
+                        Some(format!("Recovered unsaved changes from {}; save to keep them.", found.path.display()));
+                    (saved.clone(), true)
+                }
+                Some(Recovery::Discard) => {
+                    notice = Some(match std::fs::remove_file(&found.path) {
+                        Ok(()) => "Discarded the autosave.".to_string(),
+                        Err(e) => format!("Could not delete the autosave {}: {e}.", found.path.display()),
+                    });
+                    (project, false)
+                }
+                None => return Ok(()),
+            },
+            Err(e) => {
+                notice = Some(match autosave::set_aside(&found.path) {
+                    Ok(to) => format!("An autosave could not be read ({e}); it was moved to {}.", to.display()),
+                    Err(e2) => format!("An autosave could not be read ({e}) or moved aside ({e2})."),
+                });
+                (project, false)
+            }
+        },
+    };
+    screen.invalidate();
+
     let (samples, errors) = project.load_samples();
     if let Some(first) = errors.first() {
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
     let mut app = App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples);
+    if recovered {
+        // Unsaved until the user saves; the autosave is rewritten from it.
+        app.touch();
+    }
+    app.autosave = Autosave::new(app.path.as_deref(), 0);
     app.input_device = input;
     let mut midi = MidiSession::new();
     let mut output = Output::new(config, Some(midi.live.clone()));
@@ -2773,43 +2863,129 @@ pub fn run(
         message = format!("The chosen output device is missing; playing on the default. {message}");
     }
     output.next_check = Instant::now() + if output.stream.is_some() { DEVICE_CHECK } else { output.retry };
-    app.set_status(message);
+    app.set_status(match notice {
+        Some(n) => format!("{n}  {message}"),
+        None => message,
+    });
 
-    crate::tui::term::install_panic_hook();
-    let mut term = Terminal::enter().map_err(|e| format!("cannot start terminal UI: {e}"))?;
-    let (w, h) = term.size();
-    let mut screen = Screen::new(w, h);
-    let mut out = String::with_capacity(1 << 16);
-
-    loop {
-        let mut timeout = Duration::from_millis(16);
-        while let Some(ev) = term.poll(timeout).map_err(|e| e.to_string())? {
-            match ev {
-                Event::Key(k) => app.handle_key(k),
-                Event::Resize => screen.invalidate(),
+    let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+        loop {
+            let mut timeout = Duration::from_millis(16);
+            while let Some(ev) = term.poll(timeout).map_err(|e| e.to_string())? {
+                match ev {
+                    Event::Key(k) => app.handle_key(k),
+                    Event::Resize => screen.invalidate(),
+                }
+                timeout = Duration::ZERO;
             }
-            timeout = Duration::ZERO;
+            output.poll(&mut app);
+            midi.poll(&mut app);
+            app.tick();
+            if app.quit {
+                return Ok(());
+            }
+            let (w, h) = term.size();
+            screen.resize(w, h);
+            app.draw(&mut screen);
+            out.clear();
+            screen.flush_into(&mut out);
+            if !out.is_empty() {
+                term.write(&out).map_err(|e| e.to_string())?;
+            }
         }
-        output.poll(&mut app);
-        midi.poll(&mut app);
-        app.tick();
-        if app.quit {
-            break;
+    }));
+    match session {
+        Ok(Ok(())) => {
+            app.end_recording();
+            // A normal end: saved, or the user chose to discard the edits.
+            app.autosave.discard();
         }
-        let (w, h) = term.size();
-        screen.resize(w, h);
-        app.draw(&mut screen);
-        out.clear();
-        screen.flush_into(&mut out);
-        if !out.is_empty() {
-            term.write(&out).map_err(|e| e.to_string())?;
+        // The session is ending without the user deciding about unsaved
+        // edits: keep them for the next start.
+        Ok(Err(e)) => {
+            app.autosave_now();
+            app.end_recording();
+            return Err(e);
+        }
+        Err(panic) => {
+            app.autosave_now();
+            drop(term);
+            std::panic::resume_unwind(panic);
         }
     }
-    app.end_recording();
     drop(term);
     drop(midi);
     drop(output);
     Ok(())
+}
+
+/// The answer to the recovery question.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+    Recover,
+    Discard,
+}
+
+/// What a key means on the recovery screen: `Some(None)` quits without
+/// deciding (the autosave stays), `None` is not an answer.
+fn recovery_key(key: Key) -> Option<Option<Recovery>> {
+    match key {
+        Key::Char('y' | 'Y') => Some(Some(Recovery::Recover)),
+        Key::Char('n' | 'N') => Some(Some(Recovery::Discard)),
+        Key::Char('q') | Key::Esc | Key::Ctrl('c' | 'q') => Some(None),
+        _ => None,
+    }
+}
+
+/// "3 min ago" and the like, for when the autosave was written.
+fn age(d: Duration) -> String {
+    match d.as_secs() {
+        s if s < 60 => format!("{s} s ago"),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// Asks, full screen, whether to recover an autosave. `None`: quit.
+fn ask_recovery(
+    term: &mut Terminal,
+    screen: &mut Screen,
+    out: &mut String,
+    found: &autosave::Found,
+) -> Result<Option<Recovery>, String> {
+    let when = found.modified.and_then(|m| m.elapsed().ok()).map_or(String::new(), |d| format!(" {}", age(d)));
+    let text = Style::fg(Color::BrightWhite);
+    let key = Style::fg(Color::BrightCyan).bold();
+    loop {
+        let (w, h) = term.size();
+        screen.resize(w, h);
+        screen.clear();
+        screen.put(2, 1, "Unsaved changes found", Style::fg(Color::BrightYellow).bold());
+        screen.put(2, 3, "The last session ended without saving. Its edits were autosaved", text);
+        screen.put(2, 4, &format!("{when} to {}", found.path.display()), text);
+        for (y, k, what) in [
+            (6, "y", "recover them; they stay unsaved until you save"),
+            (7, "n", "discard them and delete the autosave"),
+            (8, "q", "quit and decide next time"),
+        ] {
+            let x = screen.put(4, y, k, key);
+            screen.put(4 + x + 2, y, what, text);
+        }
+        out.clear();
+        screen.flush_into(out);
+        term.write(out).map_err(|e| e.to_string())?;
+        while let Some(ev) = term.poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            match ev {
+                Event::Key(k) => {
+                    if let Some(answer) = recovery_key(k) {
+                        return Ok(answer);
+                    }
+                }
+                Event::Resize => screen.invalidate(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4018,5 +4194,73 @@ mod tests {
         assert_eq!(note_name(61), "C#4");
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+    }
+
+    #[test]
+    fn unsaved_edits_are_autosaved_and_saving_removes_the_autosave() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-autosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.tvo.autosave");
+        let mut a = app();
+        a.autosave = Autosave::at(file.clone());
+        let t0 = Instant::now();
+        a.tick_autosave(t0);
+        assert!(!file.exists(), "nothing to save yet");
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.dirty && a.revision == 1);
+        a.tick_autosave(t0);
+        let written = Project::load(&file).unwrap();
+        assert_eq!(written.to_text(), a.project.to_text(), "the autosave is the project as edited");
+        // The next edit waits for the interval.
+        keys(&mut a, &[Key::Right, Key::Enter]);
+        a.tick_autosave(t0 + autosave::INTERVAL / 2);
+        assert_ne!(Project::load(&file).unwrap().to_text(), a.project.to_text());
+        a.tick_autosave(t0 + autosave::INTERVAL);
+        assert_eq!(Project::load(&file).unwrap().to_text(), a.project.to_text());
+        // Saving makes it stale: it goes, and later autosaves sit next to the save.
+        a.save_to(dir.join("song.tvo"));
+        assert!(!file.exists() && !a.dirty);
+        assert_eq!(a.autosave.path(), Some(file.as_path()));
+        keys(&mut a, &[Key::Right, Key::Enter]);
+        a.autosave_now();
+        assert!(file.exists(), "an abnormal end writes at once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_autosave_is_reported_once() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-autosave-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory where the file should be makes every write fail.
+        let file = dir.join("song.tvo.autosave");
+        std::fs::create_dir_all(&file).unwrap();
+        let mut a = app();
+        a.autosave = Autosave::at(file);
+        keys(&mut a, &[Key::Enter]);
+        let t0 = Instant::now();
+        a.tick_autosave(t0);
+        assert!(a.status_text().unwrap().contains("Autosave failed"), "{:?}", a.status_text());
+        a.set_status("other");
+        keys(&mut a, &[Key::Right, Key::Enter]);
+        a.tick_autosave(t0 + autosave::INTERVAL);
+        assert_eq!(a.status_text(), Some("other"), "not repeated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_recovery_screen_takes_only_clear_answers() {
+        assert_eq!(recovery_key(Key::Char('y')), Some(Some(Recovery::Recover)));
+        assert_eq!(recovery_key(Key::Char('N')), Some(Some(Recovery::Discard)));
+        assert_eq!(recovery_key(Key::Esc), Some(None));
+        assert_eq!(recovery_key(Key::Ctrl('c')), Some(None));
+        // A stray key, Enter included, decides nothing.
+        assert_eq!(recovery_key(Key::Enter), None);
+        assert_eq!(recovery_key(Key::Char(' ')), None);
+        assert_eq!(age(Duration::from_secs(42)), "42 s ago");
+        assert_eq!(age(Duration::from_secs(185)), "3 min ago");
+        assert_eq!(age(Duration::from_secs(7300)), "2 h ago");
+        assert_eq!(age(Duration::from_secs(200_000)), "2 days ago");
     }
 }

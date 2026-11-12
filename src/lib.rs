@@ -5,7 +5,8 @@
 //! ```text
 //!   app        keyboard-driven UI state machine and drawing
 //!   tui        terminal I/O (raw mode, key decoding, diffing screen buffer)
-//!   audio      native real-time output backends (WASAPI / ALSA / CoreAudio)
+//!   audio      native real-time output backends (WASAPI / ALSA / JACK / CoreAudio)
+//!   autosave   crash-safe autosave of unsaved edits, and their recovery
 //!   render     offline rendering, sharing the exact real-time code path
 //!   project    document model, edits, persistence
 //!   engine     real-time audio graph: transport, tracks, mixer
@@ -20,6 +21,7 @@
 
 pub mod app;
 pub mod audio;
+pub mod autosave;
 pub mod dsp;
 pub mod engine;
 pub mod fsutil;

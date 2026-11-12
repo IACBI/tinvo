@@ -160,18 +160,29 @@ Known limits:
 - The ALSA sequencer has not run anywhere: neither the development machine's container nor the CI runners have the `snd-seq` kernel module. It compiles, links and is lint-clean; its event layout was checked against `<alsa/seq_event.h>` with a C program. Its calls were reviewed against alsa-lib's `seq.c` and `seq_hw.c`, `aseqdump` and the kernel's `seq_clientmgr.c`: an input-only client may create a port, subscribe and receive (the kernel delivers only to clients opened for reading, and alsa-lib opens input-only clients read-only); the read loop matches `aseqdump`'s; `-ENOSPC` means the FIFO overran and was cleared; and events from MIDI 2.0 clients are converted by the kernel for legacy clients like TINVO's.
 - The audio unit output runs in CI on the macOS runner's virtual devices and on BlackHole, including low latency being turned on and off again. It has not run on a real Mac's hardware here. Freeing the render state after `AudioOutputUnitStop` relies on its being synchronous when called from another thread, as an Apple engineer described it; Apple's headers do not say so.
 
-## Phase 6: Polish and production hardening
+## Phase 6a: Autosave and recovery ✅ (0.14.0, this release)
+
+- Unsaved edits are written every 5 seconds, atomically, next to the project (or in the state directory for an untitled one); saving or quitting normally removes the autosave.
+- At start-up an autosave left by a session that did not end normally is offered for recovery, discarded, or kept for next time.
+- A terminal error or a panic writes the autosave at once.
+
+Known limits:
+- Up to 5 seconds of edits can be lost if the process is killed. Within that window nothing is written, so a crash costs at most that much.
+- Two TINVO sessions on the same project, or two untitled ones, share one autosave file: the one that writes last wins, and a session started while another runs is offered the running one's autosave. Nothing locks the project file either.
+- The autosave is renamed into place but its directory is not synced afterwards, so after a power failure (not a crash of TINVO) some file systems may come back with the previous autosave or none.
+- The flow was run end to end on Linux in a pseudo-terminal: edits, `kill -9`, the recovery question, recovering and saving (the saved file equals the autosave byte for byte), and discarding. The writes on a terminal error and on a panic are covered by unit tests of the pieces, not by a run that actually fails mid-session. The recovery screen has not been tried by hand in a Windows console.
+
+## Later in Phase 6
 
 - Mouse support, themes, configurable keymaps.
-- Crash-safe autosave and recovery.
 - Fuzzing of the project and WAV parsers.
 - Performance budgets enforced in CI via `tinvo bench`.
 - Notes that span the loop point in the piano roll display (they already play correctly).
 
 ## Known limitations of the foundation
 
-- Linux and macOS backends compile and pass lint, but have not yet been run on real hardware.
-- ALSA and CoreAudio open at a fixed 48 kHz (the OS resamples). WASAPI uses the device's mix rate.
+- Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.
+- ALSA output and input, and CoreAudio input, open at a fixed 48 kHz (the OS resamples). WASAPI uses the device's mix rate; CoreAudio output and JACK use the device's or server's rate.
 - Removing a track while it is sounding cuts it off immediately, with no fade. The same applies to undoing an added track.
-- CI runs on hosted Windows, Linux and macOS machines, which have no sound card: the backends are compiled and linted there, not played through.
+- CI runs on hosted Windows, Linux and macOS machines, which have no sound card. JACK (jackd and PipeWire) and CoreAudio (BlackHole and the runner's virtual devices) are played through there; WASAPI and ALSA are only compiled, linted and listed.
 - Drum tone parameters apply from the next hit, not to a hit that is still ringing.
