@@ -33,6 +33,7 @@ const CLIENT_SYSTEM: c_int = 0;
 const EVENT_NOTEON: u8 = 6;
 const EVENT_NOTEOFF: u8 = 7;
 const POLLIN: c_short = 1;
+const EAGAIN: c_int = 11;
 const ENOSPC: c_int = 28;
 const MAX_FDS: usize = 4;
 /// How often the thread looks at the stop flag while no events arrive.
@@ -268,15 +269,17 @@ where
                     // SAFETY: an open, non-blocking sequencer; the event
                     // stays valid until the next call.
                     let r = unsafe { snd_seq_event_input(seq.0, &mut ev) };
-                    if r == -ENOSPC {
-                        // The input queue overran and events were lost;
-                        // what follows is still valid.
-                        continue;
-                    }
-                    if r < 0 || ev.is_null() {
-                        // -EAGAIN means nothing more until the next poll;
-                        // other errors are retried after it too.
-                        break;
+                    match r {
+                        // The kernel FIFO overran and was cleared; events
+                        // were lost, and what follows is valid again.
+                        _ if r == -ENOSPC => continue,
+                        // Nothing more until the next poll.
+                        _ if r == -EAGAIN => break,
+                        // Anything else would be reported again by every
+                        // poll, spinning this thread; give up instead.
+                        _ if r < 0 => return,
+                        _ if ev.is_null() => break,
+                        _ => {}
                     }
                     // SAFETY: a valid event from the sequencer.
                     if let Some(m) = message(unsafe { &*ev }) {

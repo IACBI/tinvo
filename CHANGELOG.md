@@ -6,6 +6,21 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-12
+
+A review of the 0.13.0 backends against their documentation and sources (alsa-lib, the kernel's sequencer, `aseqdump`, PipeWire's JACK, Apple's headers and technical notes), with what it found fixed.
+
+### Fixed
+- macOS: after a low-latency stream closed, the short period stayed in force for the rest of the session, because the HAL keeps one period per process. Closing the stream now puts the device's period back, so turning low latency off really turns it off.
+- Linux: the ALSA sequencer reader stops on an error that would repeat, instead of spinning on `poll`.
+- Linux: JACK recording no longer takes PipeWire's monitor ports (`…:monitor_FL`), which carry the playback, for a capture source.
+
+### Changed
+- macOS: if stopping the output unit fails, the render state is kept rather than freed, so a callback that might still run cannot touch freed memory. The device-lost flag is never freed, since the HAL does not say when a removed listener has finished.
+
+### Verified
+- JACK through PipeWire's own JACK library (PipeWire 0.3.65 on Debian 12, with `pw-jack`): samples go through unchanged. CI now runs the JACK tests against both jackd and PipeWire.
+
 ## [0.13.0] - 2026-11-12
 
 ### Added
@@ -173,7 +188,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/IACBI/tinvo/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/IACBI/tinvo/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/IACBI/tinvo/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/IACBI/tinvo/compare/v0.10.0...v0.11.0

@@ -147,18 +147,18 @@ Known limits:
 - A take ends at the longest sample TINVO loads (2^25 frames, about 11.6 minutes at 48 kHz).
 - WASAPI capture was recorded from the development machine's microphone (3 s, 48 kHz stereo, no dropped frames). ALSA and CoreAudio capture compile and link in CI but have not run on real hardware. macOS asks for microphone permission the first time and delivers silence until it is granted.
 
-## Phase 5d: More I/O ✅ (0.13.0, this release)
+## Phase 5d: More I/O ✅ (0.13.0, reviewed in 0.13.1)
 
 - macOS output through an output audio unit on the HAL, at the device's rate and period, with a low-latency mode.
 - JACK output and recording on Linux, loaded at run time; PipeWire is reached through its JACK implementation.
 - MIDI input through the ALSA sequencer, with rawmidi as the fallback.
 
 Known limits:
-- PipeWire is reached through its JACK API, not libpipewire's own stream API (which needs the SPA POD builder, a header-only C API). PipeWire's libjack has to be the one the system loads: it is on Fedora; on Debian and Ubuntu run `pw-jack tinvo` or install the `pipewire-jack` library configuration.
-- JACK is chosen explicitly (`--device jack`); the default is still ALSA's `default` PCM. TINVO connects to the first two physical ports only; mono hardware gets the left channel.
-- The JACK path ran against a real jackd (dummy driver) in a Linux container and runs in CI: samples go through unchanged. It has not run against PipeWire's JACK or real hardware.
-- The ALSA sequencer has not run anywhere: neither the development machine's container nor the CI runners have the `snd-seq` kernel module. It compiles, links and is lint-clean; its event layout was checked against `<alsa/seq_event.h>` with a C program.
-- The audio unit output runs in CI on the macOS runner's virtual devices and on BlackHole. It has not run on a real Mac's hardware here.
+- PipeWire is reached through its JACK API, not libpipewire's own stream API (which needs the SPA POD builder, a header-only C API). PipeWire's libjack has to be the one the system loads. `pw-jack tinvo` always arranges that; otherwise it depends on the distribution's packaging. On Debian and Ubuntu the `pipewire-jack` package ships an `ld.so.conf.d` example to copy (checked on Debian 12); Fedora installs one, though some releases have shipped it in a package that dnf did not pull in.
+- JACK is chosen explicitly (`--device jack`); the default is still ALSA's `default` PCM. TINVO connects to the first two physical ports only (jackd and PipeWire list the default device's first); mono hardware gets the left channel.
+- The JACK path runs in CI against a real jackd (dummy driver) and against PipeWire's JACK, and ran against both in a Linux container: samples go through unchanged. It has not run with real audio hardware.
+- The ALSA sequencer has not run anywhere: neither the development machine's container nor the CI runners have the `snd-seq` kernel module. It compiles, links and is lint-clean; its event layout was checked against `<alsa/seq_event.h>` with a C program. Its calls were reviewed against alsa-lib's `seq.c` and `seq_hw.c`, `aseqdump` and the kernel's `seq_clientmgr.c`: an input-only client may create a port, subscribe and receive (the kernel delivers only to clients opened for reading, and alsa-lib opens input-only clients read-only); the read loop matches `aseqdump`'s; `-ENOSPC` means the FIFO overran and was cleared; and events from MIDI 2.0 clients are converted by the kernel for legacy clients like TINVO's.
+- The audio unit output runs in CI on the macOS runner's virtual devices and on BlackHole, including low latency being turned on and off again. It has not run on a real Mac's hardware here. Freeing the render state after `AudioOutputUnitStop` relies on its being synchronous when called from another thread, as an Apple engineer described it; Apple's headers do not say so.
 
 ## Phase 6: Polish and production hardening
 

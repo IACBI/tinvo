@@ -58,6 +58,24 @@ jobs:
           cargo run --release -- devices
           cargo run --release -- inputs
           cargo run --release -- midi
+      - name: Probe JACK, then PipeWire's JACK
+        if: runner.os == 'Linux'
+        run: |
+          cargo run --release -- probe --device jack 1
+          pkill jackd
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pipewire pipewire-bin pipewire-jack
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          nohup setsid pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          sleep 3
+          pw-jack cargo test --release jack
+          pw-jack cargo run --release -- probe --device jack 1
+      - name: Probe low latency
+        if: runner.os == 'macOS'
+        run: |
+          cargo run --release -- probe 1
+          cargo run --release -- probe --low-latency 1
+          cargo run --release -- probe --device BlackHole --low-latency 1
 
   msrv:
     name: Minimum Rust version (1.85)

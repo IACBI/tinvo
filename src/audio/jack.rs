@@ -254,21 +254,39 @@ fn describe(ports: &[String]) -> String {
     }
 }
 
+/// Whether `port` (a full `client:port` name) is one of the monitor ports
+/// PipeWire shows for each sink (`…:monitor_FL`). They carry what is being
+/// played, so they are never taken for a capture source.
+fn is_monitor(port: &str) -> bool {
+    port.split_once(':').is_some_and(|(_, name)| name.starts_with("monitor_"))
+}
+
+impl Client {
+    /// Physical playback ports; jackd and PipeWire list the default
+    /// device's first.
+    fn playback_ports(&self) -> Vec<String> {
+        self.ports(PORT_IS_PHYSICAL | PORT_IS_INPUT)
+    }
+
+    /// Physical capture ports, without monitors.
+    fn capture_ports(&self) -> Vec<String> {
+        self.ports(PORT_IS_PHYSICAL | PORT_IS_OUTPUT).into_iter().filter(|p| !is_monitor(p)).collect()
+    }
+}
+
 /// The JACK playback entry, when a server is running.
 pub fn devices() -> Vec<Device> {
-    listing(PORT_IS_PHYSICAL | PORT_IS_INPUT)
+    listing(Client::playback_ports)
 }
 
 /// The JACK capture entry, when a server is running.
 pub fn input_devices() -> Vec<Device> {
-    listing(PORT_IS_PHYSICAL | PORT_IS_OUTPUT)
+    listing(Client::capture_ports)
 }
 
-fn listing(flags: c_ulong) -> Vec<Device> {
+fn listing(ports: fn(&Client) -> Vec<String>) -> Vec<Device> {
     match Client::open(c"tinvo-list") {
-        Ok(client) => {
-            vec![Device { id: DEVICE_ID.into(), name: describe(&client.ports(flags)), is_default: false }]
-        }
+        Ok(client) => vec![Device { id: DEVICE_ID.into(), name: describe(&ports(&client)), is_default: false }],
         Err(_) => Vec::new(),
     }
 }
@@ -361,7 +379,7 @@ where
             scratch: vec![0.0; CHUNK * 2].into_boxed_slice(),
         }));
         let dead = Arc::new(AtomicBool::new(false));
-        let targets = client.ports(PORT_IS_PHYSICAL | PORT_IS_INPUT);
+        let targets = client.playback_ports();
         let started = client.start(render::<C>, state.cast(), &dead).and_then(|()| {
             for (port, target) in ports.iter().zip(&targets) {
                 client.connect(&client.port_name(*port), target)?;
@@ -463,7 +481,7 @@ where
             scratch: vec![0.0; CHUNK * 2].into_boxed_slice(),
         }));
         let dead = Arc::new(AtomicBool::new(false));
-        let sources = client.ports(PORT_IS_PHYSICAL | PORT_IS_OUTPUT);
+        let sources = client.capture_ports();
         let started = client.start(capture::<C>, state.cast(), &dead).and_then(|()| {
             for (source, port) in sources.iter().zip(&ports) {
                 client.connect(source, &client.port_name(*port))?;
@@ -530,6 +548,16 @@ mod tests {
     }
 
     #[test]
+    fn monitor_ports_are_not_capture_sources() {
+        assert!(is_monitor("Built-in Audio Analog Stereo:monitor_FL"));
+        assert!(!is_monitor("Built-in Audio Analog Stereo:capture_FL"));
+        assert!(!is_monitor("system:capture_1"));
+        assert!(!is_monitor("monitor_FL"), "no client part: not a JACK port name");
+        assert_eq!(describe(&["Built-in Audio:playback_FL".into()]), "JACK (Built-in Audio)");
+        assert_eq!(describe(&[]), "JACK (no physical ports)");
+    }
+
+    #[test]
     fn the_jack_entry_is_listed_while_a_server_runs() {
         if !server() {
             return;
@@ -540,7 +568,10 @@ mod tests {
     }
 
     /// Plays a ramp through a TINVO output client into a TINVO input client
-    /// and checks every sample arrives unchanged and in order.
+    /// and checks every sample arrives unchanged and in order. Recording
+    /// starts once the connections have settled: right after a connection
+    /// JACK may reorder the graph, which shifts the path between the two
+    /// clients by one period (seen as a jump of exactly one period).
     #[test]
     fn samples_go_through_jack_unchanged() {
         if !server() {
@@ -555,6 +586,8 @@ mod tests {
 
         let got = Arc::new(Mutex::new(Vec::<f32>::with_capacity(1 << 20)));
         let sink = got.clone();
+        let armed = Arc::new(AtomicBool::new(false));
+        let recording = armed.clone();
         let health = Arc::new(StreamHealth::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (info, thread) = open_input_named(
@@ -562,6 +595,9 @@ mod tests {
             move |_, channels| {
                 assert_eq!(channels, 2);
                 move |samples: &[f32]| {
+                    if !recording.load(Ordering::Acquire) {
+                        return;
+                    }
                     let mut v = sink.lock().unwrap();
                     if v.len() + samples.len() <= v.capacity() {
                         v.extend_from_slice(samples);
@@ -583,6 +619,8 @@ mod tests {
         }
         patch.connect("tinvo-test-out:out_L", "tinvo-test-in:in_L").unwrap();
         patch.connect("tinvo-test-out:out_R", "tinvo-test-in:in_R").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        armed.store(true, Ordering::Release);
         let begin = Instant::now();
         while got.lock().unwrap().len() < 2 * 9600 && begin.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
@@ -591,10 +629,8 @@ mod tests {
         assert_eq!(output.error(), None);
         drop(output);
 
-        let got = got.lock().unwrap();
-        let first = got.chunks_exact(2).position(|f| f != [0.0, 0.0]).expect("nothing arrived through JACK");
-        let frames = &got[first * 2..];
-        assert!(frames.len() >= 2 * 4800, "only {} frames arrived", frames.len() / 2);
+        let frames = got.lock().unwrap();
+        assert!(frames.len() >= 2 * 9600, "only {} frames arrived", frames.len() / 2);
         let start = ((frames[0] * 4096.0) + 2048.0) as u32;
         for (i, f) in frames.chunks_exact(2).enumerate() {
             let want = ramp(start + i as u32);

@@ -415,9 +415,25 @@ fn u32_property(device: u32, selector: u32) -> Option<u32> {
     (status == 0).then_some(v)
 }
 
-/// Asks `device` for its smallest period, at least [`LOW_LATENCY_FRAMES`];
-/// returns whether the period is now smaller than it was.
-fn request_low_latency(device: u32) -> bool {
+/// Sets this process's period on `device` (the HAL keeps one per process).
+fn set_period(device: u32, frames: u32) -> bool {
+    // SAFETY: the property is one UInt32.
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            device,
+            &address(PROP_BUFFER_FRAME_SIZE, SCOPE_GLOBAL),
+            0,
+            ptr::null(),
+            4,
+            (&raw const frames).cast(),
+        )
+    };
+    status == 0
+}
+
+/// Asks `device` for its smallest period, at least [`LOW_LATENCY_FRAMES`].
+/// Returns the period it had before, if the period is now smaller.
+fn request_low_latency(device: u32) -> Option<u32> {
     let mut range = [0f64; 2];
     let mut size = size_of::<[f64; 2]>() as u32;
     // SAFETY: the property is an AudioValueRange (two Float64s).
@@ -431,26 +447,20 @@ fn request_low_latency(device: u32) -> bool {
             range.as_mut_ptr().cast(),
         )
     };
-    let Some(before) = u32_property(device, PROP_BUFFER_FRAME_SIZE) else { return false };
+    let before = u32_property(device, PROP_BUFFER_FRAME_SIZE)?;
     if status != 0 {
-        return false;
+        return None;
     }
     let want = LOW_LATENCY_FRAMES.max(range[0].ceil() as u32);
-    if want >= before {
-        return false;
+    if want >= before || !set_period(device, want) {
+        return None;
     }
-    // SAFETY: the property is one UInt32; it sets this process's I/O size.
-    let status = unsafe {
-        AudioObjectSetPropertyData(
-            device,
-            &address(PROP_BUFFER_FRAME_SIZE, SCOPE_GLOBAL),
-            0,
-            ptr::null(),
-            4,
-            (&raw const want).cast(),
-        )
-    };
-    status == 0 && u32_property(device, PROP_BUFFER_FRAME_SIZE).is_some_and(|now| now < before)
+    if u32_property(device, PROP_BUFFER_FRAME_SIZE).is_some_and(|now| now < before) {
+        Some(before)
+    } else {
+        set_period(device, before);
+        None
+    }
 }
 
 /// Marks the stream dead when the HAL reports its device gone.
@@ -461,8 +471,8 @@ unsafe extern "C" fn device_changed(
     dead: *mut c_void,
 ) -> i32 {
     if u32_property(device, PROP_IS_ALIVE) == Some(0) {
-        // SAFETY: `dead` is the flag registered in `open`, which removes
-        // this listener before freeing it.
+        // SAFETY: `dead` is the flag `start_unit` registered, which is never
+        // freed.
         unsafe { &*(dead as *const AtomicBool) }.store(true, Ordering::Release);
     }
     0
@@ -520,17 +530,25 @@ struct Unit {
     initialized: bool,
     started: bool,
     listener: Option<(u32, *mut c_void)>,
+    /// The device and period to put back: the period setting outlives the
+    /// stream, so a later stream without low latency would inherit it.
+    restore: Option<(u32, u32)>,
+    closed: bool,
 }
 
-impl Drop for Unit {
-    fn drop(&mut self) {
-        // SAFETY: each step undoes one that `open` completed. Stopping an
-        // output unit from another thread waits for its render callback to
-        // return, so the callback state can be freed after this.
+impl Unit {
+    /// Stops and disposes the unit. Returns whether the render callback is
+    /// certainly finished: AudioOutputUnitStop called from a thread other
+    /// than the I/O thread returns only once the HAL has stopped calling
+    /// it, unless the stop itself fails.
+    fn close(&mut self) -> bool {
+        if self.closed {
+            return true;
+        }
+        self.closed = true;
+        // SAFETY: each step undoes one that `open` completed.
         unsafe {
-            if self.started {
-                AudioOutputUnitStop(self.unit);
-            }
+            let quiet = !self.started || AudioOutputUnitStop(self.unit) == 0;
             if self.initialized {
                 AudioUnitUninitialize(self.unit);
             }
@@ -538,7 +556,17 @@ impl Drop for Unit {
             if let Some((device, dead)) = self.listener {
                 AudioObjectRemovePropertyListener(device, &address(PROP_IS_ALIVE, SCOPE_GLOBAL), device_changed, dead);
             }
+            if let Some((device, frames)) = self.restore {
+                set_period(device, frames);
+            }
+            quiet
         }
+    }
+}
+
+impl Drop for Unit {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -564,7 +592,7 @@ fn new_unit(device: Option<u32>) -> Result<Unit, String> {
     let mut unit: AudioUnit = ptr::null_mut();
     // SAFETY: a component from AudioComponentFindNext and a valid out-pointer.
     check(unsafe { AudioComponentInstanceNew(component, &mut unit) }, "AudioComponentInstanceNew")?;
-    let unit = Unit { unit, initialized: false, started: false, listener: None };
+    let unit = Unit { unit, initialized: false, started: false, listener: None, restore: None, closed: false };
     if let Some(id) = device {
         // SAFETY: the property is one AudioObjectID.
         let status = unsafe {
@@ -581,7 +609,7 @@ fn start_unit<C: AudioCallback>(
     unit: &mut Unit,
     state: *mut State<C>,
     chosen: Option<u32>,
-    dead: &Arc<AtomicBool>,
+    dead: &'static AtomicBool,
 ) -> Result<(), String> {
     let callback = RenderCallbackStruct { proc_: render::<C>, refcon: state.cast() };
     // SAFETY: the property is one AURenderCallbackStruct; `state` outlives
@@ -598,8 +626,9 @@ fn start_unit<C: AudioCallback>(
     };
     check(status, "setting the render callback")?;
     if let Some(id) = chosen {
-        let flag = Arc::as_ptr(dead).cast_mut().cast();
-        // SAFETY: `dead` outlives the listener, which `Unit` removes.
+        let flag = (dead as *const AtomicBool).cast_mut().cast();
+        // SAFETY: `dead` is never freed, so a notification racing with the
+        // listener's removal still finds it.
         let status =
             unsafe { AudioObjectAddPropertyListener(id, &address(PROP_IS_ALIVE, SCOPE_GLOBAL), device_changed, flag) };
         if status == 0 {
@@ -685,10 +714,15 @@ where
         if let Err(e) = check(status, "setting the output format") {
             return report(Err(e));
         }
-        let low_latency = config.low_latency && device.is_some_and(request_low_latency);
+        if config.low_latency {
+            unit.restore = device.and_then(|d| request_low_latency(d).map(|before| (d, before)));
+        }
+        let low_latency = unit.restore.is_some();
         let state = Box::into_raw(Box::new(State { callback: factory(rate as u32) }));
-        let dead = Arc::new(AtomicBool::new(false));
-        match start_unit(&mut unit, state, chosen, &dead) {
+        // One byte per stream opened, kept for good: the HAL documents no
+        // point after which a removed listener can no longer be running.
+        let dead: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        match start_unit(&mut unit, state, chosen, dead) {
             Ok(()) => {
                 let period = device.and_then(|d| u32_property(d, PROP_BUFFER_FRAME_SIZE)).unwrap_or(0);
                 let name = match &config.device {
@@ -715,9 +749,12 @@ where
             }
             Err(e) => report(Err(e)),
         }
-        drop(unit);
-        // SAFETY: the unit is stopped and disposed, so no callback can run.
-        drop(unsafe { Box::from_raw(state) });
+        if unit.close() {
+            // SAFETY: the unit is stopped and disposed, so no callback can run.
+            drop(unsafe { Box::from_raw(state) });
+        }
+        // Otherwise the state is leaked on purpose: a callback that may
+        // still run must not find it freed.
     })
 }
 
@@ -880,7 +917,8 @@ mod tests {
         }
         let configs = std::iter::once(None).chain(devices.iter().map(|d| Some(d.id.clone())));
         for device in configs {
-            for low_latency in [false, true] {
+            let mut normal = None;
+            for low_latency in [false, true, false] {
                 let frames = Arc::new(AtomicU64::new(0));
                 let counter = frames.clone();
                 let config = StreamConfig { device: device.clone(), low_latency };
@@ -898,6 +936,12 @@ mod tests {
                 assert!(frames.load(Ordering::Relaxed) >= want, "{info:?} rendered too little");
                 assert_eq!(stream.error(), None);
                 eprintln!("{info:?}");
+                match (low_latency, normal) {
+                    (false, None) => normal = Some(info.period_frames),
+                    (false, Some(p)) => assert_eq!(info.period_frames, p, "low latency left behind: {info:?}"),
+                    (true, Some(p)) => assert_eq!(info.low_latency, info.period_frames < p, "{info:?}"),
+                    (true, None) => unreachable!(),
+                }
             }
         }
     }
