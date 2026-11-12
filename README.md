@@ -17,7 +17,7 @@ A keyboard-driven digital audio workstation for the terminal: zero dependencies,
 
 ### Overview
 
-TINVO is a step-sequencer DAW that runs in a terminal window. Everything is written in Rust on top of the standard library alone: the synthesizer and drums, the real-time engine, the WAV writer, and the audio backends (WASAPI, ALSA, CoreAudio) are called through hand-written FFI. There are no crates to download, so it builds offline. The release binary is about 0.5 MB.
+TINVO is a step-sequencer DAW that runs in a terminal window. Everything is written in Rust on top of the standard library alone: the synthesizer and drums, the real-time engine, the WAV writer, and the audio backends (WASAPI, ALSA, JACK, CoreAudio) are called through hand-written FFI. There are no crates to download, so it builds offline. The release binary is about 0.5 MB.
 
 The audio thread never allocates, locks or blocks. WAV export runs the same engine as playback, so what you hear is what you export.
 
@@ -44,7 +44,7 @@ The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described
 ### Requirements
 
 - Rust 1.85 or newer.
-- Linux: the ALSA development package (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora).
+- Linux: the ALSA development package (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora). JACK is optional: TINVO uses it when a server (jackd, or PipeWire's JACK) is running and you pick it.
 - Windows 10 or later, or macOS 11 or later. Nothing extra is needed.
 - A terminal of at least 64×16 characters with UTF-8 and ANSI colours (Windows Terminal, any modern Linux or macOS terminal).
 
@@ -69,6 +69,7 @@ tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
+tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
@@ -126,7 +127,7 @@ MIT. See [LICENSE](LICENSE). Author: 𝓐.𝓒.𝓑
 
 ### Genel Bakış
 
-TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si yaklaşık 0,5 MB.
+TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, JACK, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si yaklaşık 0,5 MB.
 
 Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa aktarma çalmayla aynı motoru kullanır: ne duyuyorsan dosyaya o yazılır.
 
@@ -153,7 +154,7 @@ Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](
 ### Gereksinimler
 
 - Rust 1.85 veya üstü.
-- Linux: ALSA geliştirme paketi (Debian/Ubuntu'da `libasound2-dev`, Fedora'da `alsa-lib-devel`).
+- Linux: ALSA geliştirme paketi (Debian/Ubuntu'da `libasound2-dev`, Fedora'da `alsa-lib-devel`). JACK isteğe bağlı: bir sunucu (jackd ya da PipeWire'ın JACK'i) çalışıyorsa ve onu seçerseniz TINVO JACK üzerinden çalar.
 - Windows 10 ve üstü ya da macOS 11 ve üstü için ek bir şey gerekmez.
 - En az 64×16 karakterlik, UTF-8 ve ANSI renk destekli bir terminal (Windows Terminal ya da güncel herhangi bir Linux/macOS terminali).
 
@@ -178,6 +179,7 @@ tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
+tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard

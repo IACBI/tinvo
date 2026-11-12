@@ -41,7 +41,7 @@ AUDIO:
     --device NAME                       play on this device (its id, or a unique part of
                                         its name; default: the system default)
     --low-latency                       use the device's smallest period where the
-                                        backend supports it (WASAPI)
+                                        backend supports it (WASAPI, CoreAudio)
     --midi NAME | none                  play from this MIDI input (its id, or a unique
                                         part of its name; default: the first one)
     --input NAME                        record from this audio input (I in the editor;

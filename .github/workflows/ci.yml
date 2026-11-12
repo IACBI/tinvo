@@ -24,9 +24,23 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
-      - name: Install ALSA headers
+      - name: Install ALSA headers and start a JACK server
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libasound2-dev jackd2
+          nohup setsid jackd --no-realtime -d dummy -r 48000 -p 256 > "$RUNNER_TEMP/jackd.log" 2>&1 &
+          sleep 3
+          cat "$RUNNER_TEMP/jackd.log"
+          echo TINVO_REQUIRE_JACK=1 >> "$GITHUB_ENV"
+      - name: Install a loopback audio device
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask blackhole-2ch
+          sudo killall -9 coreaudiod
+          sleep 5
+          echo TINVO_REQUIRE_AUDIO=1 >> "$GITHUB_ENV"
+          echo TINVO_REQUIRE_LOOPBACK=1 >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -41,6 +55,9 @@ jobs:
           cargo run --release -- demo demo.tvo
           cargo run --release -- render demo.tvo demo.wav --loops 1
           cargo run --release -- bench
+          cargo run --release -- devices
+          cargo run --release -- inputs
+          cargo run --release -- midi
 
   msrv:
     name: Minimum Rust version (1.85)

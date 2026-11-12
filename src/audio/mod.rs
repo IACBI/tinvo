@@ -3,7 +3,7 @@
 //! | Platform | API                         | Linked library        |
 //! |----------|-----------------------------|-----------------------|
 //! | Windows  | WASAPI, shared/event mode   | ole32, avrt (system)  |
-//! | Linux    | ALSA PCM                    | libasound             |
+//! | Linux    | ALSA PCM; JACK (or PipeWire's JACK) | libasound; libjack loaded at run time |
 //! | macOS    | AudioToolbox AudioQueue     | AudioToolbox.framework|
 //!
 //! Each backend runs a dedicated audio thread, asks a factory for the
@@ -15,6 +15,8 @@
 pub(crate) mod alsa;
 #[cfg(target_os = "macos")]
 pub(crate) mod coreaudio;
+#[cfg(target_os = "linux")]
+mod jack;
 #[cfg(windows)]
 mod wasapi;
 
@@ -63,8 +65,9 @@ pub struct Device {
 pub struct StreamConfig {
     /// Device id; `None` plays on the system default.
     pub device: Option<String>,
-    /// Ask for the device's smallest period (WASAPI `IAudioClient3`);
-    /// other backends ignore it.
+    /// Ask for a shorter period: the smallest WASAPI `IAudioClient3` offers,
+    /// or 64 frames on CoreAudio. ALSA and JACK ignore it (JACK's period is
+    /// the server's).
     pub low_latency: bool,
 }
 
@@ -255,11 +258,67 @@ use wasapi::{
     open as platform_open, open_input as platform_open_input,
 };
 
+/// Linux lists ALSA's PCMs and, while a server runs, JACK, under the id
+/// `jack`. ALSA's own `jack` plugin PCM is left out: it needs the same
+/// libjack, and the native path replaces it.
 #[cfg(target_os = "linux")]
-use alsa::{
-    devices as platform_devices, input_devices as platform_input_devices, open as platform_open,
-    open_input as platform_open_input,
-};
+fn platform_devices() -> Result<Vec<Device>, String> {
+    with_jack(alsa::devices(), jack::devices())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_input_devices() -> Result<Vec<Device>, String> {
+    with_jack(alsa::input_devices(), jack::input_devices())
+}
+
+#[cfg(target_os = "linux")]
+fn with_jack(alsa: Result<Vec<Device>, String>, jack: Vec<Device>) -> Result<Vec<Device>, String> {
+    match alsa {
+        Ok(mut devices) => {
+            devices.retain(|d| d.id != jack::DEVICE_ID);
+            devices.extend(jack);
+            Ok(devices)
+        }
+        Err(e) if jack.is_empty() => Err(e),
+        Err(_) => Ok(jack),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_open<F, C>(
+    config: StreamConfig,
+    factory: F,
+    stop: Arc<AtomicBool>,
+    health: Arc<StreamHealth>,
+) -> Result<(StreamInfo, JoinHandle<()>), String>
+where
+    F: FnOnce(u32) -> C + Send + 'static,
+    C: AudioCallback,
+{
+    if config.device.as_deref() == Some(jack::DEVICE_ID) {
+        jack::open(config, factory, stop, health)
+    } else {
+        alsa::open(config, factory, stop, health)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_open_input<F, C>(
+    device: Option<String>,
+    factory: F,
+    stop: Arc<AtomicBool>,
+    health: Arc<StreamHealth>,
+) -> Result<(InputInfo, JoinHandle<()>), String>
+where
+    F: FnOnce(u32, u16) -> C + Send + 'static,
+    C: CaptureCallback,
+{
+    if device.as_deref() == Some(jack::DEVICE_ID) {
+        jack::open_input(factory, stop, health)
+    } else {
+        alsa::open_input(device, factory, stop, health)
+    }
+}
 
 #[cfg(target_os = "macos")]
 use coreaudio::{

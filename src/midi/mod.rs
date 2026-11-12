@@ -2,10 +2,12 @@
 //! into note messages.
 //!
 //! Each backend calls a handler on its own thread for every message (WinMM's
-//! callback thread, a TINVO thread polling ALSA rawmidi, CoreMIDI's receive
-//! thread). The handler must not block; the app's pushes into lock-free
-//! mailboxes, one for the audio engine and one for the UI.
+//! callback thread, a TINVO thread polling the ALSA sequencer or rawmidi,
+//! CoreMIDI's receive thread). The handler must not block; the app's pushes
+//! into lock-free mailboxes, one for the audio engine and one for the UI.
 
+#[cfg(target_os = "linux")]
+mod alsaseq;
 #[cfg(target_os = "macos")]
 mod coremidi;
 #[cfg(target_os = "linux")]
@@ -159,8 +161,29 @@ where
 #[cfg(windows)]
 use winmm as platform;
 
+/// Linux uses the ALSA sequencer, which also sees software clients, and
+/// falls back to rawmidi where the sequencer is missing.
 #[cfg(target_os = "linux")]
-use rawmidi as platform;
+mod platform {
+    use super::{Message, Port, alsaseq, rawmidi};
+
+    pub enum Handle {
+        Seq(#[allow(dead_code)] alsaseq::Handle),
+        Raw(#[allow(dead_code)] rawmidi::Handle),
+    }
+
+    pub fn inputs() -> Result<Vec<Port>, String> {
+        alsaseq::inputs().or_else(|_| rawmidi::inputs())
+    }
+
+    pub fn open<H: FnMut(Message) + Send + 'static>(port: &Port, handler: H) -> Result<Handle, String> {
+        if port.id.starts_with(alsaseq::PREFIX) {
+            alsaseq::open(port, handler).map(Handle::Seq)
+        } else {
+            rawmidi::open(port, handler).map(Handle::Raw)
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 use coremidi as platform;

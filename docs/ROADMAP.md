@@ -135,7 +135,7 @@ Known limits:
 - A MIDI input that is unplugged stays silent until another one is picked with `M`; it is not reopened by itself.
 - If more than 256 notes arrive within one audio callback, the extra ones are dropped (a dropped release would leave a note held until the key is pressed again).
 
-## Phase 5c: Audio input and recording ✅ (0.12.0, this release)
+## Phase 5c: Audio input and recording ✅ (0.12.0)
 
 - Capture on all three backends, through a wait-free ring of whole frames from the capture thread to the UI, which streams it to a 32-bit float WAV.
 - Recording into sampler tracks (`I`) as one undo step, `tinvo record`, `tinvo inputs`, an input page in the device list and `--input`.
@@ -147,9 +147,18 @@ Known limits:
 - A take ends at the longest sample TINVO loads (2^25 frames, about 11.6 minutes at 48 kHz).
 - WASAPI capture was recorded from the development machine's microphone (3 s, 48 kHz stereo, no dropped frames). ALSA and CoreAudio capture compile and link in CI but have not run on real hardware. macOS asks for microphone permission the first time and delivers silence until it is granted.
 
-## Phase 5d: More I/O
+## Phase 5d: More I/O ✅ (0.13.0, this release)
 
-- CoreAudio HAL unit; JACK/PipeWire native paths; the ALSA sequencer.
+- macOS output through an output audio unit on the HAL, at the device's rate and period, with a low-latency mode.
+- JACK output and recording on Linux, loaded at run time; PipeWire is reached through its JACK implementation.
+- MIDI input through the ALSA sequencer, with rawmidi as the fallback.
+
+Known limits:
+- PipeWire is reached through its JACK API, not libpipewire's own stream API (which needs the SPA POD builder, a header-only C API). PipeWire's libjack has to be the one the system loads: it is on Fedora; on Debian and Ubuntu run `pw-jack tinvo` or install the `pipewire-jack` library configuration.
+- JACK is chosen explicitly (`--device jack`); the default is still ALSA's `default` PCM. TINVO connects to the first two physical ports only; mono hardware gets the left channel.
+- The JACK path ran against a real jackd (dummy driver) in a Linux container and runs in CI: samples go through unchanged. It has not run against PipeWire's JACK or real hardware.
+- The ALSA sequencer has not run anywhere: neither the development machine's container nor the CI runners have the `snd-seq` kernel module. It compiles, links and is lint-clean; its event layout was checked against `<alsa/seq_event.h>` with a C program.
+- The audio unit output runs in CI on the macOS runner's virtual devices and on BlackHole. It has not run on a real Mac's hardware here.
 
 ## Phase 6: Polish and production hardening
 

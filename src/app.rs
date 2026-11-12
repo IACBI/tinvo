@@ -2351,7 +2351,7 @@ impl App {
         s.put(
             2,
             h.saturating_sub(2),
-            &format!("←→ output/input  ↑↓ choose  Enter switch  Tab low latency: {ll} (WASAPI)  Esc cancel"),
+            &format!("←→ output/input  ↑↓ choose  Enter switch  Tab low latency: {ll}  Esc cancel"),
             Style::fg(Color::Gray),
         );
     }

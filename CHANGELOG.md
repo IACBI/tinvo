@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-12
+
+### Added
+- JACK on Linux, for output and recording: `--device jack` (or `jack` in the `O` list, which shows it while a server runs). It works with jackd and with PipeWire's JACK implementation, so TINVO joins PipeWire's graph directly. The ports are `tinvo:out_L`/`out_R` and `tinvo-in:in_L`/`in_R`, connected to the first two physical ports on start. libjack is loaded at run time, so it is not needed to build or run TINVO.
+- MIDI input through the ALSA sequencer on Linux, which also sees software clients (virtual keyboards, other programs). Ports are named `seq:<client>:<port>`. Where there is no sequencer, TINVO falls back to rawmidi as before.
+- `tinvo probe --low-latency` and the `Tab` key in the `O` list now work on macOS: the output asks the device for a 64-frame period, or its minimum if that is larger.
+
+### Changed
+- macOS output plays through an output audio unit on the HAL instead of an AudioQueue. It renders straight into the device's buffer at the device's own sample rate and period, so there is less latency and no resampling. A chosen device that disappears is reported as lost. Recording still uses an AudioQueue.
+- ALSA's own `jack` plugin PCM is no longer listed; the native JACK entry replaces it.
+
 ## [0.12.0] - 2026-11-12
 
 ### Added
@@ -162,7 +173,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/IACBI/tinvo/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/IACBI/tinvo/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/IACBI/tinvo/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/IACBI/tinvo/compare/v0.9.0...v0.10.0

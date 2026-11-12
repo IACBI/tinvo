@@ -1,7 +1,8 @@
 //! Linux MIDI input through ALSA rawmidi.
 //!
-//! Ports are the rawmidi devices ALSA's hints list for input (hardware and
-//! USB MIDI); software clients of the ALSA sequencer are not visible here.
+//! The fallback where the ALSA sequencer is missing. Ports are the rawmidi
+//! devices ALSA's hints list for input (hardware and USB MIDI); software
+//! clients of the sequencer are not visible here.
 //! A TINVO thread polls the device and runs the byte stream through
 //! [`Parser`].
 
