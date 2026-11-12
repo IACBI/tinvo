@@ -20,6 +20,7 @@ use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
 use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
+use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
 use crate::strip::{self, Strip, track_param};
@@ -62,6 +63,27 @@ pub fn target_spec(kind: InstrumentKind, target: u8) -> Option<&'static ParamSpe
 }
 /// Internal processing block. Events inside a block are still sample-accurate.
 pub const BLOCK: usize = 64;
+/// Capacity of the live-note mailbox (MIDI input to the engine).
+pub const LIVE_QUEUE: usize = 256;
+/// Live notes held at once; pressing one more releases the oldest.
+const MAX_LIVE: usize = 32;
+/// Live notes one callback takes, so a flood cannot stretch it.
+const LIVE_BUDGET: usize = LIVE_QUEUE;
+
+/// A key played live: `velocity` 1–127 presses `note`, 0 releases it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveNote {
+    pub note: u8,
+    pub velocity: u8,
+}
+
+/// A live note sounding on a track.
+#[derive(Clone, Copy)]
+struct Held {
+    track: u8,
+    note: u8,
+    voice: VoiceId,
+}
 pub const MIN_TEMPO: f32 = 20.0;
 pub const MAX_TEMPO: f32 = 300.0;
 pub const MAX_GAIN_DB: f32 = 12.0;
@@ -324,6 +346,8 @@ pub enum Command {
         track: u8,
         sample: Option<Arc<Sample>>,
     },
+    /// The track live notes play on from now on.
+    SetLiveTrack(u8),
 }
 
 /// Work one audio callback spends on commands, in units of a simple edit.
@@ -758,6 +782,12 @@ pub struct Engine {
     /// Loudness of the output since playback started.
     loudness: LiveLoudness,
     limiter_reduction: f32,
+    /// Notes played live (MIDI input), taken at the start of each callback.
+    live: Option<Arc<Mailbox<LiveNote>>>,
+    live_track: usize,
+    /// Live notes sounding, oldest first.
+    held: [Held; MAX_LIVE],
+    held_count: usize,
 }
 
 const CHANCE_SEED: u64 = 0x5EED_C4A2_CE00_0001;
@@ -798,6 +828,10 @@ impl Engine {
             retired: None,
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
+            live: None,
+            live_track: 0,
+            held: [Held { track: 0, note: 0, voice: VoiceId::NONE }; MAX_LIVE],
+            held_count: 0,
         })
     }
 
@@ -825,6 +859,13 @@ impl Engine {
     /// look-ahead while it is on).
     pub fn latency(&self) -> usize {
         self.mix.latency()
+    }
+
+    /// Plays the notes pushed into `mailbox` live, on the track
+    /// [`Command::SetLiveTrack`] names. The mailbox may outlive the engine
+    /// and pass to its successor.
+    pub fn attach_live(&mut self, mailbox: Arc<Mailbox<LiveNote>>) {
+        self.live = Some(mailbox);
     }
 
     /// Routes every sample the engine releases from now on to `queue`.
@@ -868,13 +909,22 @@ impl Engine {
     /// Handles one command immediately.
     pub fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Edit(e) => self.apply(e),
+            Command::Edit(e) => {
+                // Track indices are about to shift; held notes would lose
+                // their tracks.
+                if matches!(e, Edit::AddTrack(_) | Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) {
+                    self.release_live();
+                }
+                self.apply(e);
+            }
+            Command::SetLiveTrack(t) => self.live_track = usize::from(t),
             Command::Play => self.start(None),
             Command::PlaySong { entry } => self.start(Some(entry)),
             Command::Cue(p) => self.cue = p.min(MAX_PATTERNS as u8 - 1),
             Command::Stop => {
                 self.transport.stop();
                 self.current = None;
+                self.held_count = 0;
                 for t in &mut self.tracks[..self.track_count] {
                     t.release_all();
                     for l in &mut t.lanes {
@@ -896,6 +946,64 @@ impl Engine {
                     self.tracks[i].hit(now, &step.sanitized(), u64::from(frames));
                 }
             }
+        }
+    }
+
+    /// Plays the live notes waiting in the mailbox, up to a budget.
+    fn play_live(&mut self) {
+        let Some(live) = self.live.take() else { return };
+        for _ in 0..LIVE_BUDGET {
+            let Some(n) = live.pop() else { break };
+            if n.velocity == 0 {
+                self.live_off(n.note);
+            } else {
+                self.live_on(n.note, n.velocity);
+            }
+        }
+        self.live = Some(live);
+    }
+
+    fn live_on(&mut self, note: u8, velocity: u8) {
+        let i = self.live_track;
+        if i >= self.track_count {
+            return;
+        }
+        // A key pressed again before its release retriggers.
+        self.live_off(note);
+        if self.held_count == MAX_LIVE {
+            self.release_held(0);
+        }
+        let kind = self.tracks[i].instrument.kind();
+        if kind == InstrumentKind::HatClosed {
+            choke_open_hats(&mut self.tracks[..self.track_count]);
+        }
+        // Drums sound at their own pitch whatever the key.
+        let pitch = if kind.is_drum() { kind.default_note() } else { note.min(127) };
+        let voice = self.tracks[i].instrument.note_on(pitch, velocity.min(127));
+        if voice != VoiceId::NONE {
+            self.held[self.held_count] = Held { track: i as u8, note, voice };
+            self.held_count += 1;
+        }
+    }
+
+    fn live_off(&mut self, note: u8) {
+        while let Some(k) = self.held[..self.held_count].iter().position(|h| h.note == note) {
+            self.release_held(k);
+        }
+    }
+
+    fn release_held(&mut self, k: usize) {
+        let h = self.held[k];
+        if let Some(t) = self.tracks[..self.track_count].get_mut(usize::from(h.track)) {
+            t.instrument.note_off(h.voice);
+        }
+        self.held.copy_within(k + 1..self.held_count, k);
+        self.held_count -= 1;
+    }
+
+    fn release_live(&mut self) {
+        while self.held_count > 0 {
+            self.release_held(self.held_count - 1);
         }
     }
 
@@ -1133,6 +1241,7 @@ impl Engine {
             }
             self.commands = Some(rx);
         }
+        self.play_live();
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
         }
@@ -1606,6 +1715,100 @@ mod tests {
         assert_eq!(e.tracks[1].instrument.kind(), InstrumentKind::Clap);
         e.apply(Edit::RemoveTrack(7)); // out of range: ignored
         assert_eq!(e.track_count(), 2);
+    }
+
+    fn live_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<LiveNote>>) {
+        let mut e = engine(edits);
+        let live = Arc::new(Mailbox::new(LIVE_QUEUE));
+        e.attach_live(live.clone());
+        (e, live)
+    }
+
+    fn press(live: &Mailbox<LiveNote>, note: u8, velocity: u8) {
+        live.push(LiveNote { note, velocity }).unwrap();
+    }
+
+    #[test]
+    fn live_notes_sound_from_the_next_callback_and_release() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        assert!(run(&mut e, 256).iter().all(|&x| x == 0.0));
+        press(&live, 60, 100);
+        let held = run(&mut e, 4800);
+        // The same note started at the same frame by an audition.
+        let mut a = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        run(&mut a, 256);
+        a.handle(Command::Audition { track: 0, step: Step::new(60, 100, 1), frames: 1 << 20 });
+        assert_eq!(held, run(&mut a, 4800), "starts at the callback's first frame");
+        assert_eq!(e.held_count, 1);
+        // Still sounding while held (sustain), silent after its release.
+        assert!(energy(&run(&mut e, 4800)[8000..]) > 1e-3);
+        press(&live, 60, 0);
+        run(&mut e, 4800);
+        assert_eq!(e.held_count, 0);
+        let tail = run(&mut e, 96_000);
+        assert!(tail[tail.len() - 2000..].iter().all(|x| x.abs() < 1e-6));
+    }
+
+    #[test]
+    fn live_notes_follow_the_live_track_and_release_on_their_own() {
+        let (mut e, live) =
+            live_engine(&[Edit::AddTrack(InstrumentKind::Synth), Edit::AddTrack(InstrumentKind::Synth)]);
+        e.handle(Command::SetLiveTrack(1));
+        press(&live, 64, 100);
+        run(&mut e, 2400);
+        assert!(e.shared.track_peaks[1].take() > 0.0);
+        assert_eq!(e.shared.track_peaks[0].take(), 0.0);
+        // Switching tracks while the key is down: the release still reaches
+        // the track the note started on.
+        e.handle(Command::SetLiveTrack(0));
+        press(&live, 64, 0);
+        run(&mut e, 96_000);
+        let quiet = run(&mut e, 2400);
+        assert!(quiet.iter().all(|x| x.abs() < 1e-6), "the note on track 1 must have been released");
+        // A live track past the last track plays nothing.
+        e.handle(Command::SetLiveTrack(5));
+        press(&live, 64, 100);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn retriggers_limits_and_track_changes_keep_the_held_list_sound() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        press(&live, 60, 100);
+        press(&live, 60, 90);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 1, "a repeated key replaces its note");
+        for n in 0..(MAX_LIVE as u8 + 5) {
+            press(&live, 70 + n, 100);
+        }
+        run(&mut e, 64);
+        assert_eq!(e.held_count, MAX_LIVE);
+        // 1 + 37 presses into 32 slots: 60 and 70..=74 made room.
+        assert_eq!(e.held[0].note, 75, "the oldest notes made room");
+        assert_eq!(e.held[MAX_LIVE - 1].note, 70 + MAX_LIVE as u8 + 4);
+        // Adding a track releases every live note before indices move.
+        e.handle(Command::Edit(Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick }));
+        assert_eq!(e.held_count, 0);
+        // Stop releases them too.
+        e.handle(Command::SetLiveTrack(1));
+        press(&live, 60, 100);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 1);
+        e.handle(Command::Stop);
+        assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn live_drums_hit_at_their_own_pitch() {
+        let (mut a, live_a) = live_engine(&[Edit::AddTrack(InstrumentKind::Kick)]);
+        let (mut b, live_b) = live_engine(&[Edit::AddTrack(InstrumentKind::Kick)]);
+        press(&live_a, 30, 100);
+        press(&live_b, 90, 100);
+        let (x, y) = (run(&mut a, 4800), run(&mut b, 4800));
+        assert!(energy(&x) > 1e-3);
+        assert_eq!(x, y, "the key does not change a drum's pitch");
+        assert_eq!(a.held_count, 0, "drums hold nothing");
     }
 
     #[test]

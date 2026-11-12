@@ -1,5 +1,6 @@
 //! Primitives for crossing the real-time boundary without locks or allocation.
 
+pub mod mailbox;
 pub mod spsc;
 
 use std::sync::atomic::{AtomicU32, Ordering};

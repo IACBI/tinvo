@@ -71,7 +71,7 @@ unsafe extern "C" {
     fn AudioQueueSetProperty(queue: AudioQueueRef, id: u32, data: *const c_void, size: u32) -> i32;
 }
 
-type CFStringRef = *const c_void;
+pub(crate) type CFStringRef = *const c_void;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -126,8 +126,8 @@ fn address(selector: u32, scope: u32) -> PropertyAddress {
     PropertyAddress { selector, scope, element: 0 }
 }
 
-/// Copies and releases a CFString the HAL handed us.
-unsafe fn take_cf_string(s: CFStringRef) -> Option<String> {
+/// Copies and releases a CFString the system handed us.
+pub(crate) unsafe fn take_cf_string(s: CFStringRef) -> Option<String> {
     if s.is_null() {
         return None;
     }
@@ -215,6 +215,20 @@ pub fn devices() -> Result<Vec<Device>, String> {
             Some(Device { id, name, is_default: Some(d) == default })
         })
         .collect())
+}
+
+/// A new CFString holding `s` (null if it cannot be made); the caller
+/// releases it with [`release`].
+pub(crate) fn new_cf_string(s: &str) -> CFStringRef {
+    let Ok(c) = CString::new(s) else { return ptr::null() };
+    // SAFETY: a NUL-terminated UTF-8 string.
+    unsafe { CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8) }
+}
+
+/// Releases a Core Foundation object we own.
+pub(crate) unsafe fn release(cf: *const c_void) {
+    // SAFETY: the caller owns one reference to `cf`.
+    unsafe { CFRelease(cf) }
 }
 
 /// Points the queue at the device with `uid`.

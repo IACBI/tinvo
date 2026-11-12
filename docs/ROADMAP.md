@@ -109,7 +109,7 @@ Known limits:
 - Drive costs about 0.7 % of one core per track (`tinvo bench`): every strip stage on all six demo tracks takes about twice what it did in 0.8.0 on the same machine.
 - Bus and master settings other than the delay time, the pre-delay, the chorus depth and the return levels change at once; automated ramps move them in 32-frame steps.
 
-## Phase 5a: Output devices ✅ (0.10.0, this release)
+## Phase 5a: Output devices ✅ (0.10.0)
 
 - Output device listing and selection on all three backends (`tinvo devices`, `--device`, `O` in the editor).
 - Recovery: a lost stream is reopened with backoff; the editor follows the system default (WASAPI) and falls back to the default while a chosen device is missing, returning when it reappears.
@@ -121,11 +121,24 @@ Known limits:
 - ALSA and CoreAudio device listing compiles and links in CI, but has not run on real hardware. ALSA and CoreAudio cannot report the default device changing; the system routes their default streams itself.
 - Reconnecting rebuilds the engine from the project: playback stops, and ringing notes and effect tails are cut.
 
-## Phase 5b–5d: More I/O
+## Phase 5b: MIDI input ✅ (0.11.0, this release)
 
-- 5b: MIDI input (WinMM / ALSA sequencer / CoreMIDI) for live playing and step entry.
+- MIDI input through WinMM, ALSA rawmidi and CoreMIDI, with a byte-stream parser that handles running status, interleaved real-time bytes, system exclusive and system common messages.
+- Live playing on the selected track: a lock-free mailbox from the MIDI thread to the audio engine, bypassing the UI.
+- Step entry with chords (`R`), and input selection (`tinvo midi`, `--midi`, `M`).
+
+Known limits:
+- No MIDI device was available while developing this phase. The parser, the engine's live notes, step entry and the path from the MIDI handler to both mailboxes are tested; the WinMM, rawmidi and CoreMIDI code compiles and links in CI but has never received a real message.
+- Live notes start at the beginning of the audio callback after they arrive, so their timing jitters by up to one device period (10 ms on the development machine) on top of the output latency. Backends' timestamps are not used yet.
+- Only notes are used: no sustain pedal, pitch bend, controllers or MIDI channels (every channel plays the selected track). There is no live recording while the pattern plays.
+- On Linux, rawmidi sees hardware and USB ports only, not software clients of the ALSA sequencer.
+- A MIDI input that is unplugged stays silent until another one is picked with `M`; it is not reopened by itself.
+- If more than 256 notes arrive within one audio callback, the extra ones are dropped (a dropped release would leave a note held until the key is pressed again).
+
+## Phase 5c–5d: More I/O
+
 - 5c: Audio input and recording.
-- 5d: CoreAudio HAL unit; JACK/PipeWire native paths.
+- 5d: CoreAudio HAL unit; JACK/PipeWire native paths; the ALSA sequencer.
 
 ## Phase 6: Polish and production hardening
 

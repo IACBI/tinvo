@@ -70,10 +70,12 @@ tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
 tinvo probe --device realtek --low-latency 3
+tinvo midi                # list the MIDI inputs
+tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo bench               # measure rendering speed
 ```
 
-The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears.
+The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor.
 
 The main keys in the editor (press `?` for the full list):
 
@@ -100,6 +102,8 @@ The main keys in the editor (press `?` for the full list):
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
 | `O` | choose the audio output device (`Tab` toggles low-latency mode) |
+| `M` | choose the MIDI input |
+| `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
 | `w` `W` `e` | save, save as, export WAV |
 | `q` | quit |
 
@@ -172,10 +176,12 @@ tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
 tinvo probe --device realtek --low-latency 3
+tinvo midi                # list the MIDI inputs
+tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo bench               # measure rendering speed
 ```
 
-Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır.
+Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır.
 
 Editördeki temel tuşlar (tam liste için `?`):
 
@@ -202,6 +208,8 @@ Editördeki temel tuşlar (tam liste için `?`):
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
 | `O` | ses çıkış cihazını seç (`Tab` düşük gecikme modunu açıp kapatır) |
+| `M` | MIDI girişini seç |
+| `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `q` | çık |
 

@@ -58,11 +58,19 @@ unsafe fn take_string(p: *mut c_char) -> Option<String> {
     Some(s)
 }
 
-/// Lists the PCMs ALSA offers for playback.
-pub fn devices() -> Result<Vec<Device>, String> {
+/// One entry of ALSA's device hints: its name, description and direction
+/// (`None` means both).
+pub(crate) struct Hint {
+    pub name: String,
+    pub desc: Option<String>,
+    pub ioid: Option<String>,
+}
+
+/// ALSA's device hints for interface `iface` (`pcm`, `rawmidi`) on every card.
+pub(crate) fn hints(iface: &CStr) -> Result<Vec<Hint>, String> {
     let mut hints: *mut *mut c_void = ptr::null_mut();
     // SAFETY: valid out-pointer; card -1 asks for all cards.
-    let r = unsafe { snd_device_name_hint(-1, c"pcm".as_ptr(), &mut hints) };
+    let r = unsafe { snd_device_name_hint(-1, iface.as_ptr(), &mut hints) };
     if r < 0 {
         return Err(alsa_error("cannot list ALSA devices", r));
     }
@@ -83,20 +91,28 @@ pub fn devices() -> Result<Vec<Device>, String> {
                 take_string(snd_device_name_get_hint(hint, c"IOID".as_ptr())),
             )
         };
-        // No IOID means the PCM does both directions.
-        let (Some(name), false) = (name, ioid.as_deref() == Some("Input")) else { continue };
-        if name == "null" {
-            continue;
+        if let Some(name) = name {
+            out.push(Hint { name, desc: desc.map(|d| d.replace('\n', ", ")), ioid });
         }
-        let label = desc.map_or_else(|| name.clone(), |d| d.replace('\n', ", "));
-        out.push(Device { is_default: name == DEFAULT_PCM, name: format!("{label} ({name})"), id: name });
     }
     // SAFETY: freeing the array snd_device_name_hint allocated, once.
     unsafe { snd_device_name_free_hint(hints) };
     Ok(out)
 }
 
-fn alsa_error(what: &str, err: c_int) -> String {
+/// Lists the PCMs ALSA offers for playback.
+pub fn devices() -> Result<Vec<Device>, String> {
+    Ok(hints(c"pcm")?
+        .into_iter()
+        .filter(|h| h.ioid.as_deref() != Some("Input") && h.name != "null")
+        .map(|h| {
+            let label = h.desc.unwrap_or_else(|| h.name.clone());
+            Device { is_default: h.name == DEFAULT_PCM, name: format!("{label} ({})", h.name), id: h.name }
+        })
+        .collect())
+}
+
+pub(crate) fn alsa_error(what: &str, err: c_int) -> String {
     // SAFETY: snd_strerror returns a static NUL-terminated string.
     let msg = unsafe { CStr::from_ptr(snd_strerror(err)) }.to_string_lossy();
     format!("{what}: {msg}")

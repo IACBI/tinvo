@@ -10,13 +10,15 @@ use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
 use crate::engine::{
-    Command, Edit, Engine, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS,
-    MIN_SWING, MIX_TARGET, PlayPosition, RETIRE_QUEUE, Shared, Step,
+    Command, Edit, Engine, LIVE_QUEUE, LiveNote, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
+    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::midi::{self, Message};
 use crate::mix;
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
 use crate::render::{self, RenderOptions, Source};
+use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
 use crate::strip::{self, track_param};
@@ -266,6 +268,24 @@ pub enum Mode {
     Confirm(Confirm),
     Prompt(PromptKind, String),
     Devices(DevicePicker),
+    MidiInputs(MidiPicker),
+}
+
+/// The MIDI input list `M` shows. Entry 0 turns MIDI off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiPicker {
+    pub ports: Vec<midi::Port>,
+    pub cursor: usize,
+}
+
+/// Which MIDI input the editor opens at start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MidiStart {
+    /// The first input present, if any.
+    First,
+    Off,
+    /// The input with this id.
+    Port(String),
 }
 
 /// The output device list `O` shows. Entry 0 is the system default.
@@ -323,6 +343,22 @@ pub struct App {
     pub audio_config: StreamConfig,
     /// A device change the picker asked for, for the run loop to make.
     audio_request: Option<StreamConfig>,
+    /// The open MIDI input's id and name.
+    pub midi_input: Option<(String, String)>,
+    /// A MIDI input change (`None`: off) the picker asked for.
+    midi_request: Option<Option<String>>,
+    /// The track the engine plays live notes on, as last sent.
+    live_track_sent: Option<usize>,
+    /// When the last MIDI note arrived, for the header's activity light.
+    midi_seen: Option<Instant>,
+    /// MIDI notes write steps at the cursor.
+    pub step_entry: bool,
+    /// Keys held during step entry, and the notes of the step they write.
+    entry_held: Vec<u8>,
+    entry_notes: Vec<(u8, u8)>,
+    /// The undo step the chord being entered is building (its time and
+    /// latest edit), so more keys extend it instead of adding steps.
+    entry_change: Option<(Instant, Edit)>,
     status: Option<(String, Instant)>,
     meters: [f32; MAX_TRACKS],
     master_meter: [f32; 2],
@@ -385,6 +421,14 @@ impl App {
             audio_label,
             audio_config: StreamConfig::default(),
             audio_request: None,
+            midi_input: None,
+            midi_request: None,
+            live_track_sent: None,
+            midi_seen: None,
+            step_entry: false,
+            entry_held: Vec::new(),
+            entry_notes: Vec::new(),
+            entry_change: None,
             status: None,
             meters: [0.0; MAX_TRACKS],
             master_meter: [0.0; 2],
@@ -420,6 +464,7 @@ impl App {
     /// stops: the new engine starts from the project, at its start.
     pub fn reconnect(&mut self, link: EngineLink, sample_rate: u32, label: String) {
         self.link = Some(link);
+        self.live_track_sent = None;
         self.sample_rate = sample_rate;
         self.audio_label = label;
         self.playing = false;
@@ -429,6 +474,117 @@ impl App {
         self.reduction = [0.0; MAX_TRACKS];
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
+    }
+
+    /// The MIDI input change the user asked for, if any.
+    pub fn take_midi_request(&mut self) -> Option<Option<String>> {
+        self.midi_request.take()
+    }
+
+    /// Shows the MIDI input picker for `ports`, on the input in use.
+    pub fn open_midi_picker(&mut self, ports: Vec<midi::Port>) {
+        let cursor =
+            self.midi_input.as_ref().and_then(|(id, _)| ports.iter().position(|p| &p.id == id)).map_or(0, |i| i + 1);
+        self.mode = Mode::MidiInputs(MidiPicker { ports, cursor });
+    }
+
+    fn key_midi(&mut self, mut p: MidiPicker, key: Key) {
+        match key {
+            Key::Up => p.cursor = p.cursor.saturating_sub(1),
+            Key::Down => p.cursor = (p.cursor + 1).min(p.ports.len()),
+            Key::Enter => {
+                self.midi_request = Some(p.cursor.checked_sub(1).map(|i| p.ports[i].id.clone()));
+                self.mode = Mode::Normal;
+                return;
+            }
+            Key::Esc | Key::Char('q' | 'M') => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::MidiInputs(p);
+    }
+
+    /// Handles a message from the MIDI input (the engine has already played
+    /// it): with step entry on, notes write the step under the cursor.
+    /// Keys pressed together make a chord; releasing them all moves on.
+    pub fn midi_message(&mut self, m: Message) {
+        self.midi_seen = Some(Instant::now());
+        let entering = self.step_entry
+            && self.mode == Mode::Normal
+            && !self.song_view
+            && !self.auto_view
+            && self.track < self.track_count();
+        match m {
+            Message::NoteOn { note, velocity, .. } => {
+                if !entering || self.entry_held.contains(&note) {
+                    return;
+                }
+                self.entry_held.push(note);
+                if self.entry_notes.len() < MAX_CHORD && !self.entry_notes.iter().any(|&(n, _)| n == note) {
+                    self.entry_notes.push((note, velocity));
+                    self.write_entry();
+                }
+            }
+            Message::NoteOff { note, .. } => {
+                let Some(i) = self.entry_held.iter().position(|&n| n == note) else { return };
+                self.entry_held.swap_remove(i);
+                if self.entry_held.is_empty() {
+                    self.entry_notes.clear();
+                    if entering {
+                        self.step = (self.step + 1) % self.pattern_len().max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes the step the held keys make, as one undo step per chord.
+    fn write_entry(&mut self) {
+        let kind = self.project.tracks[self.track].kind;
+        let mut s = self.brushes[self.track];
+        let &(root, _) = self.entry_notes.iter().min().expect("a key is held");
+        s.velocity = self.entry_notes[0].1;
+        s.chord = [0; MAX_CHORD - 1];
+        if !kind.is_drum() {
+            s.note = root;
+            let mut ivs: Vec<u8> = self.entry_notes.iter().map(|&(n, _)| n - root).filter(|&i| i > 0).collect();
+            ivs.sort_unstable();
+            for (slot, i) in s.chord.iter_mut().zip(ivs) {
+                *slot = i;
+            }
+        }
+        let s = s.sanitized();
+        let (track, pattern, step) = (self.track as u8, self.pattern as u8, self.step as u8);
+        let e = Edit::SetStep { track, pattern, step, value: Some(s) };
+        let ours = self.entry_notes.len() > 1
+            && self.entry_change.is_some_and(|(at, last)| {
+                self.redo.is_empty() && self.undo.back().is_some_and(|c| c.at == at && c.redo == [last])
+            });
+        let written = if ours {
+            // Same step, so the undo step's inverse (the step before the
+            // first key) still holds; only its redo moves on.
+            match self.apply_raw(e) {
+                Some(applied) => {
+                    let last = self.undo.back_mut().expect("checked above");
+                    last.redo = vec![applied];
+                    self.entry_change = Some((last.at, applied));
+                    true
+                }
+                None => false,
+            }
+        } else {
+            let before = self.undo.back().map(|c| c.at);
+            let done = self.edit_with(e, false);
+            // Only a change this edit pushed (not a no-op) may be extended.
+            self.entry_change = self.undo.back().filter(|c| Some(c.at) != before && c.redo == [e]).map(|c| (c.at, e));
+            done
+        };
+        if written {
+            self.dirty = true;
+            self.set_status(format!("Step {}: {}", self.step + 1, step_label(&s, kind)));
+        }
     }
 
     /// The output change the user asked for, if any.
@@ -820,6 +976,10 @@ impl App {
 
     /// Pulls playhead, meters and load from the audio thread.
     pub fn tick(&mut self) {
+        if self.link.is_some() && self.live_track_sent != Some(self.track) {
+            self.send(Command::SetLiveTrack(self.track.min(usize::from(u8::MAX)) as u8));
+            self.live_track_sent = Some(self.track);
+        }
         let Some(link) = &mut self.link else { return };
         link.flush();
         let s = &link.shared;
@@ -913,6 +1073,7 @@ impl App {
             Mode::Confirm(c) => self.key_confirm(c, key),
             Mode::Prompt(kind, text) => self.key_prompt(kind, text, key),
             Mode::Devices(p) => self.key_devices(p, key),
+            Mode::MidiInputs(p) => self.key_midi(p, key),
             Mode::Normal => self.key_normal(key),
         }
         self.clamp_cursor();
@@ -1023,6 +1184,23 @@ impl App {
                 self.focus = if self.focus == Focus::Grid { Focus::Params } else { Focus::Grid };
             }
             Key::Char('?') | Key::F(1) => self.mode = Mode::Help,
+            Key::Char('M') => match midi::inputs() {
+                Ok(ports) => self.open_midi_picker(ports),
+                Err(e) => self.set_status(format!("Cannot list MIDI inputs: {e}")),
+            },
+            Key::Char('R') => {
+                self.step_entry = !self.step_entry;
+                self.entry_held.clear();
+                self.entry_notes.clear();
+                let status = match (self.step_entry, &self.midi_input) {
+                    (false, _) => "Step entry off".to_string(),
+                    (true, Some((_, name))) => {
+                        format!("Step entry on: notes from {name} write steps at the cursor (R stops)")
+                    }
+                    (true, None) => "Step entry on, but no MIDI input is open (M chooses one)".to_string(),
+                };
+                self.set_status(status);
+            }
             Key::Char('O') => match audio::output_devices() {
                 Ok(devices) => self.open_device_picker(devices),
                 Err(e) => self.set_status(format!("Cannot list output devices: {e}")),
@@ -1534,6 +1712,10 @@ impl App {
             self.draw_devices(s, p);
             return;
         }
+        if let Mode::MidiInputs(p) = &self.mode {
+            self.draw_midi(s, p);
+            return;
+        }
         self.draw_header(s, w);
         let params_rows = self.params_rows(w);
         // header, ruler, separator, params block, status line
@@ -1587,7 +1769,13 @@ impl App {
         s.put(x, 0, &info, bar);
         let short_term = self.loudness[1];
         let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
-        let right = format!(" {lufs}{}  CPU {:4.1}%  ", self.audio_label, self.cpu * 100.0);
+        let rec = if self.step_entry { "REC  " } else { "" };
+        let midi = match (&self.midi_input, self.midi_seen) {
+            (None, _) => "",
+            (Some(_), Some(t)) if t.elapsed() < Duration::from_millis(150) => "MIDI●  ",
+            (Some(_), _) => "MIDI○  ",
+        };
+        let right = format!(" {rec}{midi}{lufs}{}  CPU {:4.1}%  ", self.audio_label, self.cpu * 100.0);
         let meter_w = 10u16;
         let rx = w.saturating_sub(right.chars().count() as u16 + meter_w + 1);
         s.put(rx, 0, &right, bar);
@@ -1987,6 +2175,21 @@ impl App {
 }
 
 impl App {
+    fn draw_midi(&self, s: &mut Screen, p: &MidiPicker) {
+        let h = s.height();
+        s.put(2, 1, "MIDI input", Style::fg(Color::BrightWhite).bold());
+        let now = self.midi_input.as_ref().map_or("off", |(_, n)| n.as_str());
+        s.put(2, 2, &format!("Now: {now}"), Style::fg(Color::Gray));
+        let current = self.midi_input.as_ref().map(|(id, _)| id.as_str());
+        let mut entries = vec![("None (MIDI off)".to_string(), current.is_none())];
+        entries.extend(p.ports.iter().map(|port| (port.name.clone(), current == Some(port.id.as_str()))));
+        if p.ports.is_empty() {
+            entries.push(("(no MIDI inputs connected)".to_string(), false));
+        }
+        draw_list(s, &entries, p.cursor);
+        s.put(2, h.saturating_sub(2), "↑↓ choose  Enter open  Esc cancel", Style::fg(Color::Gray));
+    }
+
     fn draw_devices(&self, s: &mut Screen, p: &DevicePicker) {
         let h = s.height();
         s.put(2, 1, "Audio output", Style::fg(Color::BrightWhite).bold());
@@ -1997,15 +2200,7 @@ impl App {
             let default = if d.is_default { "  (default)" } else { "" };
             entries.push((format!("{}{default}", d.name), current == Some(d.id.as_str())));
         }
-        // Keep the cursor's row on screen; rows 4.. up to the hint line.
-        let rows = usize::from(h.saturating_sub(7)).max(1);
-        let first = p.cursor.saturating_sub(rows - 1);
-        for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
-            let y = 4 + row as u16;
-            let mark = if *chosen { "● " } else { "  " };
-            let st = if i == p.cursor { Style::fg(Color::Black).on(Color::BrightCyan) } else { Style::DEFAULT };
-            s.put(2, y, &format!("{mark}{name}"), st);
-        }
+        draw_list(s, &entries, p.cursor);
         let ll = if p.low_latency { "on" } else { "off" };
         s.put(
             2,
@@ -2014,6 +2209,27 @@ impl App {
             Style::fg(Color::Gray),
         );
     }
+}
+
+/// A picker's entries from row 4 down to above the hint line, keeping the
+/// cursor's row on screen; `●` marks the one in use.
+fn draw_list(s: &mut Screen, entries: &[(String, bool)], cursor: usize) {
+    let rows = usize::from(s.height().saturating_sub(7)).max(1);
+    let first = cursor.saturating_sub(rows - 1);
+    for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
+        let mark = if *chosen { "● " } else { "  " };
+        let st = if i == cursor { Style::fg(Color::Black).on(Color::BrightCyan) } else { Style::DEFAULT };
+        s.put(2, 4 + row as u16, &format!("{mark}{name}"), st);
+    }
+}
+
+/// A step for the status line: its notes and velocity.
+fn step_label(s: &Step, kind: InstrumentKind) -> String {
+    if kind.is_drum() {
+        return format!("hit v{}", s.velocity);
+    }
+    let names: Vec<String> = s.notes().map(crate::instrument::note_name).collect();
+    format!("{} v{}", names.join(" "), s.velocity)
 }
 
 fn draw_help(s: &mut Screen) {
@@ -2048,6 +2264,7 @@ fn draw_help(s: &mut Screen) {
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
         ("O", "audio output device (and low-latency mode)"),
+        ("M R", "MIDI input; step entry: keys write the step at the cursor (held together: a chord)"),
         ("f", "parameter panel: instrument, channel strip (EQ, compressor, drive, sends), buses and master"),
         ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
         ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
@@ -2131,7 +2348,13 @@ pub fn start_audio(
     project: &Project,
     samples: &[Option<Arc<Sample>>],
     config: &StreamConfig,
+    live: Option<&Arc<Mailbox<LiveNote>>>,
 ) -> Result<(Stream, EngineLink, u32), String> {
+    // Notes played while no engine was listening are stale now.
+    let live = live.cloned();
+    if let Some(l) = &live {
+        l.clear();
+    }
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
     let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
@@ -2142,6 +2365,9 @@ pub fn start_audio(
     let stream = audio::open_with(config, move |sample_rate| {
         let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
         engine.attach_retirement(retire_tx);
+        if let Some(l) = live {
+            engine.attach_live(l);
+        }
         for (track, sample) in samples.into_iter().enumerate() {
             engine.set_sample(track, sample);
         }
@@ -2172,11 +2398,21 @@ struct Output {
     default_id: Option<String>,
     next_check: Instant,
     retry: Duration,
+    /// Live notes from the MIDI input, handed to every engine in turn.
+    live: Option<Arc<Mailbox<LiveNote>>>,
 }
 
 impl Output {
-    fn new(config: StreamConfig) -> Self {
-        Self { stream: None, config, fallback: false, default_id: None, next_check: Instant::now(), retry: RETRY_FIRST }
+    fn new(config: StreamConfig, live: Option<Arc<Mailbox<LiveNote>>>) -> Self {
+        Self {
+            stream: None,
+            config,
+            fallback: false,
+            default_id: None,
+            next_check: Instant::now(),
+            retry: RETRY_FIRST,
+            live,
+        }
     }
 
     /// (Re)opens the output and hands the new engine to `app`. Returns the
@@ -2193,7 +2429,7 @@ impl Output {
             }
         }
         app.audio_config = self.config.clone();
-        let (stream, link, sr) = match start_audio(&app.project, &app.track_samples(), &config) {
+        let (stream, link, sr) = match start_audio(&app.project, &app.track_samples(), &config, self.live.as_ref()) {
             Ok(v) => v,
             Err(e) => {
                 app.link = None;
@@ -2275,8 +2511,65 @@ impl Output {
     }
 }
 
+/// The MIDI input for the session. Its handler, on the backend's thread,
+/// pushes each note to the engine (to sound at once) and to the UI (for
+/// step entry); both mailboxes outlive inputs and engines.
+struct MidiSession {
+    input: Option<midi::Input>,
+    live: Arc<Mailbox<LiveNote>>,
+    ui: Arc<Mailbox<Message>>,
+}
+
+impl MidiSession {
+    fn new() -> Self {
+        Self { input: None, live: Arc::new(Mailbox::new(LIVE_QUEUE)), ui: Arc::new(Mailbox::new(LIVE_QUEUE)) }
+    }
+
+    /// Opens the input with `id` (`None`: closes MIDI). Returns a status.
+    fn open(&mut self, app: &mut App, id: Option<String>) -> String {
+        // Close first: a port can be open only once.
+        self.input = None;
+        app.midi_input = None;
+        let Some(id) = id else { return "MIDI input off".into() };
+        match midi::open(&id, self.handler()) {
+            Ok(input) => {
+                let name = input.name().to_string();
+                app.midi_input = Some((id, name.clone()));
+                self.input = Some(input);
+                format!("MIDI input: {name}")
+            }
+            Err(e) => format!("MIDI input unavailable: {e}"),
+        }
+    }
+
+    /// What runs on the MIDI thread for each message.
+    fn handler(&self) -> impl FnMut(Message) + Send + 'static {
+        let (live, ui) = (self.live.clone(), self.ui.clone());
+        move |m: Message| {
+            let note = match m {
+                Message::NoteOn { note, velocity, .. } => LiveNote { note, velocity },
+                Message::NoteOff { note, .. } => LiveNote { note, velocity: 0 },
+            };
+            // A full mailbox drops the note rather than block this thread.
+            let _ = live.push(note);
+            let _ = ui.push(m);
+        }
+    }
+
+    /// Runs once per UI frame.
+    fn poll(&mut self, app: &mut App) {
+        if let Some(id) = app.take_midi_request() {
+            let status = self.open(app, id);
+            app.set_status(status);
+        }
+        while let Some(m) = self.ui.pop() {
+            app.midi_message(m);
+        }
+    }
+}
+
 /// Runs the interactive session until the user quits.
-pub fn run(path: Option<PathBuf>, config: StreamConfig) -> Result<(), String> {
+pub fn run(path: Option<PathBuf>, config: StreamConfig, midi_start: MidiStart) -> Result<(), String> {
     let (project, path, mut message) = match path {
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
@@ -2299,7 +2592,17 @@ pub fn run(path: Option<PathBuf>, config: StreamConfig) -> Result<(), String> {
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
     let mut app = App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples);
-    let mut output = Output::new(config);
+    let mut midi = MidiSession::new();
+    let mut output = Output::new(config, Some(midi.live.clone()));
+    let midi_id = match midi_start {
+        MidiStart::Off => None,
+        MidiStart::Port(id) => Some(id),
+        MidiStart::First => midi::inputs().ok().and_then(|ports| ports.into_iter().next()).map(|p| p.id),
+    };
+    if midi_id.is_some() {
+        let status = midi.open(&mut app, midi_id);
+        message = format!("{message}  {status}");
+    }
     if let Err(e) = output.open(&mut app) {
         message = format!("No audio output ({e}). Retrying; editing and export still work.");
     } else if output.fallback {
@@ -2324,6 +2627,7 @@ pub fn run(path: Option<PathBuf>, config: StreamConfig) -> Result<(), String> {
             timeout = Duration::ZERO;
         }
         output.poll(&mut app);
+        midi.poll(&mut app);
         app.tick();
         if app.quit {
             break;
@@ -2338,6 +2642,7 @@ pub fn run(path: Option<PathBuf>, config: StreamConfig) -> Result<(), String> {
         }
     }
     drop(term);
+    drop(midi);
     drop(output);
     Ok(())
 }
@@ -3237,7 +3542,7 @@ mod tests {
     #[test]
     fn output_opens_switches_and_falls_back_on_real_devices() {
         let mut a = app();
-        let mut out = Output::new(StreamConfig::default());
+        let mut out = Output::new(StreamConfig::default(), None);
         if out.open(&mut a).is_err() {
             eprintln!("no audio device; skipping");
             return;
@@ -3262,6 +3567,135 @@ mod tests {
         out.next_check = Instant::now();
         out.poll(&mut a);
         assert!(out.fallback && out.stream.is_some());
+    }
+
+    fn note_on(note: u8, velocity: u8) -> Message {
+        Message::NoteOn { channel: 0, note, velocity }
+    }
+
+    fn note_off(note: u8) -> Message {
+        Message::NoteOff { channel: 0, note }
+    }
+
+    #[test]
+    fn step_entry_writes_notes_and_chords_at_the_cursor() {
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        (a.track, a.step, a.pattern) = (bass, 3, 0);
+        // Without step entry, notes only play (in the engine).
+        a.midi_message(note_on(50, 90));
+        a.midi_message(note_off(50));
+        assert_eq!(a.step, 3);
+        let before = a.project.tracks[bass].steps[0][3];
+
+        keys(&mut a, &[Key::Char('R')]);
+        assert!(a.step_entry);
+        a.midi_message(note_on(64, 90));
+        a.midi_message(note_on(60, 70));
+        a.midi_message(note_on(67, 50));
+        assert_eq!(a.step, 3, "the cursor waits until every key is up");
+        a.midi_message(note_off(60));
+        a.midi_message(note_off(64));
+        a.midi_message(note_off(67));
+        assert_eq!(a.step, 4);
+        let s = a.project.tracks[bass].steps[0][3].unwrap();
+        assert_eq!(s.notes().collect::<Vec<_>>(), [60, 64, 67]);
+        assert_eq!(s.velocity, 90, "the first key's velocity");
+        // One chord is one undo step.
+        a.undo();
+        assert_eq!(a.project.tracks[bass].steps[0][3], before);
+        a.redo();
+        assert_eq!(a.project.tracks[bass].steps[0][3], Some(s));
+
+        // A single note at the next step; wrapping at the pattern end.
+        a.step = a.pattern_len() - 1;
+        a.midi_message(note_on(48, 127));
+        a.midi_message(note_off(48));
+        assert_eq!(a.step, 0);
+        let last = a.project.tracks[bass].steps[0][a.pattern_len() - 1].unwrap();
+        assert_eq!((last.note, last.velocity, last.chord), (48, 127, [0; MAX_CHORD - 1]));
+        // A release with no press (the key was down before R) is ignored.
+        a.midi_message(note_off(30));
+        assert_eq!(a.step, 0);
+    }
+
+    #[test]
+    fn step_entry_on_drums_keeps_their_pitch_and_limits_chords() {
+        let mut a = app();
+        (a.track, a.step) = (0, 1); // kick
+        let pitch = a.brushes[0].note;
+        keys(&mut a, &[Key::Char('R')]);
+        a.midi_message(note_on(90, 33));
+        a.midi_message(note_off(90));
+        let s = a.project.tracks[0].steps[0][1].unwrap();
+        assert_eq!((s.note, s.velocity, s.chord), (pitch, 33, [0; MAX_CHORD - 1]));
+
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        (a.track, a.step) = (bass, 5);
+        for n in [60, 62, 64, 65, 67, 69] {
+            a.midi_message(note_on(n, 100));
+        }
+        let s = a.project.tracks[bass].steps[0][5].unwrap();
+        assert_eq!(s.notes().count(), MAX_CHORD, "extra keys beyond a chord's size are ignored");
+        // Step entry pauses in the song view and in dialogs.
+        for n in [60, 62, 64, 65, 67, 69] {
+            a.midi_message(note_off(n));
+        }
+        a.song_view = true;
+        a.midi_message(note_on(72, 100));
+        a.midi_message(note_off(72));
+        assert_eq!(a.step, 6);
+    }
+
+    #[test]
+    fn midi_picker_asks_for_the_chosen_input() {
+        let mut a = app();
+        let ports = vec![
+            midi::Port { id: "a".into(), name: "Keys".into() },
+            midi::Port { id: "b".into(), name: "Pads".into() },
+        ];
+        a.midi_input = Some(("b".into(), "Pads".into()));
+        a.open_midi_picker(ports.clone());
+        let Mode::MidiInputs(p) = &a.mode else { panic!("picker not shown") };
+        assert_eq!(p.cursor, 2);
+        keys(&mut a, &[Key::Up, Key::Enter]);
+        assert_eq!(a.take_midi_request(), Some(Some("a".into())));
+        a.open_midi_picker(ports);
+        keys(&mut a, &[Key::Up, Key::Up, Key::Up, Key::Enter]);
+        assert_eq!(a.take_midi_request(), Some(None), "entry 0 turns MIDI off");
+        assert_eq!(a.take_midi_request(), None);
+    }
+
+    #[test]
+    fn midi_messages_reach_the_engine_and_the_ui() {
+        let mut session = MidiSession::new();
+        let mut handler = session.handler();
+        handler(note_on(60, 99));
+        handler(note_off(60));
+        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 99 }));
+        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 0 }));
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        (a.track, a.step, a.step_entry) = (bass, 2, true);
+        session.poll(&mut a);
+        assert_eq!(a.project.tracks[bass].steps[0][2].map(|s| s.note), Some(60));
+        assert_eq!(a.step, 3);
+        assert_eq!(session.ui.pop(), None);
+    }
+
+    #[test]
+    fn the_engine_learns_the_live_track() {
+        let mut a = app();
+        let (tx, mut rx) = spsc::channel::<Command>(16);
+        a.reconnect(EngineLink::new(tx, Arc::new(Shared::new())), 48_000, "Test".into());
+        a.tick();
+        a.tick();
+        a.track = 2;
+        a.tick();
+        let sent: Vec<u8> = std::iter::from_fn(|| rx.pop())
+            .filter_map(|c| if let Command::SetLiveTrack(t) = c { Some(t) } else { None })
+            .collect();
+        assert_eq!(sent, [0, 2], "sent once per change");
     }
 
     #[test]
@@ -3299,6 +3733,11 @@ mod tests {
                     Mode::AddTrack,
                     Mode::Prompt(PromptKind::Export, "x".into()),
                     Mode::Devices(picker),
+                    Mode::MidiInputs(MidiPicker {
+                        ports: vec![midi::Port { id: "0".into(), name: "Keys".into() }],
+                        cursor: 0,
+                    }),
+                    Mode::MidiInputs(MidiPicker { ports: Vec::new(), cursor: 0 }),
                 ] {
                     a.mode = mode;
                     a.draw(&mut s);

@@ -5,10 +5,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tinvo::app::MidiStart;
 use tinvo::audio::{self, AudioCallback, StreamConfig};
 use tinvo::dsp::loudness::ExportMeter;
 use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
 use tinvo::instrument::InstrumentKind;
+use tinvo::midi;
 use tinvo::project::{Project, pattern_name};
 use tinvo::render::{self, RenderOptions, Source};
 use tinvo::strip::sp;
@@ -25,6 +27,7 @@ USAGE:
                                         pattern A); --stems also writes one file per track
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
+    tinvo midi                          list the MIDI inputs
     tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
     tinvo bench                         measure rendering speed against real time
     tinvo --help | --version
@@ -34,12 +37,14 @@ AUDIO:
                                         its name; default: the system default)
     --low-latency                       use the device's smallest period where the
                                         backend supports it (WASAPI)
+    --midi NAME | none                  play from this MIDI input (its id, or a unique
+                                        part of its name; default: the first one)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None => tinvo::app::run(None, StreamConfig::default()),
+        None => tinvo::app::run(None, StreamConfig::default(), MidiStart::First),
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             Ok(())
@@ -52,6 +57,7 @@ fn main() -> ExitCode {
         Some("demo") => cmd_demo(&args[1..]),
         Some("probe") => cmd_probe(&args[1..]),
         Some("devices") => cmd_devices(),
+        Some("midi") => cmd_midi(),
         Some("bench") => cmd_bench(),
         Some(_) => cmd_edit(&args),
     };
@@ -198,14 +204,47 @@ fn audio_options(args: &[String]) -> Result<(StreamConfig, Vec<String>), String>
     Ok((config, rest))
 }
 
+/// Takes `--midi` out of `args`, returning the rest.
+fn midi_option(args: Vec<String>) -> Result<(MidiStart, Vec<String>), String> {
+    let mut start = MidiStart::First;
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a != "--midi" {
+            rest.push(a);
+            continue;
+        }
+        let query = it.next().ok_or("--midi needs an input name or id, or none")?;
+        start = if query == "none" {
+            MidiStart::Off
+        } else {
+            let ports = midi::inputs()?;
+            MidiStart::Port(midi::find_port(&ports, &query)?.id.clone())
+        };
+    }
+    Ok((start, rest))
+}
+
 fn cmd_edit(args: &[String]) -> Result<(), String> {
     let (config, rest) = audio_options(args)?;
+    let (midi_start, rest) = midi_option(rest)?;
     match &rest[..] {
-        [] => tinvo::app::run(None, config),
+        [] => tinvo::app::run(None, config, midi_start),
         [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        [path] => tinvo::app::run(Some(PathBuf::from(path)), config),
+        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start),
         _ => Err(format!("too many arguments\n\n{USAGE}")),
     }
+}
+
+fn cmd_midi() -> Result<(), String> {
+    let ports = midi::inputs()?;
+    if ports.is_empty() {
+        println!("No MIDI inputs.");
+    }
+    for p in &ports {
+        println!("  {}\n    {}", p.name, p.id);
+    }
+    Ok(())
 }
 
 fn cmd_devices() -> Result<(), String> {

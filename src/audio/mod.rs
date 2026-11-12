@@ -12,9 +12,9 @@
 //! the output devices and open one by its id (otherwise the system default).
 
 #[cfg(target_os = "linux")]
-mod alsa;
+pub(crate) mod alsa;
 #[cfg(target_os = "macos")]
-mod coreaudio;
+pub(crate) mod coreaudio;
 #[cfg(windows)]
 mod wasapi;
 

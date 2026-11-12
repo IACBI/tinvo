@@ -6,6 +6,14 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-12
+
+### Added
+- MIDI input: WinMM on Windows, ALSA rawmidi on Linux, CoreMIDI on macOS. `tinvo midi` lists the inputs. The editor opens the first one it finds. `--midi NAME` picks another (by id or a unique part of its name), `--midi none` turns MIDI off, and `M` in the editor switches inputs.
+- Live playing: notes from the keyboard sound on the selected track. They go from the MIDI thread straight to the audio engine through a lock-free mailbox, not through the UI, and start at the beginning of the next audio callback. Drums hit at their own pitch whatever the key. Up to 32 notes can be held at once; one more releases the oldest.
+- Step entry: with `R` on, each key writes the step under the cursor (velocity from the key, length and other settings from the track's brush), and the cursor moves on when every key is up. Keys held together write a chord of up to four notes as one undo step. On drum tracks only the velocity is taken.
+- The header shows `REC` while step entry is on and a MIDI activity light while an input is open.
+
 ## [0.10.0] - 2026-11-12
 
 ### Added
@@ -143,7 +151,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/IACBI/tinvo/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/IACBI/tinvo/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/IACBI/tinvo/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/IACBI/tinvo/compare/v0.7.0...v0.8.0
