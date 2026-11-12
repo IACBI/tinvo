@@ -72,10 +72,12 @@ tinvo --device usb song.tvo        # play on the device whose name contains "usb
 tinvo probe --device realtek --low-latency 3
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
+tinvo inputs              # list the audio input devices
+tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
 ```
 
-The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor.
+The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
 
 The main keys in the editor (press `?` for the full list):
 
@@ -101,7 +103,8 @@ The main keys in the editor (press `?` for the full list):
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
-| `O` | choose the audio output device (`Tab` toggles low-latency mode) |
+| `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
+| `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
 | `M` | choose the MIDI input |
 | `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
 | `w` `W` `e` | save, save as, export WAV |
@@ -178,10 +181,12 @@ tinvo --device usb song.tvo        # play on the device whose name contains "usb
 tinvo probe --device realtek --low-latency 3
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
+tinvo inputs              # list the audio input devices
+tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
 ```
 
-Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır.
+Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
 
 Editördeki temel tuşlar (tam liste için `?`):
 
@@ -207,7 +212,8 @@ Editördeki temel tuşlar (tam liste için `?`):
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
-| `O` | ses çıkış cihazını seç (`Tab` düşük gecikme modunu açıp kapatır) |
+| `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |
+| `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |
 | `M` | MIDI girişini seç |
 | `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |

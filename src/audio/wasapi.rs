@@ -10,7 +10,8 @@
 //! that period is unavailable it falls back to the regular 20 ms buffer.
 
 use super::{
-    AudioCallback, Device, DeviceFormat, StreamConfig, StreamHealth, StreamInfo, convert_stereo, spawn_audio_thread,
+    AudioCallback, CaptureCallback, Device, DeviceFormat, InputInfo, StreamConfig, StreamHealth, StreamInfo,
+    convert_from_device, convert_stereo, spawn_audio_thread,
 };
 use std::ffi::c_void;
 use std::ptr;
@@ -45,6 +46,8 @@ const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey = PropertyKey {
 };
 const IID_IAUDIO_RENDER_CLIENT: Guid =
     Guid { d1: 0xF294_ACFC, d2: 0x3146, d3: 0x4483, d4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2] };
+const IID_IAUDIO_CAPTURE_CLIENT: Guid =
+    Guid { d1: 0xC8AD_BD64, d2: 0xE71E, d3: 0x48A0, d4: [0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17] };
 const SUBTYPE_PCM: Guid = Guid { d1: 1, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 const SUBTYPE_IEEE_FLOAT: Guid = Guid { d1: 3, d2: 0, d3: 0x10, d4: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 
@@ -57,6 +60,7 @@ const STGM_READ: u32 = 0;
 const VT_LPWSTR: u16 = 31;
 const CLSCTX_ALL: u32 = 0x17;
 const E_RENDER: i32 = 0;
+const E_CAPTURE: i32 = 1;
 const E_CONSOLE: i32 = 0;
 const AUDCLNT_SHAREMODE_SHARED: i32 = 0;
 const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x0004_0000;
@@ -67,6 +71,9 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// Requested device buffer: 20 ms in 100-ns units.
 const BUFFER_DURATION: i64 = 200_000;
+/// Capture buffer, in 100 ns units. Recording latency does not matter, and
+/// a longer buffer rides out a capture thread that is late.
+const CAPTURE_BUFFER_DURATION: i64 = 1_000_000;
 
 #[link(name = "ole32")]
 unsafe extern "system" {
@@ -185,6 +192,14 @@ struct IAudioRenderClientVtbl {
     base: IUnknownVtbl,
     get_buffer: unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> Hresult,
     release_buffer: unsafe extern "system" fn(*mut c_void, u32, u32) -> Hresult,
+}
+
+#[repr(C)]
+struct IAudioCaptureClientVtbl {
+    base: IUnknownVtbl,
+    get_buffer: unsafe extern "system" fn(*mut c_void, *mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> Hresult,
+    release_buffer: unsafe extern "system" fn(*mut c_void, u32) -> Hresult,
+    get_next_packet_size: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
 }
 
 /// WAVEFORMATEX is declared with 1-byte packing in mmreg.h.
@@ -306,20 +321,61 @@ fn enumerator() -> Result<Com, String> {
     Ok(Com(p))
 }
 
-/// The system's default render device.
-fn default_device(enumerator: &Com) -> Result<Com, String> {
+/// The system's default device for `flow` (render or capture).
+fn default_device(enumerator: &Com, flow: i32) -> Result<Com, String> {
     let mut p = ptr::null_mut();
     // SAFETY: valid enumerator and out-pointer.
     let hr = unsafe {
-        (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(
-            enumerator.0,
-            E_RENDER,
-            E_CONSOLE,
-            &mut p,
-        )
+        (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_default_audio_endpoint)(enumerator.0, flow, E_CONSOLE, &mut p)
     };
-    check(hr, "finding the default output device")?;
+    check(
+        hr,
+        if flow == E_CAPTURE { "finding the default input device" } else { "finding the default output device" },
+    )?;
     Ok(Com(p))
+}
+
+/// The device with endpoint id `id`, or the default for `flow`.
+fn find_endpoint(enumerator: &Com, id: Option<&str>, flow: i32) -> Result<Com, String> {
+    let Some(id) = id else { return default_device(enumerator, flow) };
+    let mut p = ptr::null_mut();
+    let w = wide(id);
+    // SAFETY: valid enumerator, NUL-terminated id and out-pointer.
+    let hr = unsafe { (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_device)(enumerator.0, w.as_ptr(), &mut p) };
+    check(hr, "opening the chosen device (is it still connected?)")?;
+    Ok(Com(p))
+}
+
+/// Reads a mix format: the format itself, the sample encoding TINVO can
+/// convert (if any), and the effective format tag for error messages.
+unsafe fn mix_format(mix: *const WaveFormatEx) -> (WaveFormatEx, Option<DeviceFormat>, u16) {
+    // SAFETY: `mix` is a format returned by GetMixFormat; the extensible
+    // part is only read when the header says it is there.
+    unsafe {
+        let wf = ptr::read_unaligned(mix);
+        let (tag, bits) = (wf.tag, wf.bits_per_sample);
+        let effective_tag = if tag == WAVE_FORMAT_EXTENSIBLE && wf.cb_size >= 22 {
+            let ext = ptr::read_unaligned(mix as *const WaveFormatExtensible);
+            let sub = ext.sub_format;
+            if sub == SUBTYPE_IEEE_FLOAT {
+                WAVE_FORMAT_IEEE_FLOAT
+            } else if sub == SUBTYPE_PCM {
+                WAVE_FORMAT_PCM
+            } else {
+                0
+            }
+        } else {
+            tag
+        };
+        let format = match (effective_tag, bits) {
+            (WAVE_FORMAT_IEEE_FLOAT, 32) => Some(DeviceFormat::F32),
+            (WAVE_FORMAT_PCM, 16) => Some(DeviceFormat::I16),
+            (WAVE_FORMAT_PCM, 24) => Some(DeviceFormat::I24),
+            (WAVE_FORMAT_PCM, 32) => Some(DeviceFormat::I32),
+            _ => None,
+        };
+        (wf, format, effective_tag)
+    }
 }
 
 /// The endpoint id of `device`.
@@ -356,30 +412,39 @@ fn device_name(device: &Com) -> Result<String, String> {
 
 /// Lists the active render devices.
 pub fn devices() -> Result<Vec<Device>, String> {
+    list(E_RENDER)
+}
+
+/// Lists the active capture devices.
+pub fn input_devices() -> Result<Vec<Device>, String> {
+    list(E_CAPTURE)
+}
+
+fn list(flow: i32) -> Result<Vec<Device>, String> {
     let _apartment = ComApartment::enter()?;
     let enumerator = enumerator()?;
-    let default = default_device(&enumerator).and_then(|d| device_id(&d)).ok();
+    let default = default_device(&enumerator, flow).and_then(|d| device_id(&d)).ok();
     let mut p = ptr::null_mut();
     // SAFETY: valid enumerator and out-pointer.
     let hr = unsafe {
         (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().enum_audio_endpoints)(
             enumerator.0,
-            E_RENDER,
+            flow,
             DEVICE_STATE_ACTIVE,
             &mut p,
         )
     };
-    check(hr, "listing output devices")?;
+    check(hr, "listing devices")?;
     let collection = Com(p);
     let vt = unsafe { collection.vtbl::<IMMDeviceCollectionVtbl>() };
     let mut count = 0u32;
     // SAFETY: valid collection and out-pointer.
-    check(unsafe { (vt.get_count)(collection.0, &mut count) }, "counting output devices")?;
+    check(unsafe { (vt.get_count)(collection.0, &mut count) }, "counting devices")?;
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
         let mut p = ptr::null_mut();
         // SAFETY: `i` is below the count; valid out-pointer.
-        check(unsafe { (vt.item)(collection.0, i, &mut p) }, "reading an output device")?;
+        check(unsafe { (vt.item)(collection.0, i, &mut p) }, "reading a device")?;
         let device = Com(p);
         let id = device_id(&device)?;
         let name = device_name(&device)?;
@@ -391,7 +456,7 @@ pub fn devices() -> Result<Vec<Device>, String> {
 /// Id of the current default render device.
 pub fn default_id() -> Option<String> {
     let _apartment = ComApartment::enter().ok()?;
-    default_device(&enumerator().ok()?).and_then(|d| device_id(&d)).ok()
+    default_device(&enumerator().ok()?, E_RENDER).and_then(|d| device_id(&d)).ok()
 }
 
 pub fn open<F, C>(
@@ -488,43 +553,14 @@ where
     unsafe {
         let _apartment = ComApartment::enter()?;
         let enumerator = enumerator()?;
-        let device = match &config.device {
-            None => default_device(&enumerator)?,
-            Some(id) => {
-                let mut p = ptr::null_mut();
-                let w = wide(id);
-                let hr = (enumerator.vtbl::<IMMDeviceEnumeratorVtbl>().get_device)(enumerator.0, w.as_ptr(), &mut p);
-                check(hr, "opening the chosen output device (is it still connected?)")?;
-                Com(p)
-            }
-        };
+        let device = find_endpoint(&enumerator, config.device.as_deref(), E_RENDER)?;
         let device_label = device_name(&device).unwrap_or_default();
 
         let mut client = activate(&device, &IID_IAUDIO_CLIENT)?;
         let mut mix: *mut WaveFormatEx = ptr::null_mut();
         check((client.vtbl::<IAudioClientVtbl>().get_mix_format)(client.0, &mut mix), "querying the mix format")?;
-        let wf = ptr::read_unaligned(mix);
-        let (tag, bits) = (wf.tag, wf.bits_per_sample);
-        let effective_tag = if tag == WAVE_FORMAT_EXTENSIBLE && wf.cb_size >= 22 {
-            let ext = ptr::read_unaligned(mix as *const WaveFormatExtensible);
-            let sub = ext.sub_format;
-            if sub == SUBTYPE_IEEE_FLOAT {
-                WAVE_FORMAT_IEEE_FLOAT
-            } else if sub == SUBTYPE_PCM {
-                WAVE_FORMAT_PCM
-            } else {
-                0
-            }
-        } else {
-            tag
-        };
-        let format = match (effective_tag, bits) {
-            (WAVE_FORMAT_IEEE_FLOAT, 32) => Some(DeviceFormat::F32),
-            (WAVE_FORMAT_PCM, 16) => Some(DeviceFormat::I16),
-            (WAVE_FORMAT_PCM, 24) => Some(DeviceFormat::I24),
-            (WAVE_FORMAT_PCM, 32) => Some(DeviceFormat::I32),
-            _ => None,
-        };
+        let (wf, format, effective_tag) = mix_format(mix);
+        let bits = wf.bits_per_sample;
         let sample_rate = wf.samples_per_sec;
         let channels = wf.channels;
         // A low-latency stream needs its own client; a client whose
@@ -636,6 +672,151 @@ where
             if let Err(e) = check((rc.release_buffer)(render.0, frames as u32, 0), "ReleaseBuffer") {
                 result = Err(format!("audio device lost: {e}"));
                 break;
+            }
+        }
+        (ac.stop)(client.0);
+        result
+    }
+}
+
+pub fn open_input<F, C>(
+    device: Option<String>,
+    factory: F,
+    stop: Arc<AtomicBool>,
+    health: Arc<StreamHealth>,
+) -> Result<(InputInfo, JoinHandle<()>), String>
+where
+    F: FnOnce(u32, u16) -> C + Send + 'static,
+    C: CaptureCallback,
+{
+    spawn_audio_thread(move |report| {
+        let mut reported = false;
+        // SAFETY: all COM calls follow the documented WASAPI contracts; the
+        // objects live (and are released) on this thread.
+        let result = unsafe { capture(device.as_deref(), factory, &stop, report, &mut reported) };
+        match result {
+            Err(e) if !reported => report(Err(e)),
+            Err(e) => health.fail(e),
+            Ok(()) => {}
+        }
+    })
+}
+
+/// Opens the capture device and runs the capture loop until `stop` is set.
+unsafe fn capture<F, C>(
+    id: Option<&str>,
+    factory: F,
+    stop: &AtomicBool,
+    report: &dyn Fn(Result<InputInfo, String>),
+    reported: &mut bool,
+) -> Result<(), String>
+where
+    F: FnOnce(u32, u16) -> C,
+    C: CaptureCallback,
+{
+    // SAFETY (whole function): raw COM/Win32 calls with valid arguments; every
+    // out-pointer refers to a live local.
+    unsafe {
+        let _apartment = ComApartment::enter()?;
+        let enumerator = enumerator()?;
+        let device = find_endpoint(&enumerator, id, E_CAPTURE)?;
+        let device_label = device_name(&device).unwrap_or_default();
+        let client = activate(&device, &IID_IAUDIO_CLIENT)?;
+        let ac = client.vtbl::<IAudioClientVtbl>();
+        let mut mix: *mut WaveFormatEx = ptr::null_mut();
+        check((ac.get_mix_format)(client.0, &mut mix), "querying the mix format")?;
+        let (wf, format, effective_tag) = mix_format(mix);
+        let hr = (ac.initialize)(
+            client.0,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            CAPTURE_BUFFER_DURATION,
+            0,
+            mix,
+            ptr::null(),
+        );
+        CoTaskMemFree(mix as *mut c_void);
+        let bits = wf.bits_per_sample;
+        let format = format.ok_or_else(|| format!("unsupported device format (tag {effective_tag}, {bits} bits)"))?;
+        check(hr, "initializing the capture client")?;
+        let (sample_rate, channels) = (wf.samples_per_sec, wf.channels);
+        if channels == 0 {
+            return Err("device reports zero channels".into());
+        }
+        let keep = usize::from(channels.min(2));
+
+        let event = Event(CreateEventW(ptr::null_mut(), 0, 0, ptr::null()));
+        if event.0.is_null() {
+            return Err("CreateEventW failed".into());
+        }
+        check((ac.set_event_handle)(client.0, event.0), "setting the event handle")?;
+        let mut buffer_frames = 0u32;
+        check((ac.get_buffer_size)(client.0, &mut buffer_frames), "querying the buffer size")?;
+        let mut p = ptr::null_mut();
+        check((ac.get_service)(client.0, &IID_IAUDIO_CAPTURE_CLIENT, &mut p), "getting the capture client")?;
+        let capture = Com(p);
+        let cc = capture.vtbl::<IAudioCaptureClientVtbl>();
+
+        // Allocation happens here, before capture starts.
+        let mut callback = factory(sample_rate, keep as u16);
+        let mut scratch = vec![0.0f32; buffer_frames.max(1) as usize * keep];
+        let (ch, width) = (usize::from(channels), format.bytes());
+
+        let task_name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut task_index = 0u32;
+        let _mmcss = MmcssTask(AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index));
+
+        check((ac.start)(client.0), "starting capture")?;
+        *reported = true;
+        report(Ok(InputInfo {
+            backend: "WASAPI",
+            device: device_label,
+            sample_rate,
+            device_channels: channels,
+            channels: keep as u16,
+            format: format!("{format:?}"),
+        }));
+
+        let mut result = Ok(());
+        'run: while !stop.load(Ordering::Acquire) {
+            if WaitForSingleObject(event.0, 2000) != WAIT_OBJECT_0 {
+                result = Err("input device stopped responding".to_string());
+                break;
+            }
+            loop {
+                let mut packet = 0u32;
+                if let Err(e) = check((cc.get_next_packet_size)(capture.0, &mut packet), "GetNextPacketSize") {
+                    result = Err(format!("input device lost: {e}"));
+                    break 'run;
+                }
+                if packet == 0 {
+                    break;
+                }
+                let (mut data, mut frames, mut flags) = (ptr::null_mut(), 0u32, 0u32);
+                let hr =
+                    (cc.get_buffer)(capture.0, &mut data, &mut frames, &mut flags, ptr::null_mut(), ptr::null_mut());
+                if let Err(e) = check(hr, "GetBuffer") {
+                    result = Err(format!("input device lost: {e}"));
+                    break 'run;
+                }
+                let n = frames as usize;
+                let mut done = 0;
+                while done < n {
+                    let chunk = (n - done).min(scratch.len() / keep);
+                    let dst = &mut scratch[..chunk * keep];
+                    if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
+                        dst.fill(0.0);
+                    } else {
+                        let src = std::slice::from_raw_parts(data.add(done * ch * width), chunk * ch * width);
+                        convert_from_device(src, ch, format, keep, dst);
+                    }
+                    callback.capture(dst);
+                    done += chunk;
+                }
+                if let Err(e) = check((cc.release_buffer)(capture.0, frames), "ReleaseBuffer") {
+                    result = Err(format!("input device lost: {e}"));
+                    break 'run;
+                }
             }
         }
         (ac.stop)(client.0);

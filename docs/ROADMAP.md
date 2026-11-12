@@ -121,7 +121,7 @@ Known limits:
 - ALSA and CoreAudio device listing compiles and links in CI, but has not run on real hardware. ALSA and CoreAudio cannot report the default device changing; the system routes their default streams itself.
 - Reconnecting rebuilds the engine from the project: playback stops, and ringing notes and effect tails are cut.
 
-## Phase 5b: MIDI input ✅ (0.11.0, this release)
+## Phase 5b: MIDI input ✅ (0.11.0)
 
 - MIDI input through WinMM, ALSA rawmidi and CoreMIDI, with a byte-stream parser that handles running status, interleaved real-time bytes, system exclusive and system common messages.
 - Live playing on the selected track: a lock-free mailbox from the MIDI thread to the audio engine, bypassing the UI.
@@ -135,10 +135,21 @@ Known limits:
 - A MIDI input that is unplugged stays silent until another one is picked with `M`; it is not reopened by itself.
 - If more than 256 notes arrive within one audio callback, the extra ones are dropped (a dropped release would leave a note held until the key is pressed again).
 
-## Phase 5c–5d: More I/O
+## Phase 5c: Audio input and recording ✅ (0.12.0, this release)
 
-- 5c: Audio input and recording.
-- 5d: CoreAudio HAL unit; JACK/PipeWire native paths; the ALSA sequencer.
+- Capture on all three backends, through a wait-free ring of whole frames from the capture thread to the UI, which streams it to a 32-bit float WAV.
+- Recording into sampler tracks (`I`) as one undo step, `tinvo record`, `tinvo inputs`, an input page in the device list and `--input`.
+
+Known limits:
+- Recording is free-running: it starts and stops on the key, not on the beat, and is not aligned with playback. Input and output latency are not compensated, so a take recorded over the beat lands late by both latencies.
+- There is no input monitoring through TINVO; use the interface's or the system's own monitoring.
+- The ring holds 2^20 frames (about 21 s at 48 kHz). If the editor stalls longer than that, frames are dropped, counted and reported, never torn.
+- A take ends at the longest sample TINVO loads (2^25 frames, about 11.6 minutes at 48 kHz).
+- WASAPI capture was recorded from the development machine's microphone (3 s, 48 kHz stereo, no dropped frames). ALSA and CoreAudio capture compile and link in CI but have not run on real hardware. macOS asks for microphone permission the first time and delivers silence until it is granted.
+
+## Phase 5d: More I/O
+
+- CoreAudio HAL unit; JACK/PipeWire native paths; the ALSA sequencer.
 
 ## Phase 6: Polish and production hardening
 

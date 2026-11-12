@@ -27,6 +27,7 @@ pub mod instrument;
 pub mod midi;
 pub mod mix;
 pub mod project;
+pub mod record;
 pub mod render;
 pub mod rt;
 pub mod sample;

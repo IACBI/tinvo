@@ -17,6 +17,7 @@ use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
+use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
@@ -294,6 +295,21 @@ pub struct DevicePicker {
     pub devices: Vec<Device>,
     pub cursor: usize,
     pub low_latency: bool,
+    /// The input page (←→ switches): devices to record from. Entry 0 is
+    /// the system default.
+    pub inputs: Vec<Device>,
+    pub input_cursor: usize,
+    pub input_page: bool,
+}
+
+/// A recording into a sampler track.
+struct Take {
+    recorder: Recorder,
+    /// The track it will load into; follows track insertions and removals
+    /// (`None` once that track is gone).
+    track: Option<usize>,
+    /// Input level for the header, falling back like the meters.
+    level: f32,
 }
 
 pub struct App {
@@ -353,6 +369,9 @@ pub struct App {
     midi_seen: Option<Instant>,
     /// MIDI notes write steps at the cursor.
     pub step_entry: bool,
+    /// The input device to record from (`None`: the system default).
+    pub input_device: Option<String>,
+    take: Option<Take>,
     /// Keys held during step entry, and the notes of the step they write.
     entry_held: Vec<u8>,
     entry_notes: Vec<(u8, u8)>,
@@ -426,6 +445,8 @@ impl App {
             live_track_sent: None,
             midi_seen: None,
             step_entry: false,
+            input_device: None,
+            take: None,
             entry_held: Vec::new(),
             entry_notes: Vec::new(),
             entry_change: None,
@@ -474,6 +495,87 @@ impl App {
         self.reduction = [0.0; MAX_TRACKS];
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
+    }
+
+    /// Whether a recording is running.
+    pub fn recording(&self) -> bool {
+        self.take.is_some()
+    }
+
+    /// Starts recording into the selected sampler track, or stops and
+    /// loads the recording.
+    pub fn toggle_recording(&mut self) {
+        if self.take.is_some() {
+            self.finish_take(true, None);
+            return;
+        }
+        if self.song_view || self.track >= self.track_count() {
+            self.set_status("Select a sampler track to record into (a, 7 adds one)");
+            return;
+        }
+        if self.project.tracks[self.track].kind != InstrumentKind::Sampler {
+            self.set_status("Recordings go into sampler tracks (a, 7 adds one)");
+            return;
+        }
+        let dir = match self.path.as_ref().and_then(|p| p.parent()) {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let stem = self.path.as_ref().and_then(|p| p.file_stem()).map_or("untitled".into(), |s| s.to_string_lossy());
+        let path = record_mod::next_take_path(&dir, &stem, &self.project.tracks[self.track].name);
+        match Recorder::start(self.input_device.as_deref(), &path) {
+            Ok(recorder) => {
+                let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                self.set_status(format!("Recording from {} into {name} (I stops)", recorder.device()));
+                self.take = Some(Take { recorder, track: Some(self.track), level: 0.0 });
+            }
+            Err(e) => self.set_status(format!("Cannot record: {e}")),
+        }
+    }
+
+    /// Ends the recording; with `load`, loads it into its track as one
+    /// undo step. `why` explains a stop the user did not ask for.
+    fn finish_take(&mut self, load: bool, why: Option<String>) {
+        let Some(take) = self.take.take() else { return };
+        let why = why.map_or(String::new(), |w| format!("{w}; "));
+        let rec = match take.recorder.finish() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status(format!("Recording stopped: {why}{e}"));
+                return;
+            }
+        };
+        let lost = if rec.dropped > 0 {
+            format!(" ({} frames lost: the editor fell behind)", rec.dropped)
+        } else {
+            String::new()
+        };
+        let file = rec.path.display().to_string();
+        match take.track {
+            Some(t) if load && self.project.tracks.get(t).is_some_and(|t| t.kind == InstrumentKind::Sampler) => {
+                self.track = t;
+                self.load_sample(&file);
+                self.set_status(format!("{why}Recorded {:.1} s into {file}{lost}", rec.seconds()));
+            }
+            _ => self.set_status(format!("{why}Recorded {:.1} s to {file} (o loads it){lost}", rec.seconds())),
+        }
+    }
+
+    /// Moves captured audio to disk and updates the level.
+    fn tick_recording(&mut self) {
+        let Some(take) = &mut self.take else { return };
+        take.level = take.recorder.take_peak().max(take.level * 0.85);
+        match take.recorder.drain() {
+            Ok(false) => {}
+            Ok(true) => self.finish_take(true, Some("longest sample reached".into())),
+            Err(e) => self.finish_take(true, Some(e)),
+        }
+    }
+
+    /// Completes a running recording without loading it (the session is
+    /// ending).
+    pub fn end_recording(&mut self) {
+        self.finish_take(false, None);
     }
 
     /// The MIDI input change the user asked for, if any.
@@ -593,21 +695,37 @@ impl App {
     }
 
     /// Shows the device picker for `devices`, on the device in use.
-    pub fn open_device_picker(&mut self, devices: Vec<Device>) {
-        let cursor = self
-            .audio_config
-            .device
-            .as_ref()
-            .and_then(|id| devices.iter().position(|d| &d.id == id))
-            .map_or(0, |i| i + 1);
-        self.mode = Mode::Devices(DevicePicker { devices, cursor, low_latency: self.audio_config.low_latency });
+    pub fn open_device_picker(&mut self, devices: Vec<Device>, inputs: Vec<Device>) {
+        let at = |list: &[Device], id: Option<&String>| {
+            id.and_then(|id| list.iter().position(|d| &d.id == id)).map_or(0, |i| i + 1)
+        };
+        self.mode = Mode::Devices(DevicePicker {
+            cursor: at(&devices, self.audio_config.device.as_ref()),
+            input_cursor: at(&inputs, self.input_device.as_ref()),
+            devices,
+            inputs,
+            low_latency: self.audio_config.low_latency,
+            input_page: false,
+        });
     }
 
     fn key_devices(&mut self, mut p: DevicePicker, key: Key) {
+        let (cursor, len) =
+            if p.input_page { (&mut p.input_cursor, p.inputs.len()) } else { (&mut p.cursor, p.devices.len()) };
         match key {
-            Key::Up => p.cursor = p.cursor.saturating_sub(1),
-            Key::Down => p.cursor = (p.cursor + 1).min(p.devices.len()),
-            Key::Tab | Key::BackTab => p.low_latency = !p.low_latency,
+            Key::Left | Key::Right => p.input_page = !p.input_page,
+            Key::Up => *cursor = cursor.saturating_sub(1),
+            Key::Down => *cursor = (*cursor + 1).min(len),
+            Key::Tab | Key::BackTab if !p.input_page => p.low_latency = !p.low_latency,
+            Key::Enter if p.input_page => {
+                let chosen = p.input_cursor.checked_sub(1).map(|i| &p.inputs[i]);
+                self.input_device = chosen.map(|d| d.id.clone());
+                let name = chosen.map_or("the system default", |d| d.name.as_str());
+                let later = if self.take.is_some() { " (from the next recording)" } else { "" };
+                self.set_status(format!("Recording input: {name}{later}"));
+                self.mode = Mode::Normal;
+                return;
+            }
             Key::Enter => {
                 let device = p.cursor.checked_sub(1).map(|i| p.devices[i].id.clone());
                 self.audio_request = Some(StreamConfig { device, low_latency: p.low_latency });
@@ -731,6 +849,9 @@ impl App {
                         self.brushes.remove(usize::from(t));
                     }
                     _ => {}
+                }
+                if let Some(take) = &mut self.take {
+                    take.track = follow_track(take.track, &applied);
                 }
                 if let Some(l) = &mut self.link {
                     l.send(Command::Edit(applied));
@@ -976,6 +1097,7 @@ impl App {
 
     /// Pulls playhead, meters and load from the audio thread.
     pub fn tick(&mut self) {
+        self.tick_recording();
         if self.link.is_some() && self.live_track_sent != Some(self.track) {
             self.send(Command::SetLiveTrack(self.track.min(usize::from(u8::MAX)) as u8));
             self.live_track_sent = Some(self.track);
@@ -1202,9 +1324,11 @@ impl App {
                 self.set_status(status);
             }
             Key::Char('O') => match audio::output_devices() {
-                Ok(devices) => self.open_device_picker(devices),
+                // An input listing failure only leaves that page empty.
+                Ok(devices) => self.open_device_picker(devices, audio::input_devices().unwrap_or_default()),
                 Err(e) => self.set_status(format!("Cannot list output devices: {e}")),
             },
+            Key::Char('I') => self.toggle_recording(),
             Key::Char('f') => {
                 let (page, status) = match self.page {
                     Page::Instrument => {
@@ -1769,7 +1893,15 @@ impl App {
         s.put(x, 0, &info, bar);
         let short_term = self.loudness[1];
         let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
-        let rec = if self.step_entry { "REC  " } else { "" };
+        let rec = match &self.take {
+            Some(t) => {
+                let secs = t.recorder.seconds();
+                let level = if t.level > 0.0 { format!("{:.0} dB", gain_to_db(t.level)) } else { "-inf".into() };
+                format!("● REC {}:{:04.1} IN {level}  ", (secs / 60.0) as u32, secs % 60.0)
+            }
+            None if self.step_entry => "REC  ".to_string(),
+            None => String::new(),
+        };
         let midi = match (&self.midi_input, self.midi_seen) {
             (None, _) => "",
             (Some(_), Some(t)) if t.elapsed() < Duration::from_millis(150) => "MIDI●  ",
@@ -2192,7 +2324,21 @@ impl App {
 
     fn draw_devices(&self, s: &mut Screen, p: &DevicePicker) {
         let h = s.height();
-        s.put(2, 1, "Audio output", Style::fg(Color::BrightWhite).bold());
+        let (on, off) = (Style::fg(Color::Black).on(Color::BrightWhite).bold(), Style::fg(Color::Gray));
+        let x = s.put(2, 1, " Audio output ", if p.input_page { off } else { on });
+        s.put(3 + x, 1, " Audio input ", if p.input_page { on } else { off });
+        if p.input_page {
+            let current = self.input_device.as_deref();
+            let mut entries = vec![("System default".to_string(), current.is_none())];
+            for d in &p.inputs {
+                let default = if d.is_default { "  (default)" } else { "" };
+                entries.push((format!("{}{default}", d.name), current == Some(d.id.as_str())));
+            }
+            s.put(2, 2, "Records into the selected sampler track with I", Style::fg(Color::Gray));
+            draw_list(s, &entries, p.input_cursor);
+            s.put(2, h.saturating_sub(2), "←→ output/input  ↑↓ choose  Enter use  Esc cancel", Style::fg(Color::Gray));
+            return;
+        }
         s.put(2, 2, &format!("Now: {}", self.audio_label), Style::fg(Color::Gray));
         let current = self.audio_config.device.as_deref();
         let mut entries = vec![("System default (follows changes)".to_string(), current.is_none())];
@@ -2205,9 +2351,20 @@ impl App {
         s.put(
             2,
             h.saturating_sub(2),
-            &format!("↑↓ choose  Enter switch  Tab low latency: {ll} (WASAPI)  Esc cancel"),
+            &format!("←→ output/input  ↑↓ choose  Enter switch  Tab low latency: {ll} (WASAPI)  Esc cancel"),
             Style::fg(Color::Gray),
         );
+    }
+}
+
+/// Where track `track` is after `e` (`None` once it is removed).
+fn follow_track(track: Option<usize>, e: &Edit) -> Option<usize> {
+    let t = track?;
+    match *e {
+        Edit::InsertTrack { index, .. } if usize::from(index) <= t => Some(t + 1),
+        Edit::RemoveTrack(r) if usize::from(r) == t => None,
+        Edit::RemoveTrack(r) if usize::from(r) < t => Some(t - 1),
+        _ => Some(t),
     }
 }
 
@@ -2263,7 +2420,8 @@ fn draw_help(s: &mut Screen) {
         ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
         ("a D r", "add / delete / rename track"),
         ("o", "load a WAV file into a sampler track"),
-        ("O", "audio output device (and low-latency mode)"),
+        ("O", "audio output and input devices (Tab: low-latency output; ←→: output / input)"),
+        ("I", "record from the audio input into the sampler track; I again stops and loads it"),
         ("M R", "MIDI input; step entry: keys write the step at the cursor (held together: a chord)"),
         ("f", "parameter panel: instrument, channel strip (EQ, compressor, drive, sends), buses and master"),
         ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
@@ -2569,7 +2727,12 @@ impl MidiSession {
 }
 
 /// Runs the interactive session until the user quits.
-pub fn run(path: Option<PathBuf>, config: StreamConfig, midi_start: MidiStart) -> Result<(), String> {
+pub fn run(
+    path: Option<PathBuf>,
+    config: StreamConfig,
+    midi_start: MidiStart,
+    input: Option<String>,
+) -> Result<(), String> {
     let (project, path, mut message) = match path {
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
@@ -2592,6 +2755,7 @@ pub fn run(path: Option<PathBuf>, config: StreamConfig, midi_start: MidiStart) -
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
     let mut app = App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples);
+    app.input_device = input;
     let mut midi = MidiSession::new();
     let mut output = Output::new(config, Some(midi.live.clone()));
     let midi_id = match midi_start {
@@ -2641,6 +2805,7 @@ pub fn run(path: Option<PathBuf>, config: StreamConfig, midi_start: MidiStart) -
             term.write(&out).map_err(|e| e.to_string())?;
         }
     }
+    app.end_recording();
     drop(term);
     drop(midi);
     drop(output);
@@ -3520,7 +3685,7 @@ mod tests {
         let d = |id: &str, name: &str| Device { id: id.into(), name: name.into(), is_default: id == "{a}" };
         let devices = vec![d("{a}", "Speakers"), d("{b}", "Headphones")];
         a.audio_config = StreamConfig { device: Some("{b}".into()), low_latency: false };
-        a.open_device_picker(devices.clone());
+        a.open_device_picker(devices.clone(), Vec::new());
         let Mode::Devices(p) = &a.mode else { panic!("picker not shown") };
         assert_eq!(p.cursor, 2, "starts on the device in use");
         keys(&mut a, &[Key::Up, Key::Up, Key::Up, Key::Tab, Key::Enter]);
@@ -3528,13 +3693,100 @@ mod tests {
         assert_eq!(a.take_audio_request(), Some(StreamConfig { device: None, low_latency: true }));
         assert_eq!(a.take_audio_request(), None);
 
-        a.open_device_picker(devices);
+        a.open_device_picker(devices, Vec::new());
         keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Enter]);
         assert_eq!(a.take_audio_request(), Some(StreamConfig { device: Some("{b}".into()), low_latency: false }));
 
-        a.open_device_picker(Vec::new());
+        a.open_device_picker(Vec::new(), Vec::new());
         keys(&mut a, &[Key::Down, Key::Esc]);
         assert_eq!((a.mode.clone(), a.take_audio_request()), (Mode::Normal, None));
+    }
+
+    #[test]
+    fn the_input_page_chooses_where_recordings_come_from() {
+        let mut a = app();
+        let d = |id: &str, name: &str| Device { id: id.into(), name: name.into(), is_default: false };
+        let inputs = vec![d("{m}", "Microphone"), d("{l}", "Line in")];
+        a.open_device_picker(vec![d("{a}", "Speakers")], inputs.clone());
+        // Tab is low latency on the output page only.
+        keys(&mut a, &[Key::Right, Key::Tab, Key::Down, Key::Down, Key::Enter]);
+        assert_eq!(a.input_device.as_deref(), Some("{l}"));
+        assert_eq!(a.take_audio_request(), None, "choosing an input leaves the output alone");
+        assert!(a.status_text().unwrap().contains("Line in"));
+        a.open_device_picker(Vec::new(), inputs);
+        let Mode::Devices(p) = &a.mode else { panic!("picker not shown") };
+        assert_eq!((p.input_cursor, p.low_latency), (2, false));
+        // Left switches pages too; entry 0 is the system default.
+        keys(&mut a, &[Key::Left, Key::Up, Key::Up, Key::Enter]);
+        assert_eq!(a.input_device, None);
+        assert!(a.status_text().unwrap().contains("system default"));
+    }
+
+    #[test]
+    fn recording_needs_a_sampler_track() {
+        let mut a = app();
+        a.track = 0; // kick
+        a.toggle_recording();
+        assert!(!a.recording());
+        assert!(a.status_text().unwrap().contains("sampler"));
+        a.song_view = true;
+        a.toggle_recording();
+        assert!(!a.recording());
+    }
+
+    /// Records into a sampler track on this machine's default input, with
+    /// tracks inserted and removed meanwhile; skipped without an input.
+    #[test]
+    fn recording_loads_the_take_into_its_track_as_one_undo_step() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.path = Some(dir.join("song.tvo"));
+        keys(&mut a, &[Key::Char('a'), Key::Char('7')]);
+        let sampler = a.track_count() - 1;
+        a.project.tracks[sampler].name = "Vox".into();
+        a.track = sampler;
+        a.toggle_recording();
+        if !a.recording() {
+            eprintln!("no input device; skipping: {:?}", a.status_text());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // The take follows its track while others come and go.
+        assert!(a.edit(Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick }));
+        assert!(a.edit(Edit::RemoveTrack(1)));
+        let begin = Instant::now();
+        while begin.elapsed() < Duration::from_millis(300) {
+            a.tick();
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        a.track = 0;
+        keys(&mut a, &[Key::Char('I')]);
+        assert!(!a.recording());
+        let t = a.project.tracks.iter().position(|t| t.name == "Vox").unwrap();
+        assert_eq!(a.track, t, "the recorded track is selected");
+        let file = dir.join("song-Vox-01.wav");
+        assert_eq!(a.project.tracks[t].sample.as_deref().map(PathBuf::from), Some(file.clone()));
+        assert!(a.bank.contains_key(&file.to_string_lossy().into_owned()));
+        assert!(a.status_text().unwrap().contains("Recorded"), "{:?}", a.status_text());
+        a.undo();
+        assert_eq!(a.project.tracks[t].sample, None);
+        assert!(file.exists(), "undo keeps the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_take_follows_its_track_through_insertions_and_removals() {
+        let ins = |index| Edit::InsertTrack { index, kind: InstrumentKind::Kick };
+        assert_eq!(follow_track(Some(3), &ins(0)), Some(4));
+        assert_eq!(follow_track(Some(3), &ins(3)), Some(4), "inserted at its place: it moves down");
+        assert_eq!(follow_track(Some(3), &ins(4)), Some(3));
+        assert_eq!(follow_track(Some(3), &Edit::RemoveTrack(1)), Some(2));
+        assert_eq!(follow_track(Some(3), &Edit::RemoveTrack(3)), None, "its track is gone");
+        assert_eq!(follow_track(Some(3), &Edit::RemoveTrack(5)), Some(3));
+        assert_eq!(follow_track(Some(3), &Edit::AddTrack(InstrumentKind::Kick)), Some(3));
+        assert_eq!(follow_track(None, &ins(0)), None);
     }
 
     /// Drives the real output on this machine's devices; skips where there
@@ -3726,13 +3978,18 @@ mod tests {
                     devices: vec![Device { id: "{x}".into(), name: "Speakers".into(), is_default: true }],
                     cursor: 1,
                     low_latency: false,
+                    inputs: vec![Device { id: "{m}".into(), name: "Microphone".into(), is_default: true }],
+                    input_cursor: 1,
+                    input_page: false,
                 };
+                let input_picker = DevicePicker { input_page: true, ..picker.clone() };
                 for mode in [
                     Mode::Normal,
                     Mode::Help,
                     Mode::AddTrack,
                     Mode::Prompt(PromptKind::Export, "x".into()),
-                    Mode::Devices(picker),
+                    Mode::Devices(picker.clone()),
+                    Mode::Devices(input_picker.clone()),
                     Mode::MidiInputs(MidiPicker {
                         ports: vec![midi::Port { id: "0".into(), name: "Keys".into() }],
                         cursor: 0,

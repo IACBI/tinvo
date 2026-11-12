@@ -12,6 +12,7 @@ use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
 use tinvo::instrument::InstrumentKind;
 use tinvo::midi;
 use tinvo::project::{Project, pattern_name};
+use tinvo::record::Recorder;
 use tinvo::render::{self, RenderOptions, Source};
 use tinvo::strip::sp;
 use tinvo::wav::{self, SampleFormat};
@@ -28,6 +29,10 @@ USAGE:
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
     tinvo midi                          list the MIDI inputs
+    tinvo inputs                        list the audio input devices
+    tinvo record OUT.wav [SECONDS] [--input NAME]
+                                        record from an audio input (default 5 s) to a
+                                        32-bit float WAV file
     tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
     tinvo bench                         measure rendering speed against real time
     tinvo --help | --version
@@ -39,12 +44,14 @@ AUDIO:
                                         backend supports it (WASAPI)
     --midi NAME | none                  play from this MIDI input (its id, or a unique
                                         part of its name; default: the first one)
+    --input NAME                        record from this audio input (I in the editor;
+                                        default: the system default)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None => tinvo::app::run(None, StreamConfig::default(), MidiStart::First),
+        None => tinvo::app::run(None, StreamConfig::default(), MidiStart::First, None),
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             Ok(())
@@ -58,6 +65,8 @@ fn main() -> ExitCode {
         Some("probe") => cmd_probe(&args[1..]),
         Some("devices") => cmd_devices(),
         Some("midi") => cmd_midi(),
+        Some("inputs") => cmd_inputs(),
+        Some("record") => cmd_record(&args[1..]),
         Some("bench") => cmd_bench(),
         Some(_) => cmd_edit(&args),
     };
@@ -225,15 +234,83 @@ fn midi_option(args: Vec<String>) -> Result<(MidiStart, Vec<String>), String> {
     Ok((start, rest))
 }
 
+/// Takes `--input` out of `args`, returning the input id and the rest.
+fn input_option(args: Vec<String>) -> Result<(Option<String>, Vec<String>), String> {
+    let mut input = None;
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--input" {
+            let query = it.next().ok_or("--input needs a device name or id")?;
+            let devices = audio::input_devices()?;
+            input = Some(audio::find_device(&devices, &query)?.id.clone());
+        } else {
+            rest.push(a);
+        }
+    }
+    Ok((input, rest))
+}
+
 fn cmd_edit(args: &[String]) -> Result<(), String> {
     let (config, rest) = audio_options(args)?;
     let (midi_start, rest) = midi_option(rest)?;
+    let (input, rest) = input_option(rest)?;
     match &rest[..] {
-        [] => tinvo::app::run(None, config, midi_start),
+        [] => tinvo::app::run(None, config, midi_start, input),
         [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start),
+        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input),
         _ => Err(format!("too many arguments\n\n{USAGE}")),
     }
+}
+
+fn cmd_inputs() -> Result<(), String> {
+    let devices = audio::input_devices()?;
+    if devices.is_empty() {
+        println!("No input devices.");
+    }
+    for d in &devices {
+        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, d.name, d.id);
+    }
+    if devices.iter().any(|d| d.is_default) {
+        println!("(* is the system default)");
+    }
+    Ok(())
+}
+
+fn cmd_record(args: &[String]) -> Result<(), String> {
+    let (input, rest) = input_option(args.to_vec())?;
+    let (out, seconds) = match &rest[..] {
+        [out] => (out, 5.0),
+        [out, s] => (out, s.parse::<f64>().map_err(|_| format!("'{s}' is not a number of seconds"))?),
+        _ => return Err(format!("record needs an output file\n\n{USAGE}")),
+    };
+    if !(seconds > 0.0 && seconds <= 3600.0) {
+        return Err("record length must be between 0 and 3600 seconds".into());
+    }
+    let path = PathBuf::from(out);
+    let mut r = Recorder::start(input.as_deref(), &path)?;
+    println!("Recording {seconds} s from {} ...", r.device());
+    let start = Instant::now();
+    let mut peak = 0.0f32;
+    while start.elapsed().as_secs_f64() < seconds {
+        if r.drain()? {
+            break;
+        }
+        peak = peak.max(r.take_peak());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    peak = peak.max(r.take_peak());
+    let rec = r.finish()?;
+    let peak_db = if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "silence".into() };
+    println!(
+        "Wrote {}: {:.2} s, {} Hz, {} channel(s), peak {peak_db}, {} frames dropped",
+        rec.path.display(),
+        rec.seconds(),
+        rec.sample_rate,
+        rec.channels,
+        rec.dropped
+    );
+    Ok(())
 }
 
 fn cmd_midi() -> Result<(), String> {

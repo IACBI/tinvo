@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-12
+
+### Added
+- Audio input and recording: WASAPI capture on Windows, ALSA capture on Linux, an AudioQueue input on macOS. `tinvo inputs` lists the input devices, and `tinvo record OUT.wav [SECONDS] [--input NAME]` records to a file and reports the length, peak and any dropped frames.
+- `I` in the editor records into the selected sampler track. The take is written next to the project as `<project>-<track>-NN.wav`, a 32-bit float WAV with the device's sample rate and its first one or two channels, so nothing the device delivered is changed. `I` again stops it and loads it into the track as one undo step; undo keeps the file. If tracks are inserted or removed meanwhile, the take still goes to its own track. A take whose track was deleted is kept as a file.
+- The `O` device list has an input page (`←` `→`), and `--input NAME` picks the input from the command line.
+- While recording, the header shows `● REC`, the elapsed time and the input level.
+
+### Changed
+- A device name that matches nothing says "no device matches" for inputs and outputs alike.
+
 ## [0.11.0] - 2026-11-12
 
 ### Added
@@ -151,7 +162,8 @@ Author: 𝓐.𝓒.𝓑
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/IACBI/tinvo/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/IACBI/tinvo/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/IACBI/tinvo/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/IACBI/tinvo/compare/v0.8.0...v0.9.0

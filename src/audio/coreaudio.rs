@@ -5,7 +5,9 @@
 //! HAL's devices that have output streams, identified by their UID; the queue
 //! plays on the system default unless one is set.
 
-use super::{AudioCallback, Device, StreamConfig, StreamHealth, StreamInfo, spawn_audio_thread};
+use super::{
+    AudioCallback, CaptureCallback, Device, InputInfo, StreamConfig, StreamHealth, StreamInfo, spawn_audio_thread,
+};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -16,6 +18,8 @@ use std::time::Duration;
 const SAMPLE_RATE: f64 = 48_000.0;
 const BUFFER_FRAMES: u32 = 512;
 const BUFFER_COUNT: usize = 3;
+/// Frames per input buffer (about 43 ms): recording does not need it short.
+const CAPTURE_BUFFER_FRAMES: u32 = 2048;
 const K_AUDIO_FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
 const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1;
 const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 8;
@@ -46,9 +50,21 @@ struct AudioQueueBuffer {
 
 type AudioQueueRef = *mut c_void;
 type OutputCallback = unsafe extern "C" fn(*mut c_void, AudioQueueRef, *mut AudioQueueBuffer);
+/// (user data, queue, buffer, start time, packet description count, packet descriptions).
+type InputCallback =
+    unsafe extern "C" fn(*mut c_void, AudioQueueRef, *mut AudioQueueBuffer, *const c_void, u32, *const c_void);
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
+    fn AudioQueueNewInput(
+        format: *const AudioStreamBasicDescription,
+        callback: InputCallback,
+        user_data: *mut c_void,
+        run_loop: *mut c_void,
+        run_loop_mode: *const c_void,
+        flags: u32,
+        out_queue: *mut AudioQueueRef,
+    ) -> i32;
     fn AudioQueueNewOutput(
         format: *const AudioStreamBasicDescription,
         callback: OutputCallback,
@@ -115,11 +131,13 @@ const fn fourcc(b: &[u8; 4]) -> u32 {
 }
 const PROP_DEVICES: u32 = fourcc(b"dev#");
 const PROP_DEFAULT_OUTPUT: u32 = fourcc(b"dOut");
+const PROP_DEFAULT_INPUT: u32 = fourcc(b"dIn ");
 const PROP_STREAMS: u32 = fourcc(b"stm#");
 const PROP_UID: u32 = fourcc(b"uid ");
 const PROP_NAME: u32 = fourcc(b"lnam");
 const SCOPE_GLOBAL: u32 = fourcc(b"glob");
 const SCOPE_OUTPUT: u32 = fourcc(b"outp");
+const SCOPE_INPUT: u32 = fourcc(b"inpt");
 const QUEUE_CURRENT_DEVICE: u32 = fourcc(b"aqcd");
 
 fn address(selector: u32, scope: u32) -> PropertyAddress {
@@ -162,23 +180,28 @@ fn string_property(device: u32, selector: u32) -> Option<String> {
     unsafe { take_cf_string(s) }
 }
 
-fn has_output(device: u32) -> bool {
+/// Whether `device` has streams in `scope` (output or input).
+fn has_streams(device: u32, scope: u32) -> bool {
     let mut size = 0u32;
     // SAFETY: valid address and out-pointer.
-    let status = unsafe {
-        AudioObjectGetPropertyDataSize(device, &address(PROP_STREAMS, SCOPE_OUTPUT), 0, ptr::null(), &mut size)
-    };
+    let status =
+        unsafe { AudioObjectGetPropertyDataSize(device, &address(PROP_STREAMS, scope), 0, ptr::null(), &mut size) };
     status == 0 && size > 0
 }
 
 fn default_device() -> Option<u32> {
+    default_for(PROP_DEFAULT_OUTPUT)
+}
+
+/// The default device `selector` names (`dOut` or `dIn `).
+fn default_for(selector: u32) -> Option<u32> {
     let mut id = 0u32;
     let mut size = 4u32;
     // SAFETY: the property is one AudioObjectID.
     let status = unsafe {
         AudioObjectGetPropertyData(
             SYSTEM_OBJECT,
-            &address(PROP_DEFAULT_OUTPUT, SCOPE_GLOBAL),
+            &address(selector, SCOPE_GLOBAL),
             0,
             ptr::null(),
             &mut size,
@@ -190,6 +213,15 @@ fn default_device() -> Option<u32> {
 
 /// Lists the devices with output streams.
 pub fn devices() -> Result<Vec<Device>, String> {
+    list(SCOPE_OUTPUT, PROP_DEFAULT_OUTPUT)
+}
+
+/// Lists the devices with input streams.
+pub fn input_devices() -> Result<Vec<Device>, String> {
+    list(SCOPE_INPUT, PROP_DEFAULT_INPUT)
+}
+
+fn list(scope: u32, default_selector: u32) -> Result<Vec<Device>, String> {
     let addr = address(PROP_DEVICES, SCOPE_GLOBAL);
     let mut size = 0u32;
     // SAFETY: valid address and out-pointer.
@@ -205,10 +237,10 @@ pub fn devices() -> Result<Vec<Device>, String> {
         return Err(format!("cannot list audio devices (OSStatus {status})"));
     }
     ids.truncate(size as usize / 4);
-    let default = default_device();
+    let default = default_for(default_selector);
     Ok(ids
         .into_iter()
-        .filter(|&d| has_output(d))
+        .filter(|&d| has_streams(d, scope))
         .filter_map(|d| {
             let id = string_property(d, PROP_UID)?;
             let name = string_property(d, PROP_NAME).unwrap_or_else(|| id.clone());
@@ -365,6 +397,132 @@ where
             buffer_frames: BUFFER_FRAMES * BUFFER_COUNT as u32,
             period_frames: BUFFER_FRAMES,
             low_latency: false,
+            format: "F32".into(),
+        }));
+        while !stop.load(Ordering::Acquire) {
+            std::thread::park_timeout(Duration::from_millis(50));
+        }
+        cleanup(queue);
+    })
+}
+
+struct InputState<C> {
+    callback: C,
+    stopping: AtomicBool,
+    health: Arc<StreamHealth>,
+}
+
+unsafe extern "C" fn captured<C: CaptureCallback>(
+    user: *mut c_void,
+    queue: AudioQueueRef,
+    buffer: *mut AudioQueueBuffer,
+    _start: *const c_void,
+    _packets: u32,
+    _descs: *const c_void,
+) {
+    // SAFETY: `user` is the `InputState<C>` boxed in `open_input`, alive
+    // until the queue is disposed; AudioQueue serializes callbacks.
+    let state = unsafe { &mut *(user as *mut InputState<C>) };
+    // SAFETY: AudioQueue hands us a filled buffer it owns until re-enqueued.
+    let buf = unsafe { &mut *buffer };
+    let samples = (buf.audio_data_byte_size / 4) as usize & !1;
+    // SAFETY: the buffer holds `audio_data_byte_size` bytes of stereo f32.
+    let data = unsafe { std::slice::from_raw_parts(buf.audio_data as *const f32, samples) };
+    state.callback.capture(data);
+    if !state.stopping.load(Ordering::Acquire) {
+        // SAFETY: re-enqueueing the buffer we were handed.
+        let status = unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null()) };
+        if status != 0 && !state.stopping.swap(true, Ordering::AcqRel) {
+            // Error path only: the queue is dead, so taking a lock is acceptable.
+            state.health.fail(format!("input device lost (AudioQueueEnqueueBuffer OSStatus {status})"));
+        }
+    }
+}
+
+/// Captures stereo float at 48 kHz (the queue converts the device's format)
+/// from the device with UID `device`, else the default input. macOS asks
+/// the user for microphone access the first time; until it is granted the
+/// queue delivers silence.
+pub fn open_input<F, C>(
+    device: Option<String>,
+    factory: F,
+    stop: Arc<AtomicBool>,
+    health: Arc<StreamHealth>,
+) -> Result<(InputInfo, JoinHandle<()>), String>
+where
+    F: FnOnce(u32, u16) -> C + Send + 'static,
+    C: CaptureCallback,
+{
+    spawn_audio_thread(move |report| {
+        let state = Box::into_raw(Box::new(InputState {
+            callback: factory(SAMPLE_RATE as u32, 2),
+            stopping: AtomicBool::new(false),
+            health,
+        }));
+        let format = AudioStreamBasicDescription {
+            sample_rate: SAMPLE_RATE,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_FLOAT | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 8,
+            frames_per_packet: 1,
+            bytes_per_frame: 8,
+            channels_per_frame: 2,
+            bits_per_channel: 32,
+            reserved: 0,
+        };
+        let mut queue: AudioQueueRef = ptr::null_mut();
+        // SAFETY: valid format, callback and out-pointer; `state` outlives the queue.
+        let status = unsafe {
+            AudioQueueNewInput(&format, captured::<C>, state.cast(), ptr::null_mut(), ptr::null(), 0, &mut queue)
+        };
+        if status != 0 {
+            // SAFETY: the queue was not created, so nothing else owns `state`.
+            drop(unsafe { Box::from_raw(state) });
+            return report(Err(format!("AudioQueueNewInput failed (OSStatus {status})")));
+        }
+        let cleanup = |queue: AudioQueueRef| {
+            // SAFETY: stopping synchronously guarantees no callback runs
+            // after AudioQueueStop returns, so `state` can be freed.
+            unsafe {
+                (*state).stopping.store(true, Ordering::Release);
+                AudioQueueStop(queue, 1);
+                AudioQueueDispose(queue, 1);
+                drop(Box::from_raw(state));
+            }
+        };
+        if let Some(uid) = &device {
+            if let Err(e) = set_queue_device(queue, uid) {
+                cleanup(queue);
+                return report(Err(e));
+            }
+        }
+        let name = match &device {
+            Some(uid) => input_devices().ok().and_then(|ds| ds.into_iter().find(|d| &d.id == uid)).map(|d| d.name),
+            None => default_for(PROP_DEFAULT_INPUT).and_then(|d| string_property(d, PROP_NAME)),
+        };
+        for _ in 0..BUFFER_COUNT {
+            let mut buf: *mut AudioQueueBuffer = ptr::null_mut();
+            // SAFETY: valid queue and out-pointer.
+            let s = unsafe { AudioQueueAllocateBuffer(queue, CAPTURE_BUFFER_FRAMES * 8, &mut buf) };
+            // SAFETY: handing a freshly allocated, empty buffer to the queue.
+            let s = if s == 0 { unsafe { AudioQueueEnqueueBuffer(queue, buf, 0, ptr::null()) } } else { s };
+            if s != 0 {
+                cleanup(queue);
+                return report(Err(format!("preparing the input buffers failed (OSStatus {s})")));
+            }
+        }
+        // SAFETY: valid queue.
+        let s = unsafe { AudioQueueStart(queue, ptr::null()) };
+        if s != 0 {
+            cleanup(queue);
+            return report(Err(format!("AudioQueueStart failed (OSStatus {s})")));
+        }
+        report(Ok(InputInfo {
+            backend: "CoreAudio",
+            device: name.unwrap_or_default(),
+            sample_rate: SAMPLE_RATE as u32,
+            device_channels: 2,
+            channels: 2,
             format: "F32".into(),
         }));
         while !stop.load(Ordering::Acquire) {
