@@ -22,9 +22,11 @@ TINVO - terminal digital audio workstation
 USAGE:
     tinvo [AUDIO] [PROJECT.tvo]         open the editor (demo beat if no file)
     tinvo render PROJECT OUT.wav [--format 16|24|32f] [--loops N] [--rate HZ]
-                 [--song | --region | --pattern A-P] [--stems]
+                 [--song | --region | --pattern A-P | [--from MARKER] [--to MARKER]] [--stems]
                                         export WAV (the song if it has entries, else
-                                        pattern A); --stems also writes one file per track
+                                        pattern A); --from alone is that marker's section,
+                                        --to stops where its marker starts; --stems also
+                                        writes one file per track
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
     tinvo midi                          list the MIDI inputs
@@ -96,6 +98,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut format = SampleFormat::Pcm24;
     let mut opts = RenderOptions::default();
     let mut stems = false;
+    let (mut from, mut to) = (None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
@@ -121,6 +124,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 };
                 opts.source = Source::Pattern(p);
             }
+            "--from" => from = Some(value("--from")?),
+            "--to" => to = Some(value("--to")?),
             "--stems" => stems = true,
             "--rate" => {
                 opts.sample_rate = value("--rate")?
@@ -136,7 +141,20 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let [project, out] = positional.as_slice() else {
         return Err(format!("render needs PROJECT and OUT.wav\n\n{USAGE}"));
     };
-    let project = Project::load(project.as_ref())?;
+    let mut project = Project::load(project.as_ref())?;
+    let mut range_name = None;
+    if from.is_some() || to.is_some() {
+        if opts.source != Source::Auto {
+            return Err(
+                "--from and --to pick part of the song; they do not go with --song, --region or --pattern".into()
+            );
+        }
+        // The range plays as the loop region does.
+        let range = project.marker_range(from.as_deref(), to.as_deref())?;
+        range_name = project.range_name(range);
+        project.loop_region = Some(range);
+        opts.source = Source::Region;
+    }
     let (track_samples, errors) = project.load_samples();
     if !errors.is_empty() {
         return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
@@ -148,7 +166,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     }
     let what = match render::resolve(&project, opts.source) {
         Source::Song => "the song".to_string(),
-        Source::Region => "the loop region".to_string(),
+        Source::Region => range_name.unwrap_or("the loop region".to_string()),
         Source::Pattern(p) => format!("pattern {}", pattern_name(p)),
         Source::Auto => unreachable!("resolved"),
     };

@@ -73,6 +73,7 @@ roles! {
     Value "value" [fg(Yellow)] [fg(Gray)] "an automated value between points";
     Entry "entry" [fg(BrightCyan)] [fg(Black)] "a song entry";
     EntryLoop "entry_loop" [fg(BrightGreen)] [fg(Blue).bold()] "a song entry in the loop region";
+    Marker "marker" [fg(BrightMagenta).bold()] [fg(Magenta).bold()] "a song marker and its name";
         Warning "warning" [fg(Yellow)] [fg(Red)] "what to do when a view is empty";
         Mute "mute" [fg(Black).on(Red)] [fg(BrightWhite).on(Red)] "M of a muted track";
         Solo "solo" [fg(Black).on(Yellow)] [fg(Black).on(Yellow)] "S of a soloed track";

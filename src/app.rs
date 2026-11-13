@@ -18,7 +18,7 @@ use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
 use crate::midi::{self, Message};
 use crate::mix;
-use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
+use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, VOLUME, pattern_name};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
@@ -163,16 +163,24 @@ struct TrackMeta {
     sample: Option<String>,
 }
 
+/// What lives outside the [`Edit`] stream: each track's name and sample,
+/// and the song's markers.
+#[derive(Clone, Debug, PartialEq)]
+struct Meta {
+    tracks: Vec<TrackMeta>,
+    markers: Vec<Marker>,
+}
+
 /// One undoable user action.
 struct Change {
     /// Edits that restore the state before the action, in order.
     undo: Vec<Edit>,
     /// Edits that reproduce the action.
     redo: Vec<Edit>,
-    /// Track names and samples are not part of [`Edit`], so they are
-    /// restored wholesale.
-    meta_before: Vec<TrackMeta>,
-    meta_after: Vec<TrackMeta>,
+    /// Track names, samples and markers are not part of [`Edit`], so they
+    /// are restored wholesale.
+    meta_before: Meta,
+    meta_after: Meta,
     what: &'static str,
     /// Set when later nudges of the same value may merge into this change.
     key: Option<(u8, u8, u8, u8)>,
@@ -264,6 +272,8 @@ pub enum PromptKind {
     Export,
     Rename,
     LoadSample,
+    /// The name of the marker on the song entry under the cursor.
+    Marker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -445,6 +455,8 @@ enum Target {
     Point(usize, usize),
     /// A song entry.
     Entry(usize),
+    /// A name on the song's marker line, by its index.
+    Marker(usize),
     /// The parameter panel, outside a parameter.
     Panel,
     Param(usize),
@@ -886,7 +898,7 @@ impl App {
                 return false;
             }
         };
-        let meta_before = self.track_meta();
+        let meta_before = self.meta();
         let Some(applied) = self.apply_raw(e) else { return false };
         if inverse == [applied] {
             // Already in that state (e.g. tempo at its limit): nothing to undo.
@@ -903,7 +915,7 @@ impl App {
                 return true;
             }
         }
-        let meta_after = self.track_meta();
+        let meta_after = self.meta();
         self.push_change(Change {
             undo: inverse,
             redo: vec![applied],
@@ -919,7 +931,7 @@ impl App {
     /// Applies several edits as one undo step. Invalid or no-op edits are
     /// skipped.
     fn edit_group(&mut self, edits: Vec<Edit>, what: &'static str) {
-        let meta_before = self.track_meta();
+        let meta_before = self.meta();
         let (mut undo, mut redo) = (Vec::new(), Vec::new());
         for e in edits {
             let Ok(inverse) = self.project.inverse(&e) else { continue };
@@ -935,7 +947,7 @@ impl App {
         }
         self.touch();
         self.redo.clear();
-        let meta_after = self.track_meta();
+        let meta_after = self.meta();
         self.push_change(Change { undo, redo, meta_before, meta_after, what, key: None, at: Instant::now() });
     }
 
@@ -955,7 +967,8 @@ impl App {
         if bank.is_empty() {
             return;
         }
-        let history = undo.iter().chain(redo.iter()).flat_map(|c| c.meta_before.iter().chain(&c.meta_after));
+        let history =
+            undo.iter().chain(redo.iter()).flat_map(|c| c.meta_before.tracks.iter().chain(&c.meta_after.tracks));
         let used: std::collections::HashSet<&str> = project
             .tracks
             .iter()
@@ -995,15 +1008,29 @@ impl App {
         }
     }
 
-    fn track_meta(&self) -> Vec<TrackMeta> {
-        self.project.tracks.iter().map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone() }).collect()
+    fn meta(&self) -> Meta {
+        Meta {
+            tracks: self
+                .project
+                .tracks
+                .iter()
+                .map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone() })
+                .collect(),
+            markers: self.project.markers.clone(),
+        }
     }
 
-    fn restore_meta(&mut self, meta: &[TrackMeta]) {
-        if meta.len() != self.project.tracks.len() {
+    fn restore_meta(&mut self, meta: &Meta) {
+        // The history's edits have just brought the song back to the length
+        // these markers were taken at; the check guards the file's validity
+        // should that ever not hold.
+        if meta.markers.iter().all(|m| usize::from(m.entry) < self.project.song.len()) {
+            self.project.markers.clone_from(&meta.markers);
+        }
+        if meta.tracks.len() != self.project.tracks.len() {
             return;
         }
-        for (i, m) in meta.iter().enumerate() {
+        for (i, m) in meta.tracks.iter().enumerate() {
             self.project.tracks[i].name.clone_from(&m.name);
             if self.project.tracks[i].sample != m.sample {
                 self.project.tracks[i].sample.clone_from(&m.sample);
@@ -1054,12 +1081,12 @@ impl App {
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
         self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
         self.bank.insert(key.clone(), loaded);
-        let meta_before = self.track_meta();
+        let meta_before = self.meta();
         self.project.tracks[self.track].sample = Some(key);
         self.send_sample(self.track);
         self.touch();
         self.redo.clear();
-        let meta_after = self.track_meta();
+        let meta_after = self.meta();
         self.push_change(Change {
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1519,6 +1546,11 @@ impl App {
                 }
             }
             Target::Entry(i) => self.song_cursor = i,
+            Target::Marker(i) => {
+                if let Some(m) = self.project.markers.get(i) {
+                    self.song_cursor = usize::from(m.entry);
+                }
+            }
             Target::Panel if !self.song_view => self.focus = Focus::Params,
             Target::Param(i) if !self.song_view => {
                 self.param = i;
@@ -1666,7 +1698,7 @@ impl App {
             return;
         }
         self.touch();
-        let meta_after = self.track_meta();
+        let meta_after = self.meta();
         let c = self.undo.back_mut().expect("checked above");
         // Undo runs the inverses in reverse order of the edits.
         c.undo.splice(0..0, inverse);
@@ -1725,7 +1757,8 @@ impl App {
             Key::Enter => {
                 self.mode = Mode::Normal;
                 let text = text.trim().to_string();
-                if text.is_empty() {
+                // An empty marker name removes the marker.
+                if text.is_empty() && kind != PromptKind::Marker {
                     return;
                 }
                 match kind {
@@ -1733,6 +1766,7 @@ impl App {
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => self.load_sample(&text),
+                    PromptKind::Marker => self.set_marker(&text),
                 }
                 return;
             }
@@ -1766,17 +1800,48 @@ impl App {
         if self.project.tracks.get(self.track).is_none_or(|t| t.name == name) {
             return;
         }
-        let meta_before = self.track_meta();
+        let meta_before = self.meta();
         self.project.tracks[self.track].name = name;
         self.touch();
         self.redo.clear();
-        let meta_after = self.track_meta();
+        let meta_after = self.meta();
         self.push_change(Change {
             undo: Vec::new(),
             redo: Vec::new(),
             meta_before,
             meta_after,
             what: "rename",
+            key: None,
+            at: Instant::now(),
+        });
+    }
+
+    /// Names the marker on the song entry under the cursor, or with an empty
+    /// name removes it, as one undo step.
+    fn set_marker(&mut self, name: &str) {
+        let entry = self.song_cursor as u16;
+        let meta_before = self.meta();
+        if let Err(e) = self.project.set_marker(entry, name) {
+            self.set_status(format!("Cannot do that: {e}"));
+            return;
+        }
+        let meta_after = self.meta();
+        if meta_after == meta_before {
+            return;
+        }
+        let at = u32::from(entry) + 1;
+        match self.project.marker_at(entry) {
+            Some(m) => self.set_status(format!("Marked entry {at} '{}'", m.name)),
+            None => self.set_status(format!("Removed the marker on entry {at}")),
+        }
+        self.touch();
+        self.redo.clear();
+        self.push_change(Change {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            meta_before,
+            meta_after,
+            what: "marker",
             key: None,
             at: Instant::now(),
         });
@@ -2154,6 +2219,24 @@ impl App {
             Action::NoLoop => {
                 self.edit(Edit::SetLoop(None));
             }
+            Action::Marker if n > 0 => {
+                let name = self.project.marker_at(index).map_or(String::new(), |m| m.name.clone());
+                self.mode = Mode::Prompt(PromptKind::Marker, name);
+            }
+            // With no marker that way, to the first or last entry.
+            Action::PrevMarker => {
+                let to = self.project.markers.iter().rev().find(|m| usize::from(m.entry) < c);
+                self.song_cursor = to.map_or(0, |m| usize::from(m.entry));
+            }
+            Action::NextMarker => {
+                let to = self.project.markers.iter().find(|m| usize::from(m.entry) > c);
+                self.song_cursor = to.map_or(n.saturating_sub(1), |m| usize::from(m.entry));
+            }
+            Action::LoopSection if n > 0 => {
+                if let Some(region) = self.project.section(index) {
+                    self.edit(Edit::SetLoop(Some(region)));
+                }
+            }
             _ => return false,
         }
         true
@@ -2334,7 +2417,9 @@ impl App {
     fn export_source_label(&self) -> String {
         match render::resolve(&self.project, self.export_render_source()) {
             Source::Song => "song".into(),
-            Source::Region => "loop region".into(),
+            Source::Region => {
+                self.project.active_loop().and_then(|r| self.project.range_name(r)).unwrap_or("loop region".into())
+            }
             Source::Pattern(p) => format!("pattern {}", pattern_name(p)),
             Source::Auto => unreachable!("resolved"),
         }
@@ -2660,8 +2745,8 @@ impl App {
         }
     }
 
-    /// The song: one cell per entry, wrapped to the width. `[` and `]` mark
-    /// the loop region.
+    /// The song: a line of markers, then one cell per entry, wrapped to the
+    /// width. `[` and `]` mark the loop region, `|` a marker.
     fn draw_song(&self, s: &mut Screen, w: u16, rows: u16) {
         let p = &self.project;
         let secs = p.song_steps() as f64 * Transport::samples_per_step(p.tempo, 1.0);
@@ -2670,21 +2755,28 @@ impl App {
             Some(_) => "loop region past the end".into(),
             None => "no loop".into(),
         };
-        let title = format!(
+        let mut title = format!(
             "Song · {} entries · {}:{:02} · {lp}",
             p.song.len(),
             (secs / 60.0).floor() as u64,
             (secs % 60.0).floor() as u64
         );
+        let section = p.section(self.song_cursor as u16);
+        if let Some(m) = section.and_then(|(a, _)| p.marker_at(a)) {
+            title.push_str(&format!(" · in {}", m.name));
+        }
         s.put(1, 1, &title, self.style(Role::Title));
         let k = &self.keys;
         let keys = format!(
-            "{} pattern  {} repeat  {} remove  {} loop  {} no loop  {} play  {} grid",
+            "{} pattern  {} repeat  {} remove  {} loop  {} no loop  {} marker  {} jump  {} loop section  {} play  {} grid",
             k.labels(&[Action::Up, Action::Down]),
             k.label(Action::Enter),
             k.label(Action::Clear),
             k.labels(&[Action::LoopStart, Action::LoopEnd]),
             k.label(Action::NoLoop),
+            k.label(Action::Marker),
+            k.labels(&[Action::PrevMarker, Action::NextMarker]),
+            k.label(Action::LoopSection),
             k.label(Action::Play),
             k.label(Action::SongView),
         );
@@ -2700,8 +2792,21 @@ impl App {
             s.put(2, 3, &hint, self.style(Role::Warning));
             return;
         }
+        let marker_style = self.style(Role::Marker);
+        if p.markers.is_empty() {
+            let hint = format!("No markers. {} names the entry under the cursor.", self.k(Action::Marker));
+            s.put(1, 2, &hint, self.style(Role::Dim));
+        } else {
+            let mut x = 1;
+            for (i, m) in p.markers.iter().enumerate() {
+                let text = format!("|{} {}", m.name, m.entry + 1);
+                let width = s.put(x, 2, &text, marker_style);
+                self.hit(x, 2, width, Target::Marker(i));
+                x = x.saturating_add(width + 2);
+            }
+        }
         let per_row = usize::from((w - 2) / 4).max(1);
-        let visible = usize::from(rows.saturating_sub(1)).max(1);
+        let visible = usize::from(rows.saturating_sub(2)).max(1);
         let cursor_row = self.song_cursor / per_row;
         let first_row = cursor_row.saturating_sub(visible - 1);
         let loop_region = p.active_loop();
@@ -2712,9 +2817,14 @@ impl App {
                 continue;
             }
             let x = 1 + (i % per_row) as u16 * 4;
-            let y = 2 + (row - first_row) as u16;
+            let y = 3 + (row - first_row) as u16;
             let inside = loop_region.is_some_and(|(a, b)| (usize::from(a)..=usize::from(b)).contains(&i));
-            let open = if loop_region.is_some_and(|(a, _)| usize::from(a) == i) { '[' } else { ' ' };
+            let marked = p.marker_at(i as u16).is_some();
+            let open = match (loop_region.is_some_and(|(a, _)| usize::from(a) == i), marked) {
+                (true, _) => '[',
+                (false, true) => '|',
+                (false, false) => ' ',
+            };
             let close = if loop_region.is_some_and(|(_, b)| usize::from(b) == i) { ']' } else { ' ' };
             let mut st = self.style(if inside { Role::EntryLoop } else { Role::Entry });
             if playing == Some(i) {
@@ -2724,6 +2834,9 @@ impl App {
                 st = self.style(Role::Cursor);
             }
             s.put(x, y, &format!("{open}{}{close}", pattern_name(pat)), st);
+            if marked && i != self.song_cursor {
+                s.put(x, y, &open.to_string(), marker_style);
+            }
             self.hit(x, y, 4, Target::Entry(i));
         }
     }
@@ -2925,6 +3038,9 @@ impl App {
                     PromptKind::SaveAs => "Save as: ".to_string(),
                     PromptKind::Rename => "Track name: ".to_string(),
                     PromptKind::LoadSample => "Load WAV sample: ".to_string(),
+                    PromptKind::Marker => {
+                        format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
+                    }
                     PromptKind::Export => format!(
                         "Export [{}, {} ×{}] (←→ what, Tab format, ↑↓ repeats) file: ",
                         self.export_format.label(),
@@ -4281,8 +4397,8 @@ mod tests {
         assert_eq!(a.project.loop_region, None);
         // Track keys do nothing to the hidden tracks; x repeats an entry.
         let steps = a.project.tracks[0].steps.clone();
-        keys(&mut a, &[Key::Char('m'), Key::Char('x')]);
-        assert!(!a.project.tracks[0].mute);
+        keys(&mut a, &[Key::Char('s'), Key::Char('x')]);
+        assert!(!a.project.tracks[0].solo);
         assert_eq!(a.project.tracks[0].steps, steps);
         assert_eq!(a.project.song, [3, 3, 3]);
         // Undo walks back through the nine song edits (the two Up presses
@@ -4388,6 +4504,119 @@ mod tests {
         let mut s = Screen::new(120, 30);
         a.draw(&mut s);
         assert!(s.row_text(29).contains("pattern B"), "{}", s.row_text(29));
+    }
+
+    fn type_text(a: &mut App, text: &str) {
+        for c in text.chars() {
+            a.handle_key(Key::Char(c));
+        }
+    }
+
+    fn markers(a: &App) -> Vec<(u16, &str)> {
+        a.project.markers.iter().map(|m| (m.entry, m.name.as_str())).collect()
+    }
+
+    #[test]
+    fn markers_name_jump_to_and_loop_sections() {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('S')]);
+        keys(&mut a, &[Key::Char('m')]);
+        assert_eq!(a.mode, Mode::Normal, "an empty song has nothing to mark");
+        for _ in 0..6 {
+            keys(&mut a, &[Key::Enter]);
+        }
+        keys(&mut a, &[Key::Home, Key::Right, Key::Right, Key::Char('m')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Marker, String::new()));
+        type_text(&mut a, "verse");
+        keys(&mut a, &[Key::Enter, Key::Home, Key::Char('m')]);
+        type_text(&mut a, "intro");
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(markers(&a), [(0, "intro"), (2, "verse")]);
+        assert_eq!(a.status_text(), Some("Marked entry 1 'intro'"));
+        // A name another entry has is refused.
+        keys(&mut a, &[Key::End, Key::Char('m')]);
+        type_text(&mut a, "verse");
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(markers(&a), [(0, "intro"), (2, "verse")]);
+        assert!(a.status_text().unwrap().contains("already marked 'verse'"), "{:?}", a.status_text());
+
+        // Page Up and Page Down jump between markers, then to the ends.
+        let mut at = Vec::new();
+        for k in [Key::PageUp, Key::PageUp, Key::PageUp, Key::PageDown, Key::PageDown, Key::PageDown] {
+            keys(&mut a, &[k]);
+            at.push(a.song_cursor);
+        }
+        assert_eq!(at, [2, 0, 0, 2, 5, 5]);
+        // = loops the section around the cursor.
+        keys(&mut a, &[Key::Left, Key::Char('=')]);
+        assert_eq!(a.project.loop_region, Some((2, 5)));
+        keys(&mut a, &[Key::Home, Key::Char('=')]);
+        assert_eq!(a.project.loop_region, Some((0, 1)));
+
+        // The prompt starts from the name; emptied, it removes the marker.
+        keys(&mut a, &[Key::PageDown, Key::Char('m')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Marker, "verse".into()));
+        keys(&mut a, &[Key::Backspace; 5]);
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(markers(&a), [(0, "intro")]);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(markers(&a), [(0, "intro"), (2, "verse")], "undo brings the marker back");
+        assert_eq!(a.status_text(), Some("Undid marker"));
+
+        // A removed entry takes its marker; undo brings both back.
+        keys(&mut a, &[Key::Delete]);
+        assert_eq!((a.project.song.len(), markers(&a)), (5, vec![(0, "intro")]));
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!((a.project.song.len(), markers(&a)), (6, vec![(0, "intro"), (2, "verse")]));
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(markers(&a), [(0, "intro")], "redo removes it again");
+        keys(&mut a, &[Key::Char('u')]);
+        // An entry added before a marker moves it on.
+        keys(&mut a, &[Key::Home, Key::Enter]);
+        assert_eq!(markers(&a), [(0, "intro"), (3, "verse")]);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(markers(&a), [(0, "intro"), (2, "verse")]);
+
+        // Undo walks back to an unmarked song.
+        while a.project.markers.len() + usize::from(a.project.loop_region.is_some()) > 0 {
+            let before = (a.project.markers.clone(), a.project.loop_region);
+            keys(&mut a, &[Key::Char('u')]);
+            assert_ne!((a.project.markers.clone(), a.project.loop_region), before, "each undo step changes something");
+        }
+        assert_eq!(a.project.song.len(), 6);
+    }
+
+    #[test]
+    fn the_song_view_shows_markers() {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('S')]);
+        for _ in 0..6 {
+            keys(&mut a, &[Key::Enter]);
+        }
+        let s = frame(&a);
+        assert!(s.row_text(2).contains("No markers. m names the entry under the cursor."), "{}", s.row_text(2));
+        a.project.set_marker(2, "verse").unwrap();
+        a.project.set_marker(4, "chorus").unwrap();
+        a.song_cursor = 3;
+        let s = frame(&a);
+        assert!(s.row_text(1).trim_end().ends_with("· no loop · in verse"), "{}", s.row_text(1));
+        assert!(s.row_text(2).contains("|verse 3  |chorus 5"), "{}", s.row_text(2));
+        assert!(s.row_text(3).contains(" A   A  |A   A  |A   A "), "{}", s.row_text(3));
+        let keys_line = (0..30).map(|y| s.row_text(y)).find(|r| r.contains("loop section")).unwrap_or_default();
+        assert!(keys_line.contains("m marker  PgUp PgDn jump  = loop section"), "{keys_line}");
+        click(&mut a, Target::Marker(1));
+        assert_eq!(a.song_cursor, 4);
+        a.song_cursor = 0;
+        let s = frame(&a);
+        assert!(!s.row_text(1).contains(" in "), "the start of the song has no marker: {}", s.row_text(1));
+        // The export prompt names a loop region that is a section.
+        a.export_source = Source::Region;
+        a.project.loop_region = Some((2, 3));
+        assert_eq!(a.export_source_label(), "section 'verse'");
+        a.project.loop_region = Some((0, 3));
+        assert_eq!(a.export_source_label(), "the start to 'chorus'");
+        a.project.loop_region = Some((1, 3));
+        assert_eq!(a.export_source_label(), "loop region");
     }
 
     #[test]

@@ -64,7 +64,6 @@ Known limits, planned for later phases:
 
 ## Later in Phase 3
 
-- Song-position markers and export ranges between them.
 - Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
 
 ## Phase 4a: Channel strip ✅ (0.7.0)
@@ -226,7 +225,7 @@ Known limits:
 - Questions and text prompts answer only to keys. There is no double click, and Shift, Ctrl and Alt do not change what a click does.
 - A drag paints along one track and within the steps on screen; a note's length can be dragged up to the last step shown. A key pressed during a drag ends it.
 
-## Phase 6f: Foundation limits ✅ (0.19.0, this release)
+## Phase 6f: Foundation limits ✅ (0.19.0)
 
 - A track removed while it sounds, or an added track undone, fades out over 10 ms instead of stopping dead. During the fade it plays on exactly as it would have, through its strip, fader and sends; then its sample is released.
 - Drum parameters reach a hit that is still ringing: tune, the decays, click, tone and the clap's spread, whose bursts still to come keep to the new spacing. An open hat cut short by a closed one stays short when its decay grows.
@@ -236,6 +235,19 @@ Known limits:
 - Each removed track fades in one of 16 slots. More than 16 removals within one fade cut short the fade with the fewest frames left; the editor removes one track per key press, so it does not come to that.
 - ALSA's rate is chosen with resampling turned off. Where every rate passes that check, as with `null`, TINVO opens at 48 kHz as before, and a sound server behind ALSA converts if it runs at another rate. The choice was checked on plug devices over `null` with a fixed rate (44.1, 96 and 22.05 kHz, for playback and recording), not on real hardware.
 - CoreAudio input at the device's rate has run on the macOS CI runner's BlackHole only.
+
+## Phase 7a: Markers and export ranges ✅ (0.20.0, this release)
+
+- Named markers on song entries, at most one per entry and each name once. In the song view `m` names the entry under the cursor (an empty name removes its marker), `PgUp` and `PgDn` jump to the previous and next marker, and `=` makes the section around the cursor the loop region. A section runs from a marker, or the song's start, to the entry before the next marker, or the song's end.
+- The song view lists the markers on a line of their own (a click jumps to one), shows `|` before a marked entry and names the cursor's section in its title.
+- Markers move with their entries when entries are inserted or removed; a removed entry takes its marker with it, and undo brings both back. They are part of the undo history, like track names.
+- `tinvo render --from MARKER --to MARKER`: `--from` alone renders that marker's section, `--to` stops where its marker starts, and `--to` alone starts at the song's start. The range plays as the loop region does, so `--loops` repeats it. The export prompt names a loop region that matches markers, such as `section 'verse'`.
+- Project format 10 (`marker 2 verse`); formats 1–9 load without markers. The fuzzer checks that markers stay in order, on the song and uniquely named through edit scripts and in project files.
+
+Known limits:
+- A marker is a name for the start of an entry; it does not change what plays. Ranges are whole song entries.
+- The marker line lists names in one row and cuts off what does not fit the width; `PgUp` and `PgDn` still reach every marker.
+- Like track names, marker names are drawn one column per character, so double-width characters (CJK, most emoji) push the rest of the line along.
 
 ## Known limitations of the foundation
 
