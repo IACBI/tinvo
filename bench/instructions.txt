@@ -1,0 +1,19 @@
+# Instruction budgets for `tinvo bench --instructions`.
+#
+# Each line is a scenario (see src/bench.rs) and the instructions it may take
+# per second of audio at 48 kHz: Valgrind's cachegrind counts a run of two
+# seconds and a run of none, and the difference is halved, so start-up does
+# not count. A scenario more than 10 % over its line fails CI.
+#
+# The counts are taken by CI on x86-64 Linux, built in release mode with the
+# current stable Rust. Another compiler gives other counts, and so can another
+# C library or CPU, since the C library picks routines for the CPU: a Debian
+# container with the same compiler counted the strip scenario 2.7 % higher.
+# To update after a change that costs more on purpose, or after a new Rust
+# release, copy the "Measured" lines that the command prints in CI's
+# "Instruction budgets" job, and say why in the commit.
+
+demo 215539166
+strip 395451804
+synth 560294978
+sampler 68714869

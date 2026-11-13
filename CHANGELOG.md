@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-13
+
+### Added
+- A test that the audio path does not allocate (`tests/realtime.rs`, part of `cargo test`). A counting allocator watches every call into the engine while songs play, while thousands of random edits, cues, auditions, sample changes and live-track changes arrive between callbacks of 1 to 4096 frames, and while live notes, recorded input and MIDI bytes pass through their queues. An allocation fails the test and prints where it came from.
+- A sampler scenario in `tinvo bench`: eight voices resampled through the sinc interpolator, looping, through the filter.
+- `tinvo bench --check`, which fails when a scenario's mean cost per callback is over its time budget. CI runs it on Windows, Linux and macOS.
+- Instruction budgets: on x86-64 Linux, CI counts each scenario's instructions per second of audio with Valgrind's cachegrind (`tinvo bench --instructions bench/instructions.txt`) and fails when one is more than 10 % over its budget. Unlike time, the count does not depend on how busy the machine is, so it catches small regressions.
+
+### Changed
+- `tinvo bench` now plays each scenario in callbacks of 128 frames, as a device would, and reports the mean, 99th percentile and worst callback as a share of the period, next to the real-time factor and the budget.
+
 ## [0.15.0] - 2026-11-13
 
 ### Added
@@ -212,7 +223,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/IACBI/tinvo/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/IACBI/tinvo/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/IACBI/tinvo/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/IACBI/tinvo/compare/v0.13.0...v0.13.1

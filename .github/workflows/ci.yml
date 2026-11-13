@@ -54,7 +54,7 @@ jobs:
         run: |
           cargo run --release -- demo demo.tvo
           cargo run --release -- render demo.tvo demo.wav --loops 1
-          cargo run --release -- bench
+          cargo run --release -- bench --check
           cargo run --release -- devices
           cargo run --release -- inputs
           cargo run --release -- midi
@@ -101,6 +101,21 @@ jobs:
         with:
           name: fuzz-failure
           path: fuzz-*.input
+
+  instructions:
+    name: Instruction budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev valgrind
+      - run: cargo build --release
+      # Counted by cachegrind, so the runner's load does not matter; see
+      # bench/instructions.txt for how the budgets are kept.
+      - run: ./target/release/tinvo bench --instructions bench/instructions.txt
 
   msrv:
     name: Minimum Rust version (1.85)

@@ -22,6 +22,7 @@
 pub mod app;
 pub mod audio;
 pub mod autosave;
+pub mod bench;
 pub mod dsp;
 pub mod engine;
 pub mod fsutil;

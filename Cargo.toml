@@ -1,6 +1,6 @@
 [package]
 name = "tinvo"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["A.C.B"]
@@ -15,6 +15,11 @@ publish = false
 # TINVO deliberately has no third-party dependencies. Everything is built on
 # the Rust standard library plus direct FFI to native operating-system APIs.
 [dependencies]
+
+[[test]]
+name = "realtime"
+# Its own allocator counts calls on one thread; the harness adds threads.
+harness = false
 
 [profile.dev]
 # Tests render seconds of audio; unoptimised DSP makes them needlessly slow.

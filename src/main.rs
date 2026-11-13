@@ -7,14 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tinvo::app::MidiStart;
 use tinvo::audio::{self, AudioCallback, StreamConfig};
+use tinvo::bench;
 use tinvo::dsp::loudness::ExportMeter;
-use tinvo::engine::{Edit, MAX_LANES, MAX_PATTERNS, Step};
-use tinvo::instrument::InstrumentKind;
 use tinvo::midi;
 use tinvo::project::{Project, pattern_name};
 use tinvo::record::Recorder;
 use tinvo::render::{self, RenderOptions, Source};
-use tinvo::strip::sp;
 use tinvo::wav::{self, SampleFormat};
 
 const USAGE: &str = "\
@@ -34,7 +32,10 @@ USAGE:
                                         record from an audio input (default 5 s) to a
                                         32-bit float WAV file
     tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
-    tinvo bench                         measure rendering speed against real time
+    tinvo bench [--check]               time each scenario in 128-frame callbacks; --check
+                                        fails when one is over its time budget
+    tinvo bench --instructions FILE     count instructions per scenario with Valgrind
+                                        (x86-64 Linux) against the budgets in FILE
     tinvo fuzz project|wav|edits [--seconds N | --runs N] [--seed N] [--render-every N]
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
         Some("midi") => cmd_midi(),
         Some("inputs") => cmd_inputs(),
         Some("record") => cmd_record(&args[1..]),
-        Some("bench") => cmd_bench(),
+        Some("bench") => cmd_bench(&args[1..]),
         Some("fuzz") => cmd_fuzz(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
@@ -474,81 +475,119 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_bench() -> Result<(), String> {
-    bench("Demo project", &Project::demo())?;
-    bench("Demo, every strip stage on, mid band swept", &strip_stress_project()?)?;
-    bench("Worst-case synth (8 voices, unison 4, noise, LFO)", &synth_stress_project()?)
-}
-
-fn bench(label: &str, project: &Project) -> Result<(), String> {
-    // The demo song is four patterns long, so both benches render 16 bars.
-    let loops = if project.song.is_empty() { 16 } else { 4 };
-    let opts = RenderOptions { sample_rate: 48_000, loops, max_tail_seconds: 0.0, source: Source::Auto };
-    // Warm up caches and the allocator before timing.
-    render::render(project, &[], &RenderOptions { loops: 1, ..opts });
-    let start = Instant::now();
-    let samples = render::render(project, &[], &opts);
-    let elapsed = start.elapsed().as_secs_f64();
-    let audio = samples.len() as f64 / 2.0 / 48_000.0;
-    println!(
-        "{label}, {} track(s): {audio:.1} s of audio in {elapsed:.3} s = {:.0}x real time ({:.2} % of one core)",
-        project.tracks.len(),
-        audio / elapsed,
-        elapsed / audio * 100.0
-    );
-    Ok(())
-}
-
-/// The demo with every stage of every track's channel strip on, and the mid
-/// band's frequency automated on a ramp so its coefficients never settle.
-fn strip_stress_project() -> Result<Project, String> {
-    let mut p = Project::demo();
-    let ok = |r: Result<Edit, tinvo::project::EditError>| r.map(drop).map_err(|e| e.to_string());
-    for track in 0..p.tracks.len() as u8 {
-        let kind = p.tracks[usize::from(track)].kind;
-        let base = kind.params().len() as u8;
-        let settings = [
-            (sp::HP_FREQ, 40.0),
-            (sp::LOW_GAIN, 2.0),
-            (sp::MID_GAIN, -3.0),
-            (sp::HIGH_GAIN, 2.0),
-            (sp::COMP_THRESHOLD, -30.0),
-            (sp::COMP_RATIO, 4.0),
-            (sp::DRIVE, 6.0),
-        ];
-        for (i, value) in settings {
-            ok(p.apply(Edit::SetParam { track, index: base + i as u8, value }))?;
+fn cmd_bench(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => bench_time(false),
+        [flag] if flag == "--check" => bench_time(true),
+        [flag, id, seconds] if flag == "--count" => {
+            let scenario = bench_scenario(id)?;
+            let seconds: f64 =
+                seconds.parse().ok().filter(|s| (0.0..=600.0).contains(s)).ok_or("SECONDS must be 0..=600")?;
+            println!("{}", bench::render(&scenario, seconds));
+            Ok(())
         }
-        let lane = (0..MAX_LANES as u8)
-            .find(|&l| p.tracks[usize::from(track)].lanes[usize::from(l)].target.is_none())
-            .ok_or("no free lane")?;
-        let target = Some(2 + base + sp::MID_FREQ as u8);
-        ok(p.apply(Edit::SetLane { track, lane, target, ramp: true }))?;
-        for pattern in 0..MAX_PATTERNS as u8 {
-            for (step, value) in [(0, 300.0), (8, 4000.0)] {
-                ok(p.apply(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }))?;
-            }
+        [flag, file] if flag == "--instructions" => bench_instructions(file),
+        _ => Err(format!(
+            "bench takes no arguments, --check, --count SCENARIO SECONDS or --instructions FILE\n\n{USAGE}"
+        )),
+    }
+}
+
+fn bench_scenario(id: &str) -> Result<bench::Scenario, String> {
+    let ids: Vec<&str> = bench::SCENARIOS.iter().map(|s| s.id).collect();
+    bench::find(id).ok_or(format!("no scenario '{id}' (there are {})", ids.join(", ")))
+}
+
+/// Times every scenario in device-sized callbacks; with `check`, fails when
+/// one is over its budget.
+fn bench_time(check: bool) -> Result<(), String> {
+    let mut over = Vec::new();
+    for s in bench::SCENARIOS {
+        let t = bench::time(&s, 20.0);
+        println!(
+            "{}: {}, {} track(s): {:.0}x real time. Per {}-frame callback: mean {:.1} %, p99 {:.1} %, worst {:.1} % of the period (budget: mean {:.0} %)",
+            s.id,
+            s.label,
+            s.tracks(),
+            t.audio / t.elapsed,
+            bench::PERIOD,
+            t.mean * 100.0,
+            t.p99 * 100.0,
+            t.worst * 100.0,
+            s.budget * 100.0
+        );
+        if t.mean > s.budget {
+            over.push(s.id);
         }
     }
-    Ok(p)
+    match (check, over.is_empty()) {
+        (true, false) => Err(format!("over the time budget: {}", over.join(", "))),
+        _ => Ok(()),
+    }
 }
 
-/// One synth track with every voice busy and every per-sample feature on.
-fn synth_stress_project() -> Result<Project, String> {
-    let mut p = Project::new();
-    p.apply(Edit::AddTrack(InstrumentKind::Synth)).map_err(|e| e.to_string())?;
-    let specs = InstrumentKind::Synth.params();
-    let mut set = |id: &str, value: f32| -> Result<(), String> {
-        let index = specs.iter().position(|s| s.id == id).ok_or(format!("no synth parameter {id}"))? as u8;
-        p.apply(Edit::SetParam { track: 0, index, value }).map(drop).map_err(|e| e.to_string())
+/// How far a scenario's instruction count may rise above its budget.
+const INSTRUCTION_TOLERANCE: f64 = 0.10;
+/// Seconds of audio counted per scenario (under Valgrind, which is slow).
+const COUNTED_SECONDS: f64 = 2.0;
+
+/// Counts each scenario's instructions per second of audio with Valgrind's
+/// cachegrind and compares them with the budgets in `file`.
+fn bench_instructions(file: &str) -> Result<(), String> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err("instruction budgets are counted on x86-64 Linux, where Valgrind runs".into());
+    }
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+    let budgets = bench::parse_budgets(&text).map_err(|e| format!("{file}: {e}"))?;
+    let missing: Vec<&str> =
+        bench::SCENARIOS.iter().map(|s| s.id).filter(|id| !budgets.iter().any(|(b, _)| b == id)).collect();
+    if !missing.is_empty() {
+        return Err(format!("{file}: no budget for {}", missing.join(", ")));
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let count = |id: &str, seconds: f64| -> Result<u64, String> {
+        let out = std::env::temp_dir().join(format!("tinvo-cachegrind-{}-{id}-{seconds}", std::process::id()));
+        let status = std::process::Command::new("valgrind")
+            .args(["--tool=cachegrind", "--cache-sim=no"])
+            .arg(format!("--cachegrind-out-file={}", out.display()))
+            .arg(&exe)
+            .args(["bench", "--count", id, &seconds.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("cannot run valgrind: {e}"))?;
+        let text = std::fs::read_to_string(&out);
+        let _ = std::fs::remove_file(&out);
+        if !status.success() {
+            return Err(format!("valgrind failed on scenario {id} ({status})"));
+        }
+        let text = text.map_err(|e| format!("cachegrind's output: {e}"))?;
+        bench::cachegrind_total(&text).ok_or_else(|| "no total in cachegrind's output".to_string())
     };
-    for (id, v) in [("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)] {
-        set(id, v)?;
+    let mut over = Vec::new();
+    let mut measured = Vec::new();
+    for (id, budget) in &budgets {
+        // The set-up alone, subtracted, leaves the cost of rendering.
+        let per_second = count(id, COUNTED_SECONDS)?.saturating_sub(count(id, 0.0)?) as f64 / COUNTED_SECONDS;
+        let change = per_second / *budget as f64 - 1.0;
+        println!("{id}: {per_second:.0} instructions per second of audio, {:+.1} % against its budget", change * 100.0);
+        if change > INSTRUCTION_TOLERANCE {
+            over.push(id.as_str());
+        } else if change < -INSTRUCTION_TOLERANCE {
+            println!(
+                "  {id} now costs less than its budget by more than the tolerance; lower the budget to keep it tight"
+            );
+        }
+        measured.push(format!("{id} {per_second:.0}"));
     }
-    // Two overlapping four-note chords keep all eight voices sounding.
-    let chord = Step { chord: [3, 7, 10], ..Step::new(48, 100, 2) };
-    for step in 0..16 {
-        p.apply(Edit::SetStep { track: 0, pattern: 0, step, value: Some(chord) }).map_err(|e| e.to_string())?;
+    println!("\nMeasured, in the budget file's format:\n{}", measured.join("\n"));
+    if over.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "over the instruction budget by more than {:.0} %: {}",
+            INSTRUCTION_TOLERANCE * 100.0,
+            over.join(", ")
+        ))
     }
-    Ok(p)
 }

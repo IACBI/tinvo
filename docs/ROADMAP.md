@@ -172,7 +172,7 @@ Known limits:
 - The autosave is renamed into place but its directory is not synced afterwards, so after a power failure (not a crash of TINVO) some file systems may come back with the previous autosave or none.
 - The flow was run end to end on Linux in a pseudo-terminal: edits, `kill -9`, the recovery question, recovering and saving (the saved file equals the autosave byte for byte), and discarding. The writes on a terminal error and on a panic are covered by unit tests of the pieces, not by a run that actually fails mid-session. The recovery screen has not been tried by hand in a Windows console.
 
-## Phase 6b: Fuzzing ✅ (0.15.0, this release)
+## Phase 6b: Fuzzing ✅ (0.15.0)
 
 - `tinvo fuzz` for project files, WAV files and edit scripts, with invariants that go past "does not panic": save round trips, the engine's view of a project, undo, the sample loader against the decoder, and finite output when an accepted input is played.
 - Runs in CI for 60 seconds per target on every push, and briefly in `cargo test`.
@@ -182,12 +182,23 @@ Known limits:
 - It is not coverage-guided. That needs compiler instrumentation and a fuzzing runtime (`cargo fuzz` uses libFuzzer, a nightly toolchain and crates). Instead an input is kept when it shows a feature not seen before: a new error, or a new kind of line, chunk or edit in an accepted input. Mutations that know the formats make up for part of the difference; a coverage-guided fuzzer would still reach some branches sooner.
 - Rendering covers the first half second of an accepted project, without its samples (the files are not there); sample rendering uses fixed projects. One accepted input in 16 is rendered by default.
 - Edit scripts stop after 64 edits, since each edit clones the project twice to check its undo.
-- Before this release it ran for about 24 million project inputs, 4.7 million WAV files and 200,000 edit scripts (two 10-minute runs per target on one machine). Finding nothing more in that time does not show that no bug is left.
+- Before 0.15.0 it ran for about 24 million project inputs, 4.7 million WAV files and 200,000 edit scripts (two 10-minute runs per target on one machine). Finding nothing more in that time does not show that no bug is left.
+
+## Phase 6c: Performance budgets ✅ (0.16.0, this release)
+
+- A test that counts allocations on the audio path (`tests/realtime.rs`): the engine while it plays, takes edits, cues, auditions, sample changes and live notes in callbacks of random sizes, plus the capture side of recording and the MIDI parser and mailboxes. Any allocation fails it with a backtrace.
+- `tinvo bench` measures four scenarios (the demo, the demo with every strip stage on, a worst-case synth, a worst-case sampler) per callback of 128 frames: mean, 99th percentile and worst, as a share of the period. `--check` fails when a mean is over its scenario's budget; CI runs it on every platform.
+- CI counts the instructions per second of audio of each scenario with cachegrind and fails when one is more than 10 % over `bench/instructions.txt`.
+
+Known limits:
+- The time budgets are loose (10 to 25 % of the period on average, against at most 6.2 % measured in two CI runs) because CI runners are shared, so a slowdown has to be large before they fail. The 99th percentile and the worst callback are printed but not enforced, since a shared machine's scheduler decides them.
+- Instruction counts are checked only on x86-64 Linux, and they move with the compiler, and slightly with the C library and CPU (a Debian container's counts differed from CI's Ubuntu by up to 2.7 %): a new stable Rust can push them past the tolerance without a change in TINVO. The budget file then has to be updated from CI's output.
+- Instructions are not time: a change that misses the cache more, or uses slower instructions, can cost more time with the same count.
+- The allocation test covers what the backends call on the audio thread, not the backend callbacks themselves (format conversion, device buffers). Those are checked by reading, and on Linux and macOS by running them in CI.
 
 ## Later in Phase 6
 
 - Mouse support, themes, configurable keymaps.
-- Performance budgets enforced in CI via `tinvo bench`.
 - Notes that span the loop point in the piano roll display (they already play correctly).
 
 ## Known limitations of the foundation

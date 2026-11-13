@@ -21,6 +21,10 @@ cargo test
 cargo test --release
 ```
 
+`cargo test` includes `tests/realtime.rs`, which counts every allocation made while the engine renders, while it takes edits, live notes and samples, and while input and MIDI are read. It must stay at zero; on a failure it prints where the allocation happened.
+
+If you changed anything the engine runs, run `tinvo bench --check` in release mode: it prints each scenario's cost per callback against its time budget. CI also counts the instructions each scenario takes with Valgrind's cachegrind, on x86-64 Linux, against `bench/instructions.txt`, and fails beyond 10 % over. If a change makes rendering costlier on purpose, run `tinvo bench --instructions bench/instructions.txt` there (the CI log shows the same output), copy the measured lines into the file, and say why in the pull request. The counts depend on the compiler, so a new stable Rust can move them too.
+
 If you changed the project format, the WAV reader or the edit model, run `tinvo fuzz project`, `tinvo fuzz wav` or `tinvo fuzz edits` for a few minutes (each runs 60 s by default; `--seconds N` for longer). A failing input is saved, and `tinvo fuzz TARGET --check FILE` replays it.
 
 If you changed an audio backend, run `tinvo probe` on that platform and say in the pull request what you tested on. Clippy for other platforms can be run with `--target x86_64-unknown-linux-gnu` or `--target aarch64-apple-darwin` once the target is installed with `rustup target add`.

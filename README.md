@@ -77,6 +77,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
+tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 ```
 
@@ -189,6 +190,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
+tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 ```
 
