@@ -142,7 +142,9 @@ An action listed under `[keys]` gets exactly the keys given; an empty value leav
 
 ### Contributing
 
-Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules, including the zero-dependency rule. A change has to pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. A change to a file format or the edit model should also survive a few minutes of `tinvo fuzz`.
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules, including the zero-dependency rule. A change has to pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. A change to a file format or the edit model should also survive a few minutes of `tinvo fuzz`. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+
+Found a security problem? Please report it privately, as [SECURITY.md](SECURITY.md) describes, not in an issue.
 
 ### License
 
@@ -281,7 +283,9 @@ mouse = off
 
 ### Katkı
 
-Hata bildirimleri ve pull request'ler memnuniyetle karşılanır. Sıfır bağımlılık kuralı dahil tüm kurallar [CONTRIBUTING.md](CONTRIBUTING.md) dosyasında (İngilizce). Her değişiklik `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` ve `cargo test` adımlarından geçmeli. Dosya formatlarına ya da düzenleme modeline dokunan bir değişiklik birkaç dakikalık `tinvo fuzz` çalışmasından da sağ çıkmalı.
+Hata bildirimleri ve pull request'ler memnuniyetle karşılanır. Sıfır bağımlılık kuralı dahil tüm kurallar [CONTRIBUTING.md](CONTRIBUTING.md) dosyasında (İngilizce). Her değişiklik `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` ve `cargo test` adımlarından geçmeli. Dosya formatlarına ya da düzenleme modeline dokunan bir değişiklik birkaç dakikalık `tinvo fuzz` çalışmasından da sağ çıkmalı. Projeye katılan herkes [davranış kurallarına](CODE_OF_CONDUCT.md) (İngilizce) uyar.
+
+Bir güvenlik açığı mı buldunuz? Lütfen issue açmayın; [SECURITY.md](SECURITY.md) dosyasında anlatıldığı gibi gizli olarak bildirin.
 
 ### Lisans
 
