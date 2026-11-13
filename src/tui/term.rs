@@ -1,22 +1,29 @@
 //! Raw-mode terminal access through native console APIs.
 //!
-//! Windows uses the Console API (`ReadConsoleInputW` for exact key codes,
-//! VT processing for output). Linux and macOS use termios and `poll`.
+//! Windows uses the Console API (`ReadConsoleInputW` for exact key codes
+//! and mouse records, VT processing for output). Linux and macOS use
+//! termios and `poll`, and ask the terminal for SGR mouse reports.
 
-use super::input::Key;
+use super::input::{Key, Mouse};
 use std::io::{self, Write};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Key(Key),
+    Mouse(Mouse),
     Resize,
 }
 
 /// Enter alternate screen, hide cursor, disable line wrap.
 const ENTER_SEQ: &str = "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J";
-/// Undo `ENTER_SEQ`.
-const LEAVE_SEQ: &str = "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
+/// Report button presses and releases (1000), motion while a button is held
+/// (1002), in the SGR encoding (1006), which has no limit on the column.
+/// Windows consoles report the mouse through input records instead.
+#[cfg(not(windows))]
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// Undo `ENTER_SEQ` and `MOUSE_ON`.
+const LEAVE_SEQ: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 /// A terminal in raw mode. Dropping it restores the original state.
 pub struct Terminal {
@@ -24,10 +31,15 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn enter() -> io::Result<Self> {
-        let sys = sys::RawMode::enable()?;
+    /// Takes over the terminal; with `mouse`, it reports the mouse too.
+    pub fn enter(mouse: bool) -> io::Result<Self> {
+        let sys = sys::RawMode::enable(mouse)?;
         let mut t = Self { sys };
         t.write(ENTER_SEQ)?;
+        #[cfg(not(windows))]
+        if mouse {
+            t.write(MOUSE_ON)?;
+        }
         Ok(t)
     }
 
@@ -69,6 +81,7 @@ pub fn install_panic_hook() {
 
 #[cfg(windows)]
 mod sys {
+    use super::super::input::{Button, Mouse, MouseKind};
     use super::{Event, Key};
     use std::ffi::c_void;
     use std::io;
@@ -81,9 +94,17 @@ mod sys {
     const ENABLE_PROCESSED_OUTPUT: u32 = 0x1;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
     const ENABLE_WINDOW_INPUT: u32 = 0x8;
+    const ENABLE_MOUSE_INPUT: u32 = 0x10;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x80;
     const KEY_EVENT: u16 = 0x1;
+    const MOUSE_EVENT: u16 = 0x2;
     const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x4;
+    const FROM_LEFT_1ST_BUTTON_PRESSED: u32 = 0x1;
+    const RIGHTMOST_BUTTON_PRESSED: u32 = 0x2;
+    const FROM_LEFT_2ND_BUTTON_PRESSED: u32 = 0x4;
+    const MOUSE_MOVED: u32 = 0x1;
+    const MOUSE_WHEELED: u32 = 0x4;
+    const MOUSE_HWHEELED: u32 = 0x8;
     const WAIT_OBJECT_0: u32 = 0;
     const SHIFT_PRESSED: u32 = 0x10;
     const CTRL_PRESSED: u32 = 0x4 | 0x8;
@@ -134,6 +155,15 @@ mod sys {
         control_key_state: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MouseEventRecord {
+        position: Coord,
+        button_state: u32,
+        control_key_state: u32,
+        event_flags: u32,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetStdHandle(which: u32) -> Handle;
@@ -149,10 +179,13 @@ mod sys {
         output: Handle,
         input_mode: u32,
         output_mode: u32,
+        /// The buttons held at the last mouse record, which reports only
+        /// which are down, not which changed.
+        buttons: u32,
     }
 
     impl RawMode {
-        pub fn enable() -> io::Result<Self> {
+        pub fn enable(mouse: bool) -> io::Result<Self> {
             // SAFETY: plain Win32 console calls with valid out-pointers.
             unsafe {
                 let input = GetStdHandle(STD_INPUT_HANDLE);
@@ -163,7 +196,8 @@ mod sys {
                 }
                 // No line buffering, echo or Ctrl+C processing; report resizes;
                 // disable QuickEdit so clicks do not freeze output.
-                if SetConsoleMode(input, ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS) == 0 {
+                let mouse_input = if mouse { ENABLE_MOUSE_INPUT } else { 0 };
+                if SetConsoleMode(input, ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS | mouse_input) == 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if SetConsoleMode(output, ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
@@ -171,7 +205,7 @@ mod sys {
                     SetConsoleMode(input, input_mode);
                     return Err(io::Error::other(format!("console lacks VT support: {err}")));
                 }
-                Ok(Self { input, output, input_mode, output_mode })
+                Ok(Self { input, output, input_mode, output_mode, buttons: 0 })
             }
         }
 
@@ -183,17 +217,27 @@ mod sys {
             }
         }
 
-        pub fn size(&self) -> (u16, u16) {
+        /// The visible part of the screen buffer.
+        fn window(&self) -> Option<SmallRect> {
             let mut info = ScreenBufferInfo::default();
             // SAFETY: valid handle and out-pointer.
-            if unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } == 0 {
-                return (80, 24);
-            }
-            let w = (info.window.right - info.window.left + 1).max(1) as u16;
-            let h = (info.window.bottom - info.window.top + 1).max(1) as u16;
+            (unsafe { GetConsoleScreenBufferInfo(self.output, &mut info) } != 0).then_some(info.window)
+        }
+
+        pub fn size(&self) -> (u16, u16) {
+            let Some(window) = self.window() else { return (80, 24) };
+            let w = (window.right - window.left + 1).max(1) as u16;
+            let h = (window.bottom - window.top + 1).max(1) as u16;
             (w, h)
         }
 
+        /// The event a mouse record stands for, if TINVO uses it.
+        fn mouse(&mut self, m: &MouseEventRecord) -> Option<Mouse> {
+            // Positions are in the screen buffer, which can be larger than
+            // the window when the console keeps scrollback.
+            let origin = self.window().map_or((0, 0), |w| (w.left, w.top));
+            mouse_event(m, origin, &mut self.buttons)
+        }
         pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
             let deadline = Instant::now() + timeout;
             loop {
@@ -221,6 +265,14 @@ mod sys {
                                 }
                             }
                         }
+                        MOUSE_EVENT => {
+                            // SAFETY: the union holds a MOUSE_EVENT_RECORD for this
+                            // tag, and both are 16 bytes.
+                            let m: MouseEventRecord = unsafe { std::mem::transmute(rec.event) };
+                            if let Some(m) = self.mouse(&m) {
+                                return Ok(Some(Event::Mouse(m)));
+                            }
+                        }
                         WINDOW_BUFFER_SIZE_EVENT => return Ok(Some(Event::Resize)),
                         _ => {}
                     }
@@ -230,6 +282,41 @@ mod sys {
                 }
             }
         }
+    }
+
+    /// The event mouse record `m` stands for, with the window's top left at
+    /// `(left, top)` in the buffer; `buttons` are those held before it.
+    fn mouse_event(m: &MouseEventRecord, (left, top): (i16, i16), buttons: &mut u32) -> Option<Mouse> {
+        let x = u16::try_from(m.position.x - left).ok()?;
+        let y = u16::try_from(m.position.y - top).ok()?;
+        // The wheel's distance is the signed high word: positive is away
+        // from the user, or to the right.
+        let forward = (m.button_state >> 16) as i16 > 0;
+        let kind = if m.event_flags & MOUSE_WHEELED != 0 {
+            if forward { MouseKind::ScrollUp } else { MouseKind::ScrollDown }
+        } else if m.event_flags & MOUSE_HWHEELED != 0 {
+            if forward { MouseKind::ScrollRight } else { MouseKind::ScrollLeft }
+        } else {
+            let held = m.button_state & 0x7;
+            let (pressed, released) = (held & !*buttons, *buttons & !held);
+            *buttons = held;
+            let button = |b: u32| match b {
+                _ if b & FROM_LEFT_1ST_BUTTON_PRESSED != 0 => Some(Button::Left),
+                _ if b & RIGHTMOST_BUTTON_PRESSED != 0 => Some(Button::Right),
+                _ if b & FROM_LEFT_2ND_BUTTON_PRESSED != 0 => Some(Button::Middle),
+                _ => None,
+            };
+            if let Some(b) = button(pressed) {
+                MouseKind::Press(b)
+            } else if released != 0 {
+                MouseKind::Release
+            } else if m.event_flags & MOUSE_MOVED != 0 {
+                MouseKind::Drag(button(held)?)
+            } else {
+                return None;
+            }
+        };
+        Some(Mouse { kind, x, y })
     }
 
     fn map_key(k: &KeyEventRecord) -> Option<Key> {
@@ -263,6 +350,37 @@ mod sys {
             },
         };
         Some(key)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rec(x: i16, y: i16, button_state: u32, event_flags: u32) -> MouseEventRecord {
+            MouseEventRecord { position: Coord { x, y }, button_state, control_key_state: 0, event_flags }
+        }
+
+        #[test]
+        fn mouse_records_become_events() {
+            use MouseKind::*;
+            let mut held = 0;
+            let mut ev = |r: MouseEventRecord| mouse_event(&r, (0, 10), &mut held).map(|m| (m.kind, m.x, m.y));
+            assert_eq!(ev(rec(5, 12, 1, 0)), Some((Press(Button::Left), 5, 2)));
+            assert_eq!(ev(rec(6, 12, 1, MOUSE_MOVED)), Some((Drag(Button::Left), 6, 2)));
+            assert_eq!(ev(rec(6, 12, 3, 0)), Some((Press(Button::Right), 6, 2)));
+            assert_eq!(ev(rec(6, 12, 2, 0)), Some((Release, 6, 2)));
+            assert_eq!(ev(rec(6, 12, 0, 0)), Some((Release, 6, 2)));
+            assert_eq!(ev(rec(7, 12, 0, MOUSE_MOVED)), None);
+            assert_eq!(ev(rec(1, 11, 4, 0x2)), Some((Press(Button::Middle), 1, 1)));
+            assert_eq!(ev(rec(1, 11, 0, 0)), Some((Release, 1, 1)));
+            // The wheel's high word is signed.
+            assert_eq!(ev(rec(3, 10, 120 << 16, MOUSE_WHEELED)), Some((ScrollUp, 3, 0)));
+            assert_eq!(ev(rec(3, 10, u32::from(-120i16 as u16) << 16, MOUSE_WHEELED)), Some((ScrollDown, 3, 0)));
+            assert_eq!(ev(rec(3, 10, 120 << 16, MOUSE_HWHEELED)), Some((ScrollRight, 3, 0)));
+            assert_eq!(ev(rec(3, 10, u32::from(-120i16 as u16) << 16, MOUSE_HWHEELED)), Some((ScrollLeft, 3, 0)));
+            // Above the window, in the scrollback.
+            assert_eq!(ev(rec(3, 9, 1, 0)), None);
+        }
     }
 }
 
@@ -350,7 +468,9 @@ mod sys {
     }
 
     impl RawMode {
-        pub fn enable() -> io::Result<Self> {
+        /// The mouse is asked for with escape sequences, so `_mouse` changes
+        /// nothing here.
+        pub fn enable(_mouse: bool) -> io::Result<Self> {
             let mut t = std::mem::MaybeUninit::<Termios>::uninit();
             // SAFETY: tcgetattr fully initializes `t` on success.
             let original = unsafe {
@@ -429,6 +549,10 @@ mod sys {
                         self.pending.drain(..n);
                         return Ok(Some(Event::Key(k)));
                     }
+                    Decoded::Mouse(m, n) => {
+                        self.pending.drain(..n);
+                        return Ok(Some(Event::Mouse(m)));
+                    }
                     Decoded::Skip(n) => {
                         self.pending.drain(..n);
                     }
@@ -459,7 +583,7 @@ mod sys {
     pub struct RawMode;
 
     impl RawMode {
-        pub fn enable() -> io::Result<Self> {
+        pub fn enable(_mouse: bool) -> io::Result<Self> {
             Err(io::Error::other("terminal UI is not supported on this platform"))
         }
         pub fn restore(&mut self) {}

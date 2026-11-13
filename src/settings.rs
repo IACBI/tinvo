@@ -10,12 +10,16 @@
 //! [theme]
 //! base = light
 //! cursor = black on bright-cyan bold
+//!
+//! [options]
+//! mouse = off
 //! ```
 //!
 //! An action listed here keeps only the keys listed (`pattern_shorter`
 //! above has none); the others keep their defaults. `base` picks the
-//! built-in theme the colours start from. `tinvo settings` prints every
-//! action and role with what it has.
+//! built-in theme the colours start from. `mouse = off` leaves the mouse
+//! to the terminal. `tinvo settings` prints every action and role with
+//! what it has.
 
 use crate::keymap::{self, Action, Context, Keymap};
 use crate::theme::{self, Role, Theme};
@@ -30,11 +34,14 @@ pub struct Settings {
     /// The built-in theme the colours start from.
     pub base: &'static str,
     pub theme: Theme,
+    /// Whether the editor takes mouse input. Off, the terminal keeps the
+    /// mouse for selecting text.
+    pub mouse: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { keys: Keymap::default(), base: theme::BUILT_IN[0], theme: Theme::default() }
+        Settings { keys: Keymap::default(), base: theme::BUILT_IN[0], theme: Theme::default(), mouse: true }
     }
 }
 
@@ -69,13 +76,16 @@ enum Section {
     None,
     Keys,
     Theme,
+    Options,
 }
 
+/// Reads a settings file's text; a mistake is reported with its line.
 pub fn parse(text: &str) -> Result<Settings, String> {
     let mut section = Section::None;
     let mut keys = Keymap::default();
     let mut bound: Vec<Action> = Vec::new();
     let mut base: Option<&'static str> = None;
+    let mut mouse: Option<bool> = None;
     let mut styles: Vec<(Role, crate::tui::Style)> = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let at = |e: String| format!("line {}: {e}", n + 1);
@@ -87,7 +97,10 @@ pub fn parse(text: &str) -> Result<Settings, String> {
             section = match name.trim() {
                 "keys" => Section::Keys,
                 "theme" => Section::Theme,
-                other => return Err(at(format!("unknown section [{other}] (there are [keys] and [theme])"))),
+                "options" => Section::Options,
+                other => {
+                    return Err(at(format!("unknown section [{other}] (there are [keys], [theme] and [options])")));
+                }
             };
             continue;
         }
@@ -96,7 +109,20 @@ pub fn parse(text: &str) -> Result<Settings, String> {
         };
         let (name, value) = (name.trim(), value.trim());
         match section {
-            Section::None => return Err(at("a setting must come after [keys] or [theme]".into())),
+            Section::None => return Err(at("a setting must come after [keys], [theme] or [options]".into())),
+            Section::Options => {
+                if name != "mouse" {
+                    return Err(at(format!("unknown option '{name}' (there is mouse)")));
+                }
+                if mouse.is_some() {
+                    return Err(at("mouse is set twice".into()));
+                }
+                mouse = Some(match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(at(format!("mouse is on or off, not '{value}'"))),
+                });
+            }
             Section::Keys => {
                 let a = Action::from_id(name).ok_or_else(|| at(format!("unknown action '{name}'")))?;
                 if bound.contains(&a) {
@@ -130,7 +156,7 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     for (r, s) in styles {
         theme.set(r, s);
     }
-    Ok(Settings { keys, base, theme })
+    Ok(Settings { keys, base, theme, mouse: mouse.unwrap_or(true) })
 }
 
 impl Settings {
@@ -164,6 +190,11 @@ impl Settings {
         for r in Role::ALL {
             out += &format!("# {}\n{} = {}\n", r.help(), r.id(), theme::style_name(self.theme.get(*r)));
         }
+        out += &format!(
+            "\n[options]\n# on: clicks, drags and the wheel work in the editor (Shift+drag still selects\n\
+             # text in most terminals); off: the terminal keeps the mouse.\nmouse = {}\n",
+            if self.mouse { "on" } else { "off" }
+        );
         out
     }
 }
@@ -193,12 +224,17 @@ mod tests {
         assert_eq!(s.base, "light");
         assert_eq!(s.theme.get(Role::Cursor), Style::fg(Color::Black).on(Color::Indexed(214)).bold());
         assert_eq!(s.theme.get(Role::Title), Theme::built_in("light").unwrap().get(Role::Title));
+        assert!(s.mouse);
+        assert!(!parse("[options]\nmouse = off\n").unwrap().mouse);
     }
 
     #[test]
     fn mistakes_name_their_line() {
         for (text, want) in [
-            ("undo = u", "line 1: a setting must come after [keys] or [theme]"),
+            ("undo = u", "line 1: a setting must come after [keys], [theme] or [options]"),
+            ("[options]\nmouse = yes", "line 2: mouse is on or off, not 'yes'"),
+            ("[options]\nmice = on", "line 2: unknown option 'mice'"),
+            ("[options]\nmouse = on\nmouse = off", "line 3: mouse is set twice"),
             ("[colors]", "line 1: unknown section [colors]"),
             ("[keys]\n\nundoo = u", "line 3: unknown action 'undoo'"),
             ("[keys]\nundo = u\nundo = z", "line 3: undo is set twice"),
@@ -222,10 +258,11 @@ mod tests {
         assert_eq!(parse(&defaults.to_text()), Ok(defaults));
         let custom = parse(
             "[keys]\nleft = h left\nright = l right\npattern_shorter = ctrl+l\nchance_up = = +\nplay = space f5\n\
-             [theme]\nbase = light\nplay_column = on #203040\n",
+             [theme]\nbase = light\nplay_column = on #203040\n[options]\nmouse = off\n",
         )
         .unwrap();
         let text = custom.to_text();
+        assert!(text.contains("\nmouse = off\n"), "{text}");
         assert!(text.contains("\nchance_up = = +\n"), "{text}");
         assert!(text.contains("\nplay = space f5\n"), "{text}");
         assert!(text.contains("\nplay_column = default on #203040\n"), "{text}");

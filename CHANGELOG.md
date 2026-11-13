@@ -6,6 +6,19 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-13
+
+### Added
+- Mouse support in the editor. A click toggles a step, selects a track, mutes or solos it (`M`, `S`), starts and stops playback (the play state in the header), adds or removes a piano-roll note or an automation point, selects a song entry or a parameter, and chooses an entry in the device and MIDI lists. The right button only moves the cursor there, or puts a parameter back to its default. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length; each drag is one undo step. The wheel changes the value under the pointer (tempo, swing, pattern, pattern length, a parameter, an automation point, a song entry) and scrolls the tracks, steps, piano roll and key list.
+- `mouse = off` under a new `[options]` section of the settings file, to leave the mouse to the terminal (for selecting text without Shift).
+
+### Changed
+- The piano roll scrolls only when the cursor leaves the view, instead of keeping the cursor in the middle, so what is under the pointer stays put.
+
+### Fixed
+- The key list's title was cut off on terminals narrower than about 120 columns; it is shorter now.
+- With no audio output, the message pointing to export named `e` even when export was bound to another key.
+
 ## [0.17.0] - 2026-11-13
 
 ### Added
@@ -237,7 +250,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/IACBI/tinvo/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/IACBI/tinvo/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/IACBI/tinvo/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/IACBI/tinvo/compare/v0.14.0...v0.15.0

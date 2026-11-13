@@ -39,6 +39,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
 - Autosave every 5 seconds while there are unsaved edits. If TINVO crashes or is killed, the next start offers to recover them.
 - The editor's keys and colours can be changed in a settings file. A light theme is built in.
+- Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern or the loop region, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -117,6 +118,8 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `w` `W` `e` | save, save as, export WAV |
 | `q` | quit |
 
+The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern and length in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
+
 ### Configuration
 
 Keys and colours are read from `tinvo.conf`: in `%APPDATA%\tinvo` on Windows, `~/Library/Application Support/tinvo` on macOS, and `$XDG_CONFIG_HOME/tinvo` (usually `~/.config/tinvo`) on Linux. The file needs only the lines you want to change:
@@ -130,9 +133,12 @@ pattern_shorter =
 [theme]
 base = light
 cursor = black on bright-cyan bold
+
+[options]
+mouse = off
 ```
 
-An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys.
+An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys. `mouse = off` leaves the mouse to the terminal.
 
 ### Contributing
 
@@ -172,6 +178,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
 - Kaydedilmemiş değişiklik varken 5 saniyede bir otomatik yedek. TINVO çökerse ya da öldürülürse, bir sonraki açılışta bu değişiklikleri geri yüklemeyi önerir.
 - Editörün tuşları ve renkleri bir ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
+- Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern ya da döngü bölgesi, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
@@ -250,6 +257,8 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `q` | çık |
 
+Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern ve uzunluk, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
+
 ### Yapılandırma
 
 Tuşlar ve renkler `tinvo.conf` dosyasından okunur: Windows'ta `%APPDATA%\tinvo`, macOS'te `~/Library/Application Support/tinvo`, Linux'ta `$XDG_CONFIG_HOME/tinvo` (genellikle `~/.config/tinvo`) klasöründe. Dosyaya sadece değiştirmek istediğin satırları yazman yeterli:
@@ -263,9 +272,12 @@ pattern_shorter =
 [theme]
 base = light
 cursor = black on bright-cyan bold
+
+[options]
+mouse = off
 ```
 
-`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir.
+`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir. `mouse = off` fareyi terminale bırakır.
 
 ### Katkı
 

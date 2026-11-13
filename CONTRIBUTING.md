@@ -27,7 +27,7 @@ If you changed anything the engine runs, run `tinvo bench --check` in release mo
 
 If you changed the project format, the WAV reader or the edit model, run `tinvo fuzz project`, `tinvo fuzz wav` or `tinvo fuzz edits` for a few minutes (each runs 60 s by default; `--seconds N` for longer). A failing input is saved, and `tinvo fuzz TARGET --check FILE` replays it.
 
-A new editor key is an `Action` in `src/keymap.rs`, with its context and default keys, and a new colour is a `Role` in `src/theme.rs`, with a style for both built-in themes. The handlers and drawing use these, never a key code or a colour directly, so the settings file and the key list pick them up. The keymap's tests fail if a default key clashes with another in the same view.
+A new editor key is an `Action` in `src/keymap.rs`, with its context and default keys, and a new colour is a `Role` in `src/theme.rs`, with a style for both built-in themes. The handlers and drawing use these, never a key code or a colour directly, so the settings file and the key list pick them up. The keymap's tests fail if a default key clashes with another in the same view. Something new the mouse should reach is a `Target` in `src/app.rs`: the code that draws it records where (`App::hit`), and `click` or `wheel` says what it does, through the same functions as its keys.
 
 If you changed an audio backend, run `tinvo probe` on that platform and say in the pull request what you tested on. Clippy for other platforms can be run with `--target x86_64-unknown-linux-gnu` or `--target aarch64-apple-darwin` once the target is installed with `rustup target add`.
 

@@ -27,9 +27,9 @@ use crate::sample::{self as sample_mod, Sample};
 use crate::settings::Settings;
 use crate::strip::{self, track_param};
 use crate::theme::{Role, Theme};
-use crate::tui::{Color, Event, Key, Screen, Style, Terminal};
+use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal};
 use crate::wav::{self, SampleFormat};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -407,6 +407,72 @@ pub struct App {
     /// How many lines of the key list the last frame showed, so scrolling
     /// stops where the end is in view.
     help_rows: Cell<usize>,
+    /// What the last frame drew where, for the mouse.
+    hits: RefCell<Vec<Hit>>,
+    /// The highest pitch the piano roll showed; it scrolls only when the
+    /// cursor leaves the view, so a click does not move what is under the
+    /// pointer. `None` centres the cursor.
+    roll_top: Cell<Option<u8>>,
+    /// The drag the left button started, if it is still held.
+    stroke: Option<Stroke>,
+    /// The undo step the drag is building, so each cell it crosses joins it.
+    stroke_at: Option<Instant>,
+}
+
+/// Something on screen the mouse can point at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// Shown, but does nothing (it covers what is drawn under it).
+    Inert,
+    Play,
+    Tempo,
+    Swing,
+    Pattern,
+    Length,
+    /// A step column's beat label.
+    Ruler,
+    Track(usize),
+    Mute(usize),
+    Solo(usize),
+    /// A track's step: the track and the step.
+    Step(usize, usize),
+    /// A piano-roll key.
+    Pitch(u8),
+    /// A piano-roll cell: the step and the pitch.
+    Note(usize, u8),
+    Lane(usize),
+    /// An automation cell: the lane and the step.
+    Point(usize, usize),
+    /// A song entry.
+    Entry(usize),
+    /// The parameter panel, outside a parameter.
+    Panel,
+    Param(usize),
+    /// A list entry in a picker.
+    Item(usize),
+    /// A device picker page: the input page or the output page.
+    Tab(bool),
+}
+
+/// A span of one screen row and what it shows.
+#[derive(Clone, Copy, Debug)]
+struct Hit {
+    x: u16,
+    y: u16,
+    width: u16,
+    target: Target,
+}
+
+/// What dragging with the left button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stroke {
+    /// Fills (`on`) or clears the steps of `track` the pointer crosses on
+    /// row `y`; `last` is the step it reached.
+    Paint { track: usize, on: bool, y: u16, last: usize },
+    /// Sets the length of the note at `step` to reach the step under the
+    /// pointer on row `y`. `remove`: the press was on that note, which goes
+    /// if the button is let go without dragging.
+    Length { step: usize, pitch: u8, y: u16, remove: bool },
 }
 
 impl App {
@@ -482,6 +548,10 @@ impl App {
             keys: Keymap::default(),
             theme: Theme::default(),
             help_rows: Cell::new(1),
+            hits: RefCell::new(Vec::new()),
+            roll_top: Cell::new(None),
+            stroke: None,
+            stroke_at: None,
         }
     }
 
@@ -640,12 +710,17 @@ impl App {
         key == Key::Esc || self.keys.is(Action::Quit, key) || self.keys.is(opener, key)
     }
 
-    fn key_midi(&mut self, mut p: MidiPicker, key: Key) {
+    fn key_midi(&mut self, p: MidiPicker, key: Key) {
         if self.closes_list(key, Action::MidiInputs) {
             self.mode = Mode::Normal;
             return;
         }
-        match self.keys.action(&[Context::Nav], key) {
+        let a = self.keys.action(&[Context::Nav], key);
+        self.midi_action(p, a);
+    }
+
+    fn midi_action(&mut self, mut p: MidiPicker, a: Option<Action>) {
+        match a {
             Some(Action::Up) => p.cursor = p.cursor.saturating_sub(1),
             Some(Action::Down) => p.cursor = (p.cursor + 1).min(p.ports.len()),
             Some(Action::Enter) => {
@@ -759,14 +834,19 @@ impl App {
         });
     }
 
-    fn key_devices(&mut self, mut p: DevicePicker, key: Key) {
+    fn key_devices(&mut self, p: DevicePicker, key: Key) {
         if self.closes_list(key, Action::Devices) {
             self.mode = Mode::Normal;
             return;
         }
+        let a = self.keys.action(&[Context::Nav, Context::Global], key);
+        self.devices_action(p, a);
+    }
+
+    fn devices_action(&mut self, mut p: DevicePicker, a: Option<Action>) {
         let (cursor, len) =
             if p.input_page { (&mut p.input_cursor, p.inputs.len()) } else { (&mut p.cursor, p.devices.len()) };
-        match self.keys.action(&[Context::Nav, Context::Global], key) {
+        match a {
             Some(Action::Left | Action::Right) => p.input_page = !p.input_page,
             Some(Action::Up) => *cursor = cursor.saturating_sub(1),
             Some(Action::Down) => *cursor = (*cursor + 1).min(len),
@@ -1073,7 +1153,8 @@ impl App {
     /// view, otherwise the pattern being edited.
     pub fn toggle_play(&mut self) {
         if self.link.is_none() {
-            self.set_status("No audio output. Use 'e' to export a WAV instead.");
+            let status = format!("No audio output. Use '{}' to export a WAV instead.", self.k(Action::Export));
+            self.set_status(status);
             return;
         }
         let cmd = if self.playing {
@@ -1273,6 +1354,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: Key) {
+        // A key can change the track, pattern or view a drag is editing, so
+        // it ends the drag; the release that follows does nothing.
+        self.stroke = None;
+        self.stroke_at = None;
         match self.mode.clone() {
             Mode::Help(top) => self.key_help(top, key),
             Mode::AddTrack => self.key_add_track(key),
@@ -1283,6 +1368,310 @@ impl App {
             Mode::Normal => self.key_normal(key),
         }
         self.clamp_cursor();
+    }
+
+    /// Handles a mouse event, at a position in the last frame drawn.
+    /// Questions and prompts answer only to keys.
+    pub fn handle_mouse(&mut self, m: Mouse) {
+        let target = self.target_at(m.x, m.y);
+        match self.mode.clone() {
+            Mode::Help(top) => {
+                let last = self.help_lines().len().saturating_sub(self.help_rows.get());
+                match m.kind {
+                    MouseKind::ScrollUp => self.mode = Mode::Help(top.saturating_sub(3)),
+                    MouseKind::ScrollDown => self.mode = Mode::Help((top + 3).min(last)),
+                    MouseKind::Press(_) => self.mode = Mode::Normal,
+                    _ => {}
+                }
+            }
+            Mode::Devices(mut p) => match (m.kind, target) {
+                (MouseKind::Press(Button::Left), Some(Target::Tab(input))) => {
+                    p.input_page = input;
+                    self.mode = Mode::Devices(p);
+                }
+                (MouseKind::Press(Button::Left), Some(Target::Item(i))) => {
+                    // Entry 0 is the system default, so the list is one longer.
+                    let (cursor, len) = if p.input_page {
+                        (&mut p.input_cursor, p.inputs.len())
+                    } else {
+                        (&mut p.cursor, p.devices.len())
+                    };
+                    if i <= len {
+                        *cursor = i;
+                        self.devices_action(p, Some(Action::Enter));
+                    }
+                }
+                (MouseKind::ScrollUp, _) => self.devices_action(p, Some(Action::Up)),
+                (MouseKind::ScrollDown, _) => self.devices_action(p, Some(Action::Down)),
+                _ => {}
+            },
+            Mode::MidiInputs(mut p) => match (m.kind, target) {
+                (MouseKind::Press(Button::Left), Some(Target::Item(i))) if i <= p.ports.len() => {
+                    p.cursor = i;
+                    self.midi_action(p, Some(Action::Enter));
+                }
+                (MouseKind::ScrollUp, _) => self.midi_action(p, Some(Action::Up)),
+                (MouseKind::ScrollDown, _) => self.midi_action(p, Some(Action::Down)),
+                _ => {}
+            },
+            Mode::Normal => self.mouse_normal(m, target),
+            Mode::AddTrack | Mode::Confirm(_) | Mode::Prompt(..) => {}
+        }
+        if matches!(m.kind, MouseKind::Release) {
+            self.stroke = None;
+            self.stroke_at = None;
+        }
+        self.clamp_cursor();
+    }
+
+    fn mouse_normal(&mut self, m: Mouse, target: Option<Target>) {
+        match m.kind {
+            MouseKind::Press(button) => {
+                if let Some(t) = target {
+                    self.click(t, button, m.y);
+                }
+            }
+            MouseKind::Drag(Button::Left) => self.drag(m.x),
+            MouseKind::Release => {
+                if let Some(Stroke::Length { step, pitch, remove: true, .. }) = self.live_stroke() {
+                    // Pressed on a note and let go without dragging: it goes.
+                    (self.step, self.roll_note) = (step, pitch);
+                    self.toggle_roll_note();
+                }
+            }
+            MouseKind::ScrollUp | MouseKind::ScrollDown => {
+                if let Some(t) = target {
+                    self.wheel(t, m.kind == MouseKind::ScrollUp);
+                }
+            }
+            MouseKind::ScrollLeft | MouseKind::ScrollRight => {
+                let right = m.kind == MouseKind::ScrollRight;
+                if !self.song_view && self.track < self.track_count() {
+                    let len = self.pattern_len();
+                    self.step = if right { (self.step + 1) % len } else { (self.step + len - 1) % len };
+                }
+            }
+            MouseKind::Drag(_) => {}
+        }
+    }
+
+    /// A button pressed on `t`, which is on screen row `y`. The left button
+    /// does what the target's main key does; the right one only moves the
+    /// cursor there, or puts a parameter back to its default.
+    fn click(&mut self, t: Target, button: Button, y: u16) {
+        let left = button == Button::Left;
+        if !left && button != Button::Right {
+            return;
+        }
+        match t {
+            Target::Play if left => self.toggle_play(),
+            Target::Track(ti) => {
+                self.track = ti;
+                self.focus = Focus::Grid;
+            }
+            Target::Mute(ti) | Target::Solo(ti) if left => {
+                self.track = ti;
+                let a = if matches!(t, Target::Mute(_)) { Action::Mute } else { Action::Solo };
+                self.track_action(a);
+            }
+            Target::Step(ti, i) => {
+                (self.track, self.step, self.focus) = (ti, i, Focus::Grid);
+                if left {
+                    let before = self.undo.back().map(|c| c.at);
+                    self.toggle_step();
+                    self.mark_stroke(before);
+                    let on = self.project.tracks[ti].steps[self.pattern][i].is_some();
+                    self.stroke = Some(Stroke::Paint { track: ti, on, y, last: i });
+                }
+            }
+            Target::Pitch(p) => {
+                self.roll_note = p;
+                self.focus = Focus::Grid;
+                if left {
+                    self.audition(Step::new(p, self.brushes[self.track].velocity, 1));
+                }
+            }
+            Target::Note(i, p) => {
+                (self.step, self.roll_note, self.focus) = (i, p, Focus::Grid);
+                if left {
+                    let pressed_on_note =
+                        self.project.tracks[self.track].steps[self.pattern][i].is_some_and(|s| s.has_note(p));
+                    let before = self.undo.back().map(|c| c.at);
+                    if !pressed_on_note {
+                        self.toggle_roll_note();
+                        self.mark_stroke(before);
+                    }
+                    // Only a note that is there can be stretched: adding it
+                    // fails on a full chord.
+                    if self.roll_has(i, p) {
+                        self.stroke = Some(Stroke::Length { step: i, pitch: p, y, remove: pressed_on_note });
+                    }
+                }
+            }
+            Target::Lane(k) => {
+                self.lane = k;
+                self.focus = Focus::Grid;
+            }
+            Target::Point(k, i) => {
+                (self.lane, self.step, self.focus) = (k, i, Focus::Grid);
+                if left {
+                    self.auto_action(Some(Action::Enter));
+                }
+            }
+            Target::Entry(i) => self.song_cursor = i,
+            Target::Panel if !self.song_view => self.focus = Focus::Params,
+            Target::Param(i) if !self.song_view => {
+                self.param = i;
+                self.focus = Focus::Params;
+                if !left {
+                    self.params_action(Some(Action::Default));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The wheel turned over `t`: values under the pointer change, lists
+    /// scroll.
+    fn wheel(&mut self, t: Target, up: bool) {
+        let pick = |down: Action, up_action: Action| if up { up_action } else { down };
+        match t {
+            Target::Tempo => self.global_action(pick(Action::TempoDown, Action::TempoUp)),
+            Target::Swing => self.global_action(pick(Action::SwingDown, Action::SwingUp)),
+            Target::Pattern => self.global_action(pick(Action::PrevPattern, Action::NextPattern)),
+            Target::Length => self.global_action(pick(Action::PatternShorter, Action::PatternLonger)),
+            Target::Ruler if self.track < self.track_count() => {
+                let len = self.pattern_len();
+                self.step = if up { (self.step + len - 1) % len } else { (self.step + 1) % len };
+            }
+            Target::Track(_) | Target::Mute(_) | Target::Solo(_) | Target::Step(..) => {
+                self.track = if up { self.track.saturating_sub(1) } else { self.track + 1 };
+            }
+            Target::Pitch(_) | Target::Note(..) => {
+                // The view moves with the cursor, so the pointer stays on
+                // the same row.
+                fn moved(v: u8, up: bool) -> u8 {
+                    if up { (v + 1).min(127) } else { v.saturating_sub(1) }
+                }
+                self.roll_note = moved(self.roll_note, up);
+                self.roll_top.set(self.roll_top.get().map(|t| moved(t, up)));
+            }
+            Target::Lane(_) => self.lane = if up { self.lane.saturating_sub(1) } else { self.lane + 1 },
+            Target::Point(k, i) => {
+                let has_point = self.project.tracks[self.track].lanes[k].points[self.pattern][i].is_some();
+                if has_point {
+                    (self.lane, self.step) = (k, i);
+                    self.auto_action(Some(pick(Action::PointDown, Action::PointUp)));
+                }
+            }
+            Target::Entry(i) => {
+                self.song_cursor = i;
+                self.key_song(pick(Action::Down, Action::Up));
+            }
+            Target::Param(i) if !self.song_view => {
+                self.param = i;
+                self.focus = Focus::Params;
+                self.params_action(Some(pick(Action::Left, Action::Right)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the selected track's step `i` in the edited pattern holds
+    /// pitch `p`.
+    fn roll_has(&self, i: usize, p: u8) -> bool {
+        self.project.tracks[self.track].steps[self.pattern][i].is_some_and(|s| s.has_note(p))
+    }
+
+    /// The drag in progress, if the view it started in is still showing and
+    /// its note is still there; otherwise the drag ends.
+    fn live_stroke(&mut self) -> Option<Stroke> {
+        let live = match self.stroke? {
+            Stroke::Paint { track, .. } => {
+                track < self.track_count() && !self.song_view && !self.auto_view && !self.roll_active()
+            }
+            Stroke::Length { step, pitch, .. } => {
+                !self.song_view && !self.auto_view && self.roll_active() && self.roll_has(step, pitch)
+            }
+        };
+        if !live {
+            self.stroke = None;
+            self.stroke_at = None;
+        }
+        self.stroke
+    }
+
+    /// The left button moved to column `x` while held.
+    fn drag(&mut self, x: u16) {
+        match self.live_stroke() {
+            Some(Stroke::Paint { track, on, y, last }) => {
+                let Some(Target::Step(t, i)) = self.target_at(x, y) else { return };
+                if t != track || i == last {
+                    return;
+                }
+                // Every step between, in case the pointer skipped some.
+                let (from, to) = if i > last { (last + 1, i) } else { (i, last - 1) };
+                for step in from..=to {
+                    let current = self.project.tracks[track].steps[self.pattern][step];
+                    let value = match (on, current) {
+                        (true, None) => Some(self.brushes[track]),
+                        (false, Some(_)) => None,
+                        _ => continue,
+                    };
+                    let (tr, pattern, st) = (track as u8, self.pattern as u8, step as u8);
+                    self.stroke_edit(Edit::SetStep { track: tr, pattern, step: st, value });
+                }
+                self.step = i;
+                self.stroke = Some(Stroke::Paint { track, on, y, last: i });
+            }
+            Some(Stroke::Length { step, pitch, y, .. }) => {
+                let Some(Target::Note(i, _)) = self.target_at(x, y) else { return };
+                let track = self.track;
+                let Some(s) = self.project.tracks[track].steps[self.pattern][step] else { return };
+                let length = (i.max(step) - step + 1).min(MAX_STEPS) as u8;
+                self.stroke = Some(Stroke::Length { step, pitch, y, remove: false });
+                if s.length != length {
+                    let value = Some(Step { length, ..s });
+                    let (tr, pattern, st) = (track as u8, self.pattern as u8, step as u8);
+                    self.stroke_edit(Edit::SetStep { track: tr, pattern, step: st, value });
+                    self.brushes[track].length = length;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Remembers the undo step an edit just pushed, if it pushed one, as
+    /// the one the drag extends.
+    fn mark_stroke(&mut self, before: Option<Instant>) {
+        self.stroke_at = self.undo.back().map(|c| c.at).filter(|&at| Some(at) != before);
+    }
+
+    /// Applies `e` as part of the drag: into the drag's undo step while it
+    /// is still the latest, else as a new one that later edits join.
+    fn stroke_edit(&mut self, e: Edit) {
+        let ours = self
+            .stroke_at
+            .is_some_and(|at| !self.sealed && self.redo.is_empty() && self.undo.back().is_some_and(|c| c.at == at));
+        if !ours {
+            let before = self.undo.back().map(|c| c.at);
+            if self.edit(e) {
+                self.mark_stroke(before);
+            }
+            return;
+        }
+        let Ok(inverse) = self.project.inverse(&e) else { return };
+        let Some(applied) = self.apply_raw(e) else { return };
+        if inverse == [applied] {
+            return;
+        }
+        self.touch();
+        let meta_after = self.track_meta();
+        let c = self.undo.back_mut().expect("checked above");
+        // Undo runs the inverses in reverse order of the edits.
+        c.undo.splice(0..0, inverse);
+        c.redo.push(applied);
+        c.meta_after = meta_after;
     }
 
     /// The key list scrolls with up, down, Page Up and Page Down; any other
@@ -1586,6 +1975,7 @@ impl App {
                 } else {
                     self.roll = !self.roll;
                     if self.roll {
+                        self.roll_top.set(None);
                         let t = &self.project.tracks[self.track];
                         let step = t.steps[self.pattern][self.step];
                         self.roll_note = step.map_or(self.brushes[self.track].note, |s| s.note);
@@ -1649,11 +2039,15 @@ impl App {
 
     /// Automation view keys.
     fn key_auto(&mut self, key: Key) {
+        let a = self.keys.action(&[Context::Nav, Context::Auto], key);
+        self.auto_action(a);
+    }
+
+    fn auto_action(&mut self, action: Option<Action>) {
         let len = self.pattern_len();
         let (track, lane, pattern, step) = (self.track as u8, self.lane as u8, self.pattern as u8, self.step as u8);
         let l = &self.project.tracks[self.track].lanes[self.lane];
         let (target, ramp, point) = (l.target, l.ramp, l.points[self.pattern][self.step]);
-        let action = self.keys.action(&[Context::Nav, Context::Auto], key);
         match action {
             Some(Action::Left) => self.step = (self.step + len - 1) % len,
             Some(Action::Right) => self.step = (self.step + 1) % len,
@@ -1891,10 +2285,15 @@ impl App {
     }
 
     fn key_params(&mut self, key: Key) {
+        let a = self.keys.action(&[Context::Nav, Context::Params], key);
+        self.params_action(a);
+    }
+
+    fn params_action(&mut self, a: Option<Action>) {
         let i = self.param;
         let page = self.page_params();
         let at = page.iter().position(|&p| p == i).unwrap_or(0);
-        match self.keys.action(&[Context::Nav, Context::Params], key) {
+        match a {
             Some(Action::Up) => self.param = page[at.saturating_sub(1)],
             Some(Action::Down) => self.param = page[(at + 1).min(page.len() - 1)],
             Some(a @ (Action::Left | Action::Right | Action::CoarseUp | Action::CoarseDown)) => {
@@ -1981,7 +2380,20 @@ impl App {
 
     // ---------------------------------------------------------------- drawing
 
+    /// Records that `target` is drawn on row `y` from `x` for `width` cells.
+    fn hit(&self, x: u16, y: u16, width: u16, target: Target) {
+        self.hits.borrow_mut().push(Hit { x, y, width, target });
+    }
+
+    /// What the last frame drew at `(x, y)`; of overlapping spans, the one
+    /// drawn last.
+    fn target_at(&self, x: u16, y: u16) -> Option<Target> {
+        let hits = self.hits.borrow();
+        hits.iter().rev().find(|h| h.y == y && x >= h.x && x - h.x < h.width).map(|h| h.target)
+    }
+
     pub fn draw(&self, s: &mut Screen) {
+        self.hits.borrow_mut().clear();
         s.clear();
         let (w, h) = (s.width(), s.height());
         if w < MIN_W || h < MIN_H {
@@ -2023,7 +2435,9 @@ impl App {
         s.fill(0, 0, w, ' ', bar);
         let mut x = s.put(0, 0, " TINVO ", bar.bold());
         let (txt, st) = if self.playing { ("▶ PLAY ", self.style(Role::HeaderPlay)) } else { ("■ STOP ", bar) };
-        x += s.put(x, 0, txt, st);
+        let n = s.put(x, 0, txt, st);
+        self.hit(x, 0, n, Target::Play);
+        x += n;
         let file = self
             .path
             .as_ref()
@@ -2038,15 +2452,18 @@ impl App {
             Some(p) if usize::from(p.pattern) != self.pattern => format!("playing {}  ", pattern_name(p.pattern)),
             _ => String::new(),
         };
-        let info = format!(
-            " {:.0} BPM  {swing}pattern {} · {} steps  {playing}{}{} ",
-            self.project.tempo,
-            pattern_name(self.pattern as u8),
-            self.pattern_len(),
-            file,
-            if self.dirty { "*" } else { "" }
-        );
-        s.put(x, 0, &info, bar);
+        let dirty = if self.dirty { "*" } else { "" };
+        for (text, target) in [
+            (format!(" {:.0} BPM  ", self.project.tempo), Target::Tempo),
+            (swing, Target::Swing),
+            (format!("pattern {}", pattern_name(self.pattern as u8)), Target::Pattern),
+            (format!(" · {} steps  ", self.pattern_len()), Target::Length),
+            (format!("{playing}{file}{dirty} "), Target::Inert),
+        ] {
+            let n = s.put(x, 0, &text, bar);
+            self.hit(x, 0, n, target);
+            x += n;
+        }
         let short_term = self.loudness[1];
         let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
         let rec = match &self.take {
@@ -2067,6 +2484,7 @@ impl App {
         let meter_w = 10u16;
         let rx = w.saturating_sub(right.chars().count() as u16 + meter_w + 1);
         s.put(rx, 0, &right, bar);
+        self.hit(rx, 0, w - rx, Target::Inert);
         let peak = self.master_meter[0].max(self.master_meter[1]);
         self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
     }
@@ -2082,6 +2500,7 @@ impl App {
     fn draw_ruler(&self, s: &mut Screen, w: u16) {
         s.put(LEFT - 1, 1, "│", self.style(Role::Dim));
         let (first, last) = self.visible_steps(w);
+        self.hit(LEFT, 1, (last - first) as u16 * CELL, Target::Ruler);
         for (col, i) in (first..last).enumerate() {
             let x = LEFT + col as u16 * CELL;
             if i % 4 == 0 {
@@ -2120,12 +2539,22 @@ impl App {
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
         let held = self.held_notes();
-        // Keep the cursor pitch in the middle of the view where possible.
+        // The view starts with the cursor pitch in the middle and scrolls
+        // only as far as the cursor leaves it.
         let rows = rows.min(128);
-        let top = (u16::from(self.roll_note) + rows / 2).clamp(rows - 1, 127);
+        let note = u16::from(self.roll_note);
+        let top = match self.roll_top.get().map(u16::from) {
+            None => note + rows / 2,
+            Some(t) if note > t => note,
+            Some(t) if note + rows <= t => note + rows - 1,
+            Some(t) => t,
+        }
+        .clamp(rows - 1, 127);
+        self.roll_top.set(Some(top as u8));
         for row in 0..rows {
             let y = 2 + row;
             let pitch = (top - row) as u8;
+            self.hit(0, y, LEFT, Target::Pitch(pitch));
             let black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
             let label_style = if pitch == self.roll_note {
                 self.style(Role::PitchCursor)
@@ -2159,6 +2588,7 @@ impl App {
                     st.bg = self.style(Role::CursorColumn).bg;
                 }
                 s.put(x, y, &text, st);
+                self.hit(x, y, CELL, Target::Note(i, pitch));
             }
         }
     }
@@ -2184,6 +2614,7 @@ impl App {
             };
             s.put(1, y, &label, self.style(if selected { Role::SelectedName } else { Role::Text }));
             s.put(LEFT - 1, y, "│", dim);
+            self.hit(0, y, LEFT, Target::Lane(k));
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
                 let value = spec.and_then(|sp| l.value_at(sp, self.pattern, self.pattern_len(), i).map(|v| (sp, v)));
@@ -2201,6 +2632,7 @@ impl App {
                     st = self.style(Role::Cursor);
                 }
                 s.put(x, y, &text, st);
+                self.hit(x, y, CELL, Target::Point(k, i));
             }
         }
         let info_y = 2 + MAX_LANES as u16 + 1;
@@ -2292,6 +2724,7 @@ impl App {
                 st = self.style(Role::Cursor);
             }
             s.put(x, y, &format!("{open}{}{close}", pattern_name(pat)), st);
+            self.hit(x, y, 4, Target::Entry(i));
         }
     }
 
@@ -2323,6 +2756,9 @@ impl App {
             s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
             self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
             s.put(LEFT - 1, y, "│", dim);
+            self.hit(0, y, LEFT, Target::Track(ti));
+            self.hit(26, y, 1, Target::Mute(ti));
+            self.hit(28, y, 1, Target::Solo(ti));
 
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
@@ -2356,6 +2792,7 @@ impl App {
                     st = self.style(if self.focus == Focus::Grid { Role::Cursor } else { Role::CursorIdle });
                 }
                 s.put(x, y, &text, st);
+                self.hit(x, y, CELL, Target::Step(ti, i));
             }
         }
     }
@@ -2368,6 +2805,9 @@ impl App {
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
         let dim = self.style(Role::Dim);
         s.fill(0, y, w, '─', dim);
+        for row in y..y + self.params_rows(w) {
+            self.hit(0, row, w, Target::Panel);
+        }
         let track = self.project.tracks.get(self.track);
         let title = match (self.page, track) {
             // Shared by all tracks, so shown with or without one.
@@ -2427,6 +2867,7 @@ impl App {
                 Role::Text
             };
             s.put(x, yy, &text, self.style(role));
+            self.hit(x, yy, PARAM_COL - 1, Target::Param(i));
         }
     }
 
@@ -2555,7 +2996,9 @@ impl App {
         let h = s.height();
         let (on, off) = (self.style(Role::TabOn), self.style(Role::Dim));
         let x = s.put(2, 1, " Audio output ", if p.input_page { off } else { on });
-        s.put(3 + x, 1, " Audio input ", if p.input_page { on } else { off });
+        let x2 = s.put(3 + x, 1, " Audio input ", if p.input_page { on } else { off });
+        self.hit(2, 1, x, Target::Tab(false));
+        self.hit(3 + x, 1, x2, Target::Tab(true));
         let pages = self.keys.labels(&[Action::Left, Action::Right]);
         let choose = self.keys.labels(&[Action::Up, Action::Down]);
         if p.input_page {
@@ -2597,7 +3040,8 @@ impl App {
         for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
             let mark = if *chosen { "● " } else { "  " };
             let st = self.style(if i == cursor { Role::ListCursor } else { Role::Text });
-            s.put(2, 4 + row as u16, &format!("{mark}{name}"), st);
+            let n = s.put(2, 4 + row as u16, &format!("{mark}{name}"), st);
+            self.hit(2, 4 + row as u16, n, Target::Item(i));
         }
     }
 
@@ -2632,7 +3076,7 @@ impl App {
         let top = top.min(lines.len().saturating_sub(rows));
         let more = if top + rows < lines.len() { "  ↓ more" } else { "" };
         let title = format!(
-            "TINVO keys ({}-{} of {}{more}). {} PgUp PgDn scroll, other keys close; tinvo settings shows how to change them.",
+            "TINVO keys ({}-{} of {}{more}). {} PgUp PgDn scroll, other keys close. Change them: tinvo settings",
             top + 1,
             (top + rows).min(lines.len()),
             lines.len(),
@@ -2989,7 +3433,7 @@ pub fn run(
     // The terminal comes first: a recovery question is asked in it before
     // the project the session works on, and so the engine, is chosen.
     crate::tui::term::install_panic_hook();
-    let mut term = Terminal::enter().map_err(|e| format!("cannot start terminal UI: {e}"))?;
+    let mut term = Terminal::enter(settings.mouse).map_err(|e| format!("cannot start terminal UI: {e}"))?;
     let (w, h) = term.size();
     let mut screen = Screen::new(w, h);
     let mut out = String::with_capacity(1 << 16);
@@ -3066,6 +3510,13 @@ pub fn run(
             while let Some(ev) = term.poll(timeout).map_err(|e| e.to_string())? {
                 match ev {
                     Event::Key(k) => app.handle_key(k),
+                    Event::Mouse(m) => {
+                        // Events before it in this batch may have changed
+                        // what is where; drawing again (without sending it)
+                        // resolves the pointer against the current state.
+                        app.draw(&mut screen);
+                        app.handle_mouse(m);
+                    }
                     Event::Resize => screen.invalidate(),
                 }
                 timeout = Duration::ZERO;
@@ -3176,6 +3627,8 @@ fn ask_recovery(
                     }
                 }
                 Event::Resize => screen.invalidate(),
+                // The question is answered with keys.
+                Event::Mouse(_) => {}
             }
         }
     }
@@ -4743,5 +5196,301 @@ mod tests {
         assert_eq!(age(Duration::from_secs(185)), "3 min ago");
         assert_eq!(age(Duration::from_secs(7300)), "2 h ago");
         assert_eq!(age(Duration::from_secs(200_000)), "2 days ago");
+    }
+
+    fn frame(a: &App) -> Screen {
+        let mut s = Screen::new(110, 30);
+        a.draw(&mut s);
+        s
+    }
+
+    /// Draws `a` and returns a cell where `t` is.
+    fn spot(a: &App, t: Target) -> (u16, u16) {
+        frame(a);
+        let hits = a.hits.borrow();
+        let h = hits.iter().find(|h| h.target == t).unwrap_or_else(|| panic!("{t:?} is not drawn"));
+        (h.x + h.width / 2, h.y)
+    }
+
+    fn mouse(a: &mut App, kind: MouseKind, (x, y): (u16, u16)) {
+        a.handle_mouse(Mouse { kind, x, y });
+    }
+
+    fn click(a: &mut App, t: Target) {
+        let at = spot(a, t);
+        mouse(a, MouseKind::Press(Button::Left), at);
+        mouse(a, MouseKind::Release, at);
+    }
+
+    fn filled(a: &App, track: usize) -> Vec<usize> {
+        (0..a.pattern_len()).filter(|&i| a.project.tracks[track].steps[a.pattern][i].is_some()).collect()
+    }
+
+    #[test]
+    fn clicks_select_and_toggle_steps() {
+        let mut a = app();
+        let (x, y) = spot(&a, Target::Step(1, 2));
+        // The spot is that step's cell, on that track's row.
+        assert!(frame(&a).row_text(y).contains(&a.project.tracks[1].name));
+        assert_eq!((x - LEFT) / CELL, 2);
+        let before = a.project.tracks[1].steps[0][2];
+        click(&mut a, Target::Step(1, 2));
+        assert_eq!((a.track, a.step, a.focus), (1, 2, Focus::Grid));
+        assert_eq!(a.project.tracks[1].steps[0][2].is_some(), before.is_none());
+        a.undo();
+        assert_eq!(a.project.tracks[1].steps[0][2], before);
+        // The right button only moves the cursor.
+        a.focus = Focus::Params;
+        let steps = a.project.tracks[2].steps[0];
+        let at = spot(&a, Target::Step(2, 5));
+        mouse(&mut a, MouseKind::Press(Button::Right), at);
+        assert_eq!((a.track, a.step, a.focus), (2, 5, Focus::Grid));
+        assert_eq!(a.project.tracks[2].steps[0], steps);
+        // So does a click on the track's name.
+        click(&mut a, Target::Track(0));
+        assert_eq!((a.track, a.step), (0, 5));
+    }
+
+    #[test]
+    fn dragging_paints_and_erases_as_one_undo_step() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        let mut a = App::new(p, None, None, 48_000, "test".into());
+        let (x, y) = spot(&a, Target::Step(0, 1));
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        // The pointer skips cells and wanders off the row.
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 3 * CELL, y + 1));
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 5 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + 5 * CELL, y));
+        assert_eq!(filled(&a, 0), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(a.step, 6);
+        a.undo();
+        assert_eq!(filled(&a, 0), []);
+        a.redo();
+        assert_eq!(filled(&a, 0), [1, 2, 3, 4, 5, 6]);
+        // Starting on a filled step clears, here leftwards.
+        let (x6, _) = spot(&a, Target::Step(0, 6));
+        mouse(&mut a, MouseKind::Press(Button::Left), (x6, y));
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x6 - 3 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x6 - 3 * CELL, y));
+        assert_eq!(filled(&a, 0), [1, 2]);
+        a.undo();
+        assert_eq!(filled(&a, 0), [1, 2, 3, 4, 5, 6]);
+        // A drag after the button is let go paints nothing.
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 10 * CELL, y));
+        assert_eq!(filled(&a, 0), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn mute_solo_and_play_are_clickable() {
+        let mut a = app();
+        let s = frame(&a);
+        let (mx, my) = spot(&a, Target::Mute(2));
+        let (sx, sy) = spot(&a, Target::Solo(3));
+        assert_eq!((s.char_at(mx, my), s.char_at(sx, sy)), ('M', 'S'));
+        click(&mut a, Target::Mute(2));
+        click(&mut a, Target::Solo(3));
+        assert!(a.project.tracks[2].mute && a.project.tracks[3].solo);
+        assert_eq!(a.track, 3);
+        click(&mut a, Target::Play);
+        assert!(a.status_text().unwrap().starts_with("No audio output. Use 'e'"));
+    }
+
+    #[test]
+    fn the_wheel_changes_the_value_under_the_pointer() {
+        let mut a = app();
+        let wheel = |a: &mut App, t: Target, up: bool| {
+            let at = spot(a, t);
+            mouse(a, if up { MouseKind::ScrollUp } else { MouseKind::ScrollDown }, at);
+        };
+        let (tempo, len) = (a.project.tempo, a.pattern_len());
+        let (x, y) = spot(&a, Target::Tempo);
+        let s = frame(&a);
+        let around: String = (x - 4..x + 4).map(|c| s.char_at(c, y)).collect();
+        assert!(around.contains(&format!("{tempo:.0} BPM")), "{around}");
+        wheel(&mut a, Target::Tempo, true);
+        wheel(&mut a, Target::Length, false);
+        wheel(&mut a, Target::Pattern, true);
+        assert_eq!((a.project.tempo, a.project.pattern_lens[0], a.pattern), (tempo + 1.0, len as u8 - 1, 1));
+        wheel(&mut a, Target::Pattern, false);
+        // Over the tracks, the wheel moves the selection.
+        wheel(&mut a, Target::Step(0, 3), false);
+        assert_eq!(a.track, 1);
+        wheel(&mut a, Target::Step(1, 3), true);
+        assert_eq!(a.track, 0);
+        // Over a parameter, it selects and nudges it; the right button
+        // puts it back.
+        let i = a.page_params()[2];
+        let v = a.param_value(i);
+        wheel(&mut a, Target::Param(i), true);
+        assert_eq!((a.param, a.focus), (i, Focus::Params));
+        assert!(a.param_value(i) > v);
+        let at = spot(&a, Target::Param(i));
+        mouse(&mut a, MouseKind::Press(Button::Right), at);
+        assert_eq!(a.param_value(i), a.param_spec(i).default);
+        // A click on the panel outside a parameter focuses it.
+        a.focus = Focus::Grid;
+        let (_, py) = spot(&a, Target::Param(i));
+        mouse(&mut a, MouseKind::Press(Button::Left), (109, py));
+        assert_eq!(a.focus, Focus::Params);
+    }
+
+    #[test]
+    fn the_piano_roll_takes_notes_and_lengths_from_the_mouse() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Char('v')]);
+        assert!(a.roll_active());
+        let i = (0..12).find(|&i| a.project.tracks[a.track].steps[0][i].is_none()).unwrap();
+        let p = a.roll_note;
+        let (x, y) = spot(&a, Target::Note(i, p));
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 3 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + 3 * CELL, y));
+        let step = |a: &App| a.project.tracks[a.track].steps[0][i];
+        assert!(step(&a).is_some_and(|s| s.has_note(p) && s.length == 4));
+        // Adding and stretching the note is one undo step.
+        a.undo();
+        assert_eq!(step(&a), None);
+        a.redo();
+        // Pressing on the note and dragging only changes its length.
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + CELL, y));
+        assert!(step(&a).is_some_and(|s| s.has_note(p) && s.length == 2));
+        // Pressing on it and letting go removes it.
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        mouse(&mut a, MouseKind::Release, (x, y));
+        assert_eq!(step(&a), None);
+        // A click on another pitch moves the cursor but not the view.
+        let other = Target::Pitch(p + 3);
+        let before = spot(&a, other);
+        click(&mut a, other);
+        assert_eq!(a.roll_note, p + 3);
+        assert_eq!(spot(&a, other), before);
+        // The wheel scrolls the view and the cursor together.
+        mouse(&mut a, MouseKind::ScrollUp, before);
+        assert_eq!(a.roll_note, p + 4);
+        assert_eq!(spot(&a, Target::Pitch(p + 4)), before);
+    }
+
+    #[test]
+    fn a_key_during_a_drag_ends_it() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Char('v')]);
+        let i = (0..12).find(|&i| a.project.tracks[a.track].steps[0][i].is_none()).unwrap();
+        let p = a.roll_note;
+        click(&mut a, Target::Note(i, p));
+        let (x, y) = spot(&a, Target::Note(i, p));
+        // Pressed on the note, then another pattern, then let go: no note
+        // goes or comes in either pattern.
+        let before = (a.project.tracks[a.track].steps[0], a.project.tracks[a.track].steps[1]);
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        keys(&mut a, &[Key::Char('n')]);
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 2 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + 2 * CELL, y));
+        assert_eq!((a.project.tracks[a.track].steps[0], a.project.tracks[a.track].steps[1]), before);
+        // The same for painting in the grid.
+        keys(&mut a, &[Key::Char('N'), Key::Char('v')]);
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        let mut a = App::new(p, None, None, 48_000, "test".into());
+        let (x, y) = spot(&a, Target::Step(0, 1));
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        keys(&mut a, &[Key::Char('n')]);
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 3 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + 3 * CELL, y));
+        assert_eq!((filled(&a, 0), a.pattern), (vec![], 1));
+        keys(&mut a, &[Key::Char('N')]);
+        assert_eq!(filled(&a, 0), [1]);
+    }
+
+    #[test]
+    fn a_note_that_could_not_be_added_is_not_stretched() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Char('v')]);
+        let i = (0..12).find(|&i| a.project.tracks[a.track].steps[0][i].is_none()).unwrap();
+        let p = a.roll_note;
+        for k in 0..4 {
+            click(&mut a, Target::Note(i, p - k));
+        }
+        let chord = a.project.tracks[a.track].steps[0][i].unwrap();
+        assert_eq!(chord.note_count(), 4);
+        // A fifth note is refused, and dragging from it changes nothing.
+        let (x, y) = spot(&a, Target::Note(i, p + 1));
+        mouse(&mut a, MouseKind::Press(Button::Left), (x, y));
+        assert!(a.status_text().unwrap().contains("at most"));
+        mouse(&mut a, MouseKind::Drag(Button::Left), (x + 2 * CELL, y));
+        mouse(&mut a, MouseKind::Release, (x + 2 * CELL, y));
+        assert_eq!(a.project.tracks[a.track].steps[0][i], Some(chord));
+    }
+
+    #[test]
+    fn a_click_on_an_entry_the_page_no_longer_has_is_ignored() {
+        let mut a = app();
+        let device = |id: &str| Device { id: id.into(), name: id.into(), is_default: false };
+        a.open_device_picker(vec![device("a"), device("b")], vec![device("mic")]);
+        let (tab, item) = (spot(&a, Target::Tab(true)), spot(&a, Target::Item(2)));
+        // The page switch and the click come in one batch, before a frame.
+        mouse(&mut a, MouseKind::Press(Button::Left), tab);
+        mouse(&mut a, MouseKind::Press(Button::Left), item);
+        assert!(matches!(&a.mode, Mode::Devices(p) if p.input_page && p.input_cursor == 0));
+        assert_eq!(a.input_device, None);
+    }
+
+    #[test]
+    fn the_song_view_takes_clicks_and_the_wheel() {
+        let mut a = app();
+        keys(&mut a, &[Key::Char('S'), Key::Enter, Key::Enter, Key::Enter]);
+        assert!(a.project.song.len() >= 3);
+        click(&mut a, Target::Entry(0));
+        assert_eq!(a.song_cursor, 0);
+        let pattern = a.project.song[1];
+        let at = spot(&a, Target::Entry(1));
+        mouse(&mut a, MouseKind::ScrollUp, at);
+        assert_eq!((a.song_cursor, a.project.song[1]), (1, pattern + 1));
+        // The panel stays as the keys leave it in this view.
+        let i = a.page_params()[2];
+        let v = a.param_value(i);
+        let at = spot(&a, Target::Param(i));
+        mouse(&mut a, MouseKind::ScrollUp, at);
+        mouse(&mut a, MouseKind::Press(Button::Right), at);
+        assert_eq!((a.param_value(i), a.focus), (v, Focus::Grid));
+    }
+
+    #[test]
+    fn lists_and_the_key_list_take_the_mouse() {
+        let mut a = app();
+        let device = |id: &str, is_default| Device { id: id.into(), name: id.to_uppercase(), is_default };
+        a.open_device_picker(vec![device("a", true), device("b", false)], vec![device("mic", true)]);
+        click(&mut a, Target::Item(2));
+        assert_eq!(a.take_audio_request(), Some(StreamConfig { device: Some("b".into()), low_latency: false }));
+        assert_eq!(a.mode, Mode::Normal);
+        a.open_device_picker(vec![device("a", true)], vec![device("mic", true)]);
+        click(&mut a, Target::Tab(true));
+        assert!(matches!(&a.mode, Mode::Devices(p) if p.input_page));
+        click(&mut a, Target::Item(1));
+        assert_eq!(a.input_device.as_deref(), Some("mic"));
+        a.open_midi_picker(vec![midi::Port { id: "k".into(), name: "Keys".into() }]);
+        click(&mut a, Target::Item(1));
+        assert_eq!(a.take_midi_request(), Some(Some("k".into())));
+        // The key list scrolls with the wheel and closes on a click.
+        a.mode = Mode::Help(0);
+        frame(&a);
+        mouse(&mut a, MouseKind::ScrollDown, (5, 5));
+        assert_eq!(a.mode, Mode::Help(3));
+        mouse(&mut a, MouseKind::Press(Button::Left), (5, 5));
+        assert_eq!(a.mode, Mode::Normal);
+        // Questions and prompts answer only to keys.
+        let at = spot(&a, Target::Step(0, 1));
+        let steps = a.project.tracks[0].steps[0];
+        a.mode = Mode::Prompt(PromptKind::Rename, "x".into());
+        mouse(&mut a, MouseKind::Press(Button::Left), at);
+        a.mode = Mode::Confirm(Confirm::Quit);
+        mouse(&mut a, MouseKind::Press(Button::Left), at);
+        assert_eq!(a.project.tracks[0].steps[0], steps);
+        assert_eq!(a.mode, Mode::Confirm(Confirm::Quit));
     }
 }

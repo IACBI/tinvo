@@ -196,7 +196,7 @@ Known limits:
 - Instructions are not time: a change that misses the cache more, or uses slower instructions, can cost more time with the same count.
 - The allocation test covers what the backends call on the audio thread, not the backend callbacks themselves (format conversion, device buffers). Those are checked by reading, and on Linux and macOS by running them in CI.
 
-## Phase 6d: Keys and colours ✅ (0.17.0, this release)
+## Phase 6d: Keys and colours ✅ (0.17.0)
 
 - A settings file (`tinvo.conf` in the user's configuration folder, or `--settings FILE`) rebinds any of the editor's 71 actions and sets the colour of any of its 45 roles. A key given to two actions that are active at the same time is refused, naming the key and both actions, before the terminal is touched.
 - Two built-in themes: the default for dark terminals and `light` for light ones. Colours can be the 16 named ones, a palette index or 24-bit `#rrggbb`.
@@ -206,14 +206,25 @@ Known limits:
 
 Known limits:
 - Some keys are fixed: answering questions (`y`, `n`, `Esc`), the instrument number after adding a track, and editing text in prompts.
-- The built-in themes use the 16 ANSI colours, which each terminal's palette defines, so they look different from one terminal to another. The light theme's contrast was computed from the xterm and Windows Terminal (Campbell) palettes on a white background; it has not been looked at in a real light terminal.
+- The built-in themes use the 16 ANSI colours, which each terminal's palette defines, so they look different from one terminal to another. The light theme's contrast was computed from the xterm and Windows Terminal (Campbell) palettes on a white background, and its views were looked at drawn with those palettes; it has not been looked at in a real light terminal.
 - 24-bit colours need a terminal that supports them; others show something else or nothing.
 - A note held past the pattern's end is drawn as the pattern repeating. In a song whose next entry is another pattern, the note still sounds over it, but the roll does not show that.
 - There is no editor for the settings inside TINVO; the file is edited by hand.
 
-## Later in Phase 6
+## Phase 6e: Mouse ✅ (0.18.0, this release)
 
-- Mouse support.
+- Clicks: a step toggles, a track's name selects it, `M` and `S` mute and solo, the play state in the header starts and stops. In the piano roll a click adds or removes a note, and a key on the left plays its pitch; in the automation view it adds or removes a point; in the song view it selects an entry; in the panel it selects a parameter. Device and MIDI lists choose the entry clicked. The right button only moves the cursor, or puts a parameter back to its default.
+- Dragging across a track's steps fills or clears them, as the first step clicked went. In the piano roll, dragging from a note sets its length; a press on a note and a release without dragging removes it. Each drag is one undo step.
+- The wheel changes what is under the pointer: tempo, swing, pattern and pattern length in the header, a parameter, an automation point, a song entry's pattern. Over the tracks it moves the selection, over the beat ruler the step, in the piano roll the pitches, in the key list the lines.
+- `mouse = off` under `[options]` in the settings file leaves the mouse to the terminal.
+- The piano roll now scrolls only when the cursor leaves the view, so a click does not move what is under the pointer.
+
+Known limits:
+- With the mouse on, most terminals select text only with Shift held (or with `mouse = off`).
+- On Windows the mouse comes as console input records. Windows Terminal passes the mouse to console programs through ConPTY; that path has not been tried with a real mouse here. What was tested on Windows: records written into a real console's input buffer (paint, wheel, mute, in a console with no pointer over it), and the conversion of every kind of record by unit tests.
+- On Linux and macOS TINVO asks for SGR reports (mode 1006) and also reads the older encoding, which cannot name a column or row past 223. A terminal with neither reports no mouse. The Linux path was run end to end in a pseudo-terminal with real report bytes; it has not been tried with a real mouse in a desktop terminal here.
+- Questions and text prompts answer only to keys. There is no double click, and Shift, Ctrl and Alt do not change what a click does.
+- A drag paints along one track and within the steps on screen; a note's length can be dragged up to the last step shown. A key pressed during a drag ends it.
 
 ## Known limitations of the foundation
 
