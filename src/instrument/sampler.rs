@@ -178,7 +178,9 @@ impl Sampler {
         let n = frames as f64;
         let start = (f64::from(pr[p::START]) * n).floor();
         let end = (f64::from(pr[p::END]) * n).floor().min(n);
-        let loop_start = (f64::from(pr[p::LOOP_START]) * n).floor().clamp(start, end);
+        // The points are separate knobs, so the end can be set before the
+        // start: no note starts then, and playing voices stop at the end.
+        let loop_start = (f64::from(pr[p::LOOP_START]) * n).floor().clamp(start.min(end), end);
         // One-shot plays through once; a loop needs at least one frame.
         let looping = pr[p::LOOP] >= 0.5 && !self.one_shot && end - loop_start >= 1.0;
         Region { start, end, loop_start, looping }
@@ -377,6 +379,17 @@ mod tests {
         s.render(&mut buf);
         assert!(buf[4900..].iter().all(|&x| x == 0.0), "only a tenth of the sample plays");
         s.set_param(p::END, 0.5);
+        assert_eq!(s.note_on(60, 127), VoiceId::NONE);
+        // An end before the start (found by `tinvo fuzz wav`): nothing
+        // plays, and a voice that is already playing stops.
+        s.set_param(p::START, 0.0);
+        s.set_param(p::END, 1.0);
+        s.set_param(p::LOOP, 1.0);
+        assert_ne!(s.note_on(60, 127), VoiceId::NONE);
+        s.set_param(p::START, 0.9);
+        s.set_param(p::END, 0.1);
+        s.render(&mut buf);
+        assert_eq!(s.active_voices(), 0);
         assert_eq!(s.note_on(60, 127), VoiceId::NONE);
         let mut no_sample = Sampler::new(SR);
         assert_eq!(no_sample.note_on(60, 127), VoiceId::NONE);

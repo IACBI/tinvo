@@ -399,7 +399,9 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
 }
 
 /// Reads the `info.frames` frames of audio from `r`, a block at a time, and
-/// hands each block to `sink` as interleaved samples in `[-1, 1)`.
+/// hands each block to `sink` as interleaved samples. Integer samples
+/// come out in `[-1, 1)`, except that 32-bit ones near full scale round to
+/// exactly 1.0 in `f32`; float samples come out as stored.
 pub fn read_samples<R: Read + Seek>(r: &mut R, info: &Info, mut sink: impl FnMut(&[f32])) -> Result<(), WavError> {
     // Blocks are sized in bytes, not frames: one frame may be up to 64 KiB
     // (the block-align field's limit), and 4096 such frames are 256 MiB.
@@ -434,7 +436,8 @@ fn sample_value(is_float: bool, s: &[u8]) -> f32 {
     }
 }
 
-/// A decoded WAV file with samples converted to `f32` in `[-1, 1)`.
+/// A decoded WAV file with samples converted to `f32` (see
+/// [`read_samples`] for their range).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decoded {
     pub sample_rate: u32,
@@ -503,6 +506,28 @@ mod tests {
                 assert!((a - b).abs() <= 1.5 * lsb + 1e-9, "{fmt:?}: {a} vs {b}");
             }
         }
+    }
+
+    #[test]
+    fn integer_full_scale_decodes_to_the_ends_of_the_range() {
+        let file = |bits: u16, frames: &[u8]| {
+            let width = bits / 8;
+            let mut f = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0".to_vec();
+            f.extend_from_slice(&8000u32.to_le_bytes());
+            f.extend_from_slice(&(8000 * u32::from(width)).to_le_bytes());
+            f.extend_from_slice(&width.to_le_bytes());
+            f.extend_from_slice(&bits.to_le_bytes());
+            f.extend_from_slice(b"data");
+            f.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+            f.extend_from_slice(frames);
+            decode(&f).unwrap().samples
+        };
+        let pcm32: Vec<u8> = [i32::MAX, i32::MIN].iter().flat_map(|x| x.to_le_bytes()).collect();
+        // f32 has 24 bits of precision: the largest 32-bit sample is 1.0.
+        assert_eq!(file(32, &pcm32), [1.0, -1.0]);
+        let pcm24: Vec<u8> = [0x7f_ffffi32, -0x80_0000].iter().flat_map(|x| x.to_le_bytes()[..3].to_vec()).collect();
+        assert_eq!(file(24, &pcm24), [1.0 - 1.0 / 8_388_608.0, -1.0]);
+        assert_eq!(file(16, &[0xff, 0x7f, 0x00, 0x80]), [32_767.0 / 32_768.0, -1.0]);
     }
 
     #[test]

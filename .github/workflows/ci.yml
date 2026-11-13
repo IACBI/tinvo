@@ -77,6 +77,31 @@ jobs:
           cargo run --release -- probe --low-latency 1
           cargo run --release -- probe --device BlackHole --low-latency 1
 
+  fuzz:
+    name: Fuzz the parsers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo build --release
+      # The run's id as the seed: each run explores new inputs, and the log
+      # names the seed, so a failure can be repeated.
+      - name: Fuzz projects, WAV files and edit scripts (60 s each)
+        run: |
+          for target in project wav edits; do
+            ./target/release/tinvo fuzz "$target" --seconds 60 --seed "${{ github.run_id }}"
+          done
+      - name: Keep a failing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-failure
+          path: fuzz-*.input
+
   msrv:
     name: Minimum Rust version (1.85)
     runs-on: ubuntu-latest

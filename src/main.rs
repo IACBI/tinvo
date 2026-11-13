@@ -35,6 +35,10 @@ USAGE:
                                         32-bit float WAV file
     tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
     tinvo bench                         measure rendering speed against real time
+    tinvo fuzz project|wav|edits [--seconds N | --runs N] [--seed N] [--render-every N]
+                                        fuzz what TINVO reads (default 60 s); a failing
+                                        input is reduced and saved to a file
+    tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
     tinvo --help | --version
 
 AUDIO:
@@ -68,6 +72,7 @@ fn main() -> ExitCode {
         Some("inputs") => cmd_inputs(),
         Some("record") => cmd_record(&args[1..]),
         Some("bench") => cmd_bench(),
+        Some("fuzz") => cmd_fuzz(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
     match result {
@@ -394,6 +399,79 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         (rate / f64::from(info.sample_rate) - 1.0) * 100.0
     );
     Ok(())
+}
+
+fn cmd_fuzz(args: &[String]) -> Result<(), String> {
+    use tinvo::fuzz::{self, Options, Target};
+    let names = Target::ALL.map(Target::id).join(", ");
+    let target = args.first().and_then(|a| Target::from_id(a)).ok_or(format!("fuzz needs a target: {names}"))?;
+    // A different seed each time explores further; it is printed, so a run
+    // can be repeated.
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut opts = Options { seed, runs: u64::MAX, time: None, render_every: 16 };
+    let mut check = None;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let mut number = |name: &str| -> Result<u64, String> {
+            let v = it.next().ok_or(format!("{name} needs a value"))?;
+            v.parse().map_err(|_| format!("{name} takes a whole number, not '{v}'"))
+        };
+        match a.as_str() {
+            "--seconds" => opts.time = Some(Duration::from_secs(number("--seconds")?)),
+            "--runs" => opts.runs = number("--runs")?,
+            "--seed" => opts.seed = number("--seed")?,
+            "--render-every" => opts.render_every = number("--render-every")?,
+            "--check" => check = Some(PathBuf::from(it.next().ok_or("--check needs a file")?)),
+            s => return Err(format!("unknown option '{s}'")),
+        }
+    }
+    if let Some(path) = check {
+        let input = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let accepted = fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
+        return Ok(());
+    }
+    if opts.time.is_none() && opts.runs == u64::MAX {
+        opts.time = Some(Duration::from_secs(60));
+    }
+    println!("Fuzzing {} with seed {}", target.id(), opts.seed);
+    // A panic is a finding, reported once at the end, not every time the
+    // failing input is tried while it is reduced.
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut last = Instant::now();
+    let result = fuzz::run(target, &opts, &mut |r| {
+        if last.elapsed() >= Duration::from_secs(10) {
+            last = Instant::now();
+            println!("  {} inputs, {} accepted, corpus {}", r.runs, r.accepted, r.corpus);
+        }
+    });
+    drop(std::panic::take_hook());
+    match result {
+        Ok(r) => {
+            println!(
+                "{} inputs in {:.1} s ({:.0}/s): {} accepted, {} rendered; corpus {}; slowest input {:.1} ms",
+                r.runs,
+                r.elapsed.as_secs_f64(),
+                r.runs as f64 / r.elapsed.as_secs_f64().max(1e-9),
+                r.accepted,
+                r.rendered,
+                r.corpus,
+                r.slowest.as_secs_f64() * 1e3
+            );
+            Ok(())
+        }
+        Err(f) => {
+            let name = format!("fuzz-{}-{}.input", target.id(), opts.seed);
+            std::fs::write(&name, &f.input).map_err(|e| format!("{}; and saving the input failed: {e}", f.message))?;
+            Err(format!(
+                "after {} inputs: {}\nThe input ({} bytes) is in {name}; check it again with: tinvo fuzz {} --check {name}",
+                f.runs,
+                f.message,
+                f.input.len(),
+                target.id()
+            ))
+        }
+    }
 }
 
 fn cmd_bench() -> Result<(), String> {

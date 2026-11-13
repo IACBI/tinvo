@@ -7,6 +7,7 @@
 //! happens on the audio thread.
 
 use crate::wav;
+use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -15,6 +16,17 @@ use std::sync::OnceLock;
 pub const PAD: usize = SINC_TAPS / 2;
 /// Longest sample accepted, in frames (about 11 minutes at 48 kHz).
 pub const MAX_FRAMES: usize = 1 << 25;
+/// Largest sample value kept (+60 dBFS). Float files can hold any value;
+/// beyond this they are corrupt rather than loud, and the products of the
+/// gains on the way to the output (velocity, strip, sends, master) could
+/// overflow `f32`, after which filter and reverb state stays infinite.
+pub const MAX_LEVEL: f32 = 1024.0;
+
+/// A sample value as stored: finite and within [`MAX_LEVEL`], with
+/// non-finite values replaced by silence.
+pub fn clean(x: f32) -> f32 {
+    if x.is_finite() { x.clamp(-MAX_LEVEL, MAX_LEVEL) } else { 0.0 }
+}
 
 /// Taps of the windowed-sinc interpolator.
 pub const SINC_TAPS: usize = 8;
@@ -49,7 +61,7 @@ impl Sample {
         }
         let mut data = vec![0.0f32; audio.len() + 2 * PAD];
         for (d, &s) in data[PAD..].iter_mut().zip(audio) {
-            *d = if s.is_finite() { s } else { 0.0 };
+            *d = clean(s);
         }
         Ok(Self { data: data.into_boxed_slice(), sample_rate, source_channels: 1 })
     }
@@ -102,7 +114,17 @@ pub fn load(path: &Path) -> Result<Sample, String> {
 fn load_limited(path: &Path, max_frames: usize) -> Result<Sample, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| fail(&e))?);
-    let info = wav::read_info(&mut file).map_err(|e| fail(&e))?;
+    read_limited(&mut file, max_frames).map_err(|e| fail(&e))
+}
+
+/// Reads a WAV stream into a mono [`Sample`], like [`load`].
+pub fn read<R: Read + Seek>(r: &mut R) -> Result<Sample, String> {
+    read_limited(r, MAX_FRAMES)
+}
+
+fn read_limited<R: Read + Seek>(file: &mut R, max_frames: usize) -> Result<Sample, String> {
+    let fail = |e: &dyn std::fmt::Display| e.to_string();
+    let info = wav::read_info(file).map_err(|e| fail(&e))?;
     if info.frames == 0 {
         return Err(fail(&"the file contains no audio"));
     }
@@ -113,11 +135,8 @@ fn load_limited(path: &Path, max_frames: usize) -> Result<Sample, String> {
     let gain = 1.0 / ch as f32;
     let mut data = Vec::with_capacity(info.frames as usize + 2 * PAD);
     data.resize(PAD, 0.0);
-    wav::read_samples(&mut file, &info, |block| {
-        data.extend(block.chunks_exact(ch).map(|f| {
-            let m = f.iter().sum::<f32>() * gain;
-            if m.is_finite() { m } else { 0.0 }
-        }));
+    wav::read_samples(file, &info, |block| {
+        data.extend(block.chunks_exact(ch).map(|f| clean(f.iter().sum::<f32>() * gain)));
     })
     .map_err(|e| fail(&e))?;
     data.resize(data.len() + PAD, 0.0);
@@ -187,6 +206,23 @@ pub fn relativize(path: &str, project_dir: Option<&Path>) -> String {
             parts.join("/")
         }
         _ => path.to_string(),
+    }
+}
+
+/// Why `path` cannot be kept as a sample path, if it cannot: a project
+/// file must give it back unchanged. Files hold one setting per line, and
+/// each line is trimmed. A path inside the project's folder is written from
+/// one of its components on, so no component may start or end with
+/// whitespace.
+pub fn unstorable(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        Some("A sample path cannot be empty")
+    } else if path.contains(['\n', '\r']) {
+        Some("A sample path cannot contain line breaks")
+    } else if path.split(std::path::is_separator).any(|c| c.trim() != c) {
+        Some("A sample path cannot have a folder or file name that starts or ends with whitespace")
+    } else {
+        None
     }
 }
 
@@ -269,5 +305,24 @@ mod tests {
         assert_eq!(relativize(&outside, Some(&dir)), outside);
         assert_eq!(resolve(&outside, Some(&dir)), PathBuf::from(&outside));
         assert_eq!(relativize("x.wav", None), "x.wav");
+    }
+
+    #[test]
+    fn only_paths_a_project_gives_back_are_stored() {
+        // Found by `tinvo fuzz edits`: a path of spaces made the saved
+        // project unreadable, and trailing spaces were lost.
+        for bad in ["", "   ", "kick.wav ", " kick.wav", "a\nb", "a\rb", "kits/ kick.wav", "kits /kick.wav"] {
+            assert!(unstorable(bad).is_some(), "{bad:?}");
+        }
+        let dir = absolute("project");
+        for good in ["kick.wav", "my kick.wav", "kits/808 kick.wav", "é/🎹.wav"] {
+            assert_eq!(unstorable(good), None, "{good:?}");
+            let stored = dir.join(good).to_string_lossy().into_owned();
+            assert_eq!(unstorable(&stored), None, "{stored:?}");
+            // Written relative to the project, read back, made absolute.
+            let line = format!("sample {}", relativize(&stored, Some(&dir)));
+            let read = line.trim().split_once(' ').unwrap().1.trim();
+            assert_eq!(resolve(read, Some(&dir)), PathBuf::from(&stored));
+        }
     }
 }

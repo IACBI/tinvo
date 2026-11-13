@@ -6,6 +6,20 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-13
+
+### Added
+- `tinvo fuzz project|wav|edits`, a fuzzer for what TINVO reads and keeps, written with `std` alone. It mutates project files, WAV files and scripts of edits, and checks on every input that nothing panics. For projects: an accepted file saves to text that loads back equal, is rebuilt exactly by its own edits, and renders without a non-finite sample. For WAV files: the header reader, the decoder, the block reader and the sample loader agree, and the sample renders finite through a plain and a heavily processed track. For edits: every edit is undone exactly by its inverse. A failing input is reduced and saved, and `tinvo fuzz TARGET --check FILE` replays it. CI fuzzes each target for 60 seconds on every push, and `cargo test` runs a short fuzz of each.
+
+### Fixed
+These were all found by the fuzzer.
+- Sampler: with the start point after the end point, the next note panicked the audio thread, and so did turning the knob while a note played. Now no note starts, and playing voices stop at the end point. This has been there since the sampler arrived in 0.4.0.
+- Sampler: a float WAV holding huge values (up to the largest `f32`) played as infinite output, which then stayed in the filters and effects for the rest of the session. Loaded samples are now limited to ±1024 (+60 dBFS); non-finite values were already replaced by silence.
+- A sample path with a folder or file name that starts or ends with whitespace is now refused when loading. Project files trim each line, so such a path came back changed and the sample went missing; a path made only of spaces made the saved project impossible to open.
+
+### Changed
+- The WAV reader's documentation now says that 32-bit integer samples at full scale decode to exactly 1.0, since `f32` has 24 bits of precision. It had said every integer sample stays below 1.
+
 ## [0.14.0] - 2026-11-12
 
 ### Added
@@ -198,7 +212,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/IACBI/tinvo/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/IACBI/tinvo/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/IACBI/tinvo/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/IACBI/tinvo/compare/v0.12.0...v0.13.0

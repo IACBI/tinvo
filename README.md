@@ -77,6 +77,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
+tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 ```
 
 The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
@@ -114,7 +115,7 @@ The main keys in the editor (press `?` for the full list):
 
 ### Contributing
 
-Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules, including the zero-dependency rule. A change has to pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rules, including the zero-dependency rule. A change has to pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. A change to a file format or the edit model should also survive a few minutes of `tinvo fuzz`.
 
 ### License
 
@@ -188,6 +189,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
+tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 ```
 
 Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
@@ -225,7 +227,7 @@ Editördeki temel tuşlar (tam liste için `?`):
 
 ### Katkı
 
-Hata bildirimleri ve pull request'ler memnuniyetle karşılanır. Sıfır bağımlılık kuralı dahil tüm kurallar [CONTRIBUTING.md](CONTRIBUTING.md) dosyasında (İngilizce). Her değişiklik `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` ve `cargo test` adımlarından geçmeli.
+Hata bildirimleri ve pull request'ler memnuniyetle karşılanır. Sıfır bağımlılık kuralı dahil tüm kurallar [CONTRIBUTING.md](CONTRIBUTING.md) dosyasında (İngilizce). Her değişiklik `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` ve `cargo test` adımlarından geçmeli. Dosya formatlarına ya da düzenleme modeline dokunan bir değişiklik birkaç dakikalık `tinvo fuzz` çalışmasından da sağ çıkmalı.
 
 ### Lisans
 

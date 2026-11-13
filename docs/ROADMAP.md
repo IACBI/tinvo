@@ -160,7 +160,7 @@ Known limits:
 - The ALSA sequencer has not run anywhere: neither the development machine's container nor the CI runners have the `snd-seq` kernel module. It compiles, links and is lint-clean; its event layout was checked against `<alsa/seq_event.h>` with a C program. Its calls were reviewed against alsa-lib's `seq.c` and `seq_hw.c`, `aseqdump` and the kernel's `seq_clientmgr.c`: an input-only client may create a port, subscribe and receive (the kernel delivers only to clients opened for reading, and alsa-lib opens input-only clients read-only); the read loop matches `aseqdump`'s; `-ENOSPC` means the FIFO overran and was cleared; and events from MIDI 2.0 clients are converted by the kernel for legacy clients like TINVO's.
 - The audio unit output runs in CI on the macOS runner's virtual devices and on BlackHole, including low latency being turned on and off again. It has not run on a real Mac's hardware here. Freeing the render state after `AudioOutputUnitStop` relies on its being synchronous when called from another thread, as an Apple engineer described it; Apple's headers do not say so.
 
-## Phase 6a: Autosave and recovery ✅ (0.14.0, this release)
+## Phase 6a: Autosave and recovery ✅ (0.14.0)
 
 - Unsaved edits are written every 5 seconds, atomically, next to the project (or in the state directory for an untitled one); saving or quitting normally removes the autosave.
 - At start-up an autosave left by a session that did not end normally is offered for recovery, discarded, or kept for next time.
@@ -172,10 +172,21 @@ Known limits:
 - The autosave is renamed into place but its directory is not synced afterwards, so after a power failure (not a crash of TINVO) some file systems may come back with the previous autosave or none.
 - The flow was run end to end on Linux in a pseudo-terminal: edits, `kill -9`, the recovery question, recovering and saving (the saved file equals the autosave byte for byte), and discarding. The writes on a terminal error and on a panic are covered by unit tests of the pieces, not by a run that actually fails mid-session. The recovery screen has not been tried by hand in a Windows console.
 
+## Phase 6b: Fuzzing ✅ (0.15.0, this release)
+
+- `tinvo fuzz` for project files, WAV files and edit scripts, with invariants that go past "does not panic": save round trips, the engine's view of a project, undo, the sample loader against the decoder, and finite output when an accepted input is played.
+- Runs in CI for 60 seconds per target on every push, and briefly in `cargo test`.
+- It found four problems on its first runs, all fixed: a panic on the audio thread when a sampler's start point is after its end point, infinite output from float WAV files with huge values, sample paths that a project file could not give back, and a wrong promise about the range of 32-bit WAV samples.
+
+Known limits:
+- It is not coverage-guided. That needs compiler instrumentation and a fuzzing runtime (`cargo fuzz` uses libFuzzer, a nightly toolchain and crates). Instead an input is kept when it shows a feature not seen before: a new error, or a new kind of line, chunk or edit in an accepted input. Mutations that know the formats make up for part of the difference; a coverage-guided fuzzer would still reach some branches sooner.
+- Rendering covers the first half second of an accepted project, without its samples (the files are not there); sample rendering uses fixed projects. One accepted input in 16 is rendered by default.
+- Edit scripts stop after 64 edits, since each edit clones the project twice to check its undo.
+- Before this release it ran for about 24 million project inputs, 4.7 million WAV files and 200,000 edit scripts (two 10-minute runs per target on one machine). Finding nothing more in that time does not show that no bug is left.
+
 ## Later in Phase 6
 
 - Mouse support, themes, configurable keymaps.
-- Fuzzing of the project and WAV parsers.
 - Performance budgets enforced in CI via `tinvo bench`.
 - Notes that span the loop point in the piano roll display (they already play correctly).
 

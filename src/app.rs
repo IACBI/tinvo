@@ -918,8 +918,8 @@ impl App {
     fn load_sample(&mut self, text: &str) {
         let path = sample_mod::absolute(text);
         let key = path.to_string_lossy().into_owned();
-        if key.contains(['\n', '\r']) {
-            self.set_status("A sample path cannot contain line breaks");
+        if let Some(why) = sample_mod::unstorable(&key) {
+            self.set_status(why);
             return;
         }
         let loaded = match sample_mod::load(&path) {

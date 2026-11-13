@@ -25,6 +25,7 @@ pub mod autosave;
 pub mod dsp;
 pub mod engine;
 pub mod fsutil;
+pub mod fuzz;
 pub mod instrument;
 pub mod midi;
 pub mod mix;
