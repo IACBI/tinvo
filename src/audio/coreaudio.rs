@@ -132,6 +132,7 @@ const SCOPE_GLOBAL: u32 = fourcc(b"glob");
 const SCOPE_OUTPUT: u32 = fourcc(b"outp");
 const SCOPE_INPUT: u32 = fourcc(b"inpt");
 const QUEUE_CURRENT_DEVICE: u32 = fourcc(b"aqcd");
+const PROP_NOMINAL_RATE: u32 = fourcc(b"nsrt");
 
 fn address(selector: u32, scope: u32) -> PropertyAddress {
     PropertyAddress { selector, scope, element: 0 }
@@ -395,6 +396,24 @@ fn device_for_uid(uid: &str) -> Option<u32> {
         status
     };
     (status == 0 && id != 0).then_some(id)
+}
+
+/// The sample rate `device` runs at, if it reports a usable one.
+fn nominal_rate(device: u32) -> Option<f64> {
+    let mut rate = 0f64;
+    let mut size = size_of::<f64>() as u32;
+    // SAFETY: the property is one Float64.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &address(PROP_NOMINAL_RATE, SCOPE_GLOBAL),
+            0,
+            ptr::null(),
+            &mut size,
+            (&raw mut rate).cast(),
+        )
+    };
+    (status == 0 && rate.is_finite() && rate >= 8_000.0).then_some(rate)
 }
 
 /// A `u32` property of `device` in the global scope.
@@ -791,8 +810,9 @@ unsafe extern "C" fn captured<C: CaptureCallback>(
     }
 }
 
-/// Captures stereo float at 48 kHz (the queue converts the device's format)
-/// from the device with UID `device`, else the default input. macOS asks
+/// Captures stereo float at the device's own rate (the queue converts only
+/// its sample format and channels; 48 kHz if the rate cannot be read) from
+/// the device with UID `device`, else the default input. macOS asks
 /// the user for microphone access the first time; until it is granted the
 /// queue delivers silence.
 pub fn open_input<F, C>(
@@ -806,12 +826,17 @@ where
     C: CaptureCallback,
 {
     spawn_audio_thread(move |report| {
+        let id = match &device {
+            Some(uid) => device_for_uid(uid),
+            None => default_for(PROP_DEFAULT_INPUT),
+        };
+        let rate = id.and_then(nominal_rate).unwrap_or(SAMPLE_RATE);
         let state = Box::into_raw(Box::new(InputState {
-            callback: factory(SAMPLE_RATE as u32, 2),
+            callback: factory(rate as u32, 2),
             stopping: AtomicBool::new(false),
             health,
         }));
-        let format = float_stereo(SAMPLE_RATE);
+        let format = float_stereo(rate);
         let mut queue: AudioQueueRef = ptr::null_mut();
         // SAFETY: valid format, callback and out-pointer; `state` outlives the queue.
         let status = unsafe {
@@ -862,7 +887,7 @@ where
         report(Ok(InputInfo {
             backend: "CoreAudio",
             device: name.unwrap_or_default(),
-            sample_rate: SAMPLE_RATE as u32,
+            sample_rate: rate as u32,
             device_channels: 2,
             channels: 2,
             format: "F32".into(),
@@ -969,6 +994,8 @@ mod tests {
         .unwrap();
         let config = StreamConfig { device: Some(out.id.clone()), low_latency: false };
         let output = open_with(&config, |_| Ramp(Arc::new(AtomicU64::new(0)))).unwrap();
+        // Both ends run at the device's own rate, so nothing is resampled.
+        assert_eq!(input.info().sample_rate, output.info().sample_rate);
         std::thread::sleep(Duration::from_millis(1500));
         drop(input);
         drop(output);

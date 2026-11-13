@@ -4106,12 +4106,13 @@ mod tests {
         // count matches what is really outside the UI.
         assert_eq!(Arc::strong_count(&s), 1 + MAX_TRACKS);
         assert_eq!(link.in_flight, MAX_TRACKS);
-        // Removing every track returns all of them (over two callbacks: track
-        // removals are expensive, so one callback takes at most eight).
+        // Removing every track returns all of them once they have faded out:
+        // two callbacks take the removals (one takes at most eight), and
+        // eight more of 64 frames play the 10 ms fade.
         for _ in 0..MAX_TRACKS {
             link.send(Command::Edit(Edit::RemoveTrack(0)));
         }
-        for _ in 0..2 {
+        for _ in 0..2 + 8 {
             e.process(&mut out);
             link.flush();
         }

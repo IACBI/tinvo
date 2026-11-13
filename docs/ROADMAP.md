@@ -211,7 +211,7 @@ Known limits:
 - A note held past the pattern's end is drawn as the pattern repeating. In a song whose next entry is another pattern, the note still sounds over it, but the roll does not show that.
 - There is no editor for the settings inside TINVO; the file is edited by hand.
 
-## Phase 6e: Mouse ✅ (0.18.0, this release)
+## Phase 6e: Mouse ✅ (0.18.0)
 
 - Clicks: a step toggles, a track's name selects it, `M` and `S` mute and solo, the play state in the header starts and stops. In the piano roll a click adds or removes a note, and a key on the left plays its pitch; in the automation view it adds or removes a point; in the song view it selects an entry; in the panel it selects a parameter. Device and MIDI lists choose the entry clicked. The right button only moves the cursor, or puts a parameter back to its default.
 - Dragging across a track's steps fills or clears them, as the first step clicked went. In the piano roll, dragging from a note sets its length; a press on a note and a release without dragging removes it. Each drag is one undo step.
@@ -226,10 +226,18 @@ Known limits:
 - Questions and text prompts answer only to keys. There is no double click, and Shift, Ctrl and Alt do not change what a click does.
 - A drag paints along one track and within the steps on screen; a note's length can be dragged up to the last step shown. A key pressed during a drag ends it.
 
+## Phase 6f: Foundation limits ✅ (0.19.0, this release)
+
+- A track removed while it sounds, or an added track undone, fades out over 10 ms instead of stopping dead. During the fade it plays on exactly as it would have, through its strip, fader and sends; then its sample is released.
+- Drum parameters reach a hit that is still ringing: tune, the decays, click, tone and the clap's spread, whose bursts still to come keep to the new spacing. An open hat cut short by a closed one stays short when its decay grows.
+- ALSA output and input open at a rate the device takes without resampling (ALSA's own resampler is a linear one): 48 kHz when it can, else 44.1 kHz, else the first common rate it takes. CoreAudio input runs at the device's nominal rate, as output already did.
+
+Known limits:
+- Each removed track fades in one of 16 slots. More than 16 removals within one fade cut short the fade with the fewest frames left; the editor removes one track per key press, so it does not come to that.
+- ALSA's rate is chosen with resampling turned off. Where every rate passes that check, as with `null`, TINVO opens at 48 kHz as before, and a sound server behind ALSA converts if it runs at another rate. The choice was checked on plug devices over `null` with a fixed rate (44.1, 96 and 22.05 kHz, for playback and recording), not on real hardware.
+- CoreAudio input at the device's rate has run on the macOS CI runner's BlackHole only.
+
 ## Known limitations of the foundation
 
 - Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.
-- ALSA output and input, and CoreAudio input, open at a fixed 48 kHz (the OS resamples). WASAPI uses the device's mix rate; CoreAudio output and JACK use the device's or server's rate.
-- Removing a track while it is sounding cuts it off immediately, with no fade. The same applies to undoing an added track.
 - CI runs on hosted Windows, Linux and macOS machines, which have no sound card. JACK (jackd and PipeWire) and CoreAudio (BlackHole and the runner's virtual devices) are played through there; WASAPI and ALSA are only compiled, linted and listed.
-- Drum tone parameters apply from the next hit, not to a hit that is still ringing.

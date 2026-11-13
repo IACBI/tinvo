@@ -92,6 +92,9 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 /// than a step. The rest is headroom for auditions.
 const MAX_PENDING_OFFS: usize = MAX_STEPS * MAX_CHORD + 4 * MAX_CHORD * MAX_RATCHET as usize;
 const SMOOTHING_TIME: f32 = 0.005;
+/// A removed track goes on sounding while it falls linearly to silence over
+/// this time, instead of stopping dead.
+const REMOVE_FADE_TIME: f32 = 0.010;
 
 /// Most repeats a single step can be divided into.
 pub const MAX_RATCHET: u8 = 4;
@@ -767,6 +770,12 @@ pub struct Engine {
     /// before any strip runs, so the key bus is complete when the
     /// compressors read it.
     track_bufs: Box<[[f32; BLOCK]]>,
+    /// Removed tracks still fading out. There is one slot per track, so
+    /// only removals faster than one per `MAX_TRACKS` fade times share one.
+    fading: Box<[Fading]>,
+    fading_count: usize,
+    fade_frames: u32,
+    fade_buf: [f32; BLOCK],
     key: [f32; BLOCK],
     /// Effect buses and the master limiter.
     mix: Mix,
@@ -788,6 +797,12 @@ pub struct Engine {
     /// Live notes sounding, oldest first.
     held: [Held; MAX_LIVE],
     held_count: usize,
+}
+
+/// A removed track and the frames left of its fade.
+struct Fading {
+    track: Track,
+    left: u32,
 }
 
 const CHANCE_SEED: u64 = 0x5EED_C4A2_CE00_0001;
@@ -819,6 +834,12 @@ impl Engine {
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
+            fading: (0..MAX_TRACKS)
+                .map(|_| Fading { track: Track::new(InstrumentKind::Synth, sample_rate), left: 0 })
+                .collect(),
+            fading_count: 0,
+            fade_frames: ((REMOVE_FADE_TIME * sample_rate) as u32).max(1),
+            fade_buf: [0.0; BLOCK],
             key: [0.0; BLOCK],
             mix: Mix::new(sample_rate, 120.0, BLOCK),
             commands,
@@ -847,6 +868,12 @@ impl Engine {
         for &edit in edits {
             e.apply(edit);
         }
+        // Nothing sounded yet, so a track removed on the way has nothing to fade.
+        for f in &mut e.fading[..] {
+            f.left = 0;
+            drop(f.track.instrument.set_sample(None));
+        }
+        e.fading_count = 0;
         e.settle_smoothers();
         e
     }
@@ -879,6 +906,20 @@ impl Engine {
             Some(t) => t.instrument.set_sample(sample),
             None => sample,
         };
+        retire(&mut self.retired, old);
+    }
+
+    /// Moves the track in `slot` (no longer counted) to a fading slot, taking
+    /// that slot's idle track in exchange. With every slot busy, the fade
+    /// nearest its end is cut short.
+    fn fade_out(&mut self, slot: usize) {
+        let Some(f) = self.fading.iter_mut().min_by_key(|f| f.left) else { return };
+        if f.left == 0 {
+            self.fading_count += 1;
+        }
+        std::mem::swap(&mut f.track, &mut self.tracks[slot]);
+        f.left = self.fade_frames;
+        let old = self.tracks[slot].instrument.set_sample(None);
         retire(&mut self.retired, old);
     }
 
@@ -1131,8 +1172,7 @@ impl Engine {
                         }
                     }
                     self.tracks[i..n].rotate_left(1);
-                    let old = self.tracks[n - 1].instrument.set_sample(None);
-                    retire(&mut self.retired, old);
+                    self.fade_out(n - 1);
                     self.track_count -= 1;
                     self.update_gains();
                 }
@@ -1463,7 +1503,21 @@ impl Engine {
     }
 
     fn render_segment(&mut self, a: usize, b: usize) {
-        let Self { tracks, track_count, track_bufs, key, mix_l, mix_r, mix, .. } = self;
+        let Self {
+            tracks,
+            track_count,
+            track_bufs,
+            key,
+            mix_l,
+            mix_r,
+            mix,
+            fading,
+            fading_count,
+            fade_frames,
+            fade_buf,
+            retired,
+            ..
+        } = self;
         let tracks = &mut tracks[..*track_count];
         let key = &mut key[a..b];
         key.fill(0.0);
@@ -1481,41 +1535,67 @@ impl Engine {
         for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
             let buf = &mut buf[a..b];
             t.strip.process(buf, key);
-            let mut peak = t.peak;
-            let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
-                let s = &t.sends[k];
-                s.current() != 0.0 || s.target() != 0.0
-            });
-            if sending.contains(&true) {
-                let mut inputs = mix.inputs(sending);
-                for (i, &s) in buf.iter().enumerate() {
-                    let l = s * t.gain_l.tick();
-                    let r = s * t.gain_r.tick();
-                    mix_l[a + i] += l;
-                    mix_r[a + i] += r;
-                    peak = peak.max(l.abs()).max(r.abs());
-                    let j = 2 * (a + i);
-                    for (bus, input) in inputs.iter_mut().enumerate() {
-                        if sending[bus] {
-                            let g = t.sends[bus].tick();
-                            input[j] += l * g;
-                            input[j + 1] += r * g;
-                        }
-                    }
-                }
-            } else {
-                for (i, &s) in buf.iter().enumerate() {
-                    let l = s * t.gain_l.tick();
-                    let r = s * t.gain_r.tick();
-                    mix_l[a + i] += l;
-                    mix_r[a + i] += r;
-                    peak = peak.max(l.abs()).max(r.abs());
-                }
+            mix_track(t, buf, &mut mix_l[a..b], &mut mix_r[a..b], 2 * a, mix);
+        }
+        if *fading_count == 0 {
+            return;
+        }
+        // A removed track feeds no one's key: its key send went with it.
+        for f in fading.iter_mut().filter(|f| f.left > 0) {
+            let buf = &mut fade_buf[a..b];
+            buf.fill(0.0);
+            f.track.instrument.render(buf);
+            f.track.strip.process(buf, key);
+            for s in buf.iter_mut() {
+                *s *= f.left as f32 / *fade_frames as f32;
+                f.left = f.left.saturating_sub(1);
             }
-            if peak.is_finite() {
-                t.peak = peak;
+            mix_track(&mut f.track, buf, &mut mix_l[a..b], &mut mix_r[a..b], 2 * a, mix);
+            if f.left == 0 {
+                *fading_count -= 1;
+                retire(retired, f.track.instrument.set_sample(None));
             }
         }
+    }
+}
+
+/// Adds a track's signal for one segment to the mix and to the buses it
+/// sends to, through its fader and pan. `at` is the segment's first sample
+/// in the interleaved bus inputs.
+fn mix_track(t: &mut Track, buf: &[f32], mix_l: &mut [f32], mix_r: &mut [f32], at: usize, mix: &mut Mix) {
+    let mut peak = t.peak;
+    let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
+        let s = &t.sends[k];
+        s.current() != 0.0 || s.target() != 0.0
+    });
+    if sending.contains(&true) {
+        let mut inputs = mix.inputs(sending);
+        for (i, &s) in buf.iter().enumerate() {
+            let l = s * t.gain_l.tick();
+            let r = s * t.gain_r.tick();
+            mix_l[i] += l;
+            mix_r[i] += r;
+            peak = peak.max(l.abs()).max(r.abs());
+            let j = at + 2 * i;
+            for (bus, input) in inputs.iter_mut().enumerate() {
+                if sending[bus] {
+                    let g = t.sends[bus].tick();
+                    input[j] += l * g;
+                    input[j + 1] += r * g;
+                }
+            }
+        }
+    } else {
+        for (i, &s) in buf.iter().enumerate() {
+            let l = s * t.gain_l.tick();
+            let r = s * t.gain_r.tick();
+            mix_l[i] += l;
+            mix_r[i] += r;
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+    }
+    if peak.is_finite() {
+        t.peak = peak;
     }
 }
 
@@ -1734,6 +1814,60 @@ mod tests {
         assert_eq!(e.tracks[1].instrument.kind(), InstrumentKind::Clap);
         e.apply(Edit::RemoveTrack(7)); // out of range: ignored
         assert_eq!(e.track_count(), 2);
+    }
+
+    #[test]
+    fn a_removed_track_fades_out_instead_of_stopping_dead() {
+        let held = || Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 };
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        let mut kept = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.handle(held());
+        kept.handle(held());
+        let before = run(&mut e, 4800);
+        assert_eq!(before, run(&mut kept, 4800));
+        let level = before.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(level > 0.05, "the note sounds ({level})");
+        e.apply(Edit::RemoveTrack(0));
+        let (fade, latency) = (e.fade_frames as usize, e.latency());
+        assert_eq!(fade, 480);
+        let out = run(&mut e, fade + latency + 4800);
+        let full = run(&mut kept, fade + latency + 4800);
+        // The track goes on exactly as it would have, under a linear fade...
+        for (k, (x, y)) in out.chunks_exact(2).zip(full.chunks_exact(2)).enumerate() {
+            let j = k as f32 - latency as f32;
+            let g = if j < 0.0 { 1.0 } else { ((fade as f32 - j) / fade as f32).max(0.0) };
+            for c in 0..2 {
+                assert!((x[c] - y[c] * g).abs() <= 1e-5, "frame {k}: {} against {} x {g}", x[c], y[c]);
+            }
+        }
+        // ...is silent once the fade is over, and frees its slot.
+        assert!(out[2 * (fade + latency)..].iter().all(|&x| x == 0.0));
+        assert_eq!(e.fading_count, 0);
+    }
+
+    #[test]
+    fn removals_beyond_the_fading_slots_cut_the_oldest_fade() {
+        let edits: Vec<_> = (0..MAX_TRACKS).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
+        let mut e = engine(&edits);
+        for i in 0..MAX_TRACKS {
+            e.handle(Command::Audition { track: i as u8, step: Step::new(60, 100, 1), frames: 1 << 20 });
+        }
+        run(&mut e, 256);
+        for _ in 0..MAX_TRACKS {
+            e.apply(Edit::RemoveTrack(0));
+            run(&mut e, 1);
+        }
+        assert_eq!((e.track_count(), e.fading_count), (0, MAX_TRACKS));
+        // A new track, removed at once: the fade with the fewest frames left goes.
+        e.apply(Edit::AddTrack(InstrumentKind::Kick));
+        e.apply(Edit::RemoveTrack(0));
+        assert_eq!(e.fading_count, MAX_TRACKS);
+        let left: Vec<u32> = e.fading.iter().map(|f| f.left).collect();
+        assert_eq!(left.iter().filter(|&&l| l == e.fade_frames).count(), 1, "{left:?}");
+        assert_eq!(*left.iter().min().unwrap(), e.fade_frames - (MAX_TRACKS as u32 - 1), "{left:?}");
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade);
+        assert_eq!(e.fading_count, 0);
     }
 
     fn live_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<LiveNote>>) {
@@ -1962,8 +2096,11 @@ mod tests {
         e.handle(Command::SetSample { track: 1, sample: Some(a.clone()) });
         e.handle(Command::SetSample { track: 9, sample: Some(a.clone()) });
         assert_eq!(drain(&mut rx), 3);
-        // Removing the track releases its sample too.
+        // Removing the track releases its sample too, once it has faded out.
         e.apply(Edit::RemoveTrack(0));
+        assert_eq!(drain(&mut rx), 3);
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade);
         assert_eq!(drain(&mut rx), 4);
         assert!(Arc::ptr_eq(&back[3], &b));
         // The engine holds no reference any more: every count is ours.

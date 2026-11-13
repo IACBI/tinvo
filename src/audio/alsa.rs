@@ -1,8 +1,9 @@
 //! Linux output through the ALSA PCM API (libasound).
 //!
 //! Opens the chosen PCM, else `default` (which routes through
-//! PipeWire/PulseAudio when present), as interleaved stereo float at 48 kHz,
-//! letting the ALSA plug layer convert if the hardware differs. Devices are
+//! PipeWire/PulseAudio when present), as interleaved stereo float at a rate
+//! the device takes without resampling (48 kHz when it can), letting the
+//! ALSA plug layer convert only the sample format and channels. Devices are
 //! the PCM names ALSA's hints list for output.
 
 use super::{
@@ -20,7 +21,10 @@ const SND_PCM_STREAM_CAPTURE: c_int = 1;
 const CAPTURE_LATENCY_US: c_uint = 100_000;
 const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
-const SAMPLE_RATE: c_uint = 48_000;
+/// Rates tried in turn for one the device takes as it is; ALSA's own
+/// resampler, used otherwise, is a plain linear one.
+const RATES: [c_uint; 12] =
+    [48_000, 44_100, 96_000, 88_200, 192_000, 176_400, 32_000, 24_000, 22_050, 16_000, 11_025, 8_000];
 const LATENCY_US: c_uint = 20_000;
 
 #[link(name = "asound")]
@@ -35,6 +39,11 @@ unsafe extern "C" {
         soft_resample: c_int,
         latency_us: c_uint,
     ) -> c_int;
+    fn snd_pcm_hw_params_malloc(params: *mut *mut c_void) -> c_int;
+    fn snd_pcm_hw_params_free(params: *mut c_void);
+    fn snd_pcm_hw_params_any(pcm: *mut c_void, params: *mut c_void) -> c_int;
+    fn snd_pcm_hw_params_set_rate_resample(pcm: *mut c_void, params: *mut c_void, val: c_uint) -> c_int;
+    fn snd_pcm_hw_params_test_rate(pcm: *mut c_void, params: *mut c_void, val: c_uint, dir: c_int) -> c_int;
     fn snd_pcm_get_params(pcm: *mut c_void, buffer_size: *mut c_ulong, period_size: *mut c_ulong) -> c_int;
     fn snd_pcm_writei(pcm: *mut c_void, buffer: *const c_void, frames: c_ulong) -> c_long;
     fn snd_pcm_readi(pcm: *mut c_void, buffer: *mut c_void, frames: c_ulong) -> c_long;
@@ -118,8 +127,8 @@ pub fn input_devices() -> Result<Vec<Device>, String> {
         .collect())
 }
 
-/// Captures stereo float at 48 kHz from the chosen PCM (the plug layer
-/// converts mono inputs and other rates).
+/// Captures stereo float from the chosen PCM at a rate it takes without
+/// resampling (the plug layer converts mono inputs and sample formats).
 pub fn open_input<F, C>(
     device: Option<String>,
     factory: F,
@@ -133,16 +142,16 @@ where
     spawn_audio_thread(move |report| {
         let name = device.unwrap_or_else(|| DEFAULT_PCM.into());
         // SAFETY: libasound calls with valid handles and buffers.
-        let (pcm, _, period) = match unsafe { open_pcm(&name, SND_PCM_STREAM_CAPTURE, CAPTURE_LATENCY_US) } {
+        let (pcm, rate, _, period) = match unsafe { open_pcm(&name, SND_PCM_STREAM_CAPTURE, CAPTURE_LATENCY_US) } {
             Ok(v) => v,
             Err(e) => return report(Err(e)),
         };
-        let mut callback = factory(SAMPLE_RATE, 2);
+        let mut callback = factory(rate, 2);
         let mut buf = vec![0.0f32; period * 2];
         report(Ok(InputInfo {
             backend: "ALSA",
             device: name,
-            sample_rate: SAMPLE_RATE,
+            sample_rate: rate,
             device_channels: 2,
             channels: 2,
             format: "F32".into(),
@@ -207,16 +216,16 @@ where
     spawn_audio_thread(move |report| {
         let name = config.device.unwrap_or_else(|| DEFAULT_PCM.into());
         // SAFETY: libasound calls with valid handles and buffers.
-        let (pcm, buffer, period) = match unsafe { open_pcm(&name, SND_PCM_STREAM_PLAYBACK, LATENCY_US) } {
+        let (pcm, rate, buffer, period) = match unsafe { open_pcm(&name, SND_PCM_STREAM_PLAYBACK, LATENCY_US) } {
             Ok(v) => v,
             Err(e) => return report(Err(e)),
         };
-        let mut callback = factory(SAMPLE_RATE);
+        let mut callback = factory(rate);
         let mut buf = vec![0.0f32; period * 2];
         report(Ok(StreamInfo {
             backend: "ALSA",
             device: name,
-            sample_rate: SAMPLE_RATE,
+            sample_rate: rate,
             device_channels: 2,
             buffer_frames: buffer as u32,
             period_frames: period as u32,
@@ -248,7 +257,36 @@ where
     })
 }
 
-unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm, usize, usize), String> {
+/// The first of `RATES` that `takes`, else 48 kHz (which ALSA then resamples).
+fn choose_rate(takes: impl Fn(c_uint) -> bool) -> c_uint {
+    RATES.into_iter().find(|&r| takes(r)).unwrap_or(RATES[0])
+}
+
+/// Picks the rate `pcm` runs at without resampling.
+///
+/// # Safety
+/// `pcm` must be an open handle.
+unsafe fn native_rate(pcm: *mut c_void) -> c_uint {
+    let mut params = ptr::null_mut();
+    // SAFETY: valid out-pointer.
+    if unsafe { snd_pcm_hw_params_malloc(&mut params) } < 0 {
+        return RATES[0];
+    }
+    // SAFETY: `params` was just allocated and `pcm` is open; with resampling
+    // off, the rates left are those the device (or its server) runs at.
+    let rate = unsafe {
+        if snd_pcm_hw_params_any(pcm, params) < 0 || snd_pcm_hw_params_set_rate_resample(pcm, params, 0) < 0 {
+            RATES[0]
+        } else {
+            choose_rate(|r| snd_pcm_hw_params_test_rate(pcm, params, r, 0) == 0)
+        }
+    };
+    // SAFETY: allocated above, freed once.
+    unsafe { snd_pcm_hw_params_free(params) };
+    rate
+}
+
+unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm, c_uint, usize, usize), String> {
     let mut handle = ptr::null_mut();
     let c_name = CString::new(name).map_err(|_| format!("bad ALSA device name '{name}'"))?;
     // SAFETY: valid out-pointer and NUL-terminated device name.
@@ -258,8 +296,10 @@ unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm
     }
     let pcm = Pcm(handle);
     // SAFETY: `pcm` is an open handle.
+    let rate = unsafe { native_rate(pcm.0) };
+    // SAFETY: `pcm` is an open handle.
     let r = unsafe {
-        snd_pcm_set_params(pcm.0, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SAMPLE_RATE, 1, latency_us)
+        snd_pcm_set_params(pcm.0, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1, latency_us)
     };
     if r < 0 {
         return Err(alsa_error("cannot configure ALSA device", r));
@@ -270,5 +310,29 @@ unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm
     if r < 0 || period == 0 {
         return Err(alsa_error("cannot query ALSA buffer size", r));
     }
-    Ok((pcm, buffer as usize, period as usize))
+    Ok((pcm, rate, buffer as usize, period as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rate_is_the_first_the_device_takes() {
+        assert_eq!(choose_rate(|_| true), 48_000);
+        assert_eq!(choose_rate(|r| r == 44_100 || r == 96_000), 44_100);
+        assert_eq!(choose_rate(|r| r >= 88_200), 96_000);
+        assert_eq!(choose_rate(|r| r == 22_050), 22_050);
+        // Nothing listed: ALSA resamples from 48 kHz, as before.
+        assert_eq!(choose_rate(|_| false), 48_000);
+    }
+
+    #[test]
+    fn the_null_device_opens_at_48_khz() {
+        // `null` comes with ALSA's own configuration and runs at any rate.
+        // SAFETY: opening and closing a PCM through libasound.
+        let (_pcm, rate, buffer, period) = unsafe { open_pcm("null", SND_PCM_STREAM_PLAYBACK, LATENCY_US) }.unwrap();
+        assert_eq!(rate, 48_000);
+        assert!(period > 0 && buffer >= period, "{buffer} {period}");
+    }
 }
