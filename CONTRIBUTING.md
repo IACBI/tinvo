@@ -4,6 +4,8 @@ Thanks for helping. These rules keep TINVO small, fast and correct.
 
 Author: 𝓐.𝓒.𝓑
 
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security problems go through a private report, not an issue or a pull request: see [SECURITY.md](SECURITY.md).
+
 ## Ground rules
 
 - **No third-party crates.** Use only `std` and direct FFI to operating-system APIs. A pull request that adds a dependency will not be merged. Write the piece you need, with tests.
