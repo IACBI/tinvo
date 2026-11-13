@@ -2,6 +2,7 @@
 //!
 //! Each drum is monophonic. Retriggering while a hit is still ringing
 //! cross-fades the old tail out over ~1 ms so the restart never clicks.
+//! Parameter changes reach a hit that is still ringing.
 
 use super::{InstrumentKind, ParamSpec, Unit};
 use crate::dsp::filter::{FilterMode, Svf};
@@ -76,6 +77,8 @@ pub struct Drum {
     active: bool,
     /// Samples since the trigger.
     t: u32,
+    /// Transposition by the played note; `pitch` adds the tune parameter.
+    note_ratio: f32,
     pitch: f32,
     gain: f32,
     /// Main amplitude envelope and its per-sample decay.
@@ -95,6 +98,11 @@ pub struct Drum {
     rng: Rng,
     /// Clap burst spacing in samples.
     spread: u32,
+    /// Clap events started (three bursts, then the tail) and when the next is due.
+    bursts: u8,
+    next_burst: u32,
+    /// An open hat cut short by a closed one stays short when its decay changes.
+    choked: bool,
     /// Remaining tail of the previous hit, faded out after a retrigger.
     declick: f32,
     declick_coef: f32,
@@ -116,6 +124,7 @@ impl Drum {
             param_count: specs.len(),
             active: false,
             t: 0,
+            note_ratio: 1.0,
             pitch: 1.0,
             gain: 0.0,
             amp: 0.0,
@@ -131,6 +140,9 @@ impl Drum {
             f2: Svf::new(),
             rng: Rng::new(kind as u64 + 1),
             spread: 1,
+            bursts: 0,
+            next_burst: 0,
+            choked: false,
             declick: 0.0,
             declick_coef: (-1.0 / (0.001 * sample_rate)).exp(),
             last: 0.0,
@@ -144,6 +156,9 @@ impl Drum {
     pub fn set_param(&mut self, index: usize, value: f32) {
         if index < self.param_count {
             self.params[index] = params(self.kind)[index].clamp(value);
+            if self.active {
+                self.follow_params();
+            }
         }
     }
 
@@ -153,57 +168,81 @@ impl Drum {
 
     /// Starts a hit. The note transposes the drum relative to middle C (60).
     pub fn trigger(&mut self, note: u8, velocity: u8) {
-        let sr = self.sample_rate;
-        let p = self.params;
         self.declick = if self.active { self.last } else { 0.0 };
         self.active = true;
         self.t = 0;
         self.gain = velocity_to_gain(velocity);
-        self.pitch = semitones_to_ratio(f32::from(note.min(127)) - 60.0);
+        self.note_ratio = semitones_to_ratio(f32::from(note.min(127)) - 60.0);
         self.phase1 = 0.0;
         self.phase2 = 0.0;
         self.f1.reset();
         self.f2.reset();
+        self.choked = false;
+        self.pe = 1.0;
         match self.kind {
-            InstrumentKind::Kick => {
-                self.pitch *= semitones_to_ratio(p[0]);
+            InstrumentKind::Kick | InstrumentKind::Snare => {
                 self.amp = 1.0;
-                self.amp_coef = decay_coef(p[1], sr);
-                self.pe = 1.0;
-                self.pe_coef = decay_coef(0.12, sr);
-                self.amp2 = p[3];
-                self.amp2_coef = decay_coef(0.012, sr);
-                self.f1.set_q(3000.0, 0.7, sr);
-            }
-            InstrumentKind::Snare => {
-                self.pitch *= semitones_to_ratio(p[0]);
-                self.amp = 1.0;
-                self.amp_coef = decay_coef(p[1], sr);
                 self.amp2 = 1.0;
-                self.amp2_coef = decay_coef(p[2], sr);
-                self.pe = 1.0;
-                self.pe_coef = decay_coef(0.05, sr);
-                self.f1.set_q(1500.0, 0.7, sr);
-                self.f2.set_q(9000.0, 0.7, sr);
             }
             InstrumentKind::HatClosed | InstrumentKind::HatOpen => {
-                self.pitch *= semitones_to_ratio(p[0]);
                 self.amp = 1.0;
-                self.amp_coef = decay_coef(p[1], sr);
                 self.amp2 = 0.0;
                 for (i, o) in self.metal.iter_mut().enumerate() {
                     // Staggered phases avoid a synchronized first edge.
                     o.reset(i as f64 / 6.0);
                 }
+            }
+            InstrumentKind::Clap => {
+                self.amp = 0.0;
+                self.amp2 = 0.0;
+                self.bursts = 0;
+                self.next_burst = 0;
+            }
+            InstrumentKind::Synth | InstrumentKind::Sampler => unreachable!("Drum is only constructed for drum kinds"),
+        }
+        self.follow_params();
+    }
+
+    /// Sets everything the parameters decide: pitch, decay rates, filters
+    /// and burst spacing. Levels and phases are left as they are, so this
+    /// serves a new hit and one already ringing alike.
+    fn follow_params(&mut self) {
+        let (sr, p) = (self.sample_rate, self.params);
+        match self.kind {
+            InstrumentKind::Kick => {
+                self.pitch = self.note_ratio * semitones_to_ratio(p[0]);
+                self.amp_coef = decay_coef(p[1], sr);
+                self.pe_coef = decay_coef(0.12, sr);
+                self.amp2_coef = decay_coef(0.012, sr);
+                self.f1.set_q(3000.0, 0.7, sr);
+            }
+            InstrumentKind::Snare => {
+                self.pitch = self.note_ratio * semitones_to_ratio(p[0]);
+                self.amp_coef = decay_coef(p[1], sr);
+                self.amp2_coef = decay_coef(p[2], sr);
+                self.pe_coef = decay_coef(0.05, sr);
+                self.f1.set_q(1500.0, 0.7, sr);
+                self.f2.set_q(9000.0, 0.7, sr);
+            }
+            InstrumentKind::HatClosed | InstrumentKind::HatOpen => {
+                self.pitch = self.note_ratio * semitones_to_ratio(p[0]);
+                self.amp_coef = decay_coef(p[1], sr);
+                if self.choked {
+                    self.amp_coef = self.amp_coef.min(decay_coef(CHOKE_TIME, sr));
+                }
                 self.f1.set_q(10_000.0 * self.pitch, 1.2, sr);
                 self.f2.set_q(p[2] * self.pitch, 0.7, sr);
             }
             InstrumentKind::Clap => {
-                self.amp = 0.0;
+                self.pitch = self.note_ratio;
                 self.amp_coef = decay_coef(p[1], sr);
-                self.amp2 = 1.0;
                 self.amp2_coef = decay_coef(0.02, sr);
-                self.spread = ((p[2] * sr) as u32).max(1);
+                let spread = ((p[2] * sr) as u32).max(1);
+                // The next burst keeps to the new spacing from the last one.
+                if self.bursts > 0 {
+                    self.next_burst = self.next_burst - self.spread + spread;
+                }
+                self.spread = spread;
                 self.f1.set_q(p[0] * self.pitch, 1.5, sr);
             }
             InstrumentKind::Synth | InstrumentKind::Sampler => unreachable!("Drum is only constructed for drum kinds"),
@@ -213,6 +252,7 @@ impl Drum {
     /// Cuts an open hi-hat short with a fast (but click-free) fade.
     pub fn choke(&mut self) {
         if self.kind == InstrumentKind::HatOpen && self.active {
+            self.choked = true;
             self.amp_coef = self.amp_coef.min(decay_coef(CHOKE_TIME, self.sample_rate));
         }
     }
@@ -247,7 +287,7 @@ impl Drum {
                 let f = base * (1.0 + p[2] * 5.0 * self.pe * self.pe);
                 self.phase1 = (self.phase1 + f64::from(f) / srd).fract();
                 let body = (TAU * self.phase1).sin() as f32 * self.amp;
-                let click = self.f1.process(self.rng.bipolar(), FilterMode::HighPass) * self.amp2;
+                let click = self.f1.process(self.rng.bipolar(), FilterMode::HighPass) * self.amp2 * p[3];
                 self.pe *= self.pe_coef;
                 self.amp *= self.amp_coef;
                 self.amp2 *= self.amp2_coef;
@@ -280,12 +320,14 @@ impl Drum {
                 1.6 * y
             }
             InstrumentKind::Clap => {
-                let spread = self.spread;
-                if self.t < 3 * spread && self.t % spread == 0 {
-                    self.amp2 = 1.0;
-                }
-                if self.t == 3 * spread {
-                    self.amp = 1.0;
+                if self.bursts < 4 && self.t >= self.next_burst {
+                    if self.bursts < 3 {
+                        self.amp2 = 1.0;
+                    } else {
+                        self.amp = 1.0;
+                    }
+                    self.bursts += 1;
+                    self.next_burst = self.t + self.spread;
                 }
                 let n = self.f1.process(self.rng.bipolar(), FilterMode::BandPass);
                 let y = n * (self.amp2 + 0.7 * self.amp);
@@ -296,8 +338,8 @@ impl Drum {
             InstrumentKind::Synth | InstrumentKind::Sampler => 0.0,
         };
         self.t = self.t.saturating_add(1);
-        let min_len = if self.kind == InstrumentKind::Clap { 3 * self.spread } else { 0 };
-        if self.t > min_len && self.amp < END_LEVEL && self.amp2 < END_LEVEL {
+        let tail_started = self.kind != InstrumentKind::Clap || self.bursts == 4;
+        if tail_started && self.amp < END_LEVEL && self.amp2 < END_LEVEL {
             self.active = false;
             self.amp = 0.0;
             self.amp2 = 0.0;
@@ -418,6 +460,117 @@ mod tests {
             let end_prev = rms(&buf[k * spread - 60..k * spread]);
             let start = rms(&buf[k * spread + 20..k * spread + 80]);
             assert!(start > 2.0 * end_prev, "burst {k}: {end_prev} -> {start}");
+        }
+    }
+
+    /// Renders until the hit ends; returns the frames that took.
+    fn ring_out(d: &mut Drum) -> usize {
+        let mut n = 0;
+        let mut b = [0.0f32; 64];
+        while d.active {
+            b.fill(0.0);
+            d.render(&mut b);
+            assert!(b.iter().all(|x| x.is_finite()));
+            n += 64;
+            assert!(n < 48_000 * 10, "{:?} never ends", d.kind);
+        }
+        n
+    }
+
+    #[test]
+    fn every_parameter_reaches_a_ringing_hit() {
+        for kind in InstrumentKind::ALL.into_iter().filter(|k| k.is_drum()) {
+            for (i, spec) in params(kind).iter().enumerate() {
+                let value = if spec.max - spec.default > spec.default - spec.min { spec.max } else { spec.min };
+                let mut hits = [Drum::new(kind, SR), Drum::new(kind, SR)];
+                let mut outs = [vec![0.0; 4800], vec![0.0; 4800]];
+                for (d, out) in hits.iter_mut().zip(&mut outs) {
+                    d.trigger(60, 127);
+                    d.render(&mut out[..240]);
+                }
+                hits[1].set_param(i, value);
+                for (d, out) in hits.iter_mut().zip(&mut outs) {
+                    d.render(&mut out[240..]);
+                }
+                assert_eq!(outs[0][..240], outs[1][..240]);
+                assert_ne!(outs[0][240..], outs[1][240..], "{kind:?} {}", spec.id);
+                ring_out(&mut hits[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_shorter_decay_shortens_the_hit_already_ringing() {
+        let rest = |decay: Option<f32>| {
+            let mut d = Drum::new(InstrumentKind::Kick, SR);
+            d.trigger(60, 127);
+            d.render(&mut vec![0.0; 2400]);
+            if let Some(v) = decay {
+                d.set_param(1, v);
+            }
+            ring_out(&mut d)
+        };
+        let (kept, short) = (rest(None), rest(Some(0.05)));
+        assert!(kept > (SR * 0.6) as usize, "{kept}");
+        // -100 dB at 5/3 of the new 50 ms, from a level already below 0 dB.
+        assert!(short <= (SR * 0.05 * 5.0 / 3.0) as usize + 64, "{short}");
+    }
+
+    #[test]
+    fn a_choked_hat_stays_short_when_its_decay_grows() {
+        let mut d = Drum::new(InstrumentKind::HatOpen, SR);
+        d.trigger(60, 127);
+        d.render(&mut vec![0.0; 480]);
+        d.choke();
+        d.set_param(1, 2.0);
+        let n = ring_out(&mut d);
+        assert!(n < (SR * 0.012 * 5.0 / 3.0) as usize + 64, "{n}");
+        // A new hit is not choked.
+        d.trigger(60, 127);
+        assert!(ring_out(&mut d) > SR as usize);
+    }
+
+    #[test]
+    fn tune_moves_the_pitch_of_a_ringing_kick() {
+        let crossings = |tune: f32| {
+            let mut d = Drum::new(InstrumentKind::Kick, SR);
+            d.set_param(1, 2.0);
+            d.set_param(3, 0.0);
+            d.trigger(60, 127);
+            // Past the pitch sweep.
+            d.render(&mut vec![0.0; 24_000]);
+            d.set_param(0, tune);
+            let mut buf = vec![0.0; 9600];
+            d.render(&mut buf);
+            buf.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f32
+        };
+        let ratio = crossings(12.0) / crossings(0.0);
+        assert!((ratio - 2.0).abs() < 0.1, "{ratio}");
+    }
+
+    #[test]
+    fn a_clap_keeps_three_bursts_and_a_tail_when_its_spread_changes() {
+        let spread = |s: f32| ((s * SR) as u32).max(1);
+        for (at, value) in [(100, 0.004), (500, 0.004), (100, 0.03), (1000, 0.03)] {
+            let mut d = Drum::new(InstrumentKind::Clap, SR);
+            d.trigger(60, 127);
+            let old = d.spread;
+            let mut first = vec![0.0; at];
+            d.render(&mut first);
+            let before = d.bursts;
+            d.set_param(2, value);
+            assert_eq!(d.spread, spread(value));
+            // Only the bursts still to come move.
+            let last = (u32::from(before) - 1) * old;
+            assert_eq!(d.next_burst, last + d.spread, "{at} {value}");
+            let mut n = 0;
+            while d.bursts < 4 {
+                d.render(&mut [0.0]);
+                n += 1;
+                assert!(n < 48_000, "the tail never starts");
+            }
+            assert!(d.active);
+            ring_out(&mut d);
         }
     }
 }

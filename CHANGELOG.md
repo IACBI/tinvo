@@ -6,6 +6,15 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-14
+
+### Changed
+- Drum parameters reach a hit that is still ringing: tune, the decays, click, tone and the clap's spread. They used to wait for the next hit.
+- ALSA output and input open at a rate the device takes without resampling, 48 kHz when it can, instead of always at 48 kHz through ALSA's linear resampler. CoreAudio input runs at the device's own rate, as output already did. Recordings are written at that rate.
+
+### Fixed
+- Removing a track while it sounds, or undoing an added track, no longer cuts it off with a click: it fades out over 10 ms.
+
 ## [0.18.0] - 2026-11-13
 
 ### Added
@@ -250,7 +259,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/IACBI/tinvo/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/IACBI/tinvo/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/IACBI/tinvo/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/IACBI/tinvo/compare/v0.15.0...v0.16.0
