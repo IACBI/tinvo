@@ -1650,6 +1650,25 @@ mod tests {
     }
 
     #[test]
+    fn a_note_longer_than_the_rest_of_the_pattern_sounds_on_after_it_repeats() {
+        // Four steps of 6000 frames; the last step holds for three, so into
+        // steps 0 and 1 of the next pass, and is hit again at frame 42 000.
+        let mut e = engine(&[
+            Edit::SetPatternLength { pattern: 0, len: 4 },
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetParam { track: 0, index: 16, value: 0.001 }, // fast release
+            Edit::SetStep { track: 0, pattern: 0, step: 3, value: Some(Step::new(48, 127, 3)) },
+        ]);
+        e.handle(Command::Play);
+        let out = run(&mut e, 6000 * 4 * 2);
+        let loud = |a: usize, b: usize| out[a * 2..b * 2].iter().any(|x| x.abs() > 1e-4);
+        assert!(!loud(0, 18_000));
+        assert!(loud(24_000, 25_000) && loud(34_000, 35_900), "the note stops at the pattern's end");
+        assert!(!loud(36_300, 42_000), "the note outlasts its length");
+        assert!(loud(42_000, 42_500));
+    }
+
+    #[test]
     fn pattern_loops() {
         let mut e = engine(&[
             Edit::SetPatternLength { pattern: 0, len: 4 },

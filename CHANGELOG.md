@@ -6,6 +6,20 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-13
+
+### Added
+- A settings file for keys and colours: `tinvo.conf` in `%APPDATA%\tinvo` on Windows, `~/Library/Application Support/tinvo` on macOS, and `$XDG_CONFIG_HOME/tinvo` or `~/.config/tinvo` elsewhere. `--settings FILE` reads another one. Under `[keys]`, a line such as `undo = u ctrl+z` gives an action its keys, and an empty value leaves it with none; under `[theme]`, `base = light` picks a built-in theme and a line such as `cursor = black on 214 bold` sets a role's colour. Anything left out keeps its default. A mistake stops TINVO before it takes over the terminal and names its line; a key given to two actions that are active at the same time is refused, naming both.
+- `tinvo settings [FILE]` checks the settings and prints the whole file: every action and colour role, what it does and what it has now.
+- A `light` theme for terminals with a light background.
+- Colours from the 256-colour palette (`0`–`255`) and 24-bit colours (`#rrggbb`), for terminals that support them.
+
+### Changed
+- Hints, status messages and the key list (`?`) show the keys actually bound, so they follow the settings file. The key list scrolls with the arrow keys and `PgUp`/`PgDn`, and any other key closes it.
+
+### Fixed
+- The piano roll now draws a note held past the end of the pattern on the pattern's first steps, where it goes on sounding when the pattern repeats; it was cut off at the last step. Steps beyond the pattern's length, kept from when it was longer, no longer draw held notes.
+
 ## [0.16.0] - 2026-11-13
 
 ### Added
@@ -223,7 +237,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/IACBI/tinvo/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/IACBI/tinvo/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/IACBI/tinvo/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/IACBI/tinvo/compare/v0.13.1...v0.14.0

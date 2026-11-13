@@ -15,6 +15,7 @@ use crate::engine::{
     MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, PlayPosition, RETIRE_QUEUE, Shared, Step,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::keymap::{Action, Context, Keymap};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::project::{self, FILE_EXTENSION, PAN, Project, VOLUME, pattern_name};
@@ -23,9 +24,12 @@ use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
+use crate::settings::Settings;
 use crate::strip::{self, track_param};
+use crate::theme::{Role, Theme};
 use crate::tui::{Color, Event, Key, Screen, Style, Terminal};
 use crate::wav::{self, SampleFormat};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -265,7 +269,8 @@ pub enum PromptKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    Help,
+    /// The key list, scrolled to this line.
+    Help(usize),
     AddTrack,
     Confirm(Confirm),
     Prompt(PromptKind, String),
@@ -397,6 +402,11 @@ pub struct App {
     cpu: f32,
     playing: bool,
     play_pos: Option<PlayPosition>,
+    pub keys: Keymap,
+    pub theme: Theme,
+    /// How many lines of the key list the last frame showed, so scrolling
+    /// stops where the end is in view.
+    help_rows: Cell<usize>,
 }
 
 impl App {
@@ -469,7 +479,26 @@ impl App {
             cpu: 0.0,
             playing: false,
             play_pos: None,
+            keys: Keymap::default(),
+            theme: Theme::default(),
+            help_rows: Cell::new(1),
         }
+    }
+
+    /// Uses the key bindings and colours of `settings`.
+    pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.keys = settings.keys;
+        self.theme = settings.theme;
+        self
+    }
+
+    /// The first key of `a`, for hints in messages.
+    fn k(&self, a: Action) -> String {
+        self.keys.label(a)
+    }
+
+    fn style(&self, r: Role) -> Style {
+        self.theme.get(r)
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
@@ -519,12 +548,13 @@ impl App {
             self.finish_take(true, None);
             return;
         }
+        let add = self.k(Action::AddTrack);
         if self.song_view || self.track >= self.track_count() {
-            self.set_status("Select a sampler track to record into (a, 7 adds one)");
+            self.set_status(format!("Select a sampler track to record into ({add}, 7 adds one)"));
             return;
         }
         if self.project.tracks[self.track].kind != InstrumentKind::Sampler {
-            self.set_status("Recordings go into sampler tracks (a, 7 adds one)");
+            self.set_status(format!("Recordings go into sampler tracks ({add}, 7 adds one)"));
             return;
         }
         let dir = match self.path.as_ref().and_then(|p| p.parent()) {
@@ -536,7 +566,8 @@ impl App {
         match Recorder::start(self.input_device.as_deref(), &path) {
             Ok(recorder) => {
                 let name = path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-                self.set_status(format!("Recording from {} into {name} (I stops)", recorder.device()));
+                let stop = self.k(Action::Record);
+                self.set_status(format!("Recording from {} into {name} ({stop} stops)", recorder.device()));
                 self.take = Some(Take { recorder, track: Some(self.track), level: 0.0 });
             }
             Err(e) => self.set_status(format!("Cannot record: {e}")),
@@ -567,7 +598,10 @@ impl App {
                 self.load_sample(&file);
                 self.set_status(format!("{why}Recorded {:.1} s into {file}{lost}", rec.seconds()));
             }
-            _ => self.set_status(format!("{why}Recorded {:.1} s to {file} (o loads it){lost}", rec.seconds())),
+            _ => {
+                let load = self.k(Action::LoadSample);
+                self.set_status(format!("{why}Recorded {:.1} s to {file} ({load} loads it){lost}", rec.seconds()));
+            }
         }
     }
 
@@ -600,16 +634,22 @@ impl App {
         self.mode = Mode::MidiInputs(MidiPicker { ports, cursor });
     }
 
+    /// Whether `key` closes a list: Esc, a quit key, or the key that opened
+    /// it.
+    fn closes_list(&self, key: Key, opener: Action) -> bool {
+        key == Key::Esc || self.keys.is(Action::Quit, key) || self.keys.is(opener, key)
+    }
+
     fn key_midi(&mut self, mut p: MidiPicker, key: Key) {
-        match key {
-            Key::Up => p.cursor = p.cursor.saturating_sub(1),
-            Key::Down => p.cursor = (p.cursor + 1).min(p.ports.len()),
-            Key::Enter => {
+        if self.closes_list(key, Action::MidiInputs) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        match self.keys.action(&[Context::Nav], key) {
+            Some(Action::Up) => p.cursor = p.cursor.saturating_sub(1),
+            Some(Action::Down) => p.cursor = (p.cursor + 1).min(p.ports.len()),
+            Some(Action::Enter) => {
                 self.midi_request = Some(p.cursor.checked_sub(1).map(|i| p.ports[i].id.clone()));
-                self.mode = Mode::Normal;
-                return;
-            }
-            Key::Esc | Key::Char('q' | 'M') => {
                 self.mode = Mode::Normal;
                 return;
             }
@@ -720,14 +760,18 @@ impl App {
     }
 
     fn key_devices(&mut self, mut p: DevicePicker, key: Key) {
+        if self.closes_list(key, Action::Devices) {
+            self.mode = Mode::Normal;
+            return;
+        }
         let (cursor, len) =
             if p.input_page { (&mut p.input_cursor, p.inputs.len()) } else { (&mut p.cursor, p.devices.len()) };
-        match key {
-            Key::Left | Key::Right => p.input_page = !p.input_page,
-            Key::Up => *cursor = cursor.saturating_sub(1),
-            Key::Down => *cursor = (*cursor + 1).min(len),
-            Key::Tab | Key::BackTab if !p.input_page => p.low_latency = !p.low_latency,
-            Key::Enter if p.input_page => {
+        match self.keys.action(&[Context::Nav, Context::Global], key) {
+            Some(Action::Left | Action::Right) => p.input_page = !p.input_page,
+            Some(Action::Up) => *cursor = cursor.saturating_sub(1),
+            Some(Action::Down) => *cursor = (*cursor + 1).min(len),
+            Some(Action::Focus) if !p.input_page => p.low_latency = !p.low_latency,
+            Some(Action::Enter) if p.input_page => {
                 let chosen = p.input_cursor.checked_sub(1).map(|i| &p.inputs[i]);
                 self.input_device = chosen.map(|d| d.id.clone());
                 let name = chosen.map_or("the system default", |d| d.name.as_str());
@@ -736,13 +780,9 @@ impl App {
                 self.mode = Mode::Normal;
                 return;
             }
-            Key::Enter => {
+            Some(Action::Enter) => {
                 let device = p.cursor.checked_sub(1).map(|i| p.devices[i].id.clone());
                 self.audio_request = Some(StreamConfig { device, low_latency: p.low_latency });
-                self.mode = Mode::Normal;
-                return;
-            }
-            Key::Esc | Key::Char('q' | 'O') => {
                 self.mode = Mode::Normal;
                 return;
             }
@@ -1234,7 +1274,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: Key) {
         match self.mode.clone() {
-            Mode::Help => self.mode = Mode::Normal,
+            Mode::Help(top) => self.key_help(top, key),
             Mode::AddTrack => self.key_add_track(key),
             Mode::Confirm(c) => self.key_confirm(c, key),
             Mode::Prompt(kind, text) => self.key_prompt(kind, text, key),
@@ -1243,6 +1283,19 @@ impl App {
             Mode::Normal => self.key_normal(key),
         }
         self.clamp_cursor();
+    }
+
+    /// The key list scrolls with up, down, Page Up and Page Down; any other
+    /// key closes it.
+    fn key_help(&mut self, top: usize, key: Key) {
+        let last = self.help_lines().len().saturating_sub(self.help_rows.get());
+        self.mode = match (self.keys.action(&[Context::Nav], key), key) {
+            (Some(Action::Up), _) => Mode::Help(top.saturating_sub(1)),
+            (Some(Action::Down), _) => Mode::Help((top + 1).min(last)),
+            (_, Key::PageUp) => Mode::Help(top.saturating_sub(self.help_rows.get())),
+            (_, Key::PageDown) => Mode::Help((top + self.help_rows.get()).min(last)),
+            _ => Mode::Normal,
+        };
     }
 
     fn key_add_track(&mut self, key: Key) {
@@ -1341,45 +1394,89 @@ impl App {
     }
 
     fn key_normal(&mut self, key: Key) {
-        if self.song_view && self.key_song(key) {
+        if self.song_view {
+            if let Some(a) = self.keys.action(&[Context::Song, Context::Nav], key) {
+                if self.key_song(a) {
+                    return;
+                }
+            }
+        }
+        if let Some(a) = self.keys.action(&[Context::Global], key) {
+            self.global_action(a);
             return;
         }
-        match key {
-            Key::Char(' ') => self.toggle_play(),
-            Key::Tab | Key::BackTab => {
+        // The buses and master need no track.
+        if self.track_count() == 0 && !self.song_view && self.focus == Focus::Params && self.page == Page::Mix {
+            self.key_params(key);
+            return;
+        }
+        // The rest acts on the selected track, which the song view hides.
+        let track_action = self.keys.action(&[Context::Track], key);
+        if self.song_view {
+            if track_action == Some(Action::PianoRoll) {
+                let back = self.k(Action::SongView);
+                self.set_status(format!("The song view has no piano roll ({back} returns to the grid)"));
+            }
+            return;
+        }
+        if self.track_count() == 0 {
+            return;
+        }
+        if let Some(a) = track_action {
+            self.track_action(a);
+            return;
+        }
+        match self.focus {
+            Focus::Grid if self.auto_view => self.key_auto(key),
+            Focus::Grid if self.roll_active() => self.key_roll(key),
+            Focus::Grid => self.key_grid(key),
+            Focus::Params => self.key_params(key),
+        }
+    }
+
+    /// Actions that work anywhere in the editor.
+    fn global_action(&mut self, a: Action) {
+        match a {
+            Action::Play => self.toggle_play(),
+            Action::Focus => {
                 self.focus = if self.focus == Focus::Grid { Focus::Params } else { Focus::Grid };
             }
-            Key::Char('?') | Key::F(1) => self.mode = Mode::Help,
-            Key::Char('M') => match midi::inputs() {
+            Action::Help => self.mode = Mode::Help(0),
+            Action::MidiInputs => match midi::inputs() {
                 Ok(ports) => self.open_midi_picker(ports),
                 Err(e) => self.set_status(format!("Cannot list MIDI inputs: {e}")),
             },
-            Key::Char('R') => {
+            Action::StepEntry => {
                 self.step_entry = !self.step_entry;
                 self.entry_held.clear();
                 self.entry_notes.clear();
                 let status = match (self.step_entry, &self.midi_input) {
                     (false, _) => "Step entry off".to_string(),
-                    (true, Some((_, name))) => {
-                        format!("Step entry on: notes from {name} write steps at the cursor (R stops)")
+                    (true, Some((_, name))) => format!(
+                        "Step entry on: notes from {name} write steps at the cursor ({} stops)",
+                        self.k(Action::StepEntry)
+                    ),
+                    (true, None) => {
+                        format!("Step entry on, but no MIDI input is open ({} chooses one)", self.k(Action::MidiInputs))
                     }
-                    (true, None) => "Step entry on, but no MIDI input is open (M chooses one)".to_string(),
                 };
                 self.set_status(status);
             }
-            Key::Char('O') => match audio::output_devices() {
+            Action::Devices => match audio::output_devices() {
                 // An input listing failure only leaves that page empty.
                 Ok(devices) => self.open_device_picker(devices, audio::input_devices().unwrap_or_default()),
                 Err(e) => self.set_status(format!("Cannot list output devices: {e}")),
             },
-            Key::Char('I') => self.toggle_recording(),
-            Key::Char('f') => {
+            Action::Record => self.toggle_recording(),
+            Action::Page => {
+                let f = self.k(Action::Page);
                 let (page, status) = match self.page {
-                    Page::Instrument => {
-                        (Page::Strip, "Channel strip: high-pass, EQ, compressor, drive, sends (f: buses and master)")
-                    }
-                    Page::Strip => (Page::Mix, "Buses and master: delay, reverb, limiter (f: instrument)"),
-                    Page::Mix => (Page::Instrument, "Instrument parameters (f: channel strip)"),
+                    Page::Instrument => (
+                        Page::Strip,
+                        format!("Channel strip: high-pass, EQ, compressor, drive, sends ({f}: buses and master)"),
+                    ),
+                    Page::Strip => (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)")),
+                    Page::Mix => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
                 };
                 self.page = page;
                 if self.param >= 2 {
@@ -1387,22 +1484,22 @@ impl App {
                 }
                 self.set_status(status);
             }
-            Key::Char('q') | Key::Ctrl('c') | Key::Ctrl('q') => {
+            Action::Quit => {
                 if self.dirty {
                     self.mode = Mode::Confirm(Confirm::Quit);
                 } else {
                     self.quit = true;
                 }
             }
-            Key::Ctrl('s') | Key::Char('w') => match self.path.clone() {
+            Action::Save => match self.path.clone() {
                 Some(p) => self.save_to(p),
                 None => self.mode = Mode::Prompt(PromptKind::SaveAs, "untitled.tvo".into()),
             },
-            Key::Char('W') => {
+            Action::SaveAs => {
                 let current = self.path.as_ref().map_or("untitled.tvo".into(), |p| p.display().to_string());
                 self.mode = Mode::Prompt(PromptKind::SaveAs, current);
             }
-            Key::Char('e') => {
+            Action::Export => {
                 let stem = self
                     .path
                     .as_ref()
@@ -1410,78 +1507,80 @@ impl App {
                     .map_or("tinvo_export".into(), |s| s.to_string_lossy().into_owned());
                 self.mode = Mode::Prompt(PromptKind::Export, format!("{stem}.wav"));
             }
-            Key::Char('u') | Key::Ctrl('z') => self.undo(),
-            Key::Char('U') | Key::Ctrl('y') => self.redo(),
-            Key::Char('a') => self.mode = Mode::AddTrack,
-            Key::Char('t') => {
-                self.edit_with(Edit::SetTempo(self.project.tempo.round() - 1.0), true);
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+            Action::AddTrack => self.mode = Mode::AddTrack,
+            Action::TempoDown | Action::TempoUp => {
+                let d = if a == Action::TempoUp { 1.0 } else { -1.0 };
+                self.edit_with(Edit::SetTempo(self.project.tempo.round() + d), true);
             }
-            Key::Char('T') => {
-                self.edit_with(Edit::SetTempo(self.project.tempo.round() + 1.0), true);
+            Action::SwingDown | Action::SwingUp => {
+                let d = if a == Action::SwingUp { 1.0 } else { -1.0 };
+                self.edit_with(Edit::SetSwing(self.project.swing.round() + d), true);
             }
-            Key::Char('g') => {
-                self.edit_with(Edit::SetSwing(self.project.swing.round() - 1.0), true);
-            }
-            Key::Char('G') => {
-                self.edit_with(Edit::SetSwing(self.project.swing.round() + 1.0), true);
-            }
-            Key::Char('l' | 'L') => {
+            Action::PatternShorter | Action::PatternLonger => {
                 let len = self.project.pattern_lens[self.pattern];
-                let len = if key == Key::Char('l') { len.saturating_sub(1) } else { len.saturating_add(1) };
+                let len = if a == Action::PatternShorter { len.saturating_sub(1) } else { len.saturating_add(1) };
                 self.edit_with(Edit::SetPatternLength { pattern: self.pattern as u8, len }, true);
             }
-            Key::Char('n') => self.select_pattern(self.pattern + 1),
-            Key::Char('N') => self.select_pattern(self.pattern + MAX_PATTERNS - 1),
-            Key::Char('S') => self.song_view = !self.song_view,
-            Key::Char('y') => self.copy_pattern(),
-            Key::Char('Y') => match self.clipboard.clone() {
+            Action::NextPattern => self.select_pattern(self.pattern + 1),
+            Action::PrevPattern => self.select_pattern(self.pattern + MAX_PATTERNS - 1),
+            Action::SongView => self.song_view = !self.song_view,
+            Action::Copy => self.copy_pattern(),
+            Action::Paste => match self.clipboard.clone() {
                 Some(clip) => self.replace_pattern(Some(clip), "paste"),
-                None => self.set_status("Nothing copied yet (y copies a pattern)"),
+                None => {
+                    let status = format!("Nothing copied yet ({} copies a pattern)", self.k(Action::Copy));
+                    self.set_status(status);
+                }
             },
-            Key::Char('X') => self.replace_pattern(None, "clear pattern"),
-            // The buses and master need no track.
-            _ if self.track_count() == 0
-                && !self.song_view
-                && self.focus == Focus::Params
-                && self.page == Page::Mix =>
-            {
-                self.key_params(key);
-            }
-            // The rest acts on the selected track, which the song view hides.
-            _ if self.track_count() == 0 || self.song_view => {}
-            Key::Char('D') => self.mode = Mode::Confirm(Confirm::DeleteTrack),
-            Key::Char('r') => {
+            Action::ClearPattern => self.replace_pattern(None, "clear pattern"),
+            _ => {}
+        }
+    }
+
+    /// Actions on the selected track.
+    fn track_action(&mut self, a: Action) {
+        match a {
+            Action::DeleteTrack => self.mode = Mode::Confirm(Confirm::DeleteTrack),
+            Action::RenameTrack => {
                 let name = self.project.tracks[self.track].name.clone();
                 self.mode = Mode::Prompt(PromptKind::Rename, name);
             }
-            Key::Char('m') => {
+            Action::Mute => {
                 let mute = !self.project.tracks[self.track].mute;
                 self.edit(Edit::SetMute { track: self.track as u8, mute });
             }
-            Key::Char('s') => {
+            Action::Solo => {
                 let solo = !self.project.tracks[self.track].solo;
                 self.edit(Edit::SetSolo { track: self.track as u8, solo });
             }
-            Key::Char('p') => {
+            Action::Preview => {
                 let b = self.brushes[self.track];
                 self.audition(b);
             }
-            Key::Char('o') => {
+            Action::LoadSample => {
                 if self.project.tracks[self.track].kind == InstrumentKind::Sampler {
                     let current = self.project.tracks[self.track].sample.clone().unwrap_or_default();
                     self.mode = Mode::Prompt(PromptKind::LoadSample, current);
                 } else {
-                    self.set_status("Samples load into sampler tracks (a, 7 adds one)");
+                    let status = format!("Samples load into sampler tracks ({}, 7 adds one)", self.k(Action::AddTrack));
+                    self.set_status(status);
                 }
             }
-            Key::Char('A') if self.focus == Focus::Params => self.automate_param(self.param),
-            Key::Char('A') => {
+            Action::Automate if self.focus == Focus::Params => self.automate_param(self.param),
+            Action::Automate => {
                 self.auto_view = !self.auto_view;
                 if self.auto_view && self.project.tracks[self.track].lanes.iter().all(|l| l.target.is_none()) {
-                    self.set_status("No lanes yet: pick a parameter (Tab) and press A");
+                    let status = format!(
+                        "No lanes yet: pick a parameter ({}) and press {}",
+                        self.k(Action::Focus),
+                        self.k(Action::Automate)
+                    );
+                    self.set_status(status);
                 }
             }
-            Key::Char('v') => {
+            Action::PianoRoll => {
                 if self.project.tracks[self.track].kind.is_drum() {
                     self.set_status("The piano roll is for melodic tracks");
                 } else {
@@ -1494,12 +1593,7 @@ impl App {
                     }
                 }
             }
-            _ => match self.focus {
-                Focus::Grid if self.auto_view => self.key_auto(key),
-                Focus::Grid if self.roll_active() => self.key_roll(key),
-                Focus::Grid => self.key_grid(key),
-                Focus::Params => self.key_params(key),
-            },
+            _ => {}
         }
     }
 
@@ -1509,7 +1603,9 @@ impl App {
         let label = self.param_spec(param).label;
         let target = target_of_param(param);
         let Some(t) = self.project.tracks.get(self.track) else {
-            self.set_status("Automation lives on a track's lanes: add a track first (a)");
+            let status =
+                format!("Automation lives on a track's lanes: add a track first ({})", self.k(Action::AddTrack));
+            self.set_status(status);
             return;
         };
         // A bus or master setting has at most one lane, on whichever track.
@@ -1532,9 +1628,19 @@ impl App {
                 return;
             }
             self.lane = k;
-            self.set_status(format!("Lane {}: {label}. Enter adds a point, / switches hold and ramp", k + 1));
+            let status = format!(
+                "Lane {}: {label}. {} adds a point, {} switches hold and ramp",
+                k + 1,
+                self.k(Action::Enter),
+                self.k(Action::Ramp)
+            );
+            self.set_status(status);
         } else {
-            self.set_status(format!("A track has at most {MAX_LANES} lanes (- in the automation view frees one)"));
+            let status = format!(
+                "A track has at most {MAX_LANES} lanes ({} in the automation view frees one)",
+                self.k(Action::RemoveLane)
+            );
+            self.set_status(status);
             return;
         }
         self.auto_view = true;
@@ -1547,17 +1653,24 @@ impl App {
         let (track, lane, pattern, step) = (self.track as u8, self.lane as u8, self.pattern as u8, self.step as u8);
         let l = &self.project.tracks[self.track].lanes[self.lane];
         let (target, ramp, point) = (l.target, l.ramp, l.points[self.pattern][self.step]);
-        match key {
-            Key::Left => self.step = (self.step + len - 1) % len,
-            Key::Right => self.step = (self.step + 1) % len,
-            Key::Home => self.step = 0,
-            Key::End => self.step = len - 1,
-            Key::Up => self.lane = self.lane.saturating_sub(1),
-            Key::Down => self.lane = (self.lane + 1).min(MAX_LANES - 1),
+        let action = self.keys.action(&[Context::Nav, Context::Auto], key);
+        match action {
+            Some(Action::Left) => self.step = (self.step + len - 1) % len,
+            Some(Action::Right) => self.step = (self.step + 1) % len,
+            Some(Action::First) => self.step = 0,
+            Some(Action::Last) => self.step = len - 1,
+            Some(Action::Up) => self.lane = self.lane.saturating_sub(1),
+            Some(Action::Down) => self.lane = (self.lane + 1).min(MAX_LANES - 1),
             _ if target.is_none() => {
-                self.set_status(format!("Lane {} is free: pick a parameter (Tab) and press A", self.lane + 1));
+                let status = format!(
+                    "Lane {} is free: pick a parameter ({}) and press {}",
+                    self.lane + 1,
+                    self.k(Action::Focus),
+                    self.k(Action::Automate)
+                );
+                self.set_status(status);
             }
-            Key::Enter | Key::Char('x') => {
+            Some(Action::Enter) => {
                 // A new point starts at the value already in force there.
                 let value = match point {
                     Some(_) => None,
@@ -1568,23 +1681,29 @@ impl App {
                 };
                 self.edit(Edit::SetPoint { track, lane, pattern, step, value });
             }
-            Key::Delete | Key::Backspace => {
+            Some(Action::Clear) => {
                 self.edit(Edit::SetPoint { track, lane, pattern, step, value: None });
             }
-            Key::Char(c @ ('[' | ']' | '{' | '}')) => match point {
-                Some(v) => {
-                    let spec = self.param_spec(param_of_target(target.unwrap_or(0)));
-                    let value = spec.nudge(v, if matches!(c, '[' | '{') { -1 } else { 1 }, matches!(c, '{' | '}'));
-                    self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
+            Some(a @ (Action::PointDown | Action::PointUp | Action::PointCoarseDown | Action::PointCoarseUp)) => {
+                match point {
+                    Some(v) => {
+                        let spec = self.param_spec(param_of_target(target.unwrap_or(0)));
+                        let dir = if matches!(a, Action::PointDown | Action::PointCoarseDown) { -1 } else { 1 };
+                        let value = spec.nudge(v, dir, matches!(a, Action::PointCoarseDown | Action::PointCoarseUp));
+                        self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
+                    }
+                    None => {
+                        let status = format!("No point here: {} adds one", self.k(Action::Enter));
+                        self.set_status(status);
+                    }
                 }
-                None => self.set_status("No point here: Enter adds one"),
-            },
-            Key::Char(c @ ('/' | '-')) => {
-                let (edit, status) = if c == '/' {
+            }
+            Some(a @ (Action::Ramp | Action::RemoveLane)) => {
+                let (edit, status) = if a == Action::Ramp {
                     let s = if ramp { "Lane holds each point" } else { "Lane ramps between points" };
                     (Edit::SetLane { track, lane, target, ramp: !ramp }, s.to_string())
                 } else {
-                    let s = format!("Removed lane {} (u brings it back)", self.lane + 1);
+                    let s = format!("Removed lane {} ({} brings it back)", self.lane + 1, self.k(Action::Undo));
                     (Edit::SetLane { track, lane, target: None, ramp: false }, s)
                 };
                 if self.edit(edit) {
@@ -1604,22 +1723,22 @@ impl App {
         l.value_at(spec, self.pattern, self.pattern_len(), step)
     }
 
-    /// Song view keys. Returns whether the key was used.
-    fn key_song(&mut self, key: Key) -> bool {
+    /// Song view actions. Returns whether the action was used.
+    fn key_song(&mut self, a: Action) -> bool {
         let n = self.project.song.len();
         let c = self.song_cursor;
         let index = c as u16;
-        match key {
-            Key::Left => self.song_cursor = c.saturating_sub(1),
-            Key::Right => self.song_cursor = (c + 1).min(n.saturating_sub(1)),
-            Key::Home => self.song_cursor = 0,
-            Key::End => self.song_cursor = n.saturating_sub(1),
-            Key::Up | Key::Down if n > 0 => {
-                let d = if key == Key::Up { 1 } else { MAX_PATTERNS - 1 };
+        match a {
+            Action::Left => self.song_cursor = c.saturating_sub(1),
+            Action::Right => self.song_cursor = (c + 1).min(n.saturating_sub(1)),
+            Action::First => self.song_cursor = 0,
+            Action::Last => self.song_cursor = n.saturating_sub(1),
+            Action::Up | Action::Down if n > 0 => {
+                let d = if a == Action::Up { 1 } else { MAX_PATTERNS - 1 };
                 let pattern = ((usize::from(self.project.song[c]) + d) % MAX_PATTERNS) as u8;
                 self.edit_with(Edit::SetSongEntry { index, pattern }, true);
             }
-            Key::Enter | Key::Char('x') => {
+            Action::Enter => {
                 // Repeat the entry under the cursor, or start with the
                 // pattern being edited.
                 let (at, pattern) = if n == 0 { (0, self.pattern as u8) } else { (c + 1, self.project.song[c]) };
@@ -1627,21 +1746,20 @@ impl App {
                     self.song_cursor = at;
                 }
             }
-            Key::Delete | Key::Backspace if n > 0 => {
+            Action::Clear if n > 0 => {
                 self.edit(Edit::RemoveSongEntry(index));
             }
-            Key::Char('[') if n > 0 => {
+            Action::LoopStart if n > 0 => {
                 let end = self.project.loop_region.map_or(index, |(_, b)| b.max(index));
                 self.edit(Edit::SetLoop(Some((index, end))));
             }
-            Key::Char(']') if n > 0 => {
+            Action::LoopEnd if n > 0 => {
                 let start = self.project.loop_region.map_or(index, |(a, _)| a.min(index));
                 self.edit(Edit::SetLoop(Some((start, index))));
             }
-            Key::Char('-') => {
+            Action::NoLoop => {
                 self.edit(Edit::SetLoop(None));
             }
-            Key::Char('v') => self.set_status("The song view has no piano roll (S returns to the grid)"),
             _ => return false,
         }
         true
@@ -1649,34 +1767,37 @@ impl App {
 
     fn key_grid(&mut self, key: Key) {
         let len = self.pattern_len();
-        match key {
-            Key::Left => self.step = (self.step + len - 1) % len,
-            Key::Right => self.step = (self.step + 1) % len,
-            Key::Home => self.step = 0,
-            Key::End => self.step = len - 1,
-            Key::Up => self.track = self.track.saturating_sub(1),
-            Key::Down => self.track += 1,
-            Key::Enter | Key::Char('x') => self.toggle_step(),
-            Key::Delete | Key::Backspace => {
-                self.edit(Edit::SetStep {
-                    track: self.track as u8,
-                    pattern: self.pattern as u8,
-                    step: self.step as u8,
-                    value: None,
-                });
-            }
-            _ => self.key_step_options(key),
+        match self.keys.action(&[Context::Nav, Context::Step], key) {
+            Some(Action::Left) => self.step = (self.step + len - 1) % len,
+            Some(Action::Right) => self.step = (self.step + 1) % len,
+            Some(Action::First) => self.step = 0,
+            Some(Action::Last) => self.step = len - 1,
+            Some(Action::Up) => self.track = self.track.saturating_sub(1),
+            Some(Action::Down) => self.track += 1,
+            Some(Action::Enter) => self.toggle_step(),
+            Some(Action::Clear) => self.clear_step(),
+            Some(a) => self.step_action(a),
+            None => {}
         }
     }
 
-    /// Step keys shared by the grid and the piano roll.
-    fn key_step_options(&mut self, key: Key) {
-        match key {
-            Key::Char(',') => self.modify_step(|s| *s = s.transposed(-1), true),
-            Key::Char('.') => self.modify_step(|s| *s = s.transposed(1), true),
-            Key::Char('<') => self.modify_step(|s| *s = s.transposed(-12), true),
-            Key::Char('>') => self.modify_step(|s| *s = s.transposed(12), true),
-            Key::Char('c') if !self.project.tracks[self.track].kind.is_drum() => {
+    fn clear_step(&mut self) {
+        self.edit(Edit::SetStep {
+            track: self.track as u8,
+            pattern: self.pattern as u8,
+            step: self.step as u8,
+            value: None,
+        });
+    }
+
+    /// Step actions, shared by the grid and the piano roll.
+    fn step_action(&mut self, a: Action) {
+        match a {
+            Action::PitchDown => self.modify_step(|s| *s = s.transposed(-1), true),
+            Action::PitchUp => self.modify_step(|s| *s = s.transposed(1), true),
+            Action::OctaveDown => self.modify_step(|s| *s = s.transposed(-12), true),
+            Action::OctaveUp => self.modify_step(|s| *s = s.transposed(12), true),
+            Action::Chord if !self.project.tracks[self.track].kind.is_drum() => {
                 self.modify_step(
                     |s| {
                         let i = CHORDS.iter().position(|(_, c)| *c == s.chord).map_or(0, |i| (i + 1) % CHORDS.len());
@@ -1685,41 +1806,35 @@ impl App {
                     true,
                 );
             }
-            Key::Char('(') => self.modify_step(|s| s.offset = (s.offset - 1).max(-MAX_OFFSET), false),
-            Key::Char(')') => self.modify_step(|s| s.offset = (s.offset + 1).min(MAX_OFFSET), false),
-            Key::Char('[') => self.modify_step(|s| s.velocity = s.velocity.saturating_sub(8).max(1), true),
-            Key::Char(']') => self.modify_step(|s| s.velocity = s.velocity.saturating_add(8).min(127), true),
-            Key::Char('{') => self.modify_step(|s| s.length = s.length.saturating_sub(1).max(1), false),
-            Key::Char('}') => self.modify_step(|s| s.length = s.length.saturating_add(1).min(MAX_STEPS as u8), false),
+            Action::Earlier => self.modify_step(|s| s.offset = (s.offset - 1).max(-MAX_OFFSET), false),
+            Action::Later => self.modify_step(|s| s.offset = (s.offset + 1).min(MAX_OFFSET), false),
+            Action::VelocityDown => self.modify_step(|s| s.velocity = s.velocity.saturating_sub(8).max(1), true),
+            Action::VelocityUp => self.modify_step(|s| s.velocity = s.velocity.saturating_add(8).min(127), true),
+            Action::Shorter => self.modify_step(|s| s.length = s.length.saturating_sub(1).max(1), false),
+            Action::Longer => self.modify_step(|s| s.length = s.length.saturating_add(1).min(MAX_STEPS as u8), false),
             // Chance moves in tens but can still reach 1 % at the bottom.
-            Key::Char('-') => self.modify_step(|s| s.chance = s.chance.saturating_sub(10).max(1), false),
-            Key::Char('=') => self.modify_step(|s| s.chance = (s.chance + 10).min(100), false),
-            Key::Char('/') => self.modify_step(|s| s.ratchet = s.ratchet % MAX_RATCHET + 1, true),
+            Action::ChanceDown => self.modify_step(|s| s.chance = s.chance.saturating_sub(10).max(1), false),
+            Action::ChanceUp => self.modify_step(|s| s.chance = (s.chance + 10).min(100), false),
+            Action::Ratchet => self.modify_step(|s| s.ratchet = s.ratchet % MAX_RATCHET + 1, true),
             _ => {}
         }
     }
 
     fn key_roll(&mut self, key: Key) {
         let len = self.pattern_len();
-        match key {
-            Key::Left => self.step = (self.step + len - 1) % len,
-            Key::Right => self.step = (self.step + 1) % len,
-            Key::Home => self.step = 0,
-            Key::End => self.step = len - 1,
-            Key::Up => self.roll_note = (self.roll_note + 1).min(127),
-            Key::Down => self.roll_note = self.roll_note.saturating_sub(1),
-            Key::PageUp => self.roll_note = self.roll_note.saturating_add(12).min(127),
-            Key::PageDown => self.roll_note = self.roll_note.saturating_sub(12),
-            Key::Enter | Key::Char('x') => self.toggle_roll_note(),
-            Key::Delete | Key::Backspace => {
-                self.edit(Edit::SetStep {
-                    track: self.track as u8,
-                    pattern: self.pattern as u8,
-                    step: self.step as u8,
-                    value: None,
-                });
-            }
-            _ => self.key_step_options(key),
+        match self.keys.action(&[Context::Nav, Context::Roll, Context::Step], key) {
+            Some(Action::Left) => self.step = (self.step + len - 1) % len,
+            Some(Action::Right) => self.step = (self.step + 1) % len,
+            Some(Action::First) => self.step = 0,
+            Some(Action::Last) => self.step = len - 1,
+            Some(Action::Up) => self.roll_note = (self.roll_note + 1).min(127),
+            Some(Action::Down) => self.roll_note = self.roll_note.saturating_sub(1),
+            Some(Action::RollOctaveUp) => self.roll_note = self.roll_note.saturating_add(12).min(127),
+            Some(Action::RollOctaveDown) => self.roll_note = self.roll_note.saturating_sub(12),
+            Some(Action::Enter) => self.toggle_roll_note(),
+            Some(Action::Clear) => self.clear_step(),
+            Some(a) => self.step_action(a),
+            None => {}
         }
     }
 
@@ -1779,17 +1894,17 @@ impl App {
         let i = self.param;
         let page = self.page_params();
         let at = page.iter().position(|&p| p == i).unwrap_or(0);
-        match key {
-            Key::Up => self.param = page[at.saturating_sub(1)],
-            Key::Down => self.param = page[(at + 1).min(page.len() - 1)],
-            Key::Left | Key::Right | Key::PageUp | Key::PageDown => {
-                let dir = if matches!(key, Key::Left | Key::PageDown) { -1 } else { 1 };
-                let coarse = matches!(key, Key::PageUp | Key::PageDown);
+        match self.keys.action(&[Context::Nav, Context::Params], key) {
+            Some(Action::Up) => self.param = page[at.saturating_sub(1)],
+            Some(Action::Down) => self.param = page[(at + 1).min(page.len() - 1)],
+            Some(a @ (Action::Left | Action::Right | Action::CoarseUp | Action::CoarseDown)) => {
+                let dir = if matches!(a, Action::Left | Action::CoarseDown) { -1 } else { 1 };
+                let coarse = matches!(a, Action::CoarseUp | Action::CoarseDown);
                 let spec = self.param_spec(i);
                 let v = spec.nudge(self.param_value(i), dir, coarse);
                 self.set_param_value(i, v, true);
             }
-            Key::Char('0') => {
+            Some(Action::Default) => {
                 let d = self.param_spec(i).default;
                 self.set_param_value(i, d, false);
             }
@@ -1870,11 +1985,11 @@ impl App {
         s.clear();
         let (w, h) = (s.width(), s.height());
         if w < MIN_W || h < MIN_H {
-            s.put(0, 0, &format!("TINVO needs at least {MIN_W}x{MIN_H} (now {w}x{h})"), Style::fg(Color::Yellow));
+            s.put(0, 0, &format!("TINVO needs at least {MIN_W}x{MIN_H} (now {w}x{h})"), self.style(Role::Warning));
             return;
         }
-        if self.mode == Mode::Help {
-            draw_help(s);
+        if let Mode::Help(top) = self.mode {
+            self.draw_help(s, top);
             return;
         }
         if let Mode::Devices(p) = &self.mode {
@@ -1904,14 +2019,10 @@ impl App {
     }
 
     fn draw_header(&self, s: &mut Screen, w: u16) {
-        let bar = Style::fg(Color::BrightWhite).on(Color::Blue);
+        let bar = self.style(Role::Header);
         s.fill(0, 0, w, ' ', bar);
         let mut x = s.put(0, 0, " TINVO ", bar.bold());
-        let (txt, st) = if self.playing {
-            ("▶ PLAY ", Style::fg(Color::BrightGreen).on(Color::Blue).bold())
-        } else {
-            ("■ STOP ", bar)
-        };
+        let (txt, st) = if self.playing { ("▶ PLAY ", self.style(Role::HeaderPlay)) } else { ("■ STOP ", bar) };
         x += s.put(x, 0, txt, st);
         let file = self
             .path
@@ -1957,7 +2068,7 @@ impl App {
         let rx = w.saturating_sub(right.chars().count() as u16 + meter_w + 1);
         s.put(rx, 0, &right, bar);
         let peak = self.master_meter[0].max(self.master_meter[1]);
-        draw_meter(s, w - meter_w - 1, 0, meter_w, peak, Color::Blue);
+        self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
     }
 
     fn visible_steps(&self, w: u16) -> (usize, usize) {
@@ -1969,35 +2080,46 @@ impl App {
 
     /// Beat labels and the playhead marker above the step columns.
     fn draw_ruler(&self, s: &mut Screen, w: u16) {
-        s.put(LEFT - 1, 1, "│", Style::fg(Color::Gray));
+        s.put(LEFT - 1, 1, "│", self.style(Role::Dim));
         let (first, last) = self.visible_steps(w);
         for (col, i) in (first..last).enumerate() {
             let x = LEFT + col as u16 * CELL;
             if i % 4 == 0 {
                 let label = format!("{}.{}", i / 16 + 1, (i % 16) / 4 + 1);
-                s.put(x, 1, &label, Style::fg(Color::White));
+                s.put(x, 1, &label, self.style(Role::Beat));
             }
             if self.play_step() == Some(i) {
-                s.put(x + 2, 1, "▼", Style::fg(Color::BrightGreen));
+                s.put(x + 2, 1, "▼", self.style(Role::Playhead));
             }
         }
     }
 
-    fn draw_roll(&self, s: &mut Screen, w: u16, rows: u16) {
-        let dim = Style::fg(Color::Gray);
+    /// Pitches sounding at each step of the edited pattern because an
+    /// earlier note there is still held. A note longer than what is left of
+    /// the pattern holds into its first steps, as it sounds when the pattern
+    /// repeats.
+    fn held_notes(&self) -> [u128; MAX_STEPS] {
         let t = &self.project.tracks[self.track];
-        s.put(1, 1, &format!("Piano roll · {:<16.16} v: grid", t.name), Style::fg(Color::BrightWhite).bold());
-        self.draw_ruler(s, w);
-        let (first, last) = self.visible_steps(w);
-        // Pitches sounding at each step because an earlier note is still held.
+        let len = self.pattern_len();
         let mut held = [0u128; MAX_STEPS];
-        for (j, step) in t.steps[self.pattern].iter().enumerate() {
+        for (j, step) in t.steps[self.pattern].iter().enumerate().take(len) {
             let Some(st) = step.filter(|st| st.ratchet == 1) else { continue };
             let mask = st.notes().fold(0u128, |m, n| m | 1 << n);
-            for h in held.iter_mut().take((j + usize::from(st.length)).min(MAX_STEPS)).skip(j + 1) {
-                *h |= mask;
+            for k in 1..usize::from(st.length).min(len) {
+                held[(j + k) % len] |= mask;
             }
         }
+        held
+    }
+
+    fn draw_roll(&self, s: &mut Screen, w: u16, rows: u16) {
+        let dim = self.style(Role::Dim);
+        let t = &self.project.tracks[self.track];
+        let title = format!("Piano roll · {:<16.16} {}: grid", t.name, self.k(Action::PianoRoll));
+        s.put(1, 1, &title, self.style(Role::Title));
+        self.draw_ruler(s, w);
+        let (first, last) = self.visible_steps(w);
+        let held = self.held_notes();
         // Keep the cursor pitch in the middle of the view where possible.
         let rows = rows.min(128);
         let top = (u16::from(self.roll_note) + rows / 2).clamp(rows - 1, 127);
@@ -2006,9 +2128,9 @@ impl App {
             let pitch = (top - row) as u8;
             let black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
             let label_style = if pitch == self.roll_note {
-                Style::fg(Color::BrightYellow).bold()
+                self.style(Role::PitchCursor)
             } else if pitch % 12 == 0 {
-                Style::fg(Color::BrightWhite)
+                self.style(Role::PitchC)
             } else {
                 dim
             };
@@ -2020,21 +2142,21 @@ impl App {
                 let (text, mut st) = match step {
                     Some(sp) if sp.has_note(pitch) => {
                         let r = if sp.ratchet > 1 { char::from(b'0' + sp.ratchet) } else { '■' };
-                        let color = if sp.chance < 100 { Color::Yellow } else { Color::BrightMagenta };
-                        (format!("■■{r}"), Style::fg(color))
+                        let role = if sp.chance < 100 { Role::Chance } else { Role::Note };
+                        (format!("■■{r}"), self.style(role))
                     }
-                    _ if held[i] >> pitch & 1 == 1 => ("───".to_string(), Style::fg(Color::Magenta)),
-                    _ if black => (" · ".to_string(), Style::fg(Color::Black).on(Color::Default)),
-                    _ if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
+                    _ if held[i] >> pitch & 1 == 1 => ("───".to_string(), self.style(Role::Held)),
+                    _ if black => (" · ".to_string(), self.style(Role::BlackKey)),
+                    _ if i % 4 == 0 => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
                 if self.play_step() == Some(i) {
-                    st.bg = Color::Blue;
+                    st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if i == self.step && pitch == self.roll_note {
-                    st = Style::fg(Color::Black).on(Color::BrightWhite);
+                    st = self.style(Role::Cursor);
                 } else if i == self.step && st.bg == Color::Default {
-                    st.bg = Color::Black;
+                    st.bg = self.style(Role::CursorColumn).bg;
                 }
                 s.put(x, y, &text, st);
             }
@@ -2046,36 +2168,37 @@ impl App {
     fn draw_auto(&self, s: &mut Screen, w: u16, rows: u16) {
         const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let t = &self.project.tracks[self.track];
-        let dim = Style::fg(Color::Gray);
-        s.put(1, 1, &format!("Automation · {:<16.16} A: grid", t.name), Style::fg(Color::BrightWhite).bold());
+        let dim = self.style(Role::Dim);
+        let title = format!("Automation · {:<16.16} {}: grid", t.name, self.k(Action::Automate));
+        s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
         for (k, l) in t.lanes.iter().enumerate().take(usize::from(rows)) {
             let y = 2 + k as u16;
             let selected = k == self.lane;
-            s.put(0, y, if selected { "▸" } else { " " }, Style::fg(Color::BrightYellow));
+            s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
             let spec = l.target.and_then(|x| crate::engine::target_spec(t.kind, x));
             let label = match spec {
                 Some(sp) => format!("{} {:<16.16} {}", k + 1, sp.label, if l.ramp { "ramp" } else { "hold" }),
                 None => format!("{} (free)", k + 1),
             };
-            s.put(1, y, &label, if selected { Style::fg(Color::BrightWhite).bold() } else { Style::DEFAULT });
+            s.put(1, y, &label, self.style(if selected { Role::SelectedName } else { Role::Text }));
             s.put(LEFT - 1, y, "│", dim);
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
                 let value = spec.and_then(|sp| l.value_at(sp, self.pattern, self.pattern_len(), i).map(|v| (sp, v)));
                 let glyph = |sp: &ParamSpec, v: f32| GLYPHS[(sp.to_unit(v) * 7.0).round() as usize];
                 let (text, mut st) = match (l.points[self.pattern][i], value) {
-                    (Some(_), Some((sp, v))) => (format!(" {} ", glyph(sp, v)), Style::fg(Color::BrightYellow).bold()),
-                    (None, Some((sp, v))) => (format!(" {} ", glyph(sp, v)), Style::fg(Color::Yellow)),
-                    _ if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
+                    (Some(_), Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Point)),
+                    (None, Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Value)),
+                    _ if i % 4 == 0 => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
                 if self.play_step() == Some(i) {
-                    st.bg = Color::Blue;
+                    st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if selected && i == self.step {
-                    st = Style::fg(Color::Black).on(Color::BrightWhite);
+                    st = self.style(Role::Cursor);
                 }
                 s.put(x, y, &text, st);
             }
@@ -2084,7 +2207,11 @@ impl App {
         if info_y < 2 + rows {
             let l = &t.lanes[self.lane];
             let info = match l.target.and_then(|x| crate::engine::target_spec(t.kind, x)) {
-                None => "Free lane. In the parameter panel (Tab), A gives the selected parameter a lane.".to_string(),
+                None => format!(
+                    "Free lane. In the parameter panel ({}), {} gives the selected parameter a lane.",
+                    self.k(Action::Focus),
+                    self.k(Action::Automate)
+                ),
                 Some(sp) => {
                     let at = format!("{} at step {}: ", sp.label, self.step + 1);
                     match (l.points[self.pattern][self.step], self.lane_value(self.lane, self.step)) {
@@ -2097,7 +2224,7 @@ impl App {
                     }
                 }
             };
-            s.put(1, info_y, &info, Style::fg(Color::White));
+            s.put(1, info_y, &info, self.style(Role::Beat));
         }
     }
 
@@ -2117,14 +2244,28 @@ impl App {
             (secs / 60.0).floor() as u64,
             (secs % 60.0).floor() as u64
         );
-        s.put(1, 1, &title, Style::fg(Color::BrightWhite).bold());
-        let keys = "↑↓ pattern  Enter repeat  Del remove  [ ] loop  - no loop  Space play  S grid";
+        s.put(1, 1, &title, self.style(Role::Title));
+        let k = &self.keys;
+        let keys = format!(
+            "{} pattern  {} repeat  {} remove  {} loop  {} no loop  {} play  {} grid",
+            k.labels(&[Action::Up, Action::Down]),
+            k.label(Action::Enter),
+            k.label(Action::Clear),
+            k.labels(&[Action::LoopStart, Action::LoopEnd]),
+            k.label(Action::NoLoop),
+            k.label(Action::Play),
+            k.label(Action::SongView),
+        );
         if rows > 2 {
-            s.put(1, 1 + rows, keys, Style::fg(Color::Gray));
+            s.put(1, 1 + rows, &keys, self.style(Role::Dim));
         }
         if p.song.is_empty() {
-            let hint = format!("The song is empty. Enter adds pattern {}.", pattern_name(self.pattern as u8));
-            s.put(2, 3, &hint, Style::fg(Color::Yellow));
+            let hint = format!(
+                "The song is empty. {} adds pattern {}.",
+                self.k(Action::Enter),
+                pattern_name(self.pattern as u8)
+            );
+            s.put(2, 3, &hint, self.style(Role::Warning));
             return;
         }
         let per_row = usize::from((w - 2) / 4).max(1);
@@ -2143,19 +2284,19 @@ impl App {
             let inside = loop_region.is_some_and(|(a, b)| (usize::from(a)..=usize::from(b)).contains(&i));
             let open = if loop_region.is_some_and(|(a, _)| usize::from(a) == i) { '[' } else { ' ' };
             let close = if loop_region.is_some_and(|(_, b)| usize::from(b) == i) { ']' } else { ' ' };
-            let mut st = Style::fg(if inside { Color::BrightGreen } else { Color::BrightCyan });
+            let mut st = self.style(if inside { Role::EntryLoop } else { Role::Entry });
             if playing == Some(i) {
-                st.bg = Color::Blue;
+                st.bg = self.style(Role::PlayColumn).bg;
             }
             if i == self.song_cursor {
-                st = Style::fg(Color::Black).on(Color::BrightWhite);
+                st = self.style(Role::Cursor);
             }
             s.put(x, y, &format!("{open}{}{close}", pattern_name(pat)), st);
         }
     }
 
     fn draw_grid(&self, s: &mut Screen, w: u16, rows: u16) {
-        let dim = Style::fg(Color::Gray);
+        let dim = self.style(Role::Dim);
         // Column positions match the track rows drawn below.
         s.put(1, 1, " # Track        Type", dim);
         s.put(26, 1, "M S", dim);
@@ -2165,7 +2306,8 @@ impl App {
 
         let n = self.track_count();
         if n == 0 {
-            s.put(2, 2, "No tracks. Press 'a' to add one.", Style::fg(Color::Yellow));
+            let hint = format!("No tracks. Press '{}' to add one.", self.k(Action::AddTrack));
+            s.put(2, 2, &hint, self.style(Role::Warning));
             return;
         }
         let visible = usize::from(rows);
@@ -2174,12 +2316,12 @@ impl App {
             let y = 2 + row as u16;
             let t = &self.project.tracks[ti];
             let selected = ti == self.track;
-            let name_style = if selected { Style::fg(Color::BrightWhite).bold() } else { Style::DEFAULT };
-            s.put(0, y, if selected { "▸" } else { " " }, Style::fg(Color::BrightYellow));
+            let name_style = self.style(if selected { Role::SelectedName } else { Role::Text });
+            s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
             s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, t.name, t.kind.label()), name_style);
-            s.put(26, y, "M", if t.mute { Style::fg(Color::Black).on(Color::Red) } else { Style::fg(Color::Gray) });
-            s.put(28, y, "S", if t.solo { Style::fg(Color::Black).on(Color::Yellow) } else { Style::fg(Color::Gray) });
-            draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
+            s.put(26, y, "M", if t.mute { self.style(Role::Mute) } else { dim });
+            s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
+            self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
             s.put(LEFT - 1, y, "│", dim);
 
             for (col, i) in (first..last).enumerate() {
@@ -2193,29 +2335,25 @@ impl App {
                         } else {
                             format!("{:<3}", note_name(step.note))
                         };
-                        let color = match (step.chance < 100, t.kind.is_drum(), step.note_count() > 1) {
-                            (true, ..) => Color::Yellow,
-                            (false, true, _) => Color::BrightCyan,
-                            (false, false, true) => Color::BrightGreen,
-                            (false, false, false) => Color::BrightMagenta,
+                        let role = match (step.chance < 100, t.kind.is_drum(), step.note_count() > 1) {
+                            (true, ..) => Role::Chance,
+                            (false, true, _) => Role::Drum,
+                            (false, false, true) => Role::Chord,
+                            (false, false, false) => Role::Note,
                         };
-                        (text, Style::fg(color))
+                        (text, self.style(role))
                     }
-                    None if i % 4 == 0 => (" · ".to_string(), Style::fg(Color::White)),
+                    None if i % 4 == 0 => (" · ".to_string(), self.style(Role::Beat)),
                     None => (" · ".to_string(), dim),
                 };
                 if t.mute && t.steps[self.pattern][i].is_some() {
-                    st.fg = Color::Gray;
+                    st.fg = self.style(Role::Muted).fg;
                 }
                 if self.play_step() == Some(i) {
-                    st.bg = Color::Blue;
+                    st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if selected && i == self.step {
-                    st = if self.focus == Focus::Grid {
-                        Style::fg(Color::Black).on(Color::BrightWhite)
-                    } else {
-                        Style::fg(Color::Black).on(Color::Gray)
-                    };
+                    st = self.style(if self.focus == Focus::Grid { Role::Cursor } else { Role::CursorIdle });
                 }
                 s.put(x, y, &text, st);
             }
@@ -2228,7 +2366,7 @@ impl App {
     }
 
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
-        let dim = Style::fg(Color::Gray);
+        let dim = self.style(Role::Dim);
         s.fill(0, y, w, '─', dim);
         let track = self.project.tracks.get(self.track);
         let title = match (self.page, track) {
@@ -2258,13 +2396,14 @@ impl App {
                         let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
                         format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
                     }
-                    (None, InstrumentKind::Sampler) => format!(" {} · Sampler · no sample, press o{page} ", t.name),
+                    (None, InstrumentKind::Sampler) => {
+                        format!(" {} · Sampler · no sample, press {}{page} ", t.name, self.k(Action::LoadSample))
+                    }
                     (None, kind) => format!(" {} · {}{page} ", t.name, kind.label()),
                 }
             }
         };
-        let title_style =
-            if self.focus == Focus::Params { Style::fg(Color::BrightYellow).bold() } else { Style::fg(Color::White) };
+        let title_style = self.style(if self.focus == Focus::Params { Role::PanelFocus } else { Role::Panel });
         s.put(2, y, &title, title_style);
         if let Some(t) = track.filter(|_| self.page != Page::Mix) {
             let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
@@ -2280,20 +2419,65 @@ impl App {
             let yy = y + 1 + row as u16;
             let spec = self.param_spec(i);
             let text = format!("{:<12.12}{:>13.13}", spec.label, spec.format(self.param_value(i)));
-            let st = if i == self.param && self.focus == Focus::Params {
-                Style::fg(Color::Black).on(Color::BrightWhite)
+            let role = if i == self.param && self.focus == Focus::Params {
+                Role::Cursor
             } else if i == self.param {
-                Style::fg(Color::BrightWhite)
+                Role::ParamSelected
             } else {
-                Style::DEFAULT
+                Role::Text
             };
-            s.put(x, yy, &text, st);
+            s.put(x, yy, &text, self.style(role));
+        }
+    }
+
+    /// The key hints for the bottom line.
+    fn hints(&self) -> String {
+        let k = &self.keys;
+        match self.focus {
+            Focus::Grid if self.auto_view => format!(
+                "{} step  {} lane  {} point  {} value  {} coarse  {} hold-ramp  {} remove lane  {} grid  {} undo",
+                k.labels(&[Action::Left, Action::Right]),
+                k.labels(&[Action::Up, Action::Down]),
+                k.label(Action::Enter),
+                k.labels(&[Action::PointDown, Action::PointUp]),
+                k.labels(&[Action::PointCoarseDown, Action::PointCoarseUp]),
+                k.label(Action::Ramp),
+                k.label(Action::RemoveLane),
+                k.label(Action::Automate),
+                k.label(Action::Undo),
+            ),
+            Focus::Grid => format!(
+                "{} move  {} step  {} pitch  {} vel  {} len  {} chance  {} ratchet  {} undo  {} play  {} help",
+                k.labels(&[Action::Left, Action::Right, Action::Up, Action::Down]),
+                k.label(Action::Enter),
+                k.labels(&[Action::PitchDown, Action::PitchUp]),
+                k.labels(&[Action::VelocityDown, Action::VelocityUp]),
+                k.labels(&[Action::Shorter, Action::Longer]),
+                k.labels(&[Action::ChanceDown, Action::ChanceUp]),
+                k.label(Action::Ratchet),
+                k.label(Action::Undo),
+                k.label(Action::Play),
+                k.label(Action::Help),
+            ),
+            Focus::Params => format!(
+                "{} select  {} adjust  {} coarse  {} default  {} page  {} automate  {} mute  {} solo  {} grid  {} help",
+                k.labels(&[Action::Up, Action::Down]),
+                k.labels(&[Action::Left, Action::Right]),
+                k.labels(&[Action::CoarseUp, Action::CoarseDown]),
+                k.label(Action::Default),
+                k.label(Action::Page),
+                k.label(Action::Automate),
+                k.label(Action::Mute),
+                k.label(Action::Solo),
+                k.label(Action::Focus),
+                k.label(Action::Help),
+            ),
         }
     }
 
     fn draw_status(&self, s: &mut Screen, w: u16, y: u16) {
-        s.fill(0, y, w, ' ', Style::DEFAULT.on(Color::Black));
-        let prompt = Style::fg(Color::BrightWhite).on(Color::Black).bold();
+        s.fill(0, y, w, ' ', self.style(Role::StatusBar));
+        let prompt = self.style(Role::Prompt);
         match &self.mode {
             Mode::Prompt(kind, text) => {
                 let label = match kind {
@@ -2308,8 +2492,8 @@ impl App {
                     ),
                 };
                 let x = s.put(0, y, &label, prompt);
-                let x2 = s.put(x, y, text, Style::fg(Color::BrightWhite).on(Color::Black));
-                s.put(x + x2, y, "█", Style::fg(Color::BrightWhite).on(Color::Black));
+                let x2 = s.put(x, y, text, self.style(Role::Input));
+                s.put(x + x2, y, "█", self.style(Role::Input));
             }
             Mode::Confirm(Confirm::Quit) => {
                 s.put(0, y, "Unsaved changes. Quit anyway? (y/n)", prompt);
@@ -2328,50 +2512,52 @@ impl App {
             }
             _ => {
                 let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
-                let (text, st) = match recent {
-                    Some((m, _)) => (m.as_str(), Style::fg(Color::BrightYellow).on(Color::Black)),
-                    None => (
-                        match self.focus {
-                            Focus::Grid if self.auto_view => {
-                                "←→ step  ↑↓ lane  Enter point  [ ] value  { } coarse  / hold-ramp  - remove lane  A grid  u undo"
-                            }
-                            Focus::Grid => {
-                                "←→↑↓ move  Enter step  , . pitch  [ ] vel  { } len  - = chance  / ratchet  u undo  Space play  ? help"
-                            }
-                            Focus::Params => {
-                                "↑↓ select  ←→ adjust  PgUp/PgDn coarse  0 default  f page  A automate  m mute  s solo  Tab grid  ? help"
-                            }
-                        },
-                        Style::fg(Color::Gray).on(Color::Black),
-                    ),
+                match recent {
+                    Some((m, _)) => s.put(0, y, m, self.style(Role::Message)),
+                    None => s.put(0, y, &self.hints(), self.style(Role::Hint)),
                 };
-                s.put(0, y, text, st);
             }
         }
     }
 }
 
+/// A line of the key list: the keys, then the action's name and what it
+/// does; a heading has no keys.
+struct HelpLine {
+    keys: String,
+    text: String,
+    heading: bool,
+}
+
 impl App {
     fn draw_midi(&self, s: &mut Screen, p: &MidiPicker) {
         let h = s.height();
-        s.put(2, 1, "MIDI input", Style::fg(Color::BrightWhite).bold());
+        let dim = self.style(Role::Dim);
+        s.put(2, 1, "MIDI input", self.style(Role::Title));
         let now = self.midi_input.as_ref().map_or("off", |(_, n)| n.as_str());
-        s.put(2, 2, &format!("Now: {now}"), Style::fg(Color::Gray));
+        s.put(2, 2, &format!("Now: {now}"), dim);
         let current = self.midi_input.as_ref().map(|(id, _)| id.as_str());
         let mut entries = vec![("None (MIDI off)".to_string(), current.is_none())];
         entries.extend(p.ports.iter().map(|port| (port.name.clone(), current == Some(port.id.as_str()))));
         if p.ports.is_empty() {
             entries.push(("(no MIDI inputs connected)".to_string(), false));
         }
-        draw_list(s, &entries, p.cursor);
-        s.put(2, h.saturating_sub(2), "↑↓ choose  Enter open  Esc cancel", Style::fg(Color::Gray));
+        self.draw_list(s, &entries, p.cursor);
+        let hint = format!(
+            "{} choose  {} open  Esc cancel",
+            self.keys.labels(&[Action::Up, Action::Down]),
+            self.k(Action::Enter)
+        );
+        s.put(2, h.saturating_sub(2), &hint, dim);
     }
 
     fn draw_devices(&self, s: &mut Screen, p: &DevicePicker) {
         let h = s.height();
-        let (on, off) = (Style::fg(Color::Black).on(Color::BrightWhite).bold(), Style::fg(Color::Gray));
+        let (on, off) = (self.style(Role::TabOn), self.style(Role::Dim));
         let x = s.put(2, 1, " Audio output ", if p.input_page { off } else { on });
         s.put(3 + x, 1, " Audio input ", if p.input_page { on } else { off });
+        let pages = self.keys.labels(&[Action::Left, Action::Right]);
+        let choose = self.keys.labels(&[Action::Up, Action::Down]);
         if p.input_page {
             let current = self.input_device.as_deref();
             let mut entries = vec![("System default".to_string(), current.is_none())];
@@ -2379,26 +2565,105 @@ impl App {
                 let default = if d.is_default { "  (default)" } else { "" };
                 entries.push((format!("{}{default}", d.name), current == Some(d.id.as_str())));
             }
-            s.put(2, 2, "Records into the selected sampler track with I", Style::fg(Color::Gray));
-            draw_list(s, &entries, p.input_cursor);
-            s.put(2, h.saturating_sub(2), "←→ output/input  ↑↓ choose  Enter use  Esc cancel", Style::fg(Color::Gray));
+            let what = format!("Records into the selected sampler track with {}", self.k(Action::Record));
+            s.put(2, 2, &what, off);
+            self.draw_list(s, &entries, p.input_cursor);
+            let hint = format!("{pages} output/input  {choose} choose  {} use  Esc cancel", self.k(Action::Enter));
+            s.put(2, h.saturating_sub(2), &hint, off);
             return;
         }
-        s.put(2, 2, &format!("Now: {}", self.audio_label), Style::fg(Color::Gray));
+        s.put(2, 2, &format!("Now: {}", self.audio_label), off);
         let current = self.audio_config.device.as_deref();
         let mut entries = vec![("System default (follows changes)".to_string(), current.is_none())];
         for d in &p.devices {
             let default = if d.is_default { "  (default)" } else { "" };
             entries.push((format!("{}{default}", d.name), current == Some(d.id.as_str())));
         }
-        draw_list(s, &entries, p.cursor);
+        self.draw_list(s, &entries, p.cursor);
         let ll = if p.low_latency { "on" } else { "off" };
-        s.put(
-            2,
-            h.saturating_sub(2),
-            &format!("←→ output/input  ↑↓ choose  Enter switch  Tab low latency: {ll}  Esc cancel"),
-            Style::fg(Color::Gray),
+        let hint = format!(
+            "{pages} output/input  {choose} choose  {} switch  {} low latency: {ll}  Esc cancel",
+            self.k(Action::Enter),
+            self.k(Action::Focus)
         );
+        s.put(2, h.saturating_sub(2), &hint, off);
+    }
+
+    /// A list's entries from row 4 down to above the hint line, keeping the
+    /// cursor's row on screen; `●` marks the one in use.
+    fn draw_list(&self, s: &mut Screen, entries: &[(String, bool)], cursor: usize) {
+        let rows = usize::from(s.height().saturating_sub(7)).max(1);
+        let first = cursor.saturating_sub(rows - 1);
+        for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
+            let mark = if *chosen { "● " } else { "  " };
+            let st = self.style(if i == cursor { Role::ListCursor } else { Role::Text });
+            s.put(2, 4 + row as u16, &format!("{mark}{name}"), st);
+        }
+    }
+
+    /// Every action with its keys, by context, then the keys that cannot
+    /// be changed.
+    fn help_lines(&self) -> Vec<HelpLine> {
+        let heading = |text: &str| HelpLine { keys: String::new(), text: text.to_string(), heading: true };
+        let mut lines = Vec::new();
+        for ctx in Context::ALL {
+            lines.push(heading(ctx.title()));
+            for a in Action::ALL.iter().filter(|a| a.context() == ctx) {
+                let text = format!("{:<18} {}", a.id(), a.help());
+                lines.push(HelpLine { keys: self.keys.all_labels(*a), text, heading: false });
+            }
+        }
+        lines.push(heading("Fixed keys"));
+        for (keys, text) in [
+            ("y n", "answer a question (quit, delete a track)"),
+            ("1-7", "the type of a new track, after add_track"),
+            ("Esc", "cancel a prompt, close a list"),
+            ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
+        ] {
+            lines.push(HelpLine { keys: keys.to_string(), text: text.to_string(), heading: false });
+        }
+        lines
+    }
+
+    fn draw_help(&self, s: &mut Screen, top: usize) {
+        let lines = self.help_lines();
+        let rows = usize::from(s.height().saturating_sub(2)).max(1);
+        self.help_rows.set(rows);
+        let top = top.min(lines.len().saturating_sub(rows));
+        let more = if top + rows < lines.len() { "  ↓ more" } else { "" };
+        let title = format!(
+            "TINVO keys ({}-{} of {}{more}). {} PgUp PgDn scroll, other keys close; tinvo settings shows how to change them.",
+            top + 1,
+            (top + rows).min(lines.len()),
+            lines.len(),
+            self.keys.labels(&[Action::Up, Action::Down]),
+        );
+        s.put(1, 0, &title, self.style(Role::Title));
+        for (row, line) in lines.iter().skip(top).take(rows).enumerate() {
+            let y = row as u16 + 2;
+            if line.heading {
+                s.put(1, y, &line.text, self.style(Role::Title));
+            } else {
+                s.put(2, y, &line.keys, self.style(Role::HelpKey));
+                s.put(20, y, &line.text, self.style(Role::Text));
+            }
+        }
+    }
+
+    /// Level meter on a -48..0 dBFS scale.
+    fn draw_meter(&self, s: &mut Screen, x: u16, y: u16, width: u16, level: f32, bg: Color) {
+        let db = gain_to_db(level);
+        let frac = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
+        let filled = (frac * f32::from(width)).round() as u16;
+        let role = if level >= 1.0 {
+            Role::MeterClip
+        } else if db > -6.0 {
+            Role::MeterHigh
+        } else {
+            Role::MeterLow
+        };
+        s.fill(x, y, filled, '█', Style::fg(self.style(role).fg).on(bg));
+        s.fill(x + filled, y, width - filled, '·', Style::fg(self.style(Role::MeterEmpty).fg).on(bg));
     }
 }
 
@@ -2413,18 +2678,6 @@ fn follow_track(track: Option<usize>, e: &Edit) -> Option<usize> {
     }
 }
 
-/// A picker's entries from row 4 down to above the hint line, keeping the
-/// cursor's row on screen; `●` marks the one in use.
-fn draw_list(s: &mut Screen, entries: &[(String, bool)], cursor: usize) {
-    let rows = usize::from(s.height().saturating_sub(7)).max(1);
-    let first = cursor.saturating_sub(rows - 1);
-    for (row, (i, (name, chosen))) in entries.iter().enumerate().skip(first).take(rows).enumerate() {
-        let mark = if *chosen { "● " } else { "  " };
-        let st = if i == cursor { Style::fg(Color::Black).on(Color::BrightCyan) } else { Style::DEFAULT };
-        s.put(2, 4 + row as u16, &format!("{mark}{name}"), st);
-    }
-}
-
 /// A step for the status line: its notes and velocity.
 fn step_label(s: &Step, kind: InstrumentKind) -> String {
     if kind.is_drum() {
@@ -2434,73 +2687,9 @@ fn step_label(s: &Step, kind: InstrumentKind) -> String {
     format!("{} v{}", names.join(" "), s.velocity)
 }
 
-fn draw_help(s: &mut Screen) {
-    let lines: &[(&str, &str)] = &[
-        ("", "TINVO keyboard reference (any key closes)"),
-        ("", ""),
-        ("Space", "play / stop"),
-        ("Tab", "switch between step grid and parameters"),
-        ("← → ↑ ↓", "move cursor (grid) / select and adjust (parameters)"),
-        ("Home End", "first / last step"),
-        ("Enter or x", "toggle step"),
-        ("Delete", "clear step"),
-        (", .", "step pitch down / up a semitone"),
-        ("< >", "step pitch down / up an octave"),
-        ("[ ]", "step velocity down / up"),
-        ("{ }", "step length down / up"),
-        ("- =", "step chance down / up (yellow: below 100 %)"),
-        ("/", "step ratchet: 1-4 hits per step"),
-        ("( )", "move the step earlier / later (1/24 step, up to half a step)"),
-        ("c", "cycle chord: maj, min, 7, m7, maj7, sus4 (green in the grid)"),
-        ("v", "piano roll for the track: ↑↓ pitch, PgUp/PgDn octave, Enter adds/removes a note"),
-        ("u U", "undo / redo (also Ctrl+Z / Ctrl+Y)"),
-        ("p", "preview the track's note"),
-        ("PgUp PgDn", "coarse parameter change; 0 resets to default"),
-        ("m s", "mute / solo track"),
-        ("t T", "tempo down / up"),
-        ("g G", "swing down / up (50-75 %)"),
-        ("l L", "pattern length down / up"),
-        ("n N", "next / previous pattern (A-P); while a pattern plays, it plays next"),
-        ("y Y X", "copy / paste / clear the pattern"),
-        ("S", "song view: ←→ entry, ↑↓ its pattern, Enter repeat, Del remove, [ ] loop, Space play"),
-        ("a D r", "add / delete / rename track"),
-        ("o", "load a WAV file into a sampler track"),
-        ("O", "audio output and input devices (Tab: low-latency output; ←→: output / input)"),
-        ("I", "record from the audio input into the sampler track; I again stops and loads it"),
-        ("M R", "MIDI input; step entry: keys write the step at the cursor (held together: a chord)"),
-        ("f", "parameter panel: instrument, channel strip (EQ, compressor, drive, sends), buses and master"),
-        ("A", "automation: in the parameter panel, give the selected parameter a lane; in the grid, show lanes"),
-        ("", "  Enter point, [ ] { } value, / hold or ramp, - remove lane, ↑↓ lane"),
-        ("w  Ctrl+S", "save (W: save as)"),
-        ("e", "export WAV (←→ song / pattern / loop region, Tab format, ↑↓ repeats)"),
-        ("q  Ctrl+C", "quit"),
-    ];
-    for (i, (k, d)) in lines.iter().enumerate() {
-        let y = i as u16 + 1;
-        s.put(2, y, k, Style::fg(Color::BrightYellow).bold());
-        s.put(16, y, d, Style::DEFAULT);
-    }
-}
-
 /// A gain reduction for display: "GR -3.2 dB", or "GR  0.0 dB" when idle.
 fn reduction_text(db: f32) -> String {
     if db >= 0.05 { format!("GR {:4.1} dB", -db) } else { "GR  0.0 dB".to_string() }
-}
-
-/// Level meter on a -48..0 dBFS scale.
-fn draw_meter(s: &mut Screen, x: u16, y: u16, width: u16, level: f32, bg: Color) {
-    let db = gain_to_db(level);
-    let frac = ((db + 48.0) / 48.0).clamp(0.0, 1.0);
-    let filled = (frac * f32::from(width)).round() as u16;
-    let color = if level >= 1.0 {
-        Color::BrightRed
-    } else if db > -6.0 {
-        Color::BrightYellow
-    } else {
-        Color::BrightGreen
-    };
-    s.fill(x, y, filled, '█', Style::fg(color).on(bg));
-    s.fill(x + filled, y, width - filled, '·', Style::fg(Color::Gray).on(bg));
 }
 
 fn step_summary(s: &Step) -> String {
@@ -2777,7 +2966,9 @@ pub fn run(
     config: StreamConfig,
     midi_start: MidiStart,
     input: Option<String>,
+    settings: Settings,
 ) -> Result<(), String> {
+    let (play, help) = (settings.keys.label(Action::Play), settings.keys.label(Action::Help));
     let (project, path, mut message) = match path {
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
@@ -2792,7 +2983,7 @@ pub fn run(
             let msg = format!("New project; it will be saved to {}", p.display());
             (proj, Some(p), msg)
         }
-        None => (Project::demo(), None, "Demo beat loaded. Space plays, ? shows all keys.".to_string()),
+        None => (Project::demo(), None, format!("Demo beat loaded. {play} plays, {help} shows all keys.")),
     };
 
     // The terminal comes first: a recovery question is asked in it before
@@ -2809,7 +3000,7 @@ pub fn run(
     let (project, recovered) = match autosave::find(path.as_deref()) {
         None => (project, false),
         Some(found) => match &found.project {
-            Ok(saved) => match ask_recovery(&mut term, &mut screen, &mut out, &found)? {
+            Ok(saved) => match ask_recovery(&mut term, &mut screen, &mut out, &found, &settings.theme)? {
                 Some(Recovery::Recover) => {
                     notice =
                         Some(format!("Recovered unsaved changes from {}; save to keep them.", found.path.display()));
@@ -2839,7 +3030,8 @@ pub fn run(
     if let Some(first) = errors.first() {
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
-    let mut app = App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples);
+    let mut app =
+        App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples).with_settings(settings);
     if recovered {
         // Unsaved until the user saves; the autosave is rewritten from it.
         app.touch();
@@ -2953,15 +3145,16 @@ fn ask_recovery(
     screen: &mut Screen,
     out: &mut String,
     found: &autosave::Found,
+    theme: &Theme,
 ) -> Result<Option<Recovery>, String> {
     let when = found.modified.and_then(|m| m.elapsed().ok()).map_or(String::new(), |d| format!(" {}", age(d)));
-    let text = Style::fg(Color::BrightWhite);
-    let key = Style::fg(Color::BrightCyan).bold();
+    let text = theme.get(Role::Text);
+    let key = theme.get(Role::AnswerKey);
     loop {
         let (w, h) = term.size();
         screen.resize(w, h);
         screen.clear();
-        screen.put(2, 1, "Unsaved changes found", Style::fg(Color::BrightYellow).bold());
+        screen.put(2, 1, "Unsaved changes found", theme.get(Role::Warning).bold());
         screen.put(2, 3, "The last session ended without saving. Its edits were autosaved", text);
         screen.put(2, 4, &format!("{when} to {}", found.path.display()), text);
         for (y, k, what) in [
@@ -2991,6 +3184,7 @@ fn ask_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings;
 
     fn app() -> App {
         App::new(Project::demo(), None, None, 48_000, "test".into())
@@ -4161,7 +4355,8 @@ mod tests {
                 let input_picker = DevicePicker { input_page: true, ..picker.clone() };
                 for mode in [
                     Mode::Normal,
-                    Mode::Help,
+                    Mode::Help(0),
+                    Mode::Help(usize::MAX),
                     Mode::AddTrack,
                     Mode::Prompt(PromptKind::Export, "x".into()),
                     Mode::Devices(picker.clone()),
@@ -4247,6 +4442,292 @@ mod tests {
         a.tick_autosave(t0 + autosave::INTERVAL);
         assert_eq!(a.status_text(), Some("other"), "not repeated");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keymap in which every action has one key of its own, none of them
+    /// a default key.
+    fn moved_keys() -> Keymap {
+        let mut k = Keymap::default();
+        for (i, &a) in Action::ALL.iter().enumerate() {
+            k.bind(a, vec![Key::Char(char::from_u32(0x100 + i as u32).unwrap())]);
+        }
+        k.check().unwrap();
+        k
+    }
+
+    /// Everything a key can change, to compare two apps.
+    #[allow(clippy::type_complexity)]
+    fn state(a: &App) -> (Project, [usize; 8], u8, Mode, [bool; 5], Focus, Page, Vec<Step>) {
+        (
+            a.project.clone(),
+            [a.track, a.step, a.param, a.pattern, a.song_cursor, a.lane, a.undo.len(), a.redo.len()],
+            a.roll_note,
+            a.mode.clone(),
+            [a.roll, a.song_view, a.auto_view, a.dirty, a.quit],
+            a.focus,
+            a.page,
+            a.brushes.clone(),
+        )
+    }
+
+    #[test]
+    fn every_action_works_the_same_on_any_key() {
+        enum Press {
+            Do(Action),
+            Raw(Key),
+        }
+        use Action::*;
+        use Press::{Do, Raw};
+        let synth = Project::demo().tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        let mut script = vec![
+            Do(Right),
+            Do(Right),
+            Do(Enter),
+            Do(VelocityDown),
+            Do(VelocityUp),
+            Do(Longer),
+            Do(Shorter),
+            Do(ChanceDown),
+            Do(ChanceUp),
+            Do(Ratchet),
+            Do(Earlier),
+            Do(Later),
+            Do(PitchUp),
+            Do(PitchDown),
+            Do(OctaveUp),
+            Do(OctaveDown),
+            Do(Last),
+            Do(First),
+            Do(Clear),
+            Do(Down),
+            Do(Enter),
+            Do(Up),
+            Do(Copy),
+            Do(NextPattern),
+            Do(Paste),
+            Do(ClearPattern),
+            Do(PrevPattern),
+            Do(TempoUp),
+            Do(TempoDown),
+            Do(SwingUp),
+            Do(SwingDown),
+            Do(PatternShorter),
+            Do(PatternLonger),
+            Do(Mute),
+            Do(Solo),
+            Do(Preview),
+            Do(StepEntry),
+            Do(StepEntry),
+            Do(Focus),
+            Do(Down),
+            Do(Right),
+            Do(CoarseUp),
+            Do(Left),
+            Do(CoarseDown),
+            Do(Default),
+            Do(Page),
+            Do(Down),
+            Do(Right),
+            Do(Automate),
+            Do(Enter),
+            Do(PointUp),
+            Do(PointCoarseDown),
+            Do(PointDown),
+            Do(PointCoarseUp),
+            Do(Ramp),
+            Do(Right),
+            Do(Enter),
+            Do(Clear),
+            Do(Down),
+            Do(Up),
+            Do(RemoveLane),
+            Do(Automate),
+            Do(Page),
+            Do(Page),
+        ];
+        script.extend((0..synth).map(|_| Do(Down)));
+        script.extend([
+            Do(PianoRoll),
+            Do(Up),
+            Do(RollOctaveUp),
+            Do(Enter),
+            Do(RollOctaveDown),
+            Do(Enter),
+            Do(Chord),
+            Do(Right),
+            Do(Enter),
+            Do(Clear),
+            Do(PianoRoll),
+            Do(Chord),
+            Do(SongView),
+            Do(Enter),
+            Do(Enter),
+            Do(Up),
+            Do(Down),
+            Do(Up),
+            Do(Left),
+            Do(LoopStart),
+            Do(Right),
+            Do(LoopEnd),
+            Do(NoLoop),
+            Do(Clear),
+            Do(Last),
+            Do(First),
+            Do(PianoRoll),
+            Do(SongView),
+            Do(Undo),
+            Do(Undo),
+            Do(Redo),
+            Do(Help),
+            Do(Down),
+            Do(Down),
+            Do(Up),
+            Raw(Key::Esc),
+            Do(AddTrack),
+            Raw(Key::Char('2')),
+            Do(RenameTrack),
+            Raw(Key::Char('z')),
+            Raw(Key::Enter),
+            Do(SaveAs),
+            Raw(Key::Esc),
+            Do(Export),
+            Raw(Key::Esc),
+            Do(LoadSample),
+            Do(DeleteTrack),
+            Raw(Key::Char('y')),
+            Do(Save),
+            Raw(Key::Esc),
+            Do(Quit),
+            Raw(Key::Char('n')),
+        ]);
+        let mut by_default = app();
+        let mut moved = app().with_settings(Settings { keys: moved_keys(), ..Settings::default() });
+        for (n, press) in script.iter().enumerate() {
+            let (d, m) = match *press {
+                Do(a) => (a.defaults()[0], moved.keys.keys(a)[0]),
+                Raw(k) => (k, k),
+            };
+            by_default.handle_key(d);
+            moved.handle_key(m);
+            assert!(state(&by_default) == state(&moved), "after press {n} ({d:?})");
+        }
+        assert!(by_default.undo.len() > 20, "the script did little");
+        assert_eq!(by_default.project.tracks.len(), app().project.tracks.len(), "added, then deleted");
+        assert!(!by_default.quit && by_default.mode == Mode::Normal);
+    }
+
+    #[test]
+    fn rebound_default_keys_do_nothing() {
+        let mut a = app().with_settings(Settings { keys: moved_keys(), ..Settings::default() });
+        let before = state(&a);
+        for view in 0..4 {
+            match view {
+                1 => a.focus = Focus::Params,
+                2 => (a.focus, a.song_view) = (Focus::Grid, true),
+                3 => (a.song_view, a.auto_view) = (false, true),
+                _ => {}
+            }
+            let expected = state(&a);
+            for act in Action::ALL {
+                for &k in act.defaults() {
+                    // Esc is no action's default; Enter, the arrows and the rest are.
+                    a.handle_key(k);
+                    assert!(state(&a) == expected, "{k:?} still does {}", act.id());
+                }
+            }
+        }
+        assert!(before.0 == a.project);
+    }
+
+    #[test]
+    fn hints_and_the_key_list_name_the_bound_keys() {
+        let settings = settings::parse(
+            "[keys]\nundo = z ctrl+z\nplay = f5\nhelp = h\nvelocity_down = ö\nvelocity_up = ç\npattern_shorter =\n",
+        )
+        .unwrap();
+        let mut a = app().with_settings(settings);
+        let mut s = Screen::new(140, 40);
+        a.draw(&mut s);
+        let bottom = s.row_text(39);
+        assert!(bottom.contains("ö ç vel") && bottom.contains("z undo  F5 play  h help"), "{bottom}");
+        a.handle_key(Key::Char('h'));
+        assert_eq!(a.mode, Mode::Help(0));
+        a.draw(&mut s);
+        let text: Vec<String> = (0..40).map(|y| s.row_text(y)).collect();
+        let line = |id: &str| text.iter().find(|l| l.contains(&format!(" {id} "))).cloned().unwrap_or_default();
+        assert!(line("undo").trim_start().starts_with("z Ctrl+Z"), "{}", line("undo"));
+        assert!(line("pattern_shorter").trim_start().starts_with("(unbound)"), "{}", line("pattern_shorter"));
+        // Scrolling stops once the last line is in view, then any other key closes.
+        for _ in 0..500 {
+            a.handle_key(Key::Down);
+        }
+        let Mode::Help(top) = a.mode else { panic!("{:?}", a.mode) };
+        assert_eq!(top, a.help_lines().len() - 38);
+        a.draw(&mut s);
+        let text: Vec<String> = (0..40).map(|y| s.row_text(y)).collect();
+        let line = |id: &str| text.iter().find(|l| l.contains(&format!(" {id} "))).cloned().unwrap_or_default();
+        assert!(line("velocity_down").trim_start().starts_with('ö'), "{}", line("velocity_down"));
+        assert!(s.row_text(39).contains("export prompt"), "{}", s.row_text(39));
+        a.handle_key(Key::Up);
+        assert_eq!(a.mode, Mode::Help(top - 1));
+        a.handle_key(Key::Char('x'));
+        assert_eq!(a.mode, Mode::Normal);
+        a.handle_key(Key::Char('l'));
+        assert!(!a.dirty, "l has no action now");
+        a.mode = Mode::Normal;
+        a.focus = Focus::Params;
+        a.draw(&mut s);
+        assert!(s.row_text(39).contains("PgUp PgDn coarse  0 default"), "{}", s.row_text(39));
+    }
+
+    #[test]
+    fn the_theme_colours_the_screen() {
+        let mut a = app();
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        let header = Style::fg(Color::BrightWhite).on(Color::Blue);
+        assert_eq!(s.style_at(0, 0), header.bold(), "the default theme as before");
+        assert_eq!(s.style_at(99, 0).bg, Color::Blue, "the meter on the bar");
+        let cursor = (LEFT, 2);
+        assert_eq!(s.style_at(cursor.0, cursor.1), Style::fg(Color::Black).on(Color::BrightWhite));
+        a = a.with_settings(settings::parse("[theme]\nbase = light\nheader = bright-white on #102030 bold\n").unwrap());
+        a.draw(&mut s);
+        assert_eq!(s.style_at(0, 0), Style::fg(Color::BrightWhite).on(Color::Rgb(16, 32, 48)).bold());
+        assert_eq!(s.style_at(cursor.0, cursor.1), Theme::built_in("light").unwrap().get(Role::Cursor));
+        assert_eq!(s.style_at(0, 29).bg, Color::White, "the light status bar");
+    }
+
+    #[test]
+    fn the_piano_roll_holds_a_note_past_the_end_of_the_pattern_into_its_start() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        let (track, len) = (a.track as u8, 8u8);
+        a.edit(Edit::SetPatternLength { pattern: 0, len });
+        for step in 0..MAX_STEPS as u8 {
+            a.edit(Edit::SetStep { track, pattern: 0, step, value: None });
+        }
+        // Hidden past the pattern's end: plays nothing, so holds nothing.
+        a.edit(Edit::SetStep { track, pattern: 0, step: 12, value: Some(Step::new(50, 100, 8)) });
+        a.edit(Edit::SetStep { track, pattern: 0, step: 6, value: Some(Step::new(60, 100, 4)) });
+        a.edit(Edit::SetStep { track, pattern: 0, step: 1, value: Some(Step::new(62, 100, 20)) });
+        let held = a.held_notes();
+        let at = |step: usize, note: u8| held[step] >> note & 1 == 1;
+        let sixty: Vec<usize> = (0..MAX_STEPS).filter(|&i| at(i, 60)).collect();
+        assert_eq!(sixty, [0, 1, 7], "steps 7, then 0 and 1 of the next pass");
+        // Longer than the pattern: everywhere but its own step.
+        let long: Vec<usize> = (0..MAX_STEPS).filter(|&i| at(i, 62)).collect();
+        assert_eq!(long, [0, 2, 3, 4, 5, 6, 7]);
+        assert!((0..MAX_STEPS).all(|i| !at(i, 50)));
+        a.roll = true;
+        a.roll_note = 60;
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        let row = (2..28).find(|&y| s.row_text(y).contains(" C4 ") || s.row_text(y).contains("C4 │")).unwrap();
+        let cell = |i: u16| s.row_text(row).chars().skip(usize::from(LEFT + i * CELL)).take(3).collect::<String>();
+        assert_eq!(cell(0), "───");
+        assert_eq!(cell(7), "───");
+        assert_eq!(cell(6), "■■■");
+        assert_ne!(cell(2), "───");
     }
 
     #[test]

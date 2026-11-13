@@ -13,6 +13,7 @@ use tinvo::midi;
 use tinvo::project::{Project, pattern_name};
 use tinvo::record::Recorder;
 use tinvo::render::{self, RenderOptions, Source};
+use tinvo::settings::{self, Settings};
 use tinvo::wav::{self, SampleFormat};
 
 const USAGE: &str = "\
@@ -40,6 +41,8 @@ USAGE:
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
     tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
+    tinvo settings [FILE]               check the settings file (keys and colours) and print
+                                        every setting it gives, ready to copy and edit
     tinvo --help | --version
 
 AUDIO:
@@ -51,12 +54,14 @@ AUDIO:
                                         part of its name; default: the first one)
     --input NAME                        record from this audio input (I in the editor;
                                         default: the system default)
+    --settings FILE                     read keys and colours from FILE instead of the
+                                        settings file (see tinvo settings)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None => tinvo::app::run(None, StreamConfig::default(), MidiStart::First, None),
+        None => cmd_edit(&[]),
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             Ok(())
@@ -74,6 +79,7 @@ fn main() -> ExitCode {
         Some("record") => cmd_record(&args[1..]),
         Some("bench") => cmd_bench(&args[1..]),
         Some("fuzz") => cmd_fuzz(&args[1..]),
+        Some("settings") => cmd_settings(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
     match result {
@@ -257,16 +263,72 @@ fn input_option(args: Vec<String>) -> Result<(Option<String>, Vec<String>), Stri
     Ok((input, rest))
 }
 
+/// Takes `--settings` out of `args`: the settings file to read, if not the
+/// usual one.
+fn settings_option(args: Vec<String>) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut file = None;
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--settings" {
+            file = Some(PathBuf::from(it.next().ok_or("--settings needs a file")?));
+        } else {
+            rest.push(a);
+        }
+    }
+    Ok((file, rest))
+}
+
+/// The settings in `file`, or in the usual settings file; the path read
+/// and whether a file was there. A named file must exist.
+fn read_settings(file: Option<PathBuf>) -> Result<(Settings, Option<PathBuf>, bool), String> {
+    match file {
+        Some(f) => {
+            let (s, found) = settings::load(&f)?;
+            if !found {
+                return Err(format!("{}: no such settings file", f.display()));
+            }
+            Ok((s, Some(f), true))
+        }
+        None => match settings::default_path() {
+            Some(p) => settings::load(&p).map(|(s, found)| (s, Some(p), found)),
+            None => Ok((Settings::default(), None, false)),
+        },
+    }
+}
+
 fn cmd_edit(args: &[String]) -> Result<(), String> {
-    let (config, rest) = audio_options(args)?;
+    // Settings first: a mistake in them is reported before any device opens.
+    let (file, rest) = settings_option(args.to_vec())?;
+    let (settings, ..) = read_settings(file)?;
+    let (config, rest) = audio_options(&rest)?;
     let (midi_start, rest) = midi_option(rest)?;
     let (input, rest) = input_option(rest)?;
     match &rest[..] {
-        [] => tinvo::app::run(None, config, midi_start, input),
+        [] => tinvo::app::run(None, config, midi_start, input, settings),
         [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input),
+        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input, settings),
         _ => Err(format!("too many arguments\n\n{USAGE}")),
     }
+}
+
+/// Checks the settings file and prints every setting it gives.
+fn cmd_settings(args: &[String]) -> Result<(), String> {
+    let file = match args {
+        [] => None,
+        [f] if !f.starts_with('-') => Some(PathBuf::from(f)),
+        _ => return Err(format!("settings takes at most a file\n\n{USAGE}")),
+    };
+    let (settings, path, found) = read_settings(file)?;
+    let source = match (&path, found) {
+        (Some(p), true) => format!("# Read from {}.", p.display()),
+        (Some(p), false) => {
+            format!("# {} does not exist: these are the defaults. Copy there the lines to change.", p.display())
+        }
+        (None, _) => "# No settings folder could be found (no APPDATA or HOME): these are the defaults.".to_string(),
+    };
+    print!("{source}\n{}", settings.to_text());
+    Ok(())
 }
 
 fn cmd_inputs() -> Result<(), String> {

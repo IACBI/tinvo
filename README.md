@@ -38,6 +38,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
 - Autosave every 5 seconds while there are unsaved edits. If TINVO crashes or is killed, the next start offers to recover them.
+- The editor's keys and colours can be changed in a settings file. A light theme is built in.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern or the loop region, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -79,11 +80,13 @@ tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
+tinvo settings            # check the settings file and print every key and colour
+tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
 
-The main keys in the editor (press `?` for the full list):
+The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
 | Key | Action |
 |---|---|
@@ -113,6 +116,23 @@ The main keys in the editor (press `?` for the full list):
 | `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
 | `w` `W` `e` | save, save as, export WAV |
 | `q` | quit |
+
+### Configuration
+
+Keys and colours are read from `tinvo.conf`: in `%APPDATA%\tinvo` on Windows, `~/Library/Application Support/tinvo` on macOS, and `$XDG_CONFIG_HOME/tinvo` (usually `~/.config/tinvo`) on Linux. The file needs only the lines you want to change:
+
+```ini
+[keys]
+undo = u ctrl+z
+left = h left
+pattern_shorter =
+
+[theme]
+base = light
+cursor = black on bright-cyan bold
+```
+
+An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys.
 
 ### Contributing
 
@@ -151,6 +171,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
 - Kaydedilmemiş değişiklik varken 5 saniyede bir otomatik yedek. TINVO çökerse ya da öldürülürse, bir sonraki açılışta bu değişiklikleri geri yüklemeyi önerir.
+- Editörün tuşları ve renkleri bir ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern ya da döngü bölgesi, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
@@ -192,11 +213,13 @@ tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
+tinvo settings            # check the settings file and print every key and colour
+tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
 
-Editördeki temel tuşlar (tam liste için `?`):
+Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 
 | Tuş | İşlev |
 |---|---|
@@ -226,6 +249,23 @@ Editördeki temel tuşlar (tam liste için `?`):
 | `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `q` | çık |
+
+### Yapılandırma
+
+Tuşlar ve renkler `tinvo.conf` dosyasından okunur: Windows'ta `%APPDATA%\tinvo`, macOS'te `~/Library/Application Support/tinvo`, Linux'ta `$XDG_CONFIG_HOME/tinvo` (genellikle `~/.config/tinvo`) klasöründe. Dosyaya sadece değiştirmek istediğin satırları yazman yeterli:
+
+```ini
+[keys]
+undo = u ctrl+z
+left = h left
+pattern_shorter =
+
+[theme]
+base = light
+cursor = black on bright-cyan bold
+```
+
+`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir.
 
 ### Katkı
 

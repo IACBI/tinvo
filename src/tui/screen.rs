@@ -21,10 +21,16 @@ pub enum Color {
     BrightMagenta,
     BrightCyan,
     BrightWhite,
+    /// One of the 256 colours of xterm's palette.
+    Indexed(u8),
+    /// A 24-bit colour, for terminals that support one.
+    Rgb(u8, u8, u8),
 }
 
 impl Color {
-    fn fg(self) -> u8 {
+    /// The SGR code of a palette colour as a foreground; the extended ones
+    /// have no single code.
+    fn code(self) -> u8 {
         match self {
             Color::Default => 39,
             Color::Black => 30,
@@ -43,12 +49,20 @@ impl Color {
             Color::BrightMagenta => 95,
             Color::BrightCyan => 96,
             Color::BrightWhite => 97,
+            Color::Indexed(_) | Color::Rgb(..) => 39,
         }
     }
 
-    fn bg(self) -> u8 {
-        // Background codes are the foreground codes + 10.
-        self.fg() + 10
+    /// Appends the SGR parameters that set this colour, as a background if
+    /// `bg`.
+    fn write_sgr(self, out: &mut String, bg: bool) {
+        let base = if bg { 48 } else { 38 };
+        let _ = match self {
+            Color::Indexed(n) => write!(out, "{base};5;{n}"),
+            Color::Rgb(r, g, b) => write!(out, "{base};2;{r};{g};{b}"),
+            // Background codes are the foreground codes + 10.
+            c => write!(out, "{}", c.code() + if bg { 10 } else { 0 }),
+        };
     }
 }
 
@@ -171,7 +185,10 @@ impl Screen {
                 }
                 if style != Some(cell.style) {
                     let s = cell.style;
-                    let _ = write!(out, "\x1b[0;{};{}", s.fg.fg(), s.bg.bg());
+                    out.push_str("\x1b[0;");
+                    s.fg.write_sgr(out, false);
+                    out.push(';');
+                    s.bg.write_sgr(out, true);
                     if s.bold {
                         out.push_str(";1");
                     }
@@ -192,6 +209,11 @@ impl Screen {
     /// The character at (x, y) in the frame being drawn (for tests).
     pub fn char_at(&self, x: u16, y: u16) -> char {
         self.back[usize::from(y) * usize::from(self.width) + usize::from(x)].ch
+    }
+
+    /// The style at (x, y) in the frame being drawn (for tests).
+    pub fn style_at(&self, x: u16, y: u16) -> Style {
+        self.back[usize::from(y) * usize::from(self.width) + usize::from(x)].style
     }
 
     /// One row of the frame being drawn, as text (for tests).
@@ -232,6 +254,19 @@ mod tests {
         let mut one = String::new();
         s.flush_into(&mut one);
         assert_eq!(one, "\x1b[1;2H\x1b[0;31;49ma\x1b[0m");
+    }
+
+    #[test]
+    fn extended_colours_use_their_own_sequences() {
+        let mut s = Screen::new(4, 1);
+        let mut out = String::new();
+        s.flush_into(&mut out);
+        s.put(0, 0, "a", Style::fg(Color::Indexed(208)).on(Color::Rgb(1, 2, 3)).bold());
+        s.put(1, 0, "b", Style::fg(Color::BrightWhite).on(Color::Indexed(0)));
+        out.clear();
+        s.flush_into(&mut out);
+        assert_eq!(out, "\x1b[1;1H\x1b[0;38;5;208;48;2;1;2;3;1ma\x1b[0;97;48;5;0mb\x1b[0m");
+        assert_eq!(s.style_at(1, 0).bg, Color::Indexed(0));
     }
 
     #[test]

@@ -184,7 +184,7 @@ Known limits:
 - Edit scripts stop after 64 edits, since each edit clones the project twice to check its undo.
 - Before 0.15.0 it ran for about 24 million project inputs, 4.7 million WAV files and 200,000 edit scripts (two 10-minute runs per target on one machine). Finding nothing more in that time does not show that no bug is left.
 
-## Phase 6c: Performance budgets ✅ (0.16.0, this release)
+## Phase 6c: Performance budgets ✅ (0.16.0)
 
 - A test that counts allocations on the audio path (`tests/realtime.rs`): the engine while it plays, takes edits, cues, auditions, sample changes and live notes in callbacks of random sizes, plus the capture side of recording and the MIDI parser and mailboxes. Any allocation fails it with a backtrace.
 - `tinvo bench` measures four scenarios (the demo, the demo with every strip stage on, a worst-case synth, a worst-case sampler) per callback of 128 frames: mean, 99th percentile and worst, as a share of the period. `--check` fails when a mean is over its scenario's budget; CI runs it on every platform.
@@ -196,10 +196,24 @@ Known limits:
 - Instructions are not time: a change that misses the cache more, or uses slower instructions, can cost more time with the same count.
 - The allocation test covers what the backends call on the audio thread, not the backend callbacks themselves (format conversion, device buffers). Those are checked by reading, and on Linux and macOS by running them in CI.
 
+## Phase 6d: Keys and colours ✅ (0.17.0, this release)
+
+- A settings file (`tinvo.conf` in the user's configuration folder, or `--settings FILE`) rebinds any of the editor's 71 actions and sets the colour of any of its 45 roles. A key given to two actions that are active at the same time is refused, naming the key and both actions, before the terminal is touched.
+- Two built-in themes: the default for dark terminals and `light` for light ones. Colours can be the 16 named ones, a palette index or 24-bit `#rrggbb`.
+- `tinvo settings` checks the file and prints every action and role with its value, ready to copy.
+- Hints, messages and the key list name the keys actually bound. The key list scrolls, so it fits on small terminals.
+- The piano roll draws a note held past the end of the pattern on the pattern's first steps, where it goes on sounding when the pattern repeats.
+
+Known limits:
+- Some keys are fixed: answering questions (`y`, `n`, `Esc`), the instrument number after adding a track, and editing text in prompts.
+- The built-in themes use the 16 ANSI colours, which each terminal's palette defines, so they look different from one terminal to another. The light theme's contrast was computed from the xterm and Windows Terminal (Campbell) palettes on a white background; it has not been looked at in a real light terminal.
+- 24-bit colours need a terminal that supports them; others show something else or nothing.
+- A note held past the pattern's end is drawn as the pattern repeating. In a song whose next entry is another pattern, the note still sounds over it, but the roll does not show that.
+- There is no editor for the settings inside TINVO; the file is edited by hand.
+
 ## Later in Phase 6
 
-- Mouse support, themes, configurable keymaps.
-- Notes that span the loop point in the piano roll display (they already play correctly).
+- Mouse support.
 
 ## Known limitations of the foundation
 
