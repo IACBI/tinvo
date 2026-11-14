@@ -309,6 +309,33 @@ mod tests {
     }
 
     #[test]
+    fn exports_play_each_track_s_part() {
+        let mut p = two_patterns();
+        p.song = vec![0, 0, 0];
+        p.tracks[0].parts[1] = crate::engine::Part::Pattern(1);
+        p.tracks[0].parts[2] = crate::engine::Part::Rest;
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
+        // Steps are 6000 frames: A on entry 0, B's step 2 on entry 1, a rest.
+        assert_eq!(onsets(&render(&p, &[], &opts)), [0, 36_000]);
+        // Stems of a song with parts still add up to the mix.
+        let mut q = Project::demo();
+        q.mix[crate::mix::mp::LIMITER] = 0.0;
+        q.tracks[1].parts[1] = crate::engine::Part::Rest;
+        q.tracks[5].parts[0] = crate::engine::Part::Pattern(1);
+        let mix = render(&q, &[], &opts);
+        let stems = render_stems(&q, &[], &opts);
+        let worst = (0..mix.len())
+            .map(|k| (stems.iter().map(|(_, s)| s[k]).sum::<f32>() - mix[k]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "stems differ from the mix by {worst}");
+        assert_ne!(
+            mix,
+            render(&Project { tracks: Project::demo().tracks, ..q.clone() }, &[], &opts),
+            "the parts are heard"
+        );
+    }
+
+    #[test]
     fn stems_add_up_to_the_mix() {
         let mut p = Project::demo();
         p.tracks[4].mute = true; // a muted track gets no stem

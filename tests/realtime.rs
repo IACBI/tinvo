@@ -15,7 +15,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
-use tinvo::engine::{Command, Edit, Engine, LiveNote, MAX_TRACKS, MIX_TARGET, Shared, Step};
+use tinvo::engine::{Command, Edit, Engine, LiveNote, MAX_TRACKS, MIX_TARGET, Part, Shared, Step};
 use tinvo::instrument::InstrumentKind;
 use tinvo::midi::Parser;
 use tinvo::mix::{MIX_PARAMS, mp, send};
@@ -210,7 +210,7 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
     let mut r = |n: u64| rng.next_u64() % n;
     let track = r(MAX_TRACKS as u64 + 1) as u8;
     let kind = InstrumentKind::ALL[r(InstrumentKind::ALL.len() as u64) as usize];
-    let edit = match r(22) {
+    let edit = match r(23) {
         0 => Edit::SetTempo(20.0 + r(281) as f32),
         1 => Edit::SetSwing(50.0 + r(26) as f32),
         2 => Edit::SetPatternLength { pattern: r(16) as u8, len: 1 + r(64) as u8 },
@@ -250,6 +250,14 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
             let index = r(MIX_PARAMS.len() as u64) as usize;
             let spec = &MIX_PARAMS[index];
             Edit::SetMixParam { index: index as u8, value: spec.min + (spec.max - spec.min) * (r(101) as f32 / 100.0) }
+        }
+        21 => {
+            let part = match r(3) {
+                0 => Part::Follow,
+                1 => Part::Rest,
+                _ => Part::Pattern(r(16) as u8),
+            };
+            Edit::SetPart { track, index: r(8) as u16, part }
         }
         _ => {
             return match r(7) {

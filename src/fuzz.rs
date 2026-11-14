@@ -31,7 +31,7 @@
 
 use crate::dsp::noise::Rng;
 use crate::engine::{
-    Command, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Shared, Step, target_spec,
+    Command, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, target_spec,
 };
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
@@ -385,7 +385,7 @@ fn mutate_bytes(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 // ---------------------------------------------------------------- projects
 
-const PROJECT_KEYS: [&str; 23] = [
+const PROJECT_KEYS: [&str; 24] = [
     "tinvo",
     "tempo",
     "swing",
@@ -404,6 +404,7 @@ const PROJECT_KEYS: [&str; 23] = [
     "solo",
     "pattern",
     "lane",
+    "parts",
     "point",
     "param",
     "step",
@@ -535,6 +536,9 @@ fn project_seeds() -> Vec<Vec<u8>> {
     rich.loop_region = Some((1, 2));
     rich.set_marker(0, "intro").expect("an entry");
     rich.set_marker(3, "drop é").expect("an entry");
+    rich.tracks[0].parts[1] = Part::Pattern(15);
+    rich.tracks[0].parts[4] = Part::Rest;
+    rich.tracks[2].parts[0] = Part::Pattern(1);
     rich.pattern_lens[1] = 7;
     rich.pattern_lens[15] = 64;
     rich.swing = 62.5;
@@ -573,6 +577,7 @@ fn project_seeds() -> Vec<Vec<u8>> {
             "tinvo 6\ntempo 120\n\ntrack synth\nlane 0 volume ramp\npoint 0 0 -60\npattern C\npoint 0 15 6\nend\n",
             "tinvo 8\ntempo 120\nmix reverb_decay 2.4\n\ntrack clap\nparam send_reverb -12\nend\n",
             "tinvo 10\nmarker 0 a\nmarker 2 b c\nsong A B C\n",
+            "tinvo 11\nsong A B A\npattern_length C 3\n\ntrack kick\nparts . C -\nstep 1 36 100 1 100 1 0 -\nend\n",
         ]
         .map(String::from),
     );
@@ -622,6 +627,7 @@ fn check_project(input: &[u8], render: bool) -> Result<Outcome, String> {
 /// What every project TINVO holds must satisfy.
 fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
     check_markers(p)?;
+    check_parts(p)?;
     let saved = p.to_text();
     let back = Project::from_text(&saved).map_err(|e| format!("the saved project does not load: {e}\n{saved}"))?;
     if back != *p {
@@ -639,6 +645,16 @@ fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
     }
     if render {
         render_check(p, &[])?;
+    }
+    Ok(())
+}
+
+/// Past the song's end every track follows.
+fn check_parts(p: &Project) -> Result<(), String> {
+    for (i, t) in p.tracks.iter().enumerate() {
+        if let Some(e) = t.parts[p.song.len()..].iter().position(|&x| x != Part::Follow) {
+            return Err(format!("track {i} has a part on entry {} of a song of {}", p.song.len() + e, p.song.len()));
+        }
     }
     Ok(())
 }
@@ -1070,7 +1086,7 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let step = s.below(MAX_STEPS + 2) as u8;
     let entry = s.u16() % (MAX_SONG as u16 + 2);
     let kind_of = |t: u8| p.tracks.get(usize::from(t)).map(|t| t.kind);
-    let edit = match s.below(22) {
+    let edit = match s.below(24) {
         0 => Edit::SetTempo(s.f32()),
         1 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
         2 => Edit::SetMasterGain(s.f32()),
@@ -1114,7 +1130,16 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
             let index = s.below(MIX_PARAMS.len() + 2) as u8;
             Edit::SetMixParam { index, value: s.value(MIX_PARAMS.get(usize::from(index))) }
         }
-        19 => {
+        19 | 20 => {
+            let part = match s.below(4) {
+                0 => Part::Follow,
+                1 => Part::Rest,
+                _ => Part::Pattern(pattern),
+            };
+            // Mostly entries in the song, so parts pile up and edits move them.
+            Edit::SetPart { track, index: entry % (p.song.len() as u16 + 1), part }
+        }
+        21 => {
             let t = usize::from(track);
             return if s.byte() & 1 == 0 { Action::Name(t, s.text()) } else { Action::Sample(t, s.text()) };
         }
@@ -1170,6 +1195,7 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
                             return Err(format!("{edit:?} lost {lost} markers"));
                         }
                         check_markers(&p)?;
+                        check_parts(&p)?;
                     }
                     (Err(_), Err(_)) => {
                         if p != before {

@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 10
+//! tinvo 11
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -20,6 +20,7 @@
 //! pan 0
 //! mute false
 //! solo false
+//! parts . . B -              # per song entry: . the entry's pattern, a pattern, - rest
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
 //! lane 0 decay ramp          # lane, parameter id (volume, pan, or a mix id), hold or ramp
@@ -37,14 +38,14 @@
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
-//! 6 (no channel strip), 7 (no sends or buses) and 8 and 9 (no markers)
-//! are still read.
+//! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers) and
+//! 10 (every track plays the entry's pattern) are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Step, loop_region, target_spec,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Part, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
@@ -52,7 +53,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -77,6 +78,8 @@ pub struct TrackData {
     /// to the project file when it sits inside the project's directory.
     pub sample: Option<String>,
     pub lanes: [LaneData; MAX_LANES],
+    /// What the track plays in each song entry; `Follow` past the song's end.
+    pub parts: Box<[Part; MAX_SONG]>,
 }
 
 /// An automation lane: a parameter (see [`target_spec`]) and its points.
@@ -127,6 +130,7 @@ impl TrackData {
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
+            parts: Box::new([Part::Follow; MAX_SONG]),
         }
     }
 }
@@ -373,6 +377,11 @@ impl Project {
                     return Err(EditError::SongFull);
                 }
                 self.song.insert(usize::from(index), pattern);
+                let (i, len) = (usize::from(index), self.song.len());
+                for t in &mut self.tracks {
+                    t.parts.copy_within(i..len - 1, i + 1);
+                    t.parts[i] = Part::Follow;
+                }
                 for m in &mut self.markers {
                     if m.entry >= index {
                         m.entry += 1;
@@ -383,6 +392,11 @@ impl Project {
             Edit::RemoveSongEntry(index) => {
                 self.entry(index)?;
                 self.song.remove(usize::from(index));
+                let (i, len) = (usize::from(index), self.song.len());
+                for t in &mut self.tracks {
+                    t.parts.copy_within(i + 1..=len, i);
+                    t.parts[len] = Part::Follow;
+                }
                 // The marker goes with its entry. The editor's history keeps
                 // markers beside the edits, so undo brings it back.
                 self.markers.retain(|m| m.entry != index);
@@ -397,6 +411,12 @@ impl Project {
                 check_pattern(pattern)?;
                 self.entry(index)?;
                 self.song[usize::from(index)] = pattern;
+                edit
+            }
+            Edit::SetPart { track, index, part } => {
+                check_part(part)?;
+                self.entry(index)?;
+                self.track_mut(track)?.parts[usize::from(index)] = part;
                 edit
             }
             Edit::SetLoop(region) => {
@@ -556,6 +576,12 @@ impl Project {
         self.loop_region.filter(|&(_, b)| usize::from(b) < self.song.len())
     }
 
+    /// What track `track` plays in song entry `entry` (`Follow` for anything
+    /// out of range).
+    pub fn part(&self, track: usize, entry: usize) -> Part {
+        self.tracks.get(track).and_then(|t| t.parts.get(entry)).copied().unwrap_or(Part::Follow)
+    }
+
     /// The marker on song entry `entry`, if any.
     pub fn marker_at(&self, entry: u16) -> Option<&Marker> {
         self.markers.iter().find(|m| m.entry == entry)
@@ -686,10 +712,24 @@ impl Project {
                 }
                 vec![Edit::RemoveSongEntry(index)]
             }
-            Edit::RemoveSongEntry(index) => vec![Edit::InsertSongEntry { index, pattern: self.entry(index)? }],
+            Edit::RemoveSongEntry(index) => {
+                let mut v = vec![Edit::InsertSongEntry { index, pattern: self.entry(index)? }];
+                for (t, tr) in self.tracks.iter().enumerate() {
+                    let part = tr.parts[usize::from(index)];
+                    if part != Part::Follow {
+                        v.push(Edit::SetPart { track: t as u8, index, part });
+                    }
+                }
+                v
+            }
             Edit::SetSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
                 vec![Edit::SetSongEntry { index, pattern: self.entry(index)? }]
+            }
+            Edit::SetPart { track, index, part } => {
+                check_part(part)?;
+                self.entry(index)?;
+                vec![Edit::SetPart { track, index, part: self.track(track)?.parts[usize::from(index)] }]
             }
             Edit::SetLoop(region) => {
                 if region.is_some_and(|r| loop_region(r).is_none()) {
@@ -799,6 +839,11 @@ impl Project {
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
             let _ = writeln!(s, "solo {}", t.solo);
+            // Up to the last entry that does not follow; the rest follow.
+            if let Some(last) = t.parts.iter().rposition(|&p| p != Part::Follow) {
+                let names: Vec<String> = t.parts[..=last].iter().map(|&p| part_name(p).to_string()).collect();
+                let _ = writeln!(s, "parts {}", names.join(" "));
+            }
             let n = t.kind.params().len();
             for (i, v) in t.params.iter().enumerate() {
                 let spec = track_param(t.kind, i).expect("one value per parameter");
@@ -854,8 +899,10 @@ impl Project {
         let mut current: Option<TrackData> = None;
         // The pattern that `step` lines in the current track block fill.
         let mut pattern = 0usize;
-        // Where each marker was read, for errors found once the song is known.
+        // Where each marker and `parts` line was read, for errors found once
+        // the song is known.
         let mut marker_lines = Vec::new();
+        let mut part_lines = Vec::new();
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -988,6 +1035,16 @@ impl Project {
                         }
                         t.steps[pattern][i] = Some(st);
                     }
+                    "parts" if ver >= 11 => {
+                        let words: Vec<&str> = rest.split_whitespace().collect();
+                        if words.len() > MAX_SONG {
+                            return Err(err(format!("a song has at most {MAX_SONG} entries")));
+                        }
+                        for (slot, w) in t.parts.iter_mut().zip(&words) {
+                            *slot = parse_part(w).map_err(err)?;
+                        }
+                        part_lines.push((p.tracks.len(), line_no, words.len()));
+                    }
                     "end" => {
                         if p.tracks.len() >= MAX_TRACKS {
                             return Err(err(format!("more than {MAX_TRACKS} tracks")));
@@ -1095,6 +1152,13 @@ impl Project {
                 return Err(ParseError { line, message: format!("marker '{}' is past the end of the song", m.name) });
             }
         }
+        for (track, line, count) in part_lines {
+            if count > p.song.len() {
+                let message =
+                    format!("track {} has parts for {count} song entries; the song has {}", track + 1, p.song.len());
+                return Err(ParseError { line, message });
+            }
+        }
         Ok(p)
     }
 
@@ -1136,6 +1200,30 @@ impl Project {
 /// The letter of pattern `p` (A for 0).
 pub fn pattern_name(p: u8) -> char {
     char::from(b'A' + p.min(MAX_PATTERNS as u8 - 1))
+}
+
+/// How a part is written: `.` follows the entry, `-` rests, else a pattern.
+pub fn part_name(p: Part) -> char {
+    match p {
+        Part::Follow => '.',
+        Part::Pattern(p) => pattern_name(p),
+        Part::Rest => '-',
+    }
+}
+
+fn parse_part(s: &str) -> Result<Part, String> {
+    match s {
+        "." => Ok(Part::Follow),
+        "-" => Ok(Part::Rest),
+        _ => parse_pattern(s).map(Part::Pattern).map_err(|_| format!("unknown part '{s}' (., -, or A..=P)")),
+    }
+}
+
+fn check_part(part: Part) -> Result<(), EditError> {
+    match part {
+        Part::Pattern(p) => check_pattern(p),
+        Part::Follow | Part::Rest => Ok(()),
+    }
 }
 
 fn parse_pattern(s: &str) -> Result<u8, String> {
@@ -1187,6 +1275,11 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     e.push(Edit::SetPan { track, pan: t.pan });
     e.push(Edit::SetMute { track, mute: t.mute });
     e.push(Edit::SetSolo { track, solo: t.solo });
+    for (index, &part) in t.parts.iter().enumerate() {
+        if part != Part::Follow {
+            e.push(Edit::SetPart { track, index: index as u16, part });
+        }
+    }
     for (p, steps) in t.steps.iter().enumerate() {
         for (s, step) in steps.iter().enumerate() {
             if step.is_some() {
@@ -1269,8 +1362,14 @@ mod tests {
         p.loop_region = Some((1, 3));
         p.set_marker(0, "intro").unwrap();
         p.set_marker(2, "  big   drop ").unwrap();
+        p.tracks[1].parts[1] = Part::Rest;
+        p.tracks[1].parts[3] = Part::Pattern(15);
+        p.tracks[4].parts[4] = Part::Pattern(0);
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 10\n"));
+        assert!(text.starts_with("tinvo 11\n"));
+        assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
+        assert!(text.contains("\nparts . . . . A\n"), "{text}");
+        assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
         assert!(text.contains("\nloop 1 3\nmarker 0 intro\nmarker 2 big   drop\n"), "{text}");
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
@@ -1378,6 +1477,53 @@ mod tests {
             let r = p.marker_range(from, to).unwrap();
             assert!(p.range_name(r).is_some(), "{from:?} {to:?}");
         }
+    }
+
+    #[test]
+    fn parts_are_validated_and_move_with_their_entries() {
+        let mut p = song(3);
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Snare)).unwrap();
+        assert_eq!(p.apply(Edit::SetPart { track: 0, index: 3, part: Part::Rest }), Err(EditError::NoSuchEntry(3)));
+        assert_eq!(p.apply(Edit::SetPart { track: 2, index: 0, part: Part::Rest }), Err(EditError::NoSuchTrack(2)));
+        let bad = Edit::SetPart { track: 0, index: 0, part: Part::Pattern(16) };
+        assert_eq!(p.apply(bad), Err(EditError::NoSuchPattern(16)));
+        assert_eq!(p.inverse(&bad), Err(EditError::NoSuchPattern(16)));
+        p.apply(Edit::SetPart { track: 0, index: 1, part: Part::Pattern(3) }).unwrap();
+        p.apply(Edit::SetPart { track: 1, index: 2, part: Part::Rest }).unwrap();
+        let parts = |p: &Project, t: usize| p.tracks[t].parts[..5].to_vec();
+        p.apply(Edit::InsertSongEntry { index: 1, pattern: 4 }).unwrap();
+        assert_eq!(parts(&p, 0), [Part::Follow, Part::Follow, Part::Pattern(3), Part::Follow, Part::Follow]);
+        assert_eq!(parts(&p, 1), [Part::Follow, Part::Follow, Part::Follow, Part::Rest, Part::Follow]);
+        let inverse = p.inverse(&Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(inverse.len(), 2, "the entry and the one part of its own: {inverse:?}");
+        p.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(parts(&p, 0), [Part::Follow; 5], "the part went with its entry");
+        p.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert!(p.tracks.iter().all(|t| t.parts.iter().all(|&x| x == Part::Follow)), "nothing left past the end");
+        // A new track follows everywhere.
+        p.apply(Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth }).unwrap();
+        assert_eq!(p.part(0, 0), Part::Follow);
+        assert_eq!(p.part(9, 0), Part::Follow, "out of range");
+    }
+
+    #[test]
+    fn parts_lines_are_validated() {
+        let ok = Project::from_text("tinvo 11\ntrack kick\nparts . B -\nend\nsong A A A").unwrap();
+        assert_eq!(ok.tracks[0].parts[..3], [Part::Follow, Part::Pattern(1), Part::Rest], "the song may come later");
+        for bad in [
+            "tinvo 10\nsong A\ntrack kick\nparts B\nend",
+            "tinvo 11\nsong A\ntrack kick\nparts Q\nend",
+            "tinvo 11\nsong A\ntrack kick\nparts b\nend",
+            "tinvo 11\nsong A\ntrack kick\nparts . .\nend",
+            "tinvo 11\ntrack kick\nparts .\nend",
+            "tinvo 11\nsong A\nparts B",
+        ] {
+            assert!(Project::from_text(bad).is_err(), "{bad}");
+        }
+        let long = Project::from_text("tinvo 11\nsong A\n\ntrack kick\nparts . -\nend").unwrap_err();
+        assert_eq!(long.line, 5, "{long:?}");
+        assert!(long.message.contains("parts for 2 song entries"), "{long:?}");
     }
 
     #[test]
@@ -1673,7 +1819,11 @@ mod tests {
     /// Applying any edit and then its inverse restores the project exactly.
     #[test]
     fn inverse_undoes_every_kind_of_edit() {
-        let base = Project::demo();
+        let mut base = Project::demo();
+        // Parts on the entry and the tracks removed below come back too.
+        base.tracks[0].parts[3] = Part::Rest;
+        base.tracks[5].parts[3] = Part::Pattern(2);
+        base.tracks[5].parts[1] = Part::Pattern(9);
         let s = Some(Step { chance: 40, ratchet: 2, ..Step::new(50, 80, 3) });
         let edits = [
             Edit::SetTempo(140.0),
@@ -1700,6 +1850,9 @@ mod tests {
             Edit::RemoveSongEntry(3),
             Edit::SetSongEntry { index: 1, pattern: 7 },
             Edit::SetLoop(Some((1, 2))),
+            Edit::SetPart { track: 2, index: 2, part: Part::Pattern(4) },
+            Edit::SetPart { track: 0, index: 3, part: Part::Follow },
+            Edit::SetPart { track: 5, index: 0, part: Part::Rest },
         ];
         for e in edits {
             let mut p = base.clone();

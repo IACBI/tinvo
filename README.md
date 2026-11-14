@@ -26,7 +26,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
 - Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–4 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
-- 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. Patterns switch at the end of the bar while playing.
+- 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. In any entry a track can play a pattern of its own or rest. Patterns switch at the end of the bar while playing.
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
@@ -106,7 +106,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
 | `n` `N` | next / previous pattern |
 | `y` `Y` `X` | copy / paste / clear the pattern |
-| `S` | song view (`←` `→` entry, `↑` `↓` its pattern, `Enter` repeat, `Del` remove, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section) |
+| `S` | song view: entries across, tracks down (`←` `→` entry, `↑` `↓` the song's row or a track's, `,` `.` the entry's pattern, or on a track row its own pattern, the entry's or a rest; `Enter` repeat, `Del` remove the entry or make the track follow it, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section) |
 | `f` | parameter panel: instrument, channel strip and sends, buses and master |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
@@ -168,7 +168,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 16 kanal, 64'e kadar 16'lık adım, 20–300 BPM tempo, %50–75 swing.
 - Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–4 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
-- 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Çalarken pattern değişikliği ölçü sonunda devreye girer.
+- 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Her girişte bir kanal kendi pattern'ini çalabilir ya da susabilir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
@@ -248,7 +248,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
 | `n` `N` | sonraki / önceki pattern |
 | `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
-| `S` | şarkı görünümü (`←` `→` giriş, `↑` `↓` pattern'i, `Enter` tekrarla, `Del` sil, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al) |
+| `S` | şarkı görünümü: girişler yan yana, kanallar alt alta (`←` `→` giriş, `↑` `↓` şarkı satırı ya da bir kanalın satırı, `,` `.` girişin pattern'i, kanal satırında ise kanalın kendi pattern'i, girişinki ya da sus; `Enter` tekrarla, `Del` girişi sil ya da kanalı girişe uydur, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al) |
 | `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, buslar ve master |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
