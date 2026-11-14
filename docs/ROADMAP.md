@@ -326,6 +326,80 @@ Known limits:
 - Character widths come from the common ranges (CJK, Hangul, full-width forms, emoji, combining marks), not Unicode's full tables; terminals also differ on some characters.
 - Closing a real MIDI input was not tried here (no MIDI device on the development machine); the release on closing and on a lost message are unit-tested.
 
+## Planned: more kinds of music
+
+TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. The phases below take it further, toward triplet and live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
+
+### Phase 9: Finer time (medium)
+
+For triplet and shuffle feels (6/8 and 12/8 grooves, jazz-influenced hip-hop), 32nd-note hat rolls, and songs whose tempo moves.
+- A step division per pattern: 1/8, 1/8T, 1/16 (today's grid), 1/16T or 1/32. A pattern still holds up to 64 steps, so a 1/32 pattern is two bars long. Micro-timing keeps its 24 ticks per step.
+- A time signature per pattern, which places the bar and beat lines in the grid and the piano roll.
+- Tempo automation: a song-level lane that holds or ramps. The transport integrates a ramp exactly, so playback and export agree at any buffer size.
+- A tempo-synced rate for the synth's LFO, in the delay's divisions.
+- Up to 8 ratchets.
+- Project format 12. Older files load as 1/16 in 4/4.
+- Tests: step frames for every division against the exact fraction of a beat, step positions under a tempo ramp against its integral, buffer-size independence, round trips and the fuzzer.
+
+### Phase 10: MIDI performance (medium)
+
+For playing parts in instead of entering them, expressive synth playing, and working alongside other programs and hardware.
+- Recording while the pattern plays: incoming notes written to their nearest step, keeping the rest as micro-timing or quantized fully (a setting), with velocity and length as played. A pass overdubs or replaces, is one undo step, and can start after a count-in.
+- Sustain pedal (CC 64), pitch bend with a range per track, and the mod wheel (CC 1) sent to a chosen parameter. MIDI channels can each play their own track; all channels playing the selected track stays the default.
+- Standard MIDI File import (formats 0 and 1, one TINVO track per MIDI track or channel, notes on the pattern's grid, the tempo from the first tempo event) and export of a pattern or the song.
+- MIDI output, with backends next to the input ones (WinMM, the ALSA sequencer, CoreMIDI): a track's notes to an external instrument or another program, and MIDI clock (start, stop, continue, song position, 24 clocks per quarter note). Following an external clock needs the audio clock to track another device's drift and would be a phase of its own.
+- Tests: recorded steps against the frames notes arrived on, a recorded pass identical to the same notes entered by hand, pedal and bend on the synth's voices, MIDI file round trips with the reader fuzzed like the project and WAV readers, clock bytes on their exact frames.
+
+### Phase 11: Mixer (medium)
+
+For larger arrangements and the mix structure they need: drum and vocal groups, parallel compression, more parts.
+- 32 tracks.
+- Group buses: a track goes to a group or to the master. Groups have the channel strip, sends and automation.
+- Insert chains on tracks, groups and the master: an ordered list of the built-in effects (EQ, compressor, drive, delay, reverb, chorus) and new ones (a multimode filter, a phaser, a bit crusher, a gate). Each slot can be bypassed and automated.
+- The real-time rules hold: chains are built away from the audio thread and swapped in, and old ones leave through the release queue.
+- Project format 13.
+- Tests: routed sums against a mix made by hand, chain order, click-free bypass, latency compensation for slots that look ahead, stems per group, and the allocation test while chains change during playback.
+
+### Phase 12: CLAP plugins (large)
+
+For professional instruments and effects: sampled pianos and orchestral libraries, amp models, mastering tools.
+- Hosting CLAP 1.2 plugins. CLAP is a plain C interface on Windows, Linux and macOS, so it is reached through hand-written FFI like the audio backends. VST3 (C++ COM-style interfaces) and Audio Units (macOS only) stay out.
+- Scanning the standard folders and `CLAP_PATH` for `.clap` files and bundles, away from the audio thread, with a cache.
+- A plugin as a track's instrument or in an insert slot. Its parameters (`clap.params`) appear in the panel and on automation lanes, its latency (`clap.latency`) is compensated, and its state (`clap.state`) is saved inside the project file.
+- The plugin's own window (`clap.gui`) opens as a floating window, since a terminal has no window to place it in.
+- The spec's thread rules: main-thread calls from the UI thread, processing on the audio thread, and the host's callbacks honoured.
+- Export runs plugins through the same engine. A plugin whose output depends on timing or block size can make export differ from playback; TINVO says so instead of hiding it.
+- A plugin runs inside TINVO's process, so a plugin that crashes ends the session (the autosave keeps the project). Running plugins in a separate process is not planned.
+- Project format 14: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
+- Tests: two small CLAP plugins built in the repository (a gain and a sine instrument) for scanning, loading, parameters, state, latency and the thread rules, and the allocation test with a plugin playing.
+
+### Phase 13: Sampled instruments (medium)
+
+For realistic instruments without plugins, and for chopping breaks (drum and bass, jungle, hip-hop).
+- Key zones and velocity layers in a sampler track, round robin and release samples.
+- SFZ import of the common opcodes (`sample`, `lokey`/`hikey`, `pitch_keycenter`, `lovel`/`hivel`, `seq_length`/`seq_position`, loop points, the amplitude envelope). Opcodes it does not use are listed, not dropped silently.
+- A slicer: a sample cut at its transients or into equal parts, one slice per note.
+- 16 voices per sampler. Samples stay in memory as today.
+- Tests: zone and layer choice, round-robin order, the SFZ reader fuzzed, slice points on a synthetic signal.
+
+### Phase 14: Synth engines (small to medium)
+
+For FM keys, basses and bells, and wavetable leads and pads.
+- A 4-operator FM synth: the common algorithms, feedback and an envelope per operator.
+- Wavetable oscillators in the synth: built-in tables and any WAV loaded as one, the position moved by the LFO and envelopes, band-limited across the keyboard.
+- Tests: FM sidebands against their Bessel amplitudes, wavetable aliasing measured by FFT like the existing oscillators.
+
+### Phase 15: Audio tracks (large)
+
+For vocals, guitars and other live instruments: pop, rock, singer-songwriter.
+- Audio tracks holding clips placed on the song (at a bar and step), apart from patterns, with gain, fades and trims that leave the file untouched.
+- Recording onto an audio track while the song plays, with a count-in, the round trip compensated (as `tinvo loopback` measures it), punch-in over a range, and takes kept per range to build a comp from.
+- Long clips streamed from disk: a reader thread fills buffers ahead of the audio thread, which never touches a file or allocates.
+- A clip view: clips as blocks along the song, one row per track, with a waveform overview in block characters.
+- Export and stems include audio tracks. Project format 15 (clip paths stored like sample paths).
+- Not in this phase: time-stretching and pitch correction.
+- Tests: clips on their exact frames, a slow reader making a reported dropout rather than blocking the audio thread, latency compensation measured the way the loopback check measures it, comp edits as undo steps.
+
 ## Known limitations of the foundation
 
 - Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.
