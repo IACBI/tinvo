@@ -134,8 +134,8 @@ actions! {
     PianoRoll "piano_roll" Track [c('v')] "piano roll for a melodic track / back to the grid";
     Left "left" Nav [Left] "step left; in the panel: value down; in lists: other page";
     Right "right" Nav [Right] "step right; in the panel: value up; in lists: other page";
-    Up "up" Nav [Up] "track, pitch, lane or parameter above; in the song: next pattern";
-    Down "down" Nav [Down] "track, pitch, lane or parameter below; in the song: previous pattern";
+    Up "up" Nav [Up] "track, pitch, lane, parameter or song row above";
+    Down "down" Nav [Down] "track, pitch, lane, parameter or song row below";
     First "first" Nav [Home] "first step or song entry";
     Last "last" Nav [End] "last step or song entry";
     Enter "enter" Nav [Enter, c('x')] "toggle the step or note, add a point, repeat a song entry, choose in a list";
@@ -165,6 +165,8 @@ actions! {
     LoopStart "loop_start" Song [c('[')] "start the loop region here";
     LoopEnd "loop_end" Song [c(']')] "end the loop region here";
     NoLoop "no_loop" Song [c('-')] "no loop region";
+    SongPrev "song_prev" Song [c(',')] "previous pattern of the entry, or of the track in it (its own, the entry's, or a rest)";
+    SongNext "song_next" Song [c('.')] "next pattern of the entry, or of the track in it";
     Marker "marker" Song [c('m')] "name a marker on the song entry (an empty name removes it)";
     PrevMarker "prev_marker" Song [PageUp] "to the previous marker";
     NextMarker "next_marker" Song [PageDown] "to the next marker";
@@ -391,7 +393,7 @@ mod tests {
         k.check().unwrap();
         assert_eq!(k.label(Action::PatternShorter), "(unbound)");
         // The song view and the grid are never active together.
-        k.bind(Action::LoopStart, vec![Key::Char(',')]);
+        k.bind(Action::LoopStart, vec![Key::Char('(')]);
         k.check().unwrap();
         k.bind(Action::Undo, vec![Key::Char('u'), Key::Char('u')]);
         assert!(k.check().unwrap_err().contains("u is given twice to undo"));

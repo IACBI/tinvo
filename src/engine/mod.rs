@@ -3,7 +3,8 @@
 //! The engine owns a fixed number of track slots, each holding an instrument,
 //! its steps in every pattern and a channel strip. It plays either one
 //! pattern on repeat (switching to a cued pattern at the end of the current
-//! one) or the song: a chain of patterns with an optional loop region. It is driven by [`Command`]s that
+//! one) or the song: a chain of patterns with an optional loop region, in which each track can play
+//! its own pattern or rest. It is driven by [`Command`]s that
 //! arrive through a wait-free queue and it publishes meters and the playhead
 //! through atomics in [`Shared`].
 //!
@@ -232,6 +233,33 @@ impl Step {
     }
 }
 
+/// What a track plays in a song entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The entry's pattern.
+    Follow,
+    /// Another pattern, from the entry's first step. A shorter one starts
+    /// over when it ends; a longer one is cut off when the entry ends.
+    Pattern(u8),
+    /// Nothing: no notes, and automation at the knob values.
+    Rest,
+}
+
+/// The pattern and step a track plays at `pos` when its part in that entry
+/// is `part`, or `None` while it rests. Outside the song every track
+/// follows.
+pub fn part_position(part: Part, pos: PlayPosition, pattern_lens: &[u8; MAX_PATTERNS]) -> Option<(u8, u8)> {
+    match part {
+        _ if pos.entry.is_none() => Some((pos.pattern, pos.step)),
+        Part::Follow => Some((pos.pattern, pos.step)),
+        Part::Pattern(p) => {
+            let len = pattern_lens.get(usize::from(p)).copied().unwrap_or(DEFAULT_PATTERN_LEN).max(1);
+            Some((p, pos.step % len))
+        }
+        Part::Rest => None,
+    }
+}
+
 /// A change to the document. The same edits drive both the project model on
 /// the UI thread and the engine on the audio thread, which keeps the two in
 /// lock-step by construction.
@@ -268,6 +296,12 @@ pub enum Edit {
     SetSongEntry {
         index: u16,
         pattern: u8,
+    },
+    /// What `track` plays in song entry `index`.
+    SetPart {
+        track: u8,
+        index: u16,
+        part: Part,
     },
     /// Song entries `start..=end` repeat while the song plays. A region that
     /// reaches past the end of the song is ignored until the song is long
@@ -529,6 +563,8 @@ impl Lane {
 struct Track {
     instrument: Instrument,
     steps: [[Option<Step>; MAX_STEPS]; MAX_PATTERNS],
+    /// What the track plays in each song entry; `Follow` past the song's end.
+    parts: [Part; MAX_SONG],
     lanes: [Lane; MAX_LANES],
     /// Parameter values set by edits; automation overrides them while a
     /// point is in force and returns to them afterwards.
@@ -559,6 +595,7 @@ impl Track {
         Self {
             instrument: Instrument::new(kind, sample_rate),
             steps: [[None; MAX_STEPS]; MAX_PATTERNS],
+            parts: [Part::Follow; MAX_SONG],
             lanes: [Lane::EMPTY; MAX_LANES],
             base: base_params(kind),
             strip: Strip::new(sample_rate),
@@ -587,6 +624,7 @@ impl Track {
         for p in &mut self.steps {
             p.fill(None);
         }
+        self.parts.fill(Part::Follow);
         self.lanes.fill(Lane::EMPTY);
         self.base = base_params(kind);
         self.strip = Strip::new(sample_rate);
@@ -1118,6 +1156,10 @@ impl Engine {
                 if self.song_len < MAX_SONG && i <= self.song_len && usize::from(pattern) < MAX_PATTERNS {
                     self.song.copy_within(i..self.song_len, i + 1);
                     self.song[i] = pattern;
+                    for t in &mut self.tracks[..n] {
+                        t.parts.copy_within(i..self.song_len, i + 1);
+                        t.parts[i] = Part::Follow;
+                    }
                     self.song_len += 1;
                 }
             }
@@ -1125,6 +1167,10 @@ impl Engine {
                 let i = usize::from(index);
                 if i < self.song_len {
                     self.song.copy_within(i + 1..self.song_len, i);
+                    for t in &mut self.tracks[..n] {
+                        t.parts.copy_within(i + 1..self.song_len, i);
+                        t.parts[self.song_len - 1] = Part::Follow;
+                    }
                     self.song_len -= 1;
                     // Nothing left to chain: the cued pattern follows.
                     self.song_mode &= self.song_len > 0;
@@ -1133,6 +1179,17 @@ impl Engine {
             Edit::SetSongEntry { index, pattern } => {
                 if usize::from(index) < self.song_len && usize::from(pattern) < MAX_PATTERNS {
                     self.song[usize::from(index)] = pattern;
+                }
+            }
+            Edit::SetPart { track, index, part } => {
+                let valid = match part {
+                    Part::Pattern(p) => usize::from(p) < MAX_PATTERNS,
+                    Part::Follow | Part::Rest => true,
+                };
+                if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
+                    if valid && usize::from(index) < self.song_len {
+                        t.parts[usize::from(index)] = part;
+                    }
                 }
             }
             Edit::SetLoop(region) => self.loop_region = region.and_then(loop_region),
@@ -1353,18 +1410,27 @@ impl Engine {
     /// point in the pattern. Without an earlier point in the pattern the
     /// parameter is at its base value.
     fn update_segments(&mut self, abs: u64, pos: PlayPosition) {
-        let (pattern, s) = (usize::from(pos.pattern), usize::from(pos.step));
-        let len = usize::from(self.pattern_lens[pattern]);
-        let transport = &self.transport;
+        // Steps of the entry still to come, this one included: a ramp of a
+        // track playing a longer pattern ends where the entry does.
+        let left = usize::from(self.pattern_lens[usize::from(pos.pattern)]) - usize::from(pos.step);
+        let entry = pos.entry.map(usize::from);
+        let (transport, lens) = (&self.transport, &self.pattern_lens);
         let mut ramping = false;
         for t in &mut self.tracks[..self.track_count] {
             let kind = t.instrument.kind();
+            let part = entry.map_or(Part::Follow, |e| t.parts[e]);
+            let at = part_position(part, pos, lens);
             for l in &mut t.lanes {
                 let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { continue };
+                let Some((pattern, s)) = at.map(|(p, s)| (usize::from(p), usize::from(s))) else {
+                    l.segment = None;
+                    continue;
+                };
+                let end = usize::from(lens[pattern]).min(s + left);
                 let pts = &l.points[pattern];
                 l.segment = (0..=s).rev().find(|&i| !pts[i].is_nan()).map(|i| {
                     let v0 = spec.clamp(pts[i]);
-                    match (s + 1..len).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
+                    match (s + 1..end).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
                         Some(j) => Segment {
                             f0: transport.frame_of_step(abs.saturating_sub((s - i) as u64)),
                             v0,
@@ -1411,7 +1477,7 @@ impl Engine {
     /// track: all of them (`early` is `None`), only the early ones, or only
     /// the others.
     fn queue_hits(&mut self, abs: u64, pos: PlayPosition, early: Option<bool>) {
-        let (pattern, idx) = (usize::from(pos.pattern), usize::from(pos.step));
+        let entry = pos.entry.map(usize::from);
         let start = self.transport.frame_of_step(abs);
         let span = self.transport.frame_of_step(abs + 1).saturating_sub(start).max(1);
         // Ticks are a fraction of a straight step, so the earliest offset
@@ -1419,7 +1485,9 @@ impl Engine {
         let tick = self.transport.step_frames() / f64::from(TICKS_PER_STEP);
         let now = self.now;
         for t in &mut self.tracks[..self.track_count] {
-            let Some(step) = t.steps[pattern][idx] else { continue };
+            let part = entry.map_or(Part::Follow, |e| t.parts[e]);
+            let Some((pattern, idx)) = part_position(part, pos, &self.pattern_lens) else { continue };
+            let Some(step) = t.steps[usize::from(pattern)][usize::from(idx)] else { continue };
             if early.is_some_and(|e| e != (step.offset < 0)) {
                 continue;
             }
@@ -2328,6 +2396,83 @@ mod tests {
         let mut e = engine(&edits);
         e.handle(Command::PlaySong { entry: 3 });
         assert_eq!(onsets(&run(&mut e, 60_000), 1000), [0, 46_500]);
+    }
+
+    /// A closed hat in a song of four 4-step entries of pattern A (a hit on
+    /// step 0). B is 8 steps (hits on 2 and 6), C is 2 steps (a hit on 1).
+    /// The hat plays B in entry 1, C in entry 2 and rests in entry 3.
+    fn parted_song() -> Vec<Edit> {
+        let mut edits = vec![Edit::AddTrack(InstrumentKind::HatClosed)];
+        for (pattern, len, hits) in [(0u8, 4u8, &[0u8][..]), (1, 8, &[2, 6]), (2, 2, &[1])] {
+            edits.push(Edit::SetPatternLength { pattern, len });
+            for &h in hits {
+                edits.push(Edit::SetStep { track: 0, pattern, step: h, value: step(60) });
+            }
+        }
+        for index in 0..4 {
+            edits.push(Edit::InsertSongEntry { index, pattern: 0 });
+        }
+        for (index, part) in [(1, Part::Pattern(1)), (2, Part::Pattern(2)), (3, Part::Rest)] {
+            edits.push(Edit::SetPart { track: 0, index, part });
+        }
+        edits
+    }
+
+    #[test]
+    fn a_track_plays_its_own_pattern_or_rests_in_a_song_entry() {
+        let mut e = engine(&parted_song());
+        e.handle(Command::PlaySong { entry: 0 });
+        // Steps are 6000 frames. Entry 0 follows A; entry 1 plays B's first
+        // four steps (its hit on 6 is past the entry); entry 2 plays C twice;
+        // entry 3 rests. The song then starts again.
+        assert_eq!(onsets(&run(&mut e, 120_000), 1000), [0, 36_000, 54_000, 66_000, 96_000]);
+        // The parts move with their entries.
+        let mut e = engine(&parted_song());
+        e.apply(Edit::InsertSongEntry { index: 1, pattern: 0 });
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 120_000), 1000), [0, 24_000, 60_000, 78_000, 90_000]);
+        e.handle(Command::Stop);
+        e.apply(Edit::RemoveSongEntry(1));
+        e.apply(Edit::SetPart { track: 0, index: 3, part: Part::Follow });
+        e.handle(Command::PlaySong { entry: 2 });
+        assert_eq!(onsets(&run(&mut e, 48_000), 1000), [6000, 18_000, 24_000]);
+        // Invalid parts are ignored, as the project refuses them.
+        e.apply(Edit::SetPart { track: 0, index: 4, part: Part::Rest });
+        e.apply(Edit::SetPart { track: 0, index: 0, part: Part::Pattern(16) });
+        e.apply(Edit::SetPart { track: 1, index: 0, part: Part::Rest });
+        assert!(e.tracks[0].parts[..4] == [Part::Follow, Part::Pattern(1), Part::Pattern(2), Part::Follow]);
+        assert!(e.tracks[0].parts[4..].iter().all(|&p| p == Part::Follow));
+        // Outside the song every track plays the cued pattern.
+        e.handle(Command::Stop);
+        e.handle(Command::Play);
+        assert_eq!(onsets(&run(&mut e, 24_000), 1000), [0]);
+    }
+
+    #[test]
+    fn automation_follows_the_track_s_own_pattern() {
+        // A volume lane: B holds -12 dB from step 0 and ramps to -24 dB on
+        // step 6, which entry 1 never reaches; C has no points.
+        let mut edits = parted_song();
+        edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(0), ramp: true });
+        edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 1, step: 0, value: Some(-12.0) });
+        edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 1, step: 6, value: Some(-24.0) });
+        edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(-6.0) });
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        let gain = |e: &Engine| e.tracks[0].auto_gain;
+        run(&mut e, 1);
+        assert_eq!(gain(&e), Some(-6.0));
+        run(&mut e, 24_000);
+        assert_eq!(gain(&e), Some(-12.0));
+        // The ramp would end past the entry, so the value holds to its end.
+        run(&mut e, 23_999);
+        assert_eq!(gain(&e), Some(-12.0));
+        run(&mut e, 1);
+        assert_eq!(gain(&e), None, "C has no points");
+        run(&mut e, 24_000);
+        assert_eq!(gain(&e), None, "a resting track is at its knob values");
+        run(&mut e, 24_000);
+        assert_eq!(gain(&e), Some(-6.0));
     }
 
     #[test]

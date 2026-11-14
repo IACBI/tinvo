@@ -12,7 +12,7 @@ use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
 use crate::engine::{
     Command, Edit, Engine, LIVE_QUEUE, LiveNote, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
-    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, PlayPosition, RETIRE_QUEUE, Shared, Step,
+    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, part_position,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
@@ -41,6 +41,8 @@ const COMMAND_QUEUE: usize = 4096;
 const AUDITION_SECONDS: f32 = 0.25;
 const STATUS_SECONDS: u64 = 5;
 const LEFT: u16 = 36;
+/// Where the song view's entry columns start, after the row labels.
+const SONG_LEFT: u16 = 15;
 const CELL: u16 = 3;
 const PARAM_COL: u16 = 28;
 const MIN_W: u16 = 64;
@@ -201,8 +203,25 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetSongEntry { index, .. } => (8, (index >> 8) as u8, index as u8, 0),
         Edit::SetPoint { track, lane, pattern, step, .. } => (9 + lane, track, pattern, step),
         Edit::SetMixParam { index, .. } => (9 + MAX_LANES as u8, index, 0, 0),
+        Edit::SetPart { track, index, .. } => (10 + MAX_LANES as u8, track, (index >> 8) as u8, index as u8),
         _ => return None,
     })
+}
+
+/// The part after (`up`) or before `p` in the order the song view steps
+/// through: the entry's pattern, patterns A to P, a rest.
+fn cycle_part(p: Part, up: bool) -> Part {
+    const COUNT: usize = MAX_PATTERNS + 2;
+    let i = match p {
+        Part::Follow => 0,
+        Part::Pattern(q) => 1 + usize::from(q),
+        Part::Rest => COUNT - 1,
+    };
+    match (i + if up { 1 } else { COUNT - 1 }) % COUNT {
+        0 => Part::Follow,
+        j if j == COUNT - 1 => Part::Rest,
+        j => Part::Pattern((j - 1) as u8),
+    }
 }
 
 fn describe(e: &Edit) -> &'static str {
@@ -214,6 +233,7 @@ fn describe(e: &Edit) -> &'static str {
         Edit::InsertSongEntry { .. } => "add song entry",
         Edit::RemoveSongEntry(_) => "remove song entry",
         Edit::SetSongEntry { .. } => "song entry",
+        Edit::SetPart { .. } => "track part",
         Edit::SetLoop(_) => "loop region",
         Edit::SetLane { .. } => "automation lane",
         Edit::SetPoint { .. } => "automation point",
@@ -352,6 +372,8 @@ pub struct App {
     /// Song view instead of the step grid.
     pub song_view: bool,
     pub song_cursor: usize,
+    /// The song view's row: 0 is the song itself, `1 + t` track `t`.
+    pub song_row: usize,
     /// Automation lanes of the selected track instead of the step grid.
     pub auto_view: bool,
     /// Lane under the cursor in the automation view.
@@ -455,6 +477,8 @@ enum Target {
     Point(usize, usize),
     /// A song entry.
     Entry(usize),
+    /// What a track plays in a song entry: the entry and the track.
+    Part(usize, usize),
     /// A name on the song's marker line, by its index.
     Marker(usize),
     /// The parameter panel, outside a parameter.
@@ -520,6 +544,7 @@ impl App {
             pattern: 0,
             song_view: false,
             song_cursor: 0,
+            song_row: 0,
             auto_view: false,
             lane: 0,
             page: Page::Instrument,
@@ -1196,9 +1221,20 @@ impl App {
         self.send(cmd);
     }
 
-    /// The playing step, if the pattern being edited is the one playing.
-    fn play_step(&self) -> Option<usize> {
-        self.play_pos.filter(|p| usize::from(p.pattern) == self.pattern).map(|p| usize::from(p.step))
+    /// The step track `t` is playing, if it is playing the pattern being
+    /// edited (in the song a track may play its own pattern, or rest).
+    fn play_step(&self, t: usize) -> Option<usize> {
+        let pos = self.play_pos?;
+        let part = pos.entry.map_or(Part::Follow, |e| self.project.part(t, usize::from(e)));
+        let (pattern, step) = part_position(part, pos, &self.project.pattern_lens)?;
+        (usize::from(pattern) == self.pattern).then_some(usize::from(step))
+    }
+
+    /// The track the song view's cursor is on, if any.
+    /// A row past the last track (one was deleted) is the last track's, for
+    /// the keys as on screen.
+    fn song_track(&self) -> Option<usize> {
+        self.song_row.min(self.track_count()).checked_sub(1)
     }
 
     fn pattern_len(&self) -> usize {
@@ -1545,7 +1581,8 @@ impl App {
                     self.auto_action(Some(Action::Enter));
                 }
             }
-            Target::Entry(i) => self.song_cursor = i,
+            Target::Entry(i) => (self.song_cursor, self.song_row) = (i, 0),
+            Target::Part(i, t) => (self.song_cursor, self.song_row, self.track) = (i, t + 1, t),
             Target::Marker(i) => {
                 if let Some(m) = self.project.markers.get(i) {
                     self.song_cursor = usize::from(m.entry);
@@ -1597,8 +1634,12 @@ impl App {
                 }
             }
             Target::Entry(i) => {
-                self.song_cursor = i;
-                self.key_song(pick(Action::Down, Action::Up));
+                (self.song_cursor, self.song_row) = (i, 0);
+                self.key_song(pick(Action::SongPrev, Action::SongNext));
+            }
+            Target::Part(i, t) => {
+                (self.song_cursor, self.song_row, self.track) = (i, t + 1, t);
+                self.key_song(pick(Action::SongPrev, Action::SongNext));
             }
             Target::Param(i) if !self.song_view => {
                 self.param = i;
@@ -2192,22 +2233,58 @@ impl App {
             Action::Right => self.song_cursor = (c + 1).min(n.saturating_sub(1)),
             Action::First => self.song_cursor = 0,
             Action::Last => self.song_cursor = n.saturating_sub(1),
-            Action::Up | Action::Down if n > 0 => {
-                let d = if a == Action::Up { 1 } else { MAX_PATTERNS - 1 };
-                let pattern = ((usize::from(self.project.song[c]) + d) % MAX_PATTERNS) as u8;
-                self.edit_with(Edit::SetSongEntry { index, pattern }, true);
+            Action::Up | Action::Down => {
+                let row = self.song_row.min(self.track_count());
+                self.song_row = if a == Action::Up { row.saturating_sub(1) } else { (row + 1).min(self.track_count()) };
+                // The track row selected here is the track the grid selects.
+                if let Some(t) = self.song_track() {
+                    self.track = t;
+                }
+            }
+            Action::SongPrev | Action::SongNext if n > 0 => {
+                let up = a == Action::SongNext;
+                match self.song_track() {
+                    None => {
+                        let d = if up { 1 } else { MAX_PATTERNS - 1 };
+                        let pattern = ((usize::from(self.project.song[c]) + d) % MAX_PATTERNS) as u8;
+                        self.edit_with(Edit::SetSongEntry { index, pattern }, true);
+                    }
+                    Some(t) => {
+                        let part = cycle_part(self.project.part(t, c), up);
+                        self.edit_with(Edit::SetPart { track: t as u8, index, part }, true);
+                    }
+                }
             }
             Action::Enter => {
-                // Repeat the entry under the cursor, or start with the
-                // pattern being edited.
+                // Repeat the entry under the cursor with its tracks' parts,
+                // or start with the pattern being edited.
                 let (at, pattern) = if n == 0 { (0, self.pattern as u8) } else { (c + 1, self.project.song[c]) };
-                if self.edit(Edit::InsertSongEntry { index: at as u16, pattern }) {
+                let insert = Edit::InsertSongEntry { index: at as u16, pattern };
+                // The parts below would land on the entry already there.
+                if let Err(err) = self.project.inverse(&insert) {
+                    self.set_status(format!("Cannot do that: {err}"));
+                    return true;
+                }
+                let mut edits = vec![insert];
+                for t in 0..self.track_count() {
+                    let part = self.project.part(t, c);
+                    if n > 0 && part != Part::Follow {
+                        edits.push(Edit::SetPart { track: t as u8, index: at as u16, part });
+                    }
+                }
+                self.edit_group(edits, "add song entry");
+                if self.project.song.len() > n {
                     self.song_cursor = at;
                 }
             }
-            Action::Clear if n > 0 => {
-                self.edit(Edit::RemoveSongEntry(index));
-            }
+            Action::Clear if n > 0 => match self.song_track() {
+                None => {
+                    self.edit(Edit::RemoveSongEntry(index));
+                }
+                Some(t) => {
+                    self.edit(Edit::SetPart { track: t as u8, index, part: Part::Follow });
+                }
+            },
             Action::LoopStart if n > 0 => {
                 let end = self.project.loop_region.map_or(index, |(_, b)| b.max(index));
                 self.edit(Edit::SetLoop(Some((index, end))));
@@ -2592,7 +2669,7 @@ impl App {
                 let label = format!("{}.{}", i / 16 + 1, (i % 16) / 4 + 1);
                 s.put(x, 1, &label, self.style(Role::Beat));
             }
-            if self.play_step() == Some(i) {
+            if self.play_step(self.track) == Some(i) {
                 s.put(x + 2, 1, "▼", self.style(Role::Playhead));
             }
         }
@@ -2664,7 +2741,7 @@ impl App {
                     _ if i % 4 == 0 => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
-                if self.play_step() == Some(i) {
+                if self.play_step(self.track) == Some(i) {
                     st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if i == self.step && pitch == self.roll_note {
@@ -2710,7 +2787,7 @@ impl App {
                     _ if i % 4 == 0 => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
-                if self.play_step() == Some(i) {
+                if self.play_step(self.track) == Some(i) {
                     st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if selected && i == self.step {
@@ -2745,8 +2822,10 @@ impl App {
         }
     }
 
-    /// The song: a line of markers, then one cell per entry, wrapped to the
-    /// width. `[` and `]` mark the loop region, `|` a marker.
+    /// The song: a line of markers, then the entries as columns: the song's
+    /// own row of patterns, and below it what each track plays (`·` the
+    /// entry's pattern, a pattern of its own, or `-` a rest). `[` and `]`
+    /// mark the loop region, `|` a marker.
     fn draw_song(&self, s: &mut Screen, w: u16, rows: u16) {
         let p = &self.project;
         let secs = p.song_steps() as f64 * Transport::samples_per_step(p.tempo, 1.0);
@@ -2768,8 +2847,9 @@ impl App {
         s.put(1, 1, &title, self.style(Role::Title));
         let k = &self.keys;
         let keys = format!(
-            "{} pattern  {} repeat  {} remove  {} loop  {} no loop  {} marker  {} jump  {} loop section  {} play  {} grid",
+            "{} row  {} pattern  {} repeat  {} remove  {} loop  {} no loop  {} marker  {} jump  {} loop section  {} play  {} grid",
             k.labels(&[Action::Up, Action::Down]),
+            k.labels(&[Action::SongPrev, Action::SongNext]),
             k.label(Action::Enter),
             k.label(Action::Clear),
             k.labels(&[Action::LoopStart, Action::LoopEnd]),
@@ -2805,19 +2885,44 @@ impl App {
                 x = x.saturating_add(width + 2);
             }
         }
-        let per_row = usize::from((w - 2) / 4).max(1);
-        let visible = usize::from(rows.saturating_sub(2)).max(1);
-        let cursor_row = self.song_cursor / per_row;
-        let first_row = cursor_row.saturating_sub(visible - 1);
+        // Entries are shown a screenful at a time, like steps in the grid.
+        let cap = usize::from(w.saturating_sub(SONG_LEFT + 1) / 4).max(1);
+        let first = (self.song_cursor / cap) * cap;
+        let last = (first + cap).min(p.song.len());
         let loop_region = p.active_loop();
         let playing = self.play_pos.and_then(|q| q.entry).map(usize::from);
-        for (i, &pat) in p.song.iter().enumerate() {
-            let row = i / per_row;
-            if row < first_row || row >= first_row + visible {
-                continue;
+        let row = self.song_row.min(self.track_count());
+        let dim = self.style(Role::Dim);
+        let label = |r: usize| if r == row { Role::SelectedName } else { Role::Text };
+        s.put(0, 3, if row == 0 { "▸" } else { " " }, self.style(Role::Selected));
+        s.put(1, 3, "   Song", self.style(label(0)));
+        // The track rows below the song's, scrolled to keep the cursor's.
+        let visible = usize::from(rows.saturating_sub(3));
+        let top = row.saturating_sub(visible).min(self.track_count().saturating_sub(visible));
+        for (k, t) in (top..self.track_count().min(top + visible)).enumerate() {
+            let y = 4 + k as u16;
+            s.put(0, y, if row == t + 1 { "▸" } else { " " }, self.style(Role::Selected));
+            s.put(1, y, &format!("{:>2} {:<10.10}", t + 1, p.tracks[t].name), self.style(label(t + 1)));
+            for (col, i) in (first..last).enumerate() {
+                let x = SONG_LEFT + col as u16 * 4;
+                let (text, mut st) = match p.part(t, i) {
+                    Part::Follow => (" · ".to_string(), dim),
+                    Part::Pattern(q) => (format!(" {} ", pattern_name(q)), self.style(Role::Entry)),
+                    Part::Rest => (" - ".to_string(), dim),
+                };
+                if playing == Some(i) {
+                    st.bg = self.style(Role::PlayColumn).bg;
+                }
+                if i == self.song_cursor && row == t + 1 {
+                    st = self.style(Role::Cursor);
+                }
+                s.put(x, y, &text, st);
+                self.hit(x, y, 4, Target::Part(i, t));
             }
-            let x = 1 + (i % per_row) as u16 * 4;
-            let y = 3 + (row - first_row) as u16;
+        }
+        for (col, i) in (first..last).enumerate() {
+            let pat = p.song[i];
+            let (x, y) = (SONG_LEFT + col as u16 * 4, 3);
             let inside = loop_region.is_some_and(|(a, b)| (usize::from(a)..=usize::from(b)).contains(&i));
             let marked = p.marker_at(i as u16).is_some();
             let open = match (loop_region.is_some_and(|(a, _)| usize::from(a) == i), marked) {
@@ -2830,11 +2935,14 @@ impl App {
             if playing == Some(i) {
                 st.bg = self.style(Role::PlayColumn).bg;
             }
-            if i == self.song_cursor {
+            let cursor = i == self.song_cursor && row == 0;
+            if cursor {
                 st = self.style(Role::Cursor);
+            } else if i == self.song_cursor {
+                st.bg = self.style(Role::CursorColumn).bg;
             }
             s.put(x, y, &format!("{open}{}{close}", pattern_name(pat)), st);
-            if marked && i != self.song_cursor {
+            if marked && !cursor {
                 s.put(x, y, &open.to_string(), marker_style);
             }
             self.hit(x, y, 4, Target::Entry(i));
@@ -2898,7 +3006,7 @@ impl App {
                 if t.mute && t.steps[self.pattern][i].is_some() {
                     st.fg = self.style(Role::Muted).fg;
                 }
-                if self.play_step() == Some(i) {
+                if self.play_step(ti) == Some(i) {
                     st.bg = self.style(Role::PlayColumn).bg;
                 }
                 if selected && i == self.step {
@@ -4383,7 +4491,7 @@ mod tests {
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);
         assert!((0..30).any(|y| s.row_text(y).contains("Enter adds pattern B")));
-        keys(&mut a, &[Key::Enter, Key::Enter, Key::Up, Key::Up, Key::Enter]);
+        keys(&mut a, &[Key::Enter, Key::Enter, Key::Char('.'), Key::Char('.'), Key::Enter]);
         assert_eq!(a.project.song, [1, 3, 3]);
         assert_eq!(a.song_cursor, 2);
         keys(&mut a, &[Key::Char(']'), Key::Left, Key::Char('[')]);
@@ -4584,6 +4692,129 @@ mod tests {
             assert_ne!((a.project.markers.clone(), a.project.loop_region), before, "each undo step changes something");
         }
         assert_eq!(a.project.song.len(), 6);
+    }
+
+    /// A kick and a snare in a song of three entries of pattern A, in the
+    /// song view.
+    fn parted_app() -> App {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('2'), Key::Char('a'), Key::Char('3'), Key::Char('S')]);
+        keys(&mut a, &[Key::Enter, Key::Enter, Key::Enter, Key::Home]);
+        assert_eq!(a.project.song, [0, 0, 0]);
+        a
+    }
+
+    fn parts(a: &App, t: usize) -> Vec<Part> {
+        a.project.tracks[t].parts[..a.project.song.len()].to_vec()
+    }
+
+    #[test]
+    fn parts_cycle_through_the_entry_s_pattern_patterns_and_a_rest() {
+        assert_eq!(cycle_part(Part::Follow, true), Part::Pattern(0));
+        assert_eq!(cycle_part(Part::Pattern(15), true), Part::Rest);
+        assert_eq!(cycle_part(Part::Rest, true), Part::Follow);
+        assert_eq!(cycle_part(Part::Follow, false), Part::Rest);
+        assert_eq!(cycle_part(Part::Pattern(0), false), Part::Follow);
+    }
+
+    #[test]
+    fn the_song_view_sets_what_each_track_plays() {
+        let mut a = parted_app();
+        // Down goes from the song's row to the tracks; . and , step through
+        // the parts, and quick repeats are one undo step.
+        keys(&mut a, &[Key::Down, Key::Right, Key::Char('.'), Key::Char('.'), Key::Char('.')]);
+        assert_eq!((a.song_row, a.track), (1, 0));
+        assert_eq!(parts(&a, 0), [Part::Follow, Part::Pattern(2), Part::Follow]);
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Char(',')]);
+        assert_eq!(a.song_row, 2, "the last track is the last row");
+        assert_eq!(parts(&a, 1), [Part::Follow, Part::Rest, Part::Follow]);
+        assert_eq!(a.project.song, [0, 0, 0], "the entry keeps its pattern");
+        // On the song's row they change the entry's pattern.
+        keys(&mut a, &[Key::Up, Key::Up, Key::Char('.')]);
+        assert_eq!((a.song_row, a.project.song.as_slice()), (0, [0, 1, 0].as_slice()));
+        // Repeating an entry copies its parts.
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.song_cursor, 2);
+        assert_eq!(a.project.song, [0, 1, 1, 0]);
+        assert_eq!(parts(&a, 0), [Part::Follow, Part::Pattern(2), Part::Pattern(2), Part::Follow]);
+        assert_eq!(parts(&a, 1), [Part::Follow, Part::Rest, Part::Rest, Part::Follow]);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.song.len(), 3, "one undo step");
+        // Delete on a track row makes it follow; on the song's row it
+        // removes the entry, and undo brings its parts back.
+        keys(&mut a, &[Key::Left, Key::Down, Key::Delete]);
+        assert_eq!(parts(&a, 0), [Part::Follow; 3]);
+        assert_eq!(a.project.song.len(), 3);
+        keys(&mut a, &[Key::Char('u'), Key::Up, Key::Delete]);
+        assert_eq!((a.project.song.as_slice(), parts(&a, 1)), ([0, 0].as_slice(), vec![Part::Follow; 2]));
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(parts(&a, 0), [Part::Follow, Part::Pattern(2), Part::Follow]);
+        assert_eq!(parts(&a, 1), [Part::Follow, Part::Rest, Part::Follow]);
+        // When the selected row's track is deleted, the keys act on the
+        // last track's row, which is the one drawn selected.
+        a.song_row = 2;
+        a.track = 1;
+        keys(&mut a, &[Key::Char('S'), Key::Char('D'), Key::Char('y'), Key::Char('S'), Key::Home, Key::Char('.')]);
+        assert_eq!(a.track_count(), 1);
+        assert!(frame(&a).row_text(4).starts_with("▸ 1 Kick"), "{}", frame(&a).row_text(4));
+        assert_eq!((a.project.song.as_slice(), a.project.part(0, 0)), ([0, 1, 0].as_slice(), Part::Pattern(0)));
+        keys(&mut a, &[Key::Delete]);
+        assert_eq!((a.project.song.len(), a.project.part(0, 0)), (3, Part::Follow), "Delete resets the part");
+        keys(&mut a, &[Key::Up]);
+        assert_eq!(a.song_row, 0);
+    }
+
+    #[test]
+    fn repeating_an_entry_of_a_full_song_changes_nothing() {
+        let mut a = parted_app();
+        for _ in 3..crate::engine::MAX_SONG {
+            keys(&mut a, &[Key::Enter]);
+        }
+        assert_eq!(a.project.song.len(), crate::engine::MAX_SONG);
+        a.project.tracks[0].parts[0] = Part::Rest;
+        let before = a.project.clone();
+        let undo = a.undo.len();
+        keys(&mut a, &[Key::Home, Key::Enter]);
+        assert_eq!(a.project, before, "the next entry keeps its parts");
+        assert_eq!(a.undo.len(), undo);
+        assert!(a.status_text().unwrap().starts_with("Cannot do that"), "{:?}", a.status_text());
+    }
+
+    #[test]
+    fn the_song_view_draws_and_clicks_parts() {
+        let mut a = parted_app();
+        a.project.tracks[0].parts[1] = Part::Pattern(3);
+        a.project.tracks[1].parts[2] = Part::Rest;
+        let s = frame(&a);
+        assert!(s.row_text(3).starts_with("▸   Song"), "{}", s.row_text(3));
+        assert!(s.row_text(4).contains(" 1 Kick        ·   D   · "), "{}", s.row_text(4));
+        assert!(s.row_text(5).contains(" 2 Snare       ·   ·   - "), "{}", s.row_text(5));
+        click(&mut a, Target::Part(2, 1));
+        assert_eq!((a.song_cursor, a.song_row, a.track), (2, 2, 1));
+        let at = spot(&a, Target::Part(1, 0));
+        mouse(&mut a, MouseKind::ScrollUp, at);
+        assert_eq!((a.song_row, a.project.part(0, 1)), (1, Part::Pattern(4)));
+        click(&mut a, Target::Entry(0));
+        assert_eq!((a.song_cursor, a.song_row), (0, 0));
+    }
+
+    #[test]
+    fn the_grid_shows_where_each_track_plays() {
+        let mut a = parted_app();
+        a.project.pattern_lens[2] = 4;
+        a.project.tracks[0].parts[1] = Part::Pattern(2);
+        a.project.tracks[1].parts[2] = Part::Rest;
+        a.play_pos = Some(PlayPosition { entry: Some(1), pattern: 0, step: 5 });
+        a.pattern = 0;
+        assert_eq!((a.play_step(0), a.play_step(1)), (None, Some(5)));
+        a.pattern = 2;
+        assert_eq!((a.play_step(0), a.play_step(1)), (Some(1), None));
+        a.play_pos = Some(PlayPosition { entry: Some(2), pattern: 0, step: 5 });
+        a.pattern = 0;
+        assert_eq!((a.play_step(0), a.play_step(1)), (Some(5), None), "a resting track plays nothing");
+        // Outside the song every track plays the cued pattern.
+        a.play_pos = Some(PlayPosition { entry: None, pattern: 0, step: 3 });
+        assert_eq!((a.play_step(0), a.play_step(1)), (Some(3), Some(3)));
     }
 
     #[test]

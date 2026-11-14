@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-14
+
+### Added
+- Per-track patterns in the song. In each entry a track follows the entry's pattern, plays a pattern of its own, or rests. A shorter pattern starts over within the entry and a longer one is cut off when the entry ends; automation follows the pattern the track plays. Exports and stems play the parts.
+- The song view is a grid of entries and tracks: the song's own row on top, then one row per track showing `·` (the entry's pattern), its own pattern, or `-` (a rest). A click or the wheel works on every cell. Repeating an entry copies its parts.
+
+### Changed
+- In the song view `↑` and `↓` move between rows; `,` and `.` change the pattern under the cursor (they used to be `↑` and `↓`). `Del` on a track's row makes the track follow the entry.
+- The grid, piano roll and automation view show the play column for each track where it plays the pattern on screen.
+- Project format 11, which adds `parts` lines. Older files still load, with every track following.
+
 ## [0.20.0] - 2026-11-14
 
 ### Added
@@ -269,7 +280,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/IACBI/tinvo/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/IACBI/tinvo/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/IACBI/tinvo/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/IACBI/tinvo/compare/v0.17.0...v0.18.0

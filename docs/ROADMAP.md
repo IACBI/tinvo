@@ -62,10 +62,6 @@ Known limits, planned for later phases:
 - Before the first point of a pattern, and after stop, a parameter is at its knob value. Notes with a negative micro-timing offset start before their step and so use the value in force before it.
 - Project format 6; formats 1–5 load without automation.
 
-## Later in Phase 3
-
-- Pattern chaining by track (different patterns per track in one song entry) if the single-chain model proves too rigid.
-
 ## Phase 4a: Channel strip ✅ (0.7.0)
 
 - Every track: high-pass, low shelf, mid bell, high shelf (RBJ cookbook biquads in `f64`), a feed-forward compressor with a soft knee, and `tanh` drive with first-order antiderivative antialiasing (measured on a driven 4.5 kHz sine: folded-back energy −34 dB against −25 dB for a plain `tanh`).
@@ -236,7 +232,7 @@ Known limits:
 - ALSA's rate is chosen with resampling turned off. Where every rate passes that check, as with `null`, TINVO opens at 48 kHz as before, and a sound server behind ALSA converts if it runs at another rate. The choice was checked on plug devices over `null` with a fixed rate (44.1, 96 and 22.05 kHz, for playback and recording), not on real hardware.
 - CoreAudio input at the device's rate has run on the macOS CI runner's BlackHole only.
 
-## Phase 7a: Markers and export ranges ✅ (0.20.0, this release)
+## Phase 7a: Markers and export ranges ✅ (0.20.0)
 
 - Named markers on song entries, at most one per entry and each name once. In the song view `m` names the entry under the cursor (an empty name removes its marker), `PgUp` and `PgDn` jump to the previous and next marker, and `=` makes the section around the cursor the loop region. A section runs from a marker, or the song's start, to the entry before the next marker, or the song's end.
 - The song view lists the markers on a line of their own (a click jumps to one), shows `|` before a marked entry and names the cursor's section in its title.
@@ -248,6 +244,19 @@ Known limits:
 - A marker is a name for the start of an entry; it does not change what plays. Ranges are whole song entries.
 - The marker line lists names in one row and cuts off what does not fit the width; `PgUp` and `PgDn` still reach every marker.
 - Like track names, marker names are drawn one column per character, so double-width characters (CJK, most emoji) push the rest of the line along.
+
+## Phase 7b: Per-track patterns ✅ (0.21.0, this release)
+
+- In each song entry a track follows the entry's pattern, plays a pattern of its own, or rests. The entry's pattern sets how long the entry lasts. A track's own pattern starts on the entry's first step; a shorter one starts over when it ends, a longer one is cut off when the entry ends.
+- A track's automation follows the pattern it plays. A ramp towards a point the entry never reaches holds its value to the entry's end; a resting track is at its knob values.
+- The song view is a grid: entries across, the song's own row of patterns on top and one row per track below it, showing `·` (the entry's pattern), a pattern of its own, or `-` (a rest). `↑` `↓` move between rows and `,` `.` change the cell: the entry's pattern on the song's row; on a track's row its part, through the entry's pattern, A to P and a rest. `Del` on a track's row makes it follow again. Repeating an entry copies its parts. Entries are shown a screenful at a time, as steps are in the grid.
+- Parts move with their entries; removing an entry, or a track, and undoing it brings its parts back. Exports and stems play them; the grid's play column follows each track's own pattern.
+- Project format 11 (`parts . B -` in a track block, up to its last part of its own); formats 1–10 load with every track following. The fuzzer checks that no part is left past the song's end, and the real-time test sends parts while playing.
+
+Known limits:
+- `↑` and `↓` now move between the song view's rows; changing an entry's pattern moved to `,` and `.`.
+- A track's own pattern always starts on the entry's first step; it cannot start part-way or carry on from the entry before.
+- The play column in the grid, piano roll and automation view shows the selected pattern only for tracks playing it.
 
 ## Known limitations of the foundation
 
