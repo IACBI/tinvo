@@ -3,13 +3,15 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 8
+//! tinvo 10
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
 //! master_gain_db 0
 //! song A A A B               # only when the song is not empty
 //! loop 2 3                   # song entries, 0-based; only when set
+//! marker 0 intro             # a named song position: entry, name
+//! marker 4 chorus
 //! mix reverb_decay 2.4       # buses and master; only values off their default
 //!
 //! track kick
@@ -35,7 +37,8 @@
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
-//! 6 (no channel strip) and 7 (no sends or buses) are still read.
+//! 6 (no channel strip), 7 (no sends or buses) and 8 and 9 (no markers)
+//! are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
@@ -49,7 +52,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -142,6 +145,34 @@ pub struct Project {
     pub loop_region: Option<(u16, u16)>,
     /// Bus and master settings (see [`MIX_PARAMS`]).
     pub mix: [f32; mp::COUNT],
+    /// Named song positions in song order: at most one per entry, with
+    /// distinct names. Edits move them with their entries; the engine never
+    /// sees them.
+    pub markers: Vec<Marker>,
+}
+
+/// A named position in the song: the start of the entry it sits on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    pub entry: u16,
+    pub name: String,
+}
+
+/// Why a marker could not be set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkerError {
+    NoSuchEntry(u16),
+    /// Another entry already has a marker of that name.
+    NameTaken(String),
+}
+
+impl fmt::Display for MarkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MarkerError::NoSuchEntry(e) => write!(f, "no song entry {}", u32::from(*e) + 1),
+            MarkerError::NameTaken(n) => write!(f, "another entry is already marked '{n}'"),
+        }
+    }
 }
 
 impl Default for Project {
@@ -217,6 +248,7 @@ impl Project {
             song: Vec::new(),
             loop_region: None,
             mix: MIX_PARAMS.map(|p| p.default),
+            markers: Vec::new(),
         }
     }
 
@@ -341,11 +373,24 @@ impl Project {
                     return Err(EditError::SongFull);
                 }
                 self.song.insert(usize::from(index), pattern);
+                for m in &mut self.markers {
+                    if m.entry >= index {
+                        m.entry += 1;
+                    }
+                }
                 edit
             }
             Edit::RemoveSongEntry(index) => {
                 self.entry(index)?;
                 self.song.remove(usize::from(index));
+                // The marker goes with its entry. The editor's history keeps
+                // markers beside the edits, so undo brings it back.
+                self.markers.retain(|m| m.entry != index);
+                for m in &mut self.markers {
+                    if m.entry > index {
+                        m.entry -= 1;
+                    }
+                }
                 edit
             }
             Edit::SetSongEntry { index, pattern } => {
@@ -511,6 +556,94 @@ impl Project {
         self.loop_region.filter(|&(_, b)| usize::from(b) < self.song.len())
     }
 
+    /// The marker on song entry `entry`, if any.
+    pub fn marker_at(&self, entry: u16) -> Option<&Marker> {
+        self.markers.iter().find(|m| m.entry == entry)
+    }
+
+    /// The marker called `name`, if any.
+    pub fn find_marker(&self, name: &str) -> Option<&Marker> {
+        self.markers.iter().find(|m| m.name == name)
+    }
+
+    /// Names song entry `entry`, or, given an empty name, removes its marker.
+    /// Names are cleaned as track names are.
+    pub fn set_marker(&mut self, entry: u16, name: &str) -> Result<(), MarkerError> {
+        if usize::from(entry) >= self.song.len() {
+            return Err(MarkerError::NoSuchEntry(entry));
+        }
+        let name = clean_marker_name(name);
+        if name.is_empty() {
+            self.markers.retain(|m| m.entry != entry);
+            return Ok(());
+        }
+        if self.markers.iter().any(|m| m.name == name && m.entry != entry) {
+            return Err(MarkerError::NameTaken(name));
+        }
+        match self.markers.binary_search_by_key(&entry, |m| m.entry) {
+            Ok(i) => self.markers[i].name = name,
+            Err(i) => self.markers.insert(i, Marker { entry, name }),
+        }
+        Ok(())
+    }
+
+    /// The section holding song entry `entry`: from the marker at or before
+    /// it (or the song's start) to the entry before the next marker (or the
+    /// song's end). `None` if `entry` is not in the song.
+    pub fn section(&self, entry: u16) -> Option<(u16, u16)> {
+        let len = u16::try_from(self.song.len()).ok()?;
+        if entry >= len {
+            return None;
+        }
+        let start = self.markers.iter().rev().find(|m| m.entry <= entry).map_or(0, |m| m.entry);
+        let end = self.markers.iter().find(|m| m.entry > entry).map_or(len - 1, |m| m.entry - 1);
+        Some((start, end))
+    }
+
+    /// Names song entries `a..=b` by their markers, as `section 'verse'`,
+    /// `'verse' to 'chorus'` (up to where `chorus` starts), `the start to
+    /// 'chorus'` or `'verse' to the end`. `None` unless the range starts at a
+    /// marker or the song's start and ends before one or at the song's end.
+    pub fn range_name(&self, (a, b): (u16, u16)) -> Option<String> {
+        let len = self.song.len();
+        if a > b || usize::from(b) >= len {
+            return None;
+        }
+        let to_end = usize::from(b) + 1 == len;
+        let end = if to_end { "the end".to_string() } else { format!("'{}'", self.marker_at(b + 1)?.name) };
+        match self.marker_at(a) {
+            Some(m) if self.section(a) == Some((a, b)) => Some(format!("section '{}'", m.name)),
+            Some(m) => Some(format!("'{}' to {end}", m.name)),
+            None if a != 0 => None,
+            None if to_end => Some("the whole song".into()),
+            None => Some(format!("the start to {end}")),
+        }
+    }
+
+    /// Song entries from marker `from` (or the song's start) to the entry
+    /// before marker `to` (or the song's end). `from` alone is its section:
+    /// up to the next marker.
+    pub fn marker_range(&self, from: Option<&str>, to: Option<&str>) -> Result<(u16, u16), String> {
+        let find =
+            |name: &str| self.find_marker(name).map(|m| m.entry).ok_or_else(|| format!("no marker named '{name}'"));
+        let Some(last) = self.song.len().checked_sub(1) else {
+            return Err("the song is empty".into());
+        };
+        let start = from.map_or(Ok(0), find)?;
+        let end = match (from, to) {
+            (_, Some(name)) => {
+                let at = find(name)?;
+                if at <= start {
+                    return Err(format!("marker '{name}' does not come after the start"));
+                }
+                at - 1
+            }
+            (Some(_), None) => self.section(start).map_or(start, |(_, b)| b),
+            (None, None) => last as u16,
+        };
+        Ok((start, end))
+    }
+
     /// The sequence of edits that rebuilds this project (except track names,
     /// which the engine does not need) from `Project::new()`.
     pub fn to_edits(&self) -> Vec<Edit> {
@@ -648,6 +781,9 @@ impl Project {
         if let Some((a, b)) = self.loop_region {
             let _ = writeln!(s, "loop {a} {b}");
         }
+        for m in &self.markers {
+            let _ = writeln!(s, "marker {} {}", m.entry, m.name);
+        }
         for (spec, &v) in MIX_PARAMS.iter().zip(&self.mix) {
             if v != spec.default {
                 let _ = writeln!(s, "mix {} {v}", spec.id);
@@ -718,6 +854,8 @@ impl Project {
         let mut current: Option<TrackData> = None;
         // The pattern that `step` lines in the current track block fill.
         let mut pattern = 0usize;
+        // Where each marker was read, for errors found once the song is known.
+        let mut marker_lines = Vec::new();
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -906,6 +1044,24 @@ impl Project {
                     }
                     p.loop_region = Some(r);
                 }
+                "marker" if ver >= 10 => {
+                    let (entry, name) = rest
+                        .split_once(char::is_whitespace)
+                        .ok_or_else(|| err("expected 'marker <entry> <name>'".into()))?;
+                    let entry: u16 = parse_num(entry).map_err(err)?;
+                    let name = name.trim();
+                    if clean_marker_name(name) != name {
+                        return Err(err(format!("a marker name is at most {MAX_NAME_CHARS} printable characters")));
+                    }
+                    if p.markers.last().is_some_and(|m| m.entry >= entry) {
+                        return Err(err("markers must come in song order, one per entry".into()));
+                    }
+                    if p.find_marker(name).is_some() {
+                        return Err(err(format!("two markers are named '{name}'")));
+                    }
+                    marker_lines.push(line_no);
+                    p.markers.push(Marker { entry, name: name.to_string() });
+                }
                 "master_gain_db" => p.master_gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                 "mix" if ver >= 8 => {
                     let (id, value) = rest
@@ -933,6 +1089,11 @@ impl Project {
         }
         if current.is_some() {
             return Err(ParseError { line: text.lines().count(), message: "track block missing 'end'".into() });
+        }
+        for (m, &line) in p.markers.iter().zip(&marker_lines) {
+            if usize::from(m.entry) >= p.song.len() {
+                return Err(ParseError { line, message: format!("marker '{}' is past the end of the song", m.name) });
+            }
         }
         Ok(p)
     }
@@ -1059,6 +1220,13 @@ pub fn sanitize_name(name: &str) -> String {
     if s.is_empty() { "Track".to_string() } else { s }
 }
 
+/// Marker names are cleaned as track names are, but may be empty: an empty
+/// name removes the marker.
+fn clean_marker_name(name: &str) -> String {
+    let s: String = name.chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
+    s.trim().to_string()
+}
+
 fn parse_num<T: std::str::FromStr>(s: &str) -> Result<T, String> {
     s.parse().map_err(|_| format!("invalid number '{s}'"))
 }
@@ -1099,8 +1267,11 @@ mod tests {
         p.pattern_lens[15] = 64;
         p.song = vec![0, 15, 2, 2, 1];
         p.loop_region = Some((1, 3));
+        p.set_marker(0, "intro").unwrap();
+        p.set_marker(2, "  big   drop ").unwrap();
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 9\n"));
+        assert!(text.starts_with("tinvo 10\n"));
+        assert!(text.contains("\nloop 1 3\nmarker 0 intro\nmarker 2 big   drop\n"), "{text}");
         assert!(text.contains("step 1 45 100 3 100 1 12 3,7,10\n"), "{text}");
         assert!(text.contains("\npattern_length C 7\npattern_length P 64\nmaster_gain_db"), "{text}");
         assert!(text.contains("\nsong A P C C B\nloop 1 3\n"), "{text}");
@@ -1109,6 +1280,127 @@ mod tests {
         // A project without a song or loop writes neither line.
         let plain = Project::new().to_text();
         assert!(!plain.contains("song") && !plain.contains("loop") && !plain.contains("pattern"), "{plain}");
+        assert!(!plain.contains("marker"), "{plain}");
+    }
+
+    fn song(len: usize) -> Project {
+        let mut p = Project::new();
+        p.song = vec![0; len];
+        p
+    }
+
+    fn marked(p: &Project) -> Vec<(u16, &str)> {
+        p.markers.iter().map(|m| (m.entry, m.name.as_str())).collect()
+    }
+
+    #[test]
+    fn markers_are_named_renamed_and_removed() {
+        let mut p = song(6);
+        p.set_marker(4, "chorus").unwrap();
+        p.set_marker(0, "intro").unwrap();
+        p.set_marker(2, "verse").unwrap();
+        assert_eq!(marked(&p), [(0, "intro"), (2, "verse"), (4, "chorus")], "kept in song order");
+        p.set_marker(2, "verse 1").unwrap();
+        assert_eq!(p.marker_at(2).map(|m| m.name.as_str()), Some("verse 1"));
+        assert_eq!(p.set_marker(3, "chorus"), Err(MarkerError::NameTaken("chorus".into())));
+        assert_eq!(p.set_marker(4, "chorus"), Ok(()), "an entry may keep its own name");
+        assert_eq!(p.set_marker(6, "outro"), Err(MarkerError::NoSuchEntry(6)));
+        p.set_marker(2, " \t ").unwrap();
+        assert_eq!(marked(&p), [(0, "intro"), (4, "chorus")], "an empty name removes the marker");
+        p.set_marker(3, "").unwrap();
+        assert_eq!(p.markers.len(), 2, "removing a marker that is not there changes nothing");
+        p.set_marker(1, &"x".repeat(40)).unwrap();
+        assert_eq!(p.marker_at(1).unwrap().name.len(), MAX_NAME_CHARS);
+        assert_eq!(p.find_marker("chorus").map(|m| m.entry), Some(4));
+        assert_eq!(p.find_marker("Chorus"), None, "names are matched exactly");
+    }
+
+    #[test]
+    fn markers_move_with_their_entries() {
+        let mut p = song(5);
+        p.set_marker(1, "a").unwrap();
+        p.set_marker(3, "b").unwrap();
+        p.apply(Edit::InsertSongEntry { index: 1, pattern: 2 }).unwrap();
+        assert_eq!(marked(&p), [(2, "a"), (4, "b")], "an entry inserted before a marker pushes it on");
+        p.apply(Edit::InsertSongEntry { index: 6, pattern: 2 }).unwrap();
+        assert_eq!(marked(&p), [(2, "a"), (4, "b")], "appending moves nothing");
+        p.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(marked(&p), [(3, "b")], "a marker goes with its entry");
+        p.apply(Edit::RemoveSongEntry(0)).unwrap();
+        assert_eq!(marked(&p), [(2, "b")]);
+        p.apply(Edit::SetSongEntry { index: 2, pattern: 5 }).unwrap();
+        assert_eq!(marked(&p), [(2, "b")], "changing an entry's pattern keeps its marker");
+    }
+
+    #[test]
+    fn sections_run_from_marker_to_marker() {
+        let mut p = song(8);
+        assert_eq!(p.section(5), Some((0, 7)), "without markers the song is one section");
+        assert_eq!(p.section(8), None);
+        p.set_marker(2, "verse").unwrap();
+        p.set_marker(5, "chorus").unwrap();
+        assert_eq!(p.section(0), Some((0, 1)), "the start of the song before the first marker");
+        assert_eq!(p.section(1), Some((0, 1)));
+        assert_eq!(p.section(2), Some((2, 4)));
+        assert_eq!(p.section(4), Some((2, 4)));
+        assert_eq!(p.section(5), Some((5, 7)));
+        assert_eq!(p.section(7), Some((5, 7)));
+        p.set_marker(6, "end").unwrap();
+        assert_eq!(p.section(5), Some((5, 5)), "a one-entry section");
+
+        assert_eq!(p.marker_range(Some("verse"), None), Ok((2, 4)), "from alone is its section");
+        assert_eq!(p.marker_range(Some("verse"), Some("end")), Ok((2, 5)), "to is exclusive");
+        assert_eq!(p.marker_range(None, Some("chorus")), Ok((0, 4)), "to alone starts the song");
+        assert_eq!(p.marker_range(Some("end"), None), Ok((6, 7)));
+        assert_eq!(p.marker_range(None, None), Ok((0, 7)));
+        assert!(p.marker_range(Some("chorus"), Some("verse")).is_err(), "to before from");
+        assert!(p.marker_range(Some("chorus"), Some("chorus")).is_err(), "an empty range");
+        assert!(p.marker_range(Some("bridge"), None).unwrap_err().contains("bridge"));
+        assert!(song(0).marker_range(None, None).is_err());
+    }
+
+    #[test]
+    fn ranges_are_named_by_their_markers() {
+        let mut p = song(8);
+        assert_eq!(p.range_name((0, 7)), Some("the whole song".into()));
+        assert_eq!(p.range_name((0, 3)), None, "no marker after it");
+        p.set_marker(2, "verse").unwrap();
+        p.set_marker(5, "chorus line").unwrap();
+        assert_eq!(p.range_name((2, 4)), Some("section 'verse'".into()));
+        assert_eq!(p.range_name((5, 7)), Some("section 'chorus line'".into()));
+        assert_eq!(p.range_name((0, 1)), Some("the start to 'verse'".into()));
+        assert_eq!(p.range_name((0, 4)), Some("the start to 'chorus line'".into()));
+        assert_eq!(p.range_name((2, 7)), Some("'verse' to the end".into()));
+        assert_eq!(p.range_name((3, 4)), None, "does not start at a marker");
+        assert_eq!(p.range_name((2, 3)), None, "does not end before a marker");
+        assert_eq!(p.range_name((2, 8)), None, "past the song");
+        for (from, to) in [(Some("verse"), None), (None, Some("chorus line")), (Some("verse"), Some("chorus line"))] {
+            let r = p.marker_range(from, to).unwrap();
+            assert!(p.range_name(r).is_some(), "{from:?} {to:?}");
+        }
+    }
+
+    #[test]
+    fn marker_lines_are_validated() {
+        let ok = Project::from_text("tinvo 10\nmarker 0 in tro\nmarker 2 b\nsong A A A").unwrap();
+        assert_eq!(marked(&ok), [(0, "in tro"), (2, "b")], "the song line may come after the markers");
+        for bad in [
+            "tinvo 9\nsong A\nmarker 0 a",
+            "tinvo 10\nsong A\nmarker 0",
+            "tinvo 10\nsong A\nmarker x a",
+            "tinvo 10\nsong A A\nmarker 1 a\nmarker 0 b",
+            "tinvo 10\nsong A A\nmarker 0 a\nmarker 0 b",
+            "tinvo 10\nsong A A\nmarker 0 a\nmarker 1 a",
+            "tinvo 10\nsong A A\nmarker 2 a",
+            "tinvo 10\nmarker 0 a",
+            &format!("tinvo 10\nsong A\nmarker 0 {}", "x".repeat(MAX_NAME_CHARS + 1)),
+            "tinvo 10\nsong A\nmarker 0 a\tb",
+            "tinvo 10\nsong A\ntrack kick\nmarker 0 a\nend",
+        ] {
+            assert!(Project::from_text(bad).is_err(), "{bad}");
+        }
+        let past = Project::from_text("tinvo 10\nsong A A\n\nmarker 0 a\nmarker 5 b").unwrap_err();
+        assert_eq!(past.line, 5, "{past:?}");
     }
 
     #[test]
@@ -1474,7 +1766,7 @@ mod tests {
         let cases = [
             ("", 1, "empty"),
             ("hello 1", 1, "not a TINVO"),
-            ("tinvo 10", 1, "version"),
+            (&*format!("tinvo {}", FORMAT_VERSION + 1), 1, "version"),
             ("tinvo 6\ntrack kick\nparam eq_mid_gain 3\nend", 3, "unknown parameter"),
             ("tinvo 6\ntrack kick\nlane 0 hp_freq hold\nend", 3, "unknown parameter 'hp_freq'"),
             ("tinvo 6\ntrack kick\nlane 0 decay slide\nend", 3, "hold or ramp"),

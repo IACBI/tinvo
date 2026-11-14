@@ -6,6 +6,16 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-14
+
+### Added
+- Song markers. In the song view, `m` names the entry under the cursor (an empty name removes its marker), `PgUp` and `PgDn` jump to the previous and next marker, and `=` loops the section around the cursor: from the marker before it to the entry before the next one. A line under the title lists the markers (click one to jump there), `|` shows before a marked entry, and the title names the section the cursor is in. Markers move with their entries, and undo covers them.
+- `tinvo render --from MARKER --to MARKER` exports part of the song: `--from` alone is that marker's section, `--to` stops where its marker starts. The export prompt names a loop region that matches markers, such as `section 'verse'`.
+
+### Changed
+- Project format 10, which adds `marker` lines. Older files still load.
+- In the song view `m` names a marker; it did nothing there before.
+
 ## [0.19.0] - 2026-11-14
 
 ### Changed
@@ -259,7 +269,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/IACBI/tinvo/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/IACBI/tinvo/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/IACBI/tinvo/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/IACBI/tinvo/compare/v0.16.0...v0.17.0

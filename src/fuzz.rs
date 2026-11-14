@@ -385,7 +385,7 @@ fn mutate_bytes(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 // ---------------------------------------------------------------- projects
 
-const PROJECT_KEYS: [&str; 22] = [
+const PROJECT_KEYS: [&str; 23] = [
     "tinvo",
     "tempo",
     "swing",
@@ -393,6 +393,7 @@ const PROJECT_KEYS: [&str; 22] = [
     "master_gain_db",
     "song",
     "loop",
+    "marker",
     "mix",
     "track",
     "name",
@@ -532,6 +533,8 @@ fn project_seeds() -> Vec<Vec<u8>> {
     let mut rich = Project::demo();
     rich.song = vec![0, 1, 2, 1, 15];
     rich.loop_region = Some((1, 2));
+    rich.set_marker(0, "intro").expect("an entry");
+    rich.set_marker(3, "drop é").expect("an entry");
     rich.pattern_lens[1] = 7;
     rich.pattern_lens[15] = 64;
     rich.swing = 62.5;
@@ -569,6 +572,7 @@ fn project_seeds() -> Vec<Vec<u8>> {
             "tinvo 5\nsong A B A\nloop 1 2\npattern_length B 32\n\ntrack snare\npattern B\nstep 31 38 127 1 100 2 0 -\nend\n",
             "tinvo 6\ntempo 120\n\ntrack synth\nlane 0 volume ramp\npoint 0 0 -60\npattern C\npoint 0 15 6\nend\n",
             "tinvo 8\ntempo 120\nmix reverb_decay 2.4\n\ntrack clap\nparam send_reverb -12\nend\n",
+            "tinvo 10\nmarker 0 a\nmarker 2 b c\nsong A B C\n",
         ]
         .map(String::from),
     );
@@ -617,6 +621,7 @@ fn check_project(input: &[u8], render: bool) -> Result<Outcome, String> {
 
 /// What every project TINVO holds must satisfy.
 fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
+    check_markers(p)?;
     let saved = p.to_text();
     let back = Project::from_text(&saved).map_err(|e| format!("the saved project does not load: {e}\n{saved}"))?;
     if back != *p {
@@ -638,13 +643,37 @@ fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The project without what edits do not carry: track names and samples.
+/// Markers sit on song entries, in song order, one per entry, with
+/// distinct, clean, non-empty names.
+fn check_markers(p: &Project) -> Result<(), String> {
+    for pair in p.markers.windows(2) {
+        if pair[0].entry >= pair[1].entry {
+            return Err(format!("markers out of order: {:?}", p.markers));
+        }
+    }
+    for (i, m) in p.markers.iter().enumerate() {
+        if usize::from(m.entry) >= p.song.len() {
+            return Err(format!("marker {m:?} is past the song's {} entries", p.song.len()));
+        }
+        if m.name.is_empty() || m.name.trim() != m.name || m.name.chars().any(char::is_control) {
+            return Err(format!("marker {m:?} has an unclean name"));
+        }
+        if p.markers[..i].iter().any(|o| o.name == m.name) {
+            return Err(format!("two markers are named {:?}", m.name));
+        }
+    }
+    Ok(())
+}
+
+/// The project without what edits do not carry: track names, samples and
+/// markers.
 fn without_meta(p: &Project) -> Project {
     let mut p = p.clone();
     for t in &mut p.tracks {
         t.name.clear();
         t.sample = None;
     }
+    p.markers.clear();
     p
 }
 
@@ -1032,6 +1061,7 @@ enum Action {
     Edit(Edit),
     Name(usize, String),
     Sample(usize, String),
+    Marker(u16, String),
 }
 
 fn next_action(s: &mut Script, p: &Project) -> Action {
@@ -1040,7 +1070,7 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let step = s.below(MAX_STEPS + 2) as u8;
     let entry = s.u16() % (MAX_SONG as u16 + 2);
     let kind_of = |t: u8| p.tracks.get(usize::from(t)).map(|t| t.kind);
-    let edit = match s.below(20) {
+    let edit = match s.below(22) {
         0 => Edit::SetTempo(s.f32()),
         1 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
         2 => Edit::SetMasterGain(s.f32()),
@@ -1084,10 +1114,12 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
             let index = s.below(MIX_PARAMS.len() + 2) as u8;
             Edit::SetMixParam { index, value: s.value(MIX_PARAMS.get(usize::from(index))) }
         }
-        _ => {
+        19 => {
             let t = usize::from(track);
             return if s.byte() & 1 == 0 { Action::Name(t, s.text()) } else { Action::Sample(t, s.text()) };
         }
+        // Mostly entries in the song, so markers pile up and edits move them.
+        _ => return Action::Marker(entry % (p.song.len() as u16 + 1), s.text()),
     };
     Action::Edit(edit)
 }
@@ -1131,6 +1163,13 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
                         if without_meta(&undone) != without_meta(&before) {
                             return Err(format!("undoing {edit:?} with {inverse:?} does not restore the project"));
                         }
+                        // Only removing a song entry may lose a marker; the
+                        // others move or keep every one.
+                        let lost = before.markers.len() - p.markers.len();
+                        if lost > usize::from(matches!(edit, Edit::RemoveSongEntry(_))) {
+                            return Err(format!("{edit:?} lost {lost} markers"));
+                        }
+                        check_markers(&p)?;
                     }
                     (Err(_), Err(_)) => {
                         if p != before {
@@ -1156,6 +1195,15 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
                         t.sample = Some(path);
                     }
                 }
+            }
+            Action::Marker(entry, name) => {
+                let before = p.clone();
+                let set = p.set_marker(entry, &name);
+                features.insert(hash_of(("marker", set.is_ok(), p.markers.len().min(8))));
+                if set.is_err() && p != before {
+                    return Err(format!("the refused marker {name:?} on {entry} changed the project"));
+                }
+                check_markers(&p)?;
             }
         }
     }

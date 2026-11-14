@@ -165,6 +165,10 @@ actions! {
     LoopStart "loop_start" Song [c('[')] "start the loop region here";
     LoopEnd "loop_end" Song [c(']')] "end the loop region here";
     NoLoop "no_loop" Song [c('-')] "no loop region";
+    Marker "marker" Song [c('m')] "name a marker on the song entry (an empty name removes it)";
+    PrevMarker "prev_marker" Song [PageUp] "to the previous marker";
+    NextMarker "next_marker" Song [PageDown] "to the next marker";
+    LoopSection "loop_section" Song [c('=')] "loop the section: from the marker before the entry to the next one";
     CoarseUp "coarse_up" Params [PageUp] "value up, coarse";
     CoarseDown "coarse_down" Params [PageDown] "value down, coarse";
     Default "default" Params [c('0')] "back to the default value";

@@ -26,7 +26,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
 - Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–4 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
-- 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region. Patterns switch at the end of the bar while playing.
+- 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. Patterns switch at the end of the bar while playing.
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
@@ -40,7 +40,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - Autosave every 5 seconds while there are unsaved edits. If TINVO crashes or is killed, the next start offers to recover them.
 - The editor's keys and colours can be changed in a settings file. A light theme is built in.
 - Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
-- WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern or the loop region, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
+- WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -68,6 +68,7 @@ tinvo                     # open the editor with the demo beat
 tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
+tinvo render song.tvo chorus.wav --from chorus --loops 1   # the section from marker "chorus" to the next
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
@@ -105,7 +106,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
 | `n` `N` | next / previous pattern |
 | `y` `Y` `X` | copy / paste / clear the pattern |
-| `S` | song view (`←` `→` entry, `↑` `↓` its pattern, `Enter` repeat, `Del` remove, `[` `]` loop) |
+| `S` | song view (`←` `→` entry, `↑` `↓` its pattern, `Enter` repeat, `Del` remove, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section) |
 | `f` | parameter panel: instrument, channel strip and sends, buses and master |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
@@ -167,7 +168,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 16 kanal, 64'e kadar 16'lık adım, 20–300 BPM tempo, %50–75 swing.
 - Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–4 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
-- 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
+- 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
@@ -181,7 +182,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - Kaydedilmemiş değişiklik varken 5 saniyede bir otomatik yedek. TINVO çökerse ya da öldürülürse, bir sonraki açılışta bu değişiklikleri geri yüklemeyi önerir.
 - Editörün tuşları ve renkleri bir ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
 - Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
-- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern ya da döngü bölgesi, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
+- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
 
@@ -209,6 +210,7 @@ tinvo                     # open the editor with the demo beat
 tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
+tinvo render song.tvo chorus.wav --from chorus --loops 1   # the section from marker "chorus" to the next
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
@@ -246,7 +248,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
 | `n` `N` | sonraki / önceki pattern |
 | `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
-| `S` | şarkı görünümü (`←` `→` giriş, `↑` `↓` pattern'i, `Enter` tekrarla, `Del` sil, `[` `]` döngü) |
+| `S` | şarkı görünümü (`←` `→` giriş, `↑` `↓` pattern'i, `Enter` tekrarla, `Del` sil, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al) |
 | `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, buslar ve master |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
