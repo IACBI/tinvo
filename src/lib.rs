@@ -29,6 +29,7 @@ pub mod fsutil;
 pub mod fuzz;
 pub mod instrument;
 pub mod keymap;
+pub mod loopback;
 pub mod midi;
 pub mod mix;
 pub mod project;

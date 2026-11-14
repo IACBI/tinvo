@@ -35,6 +35,10 @@ USAGE:
                                         record from an audio input (default 5 s) to a
                                         32-bit float WAV file
     tinvo probe [AUDIO] [SECONDS]       open the audio device, output silence, report timing
+    tinvo loopback [AUDIO] [--input NAME]
+                                        play five short sweeps on the output and find
+                                        them on the input: checks both end to end and
+                                        measures the round-trip latency
     tinvo bench [--check]               time each scenario in 128-frame callbacks; --check
                                         fails when one is over its time budget
     tinvo bench --instructions FILE     count instructions per scenario with Valgrind
@@ -75,6 +79,7 @@ fn main() -> ExitCode {
         Some("render") => cmd_render(&args[1..]),
         Some("demo") => cmd_demo(&args[1..]),
         Some("probe") => cmd_probe(&args[1..]),
+        Some("loopback") => cmd_loopback(&args[1..]),
         Some("devices") => cmd_devices(),
         Some("midi") => cmd_midi(),
         Some("inputs") => cmd_inputs(),
@@ -433,18 +438,27 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     struct Silence {
         frames: Arc<AtomicU64>,
         calls: Arc<AtomicU64>,
+        longest_gap_ns: Arc<AtomicU64>,
+        last: Option<Instant>,
     }
     impl AudioCallback for Silence {
         fn process(&mut self, out: &mut [f32]) {
             out.fill(0.0);
+            let now = Instant::now();
+            if let Some(last) = self.last {
+                let gap = now.duration_since(last).as_nanos().min(u128::from(u64::MAX)) as u64;
+                self.longest_gap_ns.fetch_max(gap, Ordering::Relaxed);
+            }
+            self.last = Some(now);
             self.frames.fetch_add(out.len() as u64 / 2, Ordering::Relaxed);
             self.calls.fetch_add(1, Ordering::Relaxed);
         }
     }
     let frames = Arc::new(AtomicU64::new(0));
     let calls = Arc::new(AtomicU64::new(0));
-    let (f, c) = (frames.clone(), calls.clone());
-    let stream = audio::open_with(&config, move |_| Silence { frames: f, calls: c })?;
+    let longest_gap_ns = Arc::new(AtomicU64::new(0));
+    let (f, c, g) = (frames.clone(), calls.clone(), longest_gap_ns.clone());
+    let stream = audio::open_with(&config, move |_| Silence { frames: f, calls: c, longest_gap_ns: g, last: None })?;
     let info = stream.info().clone();
     let ms = |frames: u32| f64::from(frames) * 1000.0 / f64::from(info.sample_rate);
     println!(
@@ -478,6 +492,175 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         "{} callbacks, {delivered} frames in {elapsed:.2} s = {rate:.0} frames/s ({:+.2} % vs nominal)",
         calls.load(Ordering::Relaxed),
         (rate / f64::from(info.sample_rate) - 1.0) * 100.0
+    );
+    let gap = longest_gap_ns.load(Ordering::Relaxed) as f64 / 1e6;
+    // A callback that comes later than the buffer lasts has let it run dry.
+    let late = if gap > ms(info.buffer_frames) { ", longer than the buffer: the output may have glitched" } else { "" };
+    println!("Longest gap between callbacks: {gap:.2} ms{late}");
+    Ok(())
+}
+
+fn cmd_loopback(args: &[String]) -> Result<(), String> {
+    use tinvo::loopback::{self, HEARD};
+    use tinvo::record::{self as rec, Meter, RING_FRAMES};
+    use tinvo::rt::spsc;
+    const SWEEPS: usize = 5;
+    const LEVEL: f32 = 0.25;
+    let (config, args) = audio_options(args)?;
+    let (input, rest) = input_option(args)?;
+    if let Some(a) = rest.first() {
+        return Err(format!("unknown argument '{a}'\n\n{USAGE}"));
+    }
+    let t0 = Instant::now();
+    let secs = |t: Instant| t.saturating_duration_since(t0).as_secs_f64();
+
+    // The input runs first, so it is listening when the first sweep plays.
+    // Both callbacks note when each buffer passes (the end of a captured
+    // one, the start of a played one) to put both streams on one clock.
+    let (mut tx, mut rx) = spsc::channel::<[f32; 2]>(RING_FRAMES);
+    let (mut in_tx, mut in_rx) = spsc::channel::<(Instant, u64)>(1 << 14);
+    let meter = Arc::new(Meter::default());
+    let m = meter.clone();
+    let instream = audio::open_input(input.as_deref(), move |_, channels| {
+        let ch = usize::from(channels);
+        let mut frames = 0u64;
+        move |samples: &[f32]| {
+            let now = Instant::now();
+            rec::capture_into(&mut tx, &m, samples, ch);
+            frames += (samples.len() / ch) as u64;
+            let _ = in_tx.push((now, frames));
+        }
+    })?;
+    let in_info = instream.info().clone();
+
+    struct Sweeps {
+        sweep: Vec<f32>,
+        starts: [u64; SWEEPS],
+        frame: u64,
+        times: spsc::Producer<(Instant, u64)>,
+        played: Arc<AtomicU64>,
+    }
+    impl AudioCallback for Sweeps {
+        fn process(&mut self, out: &mut [f32]) {
+            let _ = self.times.push((Instant::now(), self.frame));
+            for (i, f) in out.chunks_exact_mut(2).enumerate() {
+                let n = self.frame + i as u64;
+                let x = self
+                    .starts
+                    .iter()
+                    .find_map(|&s| n.checked_sub(s).and_then(|k| self.sweep.get(k as usize)))
+                    .copied()
+                    .unwrap_or(0.0);
+                f.fill(x);
+            }
+            self.frame += out.len() as u64 / 2;
+            self.played.store(self.frame, Ordering::Release);
+        }
+    }
+    let (out_tx, mut out_rx) = spsc::channel::<(Instant, u64)>(1 << 14);
+    let played = Arc::new(AtomicU64::new(0));
+    let p = played.clone();
+    let outstream = audio::open_with(&config, move |rate| {
+        let r = u64::from(rate);
+        // Half a second to settle, then a sweep every 0.4 s.
+        let starts = std::array::from_fn(|k| r / 2 + k as u64 * (r * 2 / 5));
+        Sweeps { sweep: loopback::sweep(rate, LEVEL), starts, frame: 0, times: out_tx, played: p }
+    })?;
+    let out_info = outstream.info().clone();
+    let rate = out_info.sample_rate;
+    println!(
+        "Output: {} on {}, {rate} Hz, {:.2} ms period",
+        out_info.backend,
+        if out_info.device.is_empty() { "the default device" } else { &out_info.device },
+        f64::from(out_info.period_frames) * 1000.0 / f64::from(rate)
+    );
+    println!(
+        "Input:  {} on {}, {} Hz, {} channel(s)",
+        in_info.backend, in_info.device, in_info.sample_rate, in_info.device_channels
+    );
+    if in_info.sample_rate != rate {
+        return Err(format!(
+            "the output runs at {rate} Hz and the input at {} Hz; set both to the same rate in the system's sound settings",
+            in_info.sample_rate
+        ));
+    }
+    println!("Playing {SWEEPS} short sweeps at -12 dBFS ...");
+    let r = u64::from(rate);
+    let spacing = r * 2 / 5;
+    let sweep = loopback::sweep(rate, LEVEL);
+    // Up to a second for the last sweep to come back.
+    let end = r / 2 + (SWEEPS as u64 - 1) * spacing + sweep.len() as u64 + r;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut heard = Vec::new();
+    while played.load(Ordering::Acquire) < end {
+        if Instant::now() > deadline {
+            return Err("the output stopped asking for audio".into());
+        }
+        if let Some(e) = outstream.error().or_else(|| instream.error()) {
+            return Err(format!("stream failed: {e}"));
+        }
+        while let Some(f) = rx.pop() {
+            heard.push(f[0]);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(outstream);
+    drop(instream);
+    while let Some(f) = rx.pop() {
+        heard.push(f[0]);
+    }
+    let (mut in_times, mut out_times) = (Vec::new(), Vec::new());
+    while let Some(t) = in_rx.pop() {
+        in_times.push(t);
+    }
+    while let Some(t) = out_rx.pop() {
+        out_times.push(t);
+    }
+    let dropped = meter.dropped.load(Ordering::Relaxed);
+    if dropped > 0 {
+        return Err(format!("{dropped} input frames were lost; try again"));
+    }
+
+    // Where frame 0 of each stream was on the clock: a played frame left
+    // TINVO when its buffer was asked for, a captured one arrived when its
+    // buffer was handed over. The median steadies the scheduler's jitter.
+    let fr = f64::from(rate);
+    let out_zero = loopback::median(&mut out_times.iter().map(|&(t, f)| secs(t) - f as f64 / fr).collect::<Vec<_>>());
+    let in_zero = loopback::median(&mut in_times.iter().map(|&(t, f)| secs(t) - f as f64 / fr).collect::<Vec<_>>());
+    let (Some(out_zero), Some(in_zero)) = (out_zero, in_zero) else {
+        return Err("no audio came through".into());
+    };
+    let peak = heard.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let peak_db = if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "silence".into() };
+    let slack = rate as usize / 1000;
+    let train = loopback::find_train(&heard, &sweep, SWEEPS, spacing as usize, slack)
+        .ok_or("the input delivered too little audio")?;
+    let count = train.clarity.iter().filter(|&&c| c >= HEARD).count();
+    println!("Input peak {peak_db}; heard {count} of {SWEEPS} sweeps (clarity {:.0})", train.train_clarity);
+    if train.train_clarity < HEARD {
+        return Err(
+            "the sweeps were not heard: turn the output up, unmute the input, or move the microphone nearer".into()
+        );
+    }
+    // A sweep the input's noise suppression swallowed has no peak of its own.
+    let all = count == 0;
+    let mut latencies: Vec<f64> = train
+        .starts
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| all || train.clarity[k] >= HEARD)
+        .map(|(k, &n)| {
+            let played_at = out_zero + (r / 2 + k as u64 * spacing) as f64 / fr;
+            in_zero + n as f64 / fr - played_at
+        })
+        .collect();
+    let spread = latencies.iter().fold(f64::MIN, |m, &x| m.max(x)) - latencies.iter().fold(f64::MAX, |m, &x| m.min(x));
+    let latency = loopback::median(&mut latencies).unwrap_or(0.0);
+    println!(
+        "Round trip: {:.1} ms ({:.0} frames); the sweeps agree within {:.2} ms",
+        latency * 1000.0,
+        latency * fr,
+        spread * 1000.0
     );
     Ok(())
 }

@@ -75,6 +75,7 @@ tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
 tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
+tinvo loopback --input realtek     # play sweeps and hear them back: checks both devices, measures the round trip
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices
@@ -217,6 +218,7 @@ tinvo devices             # list the output devices
 tinvo --device usb song.tvo        # play on the device whose name contains "usb"
 tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
+tinvo loopback --input realtek     # play sweeps and hear them back: checks both devices, measures the round trip
 tinvo midi                # list the MIDI inputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo inputs              # list the audio input devices

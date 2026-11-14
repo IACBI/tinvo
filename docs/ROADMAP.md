@@ -245,7 +245,7 @@ Known limits:
 - The marker line lists names in one row and cuts off what does not fit the width; `PgUp` and `PgDn` still reach every marker.
 - Like track names, marker names are drawn one column per character, so double-width characters (CJK, most emoji) push the rest of the line along.
 
-## Phase 7b: Per-track patterns ✅ (0.21.0, this release)
+## Phase 7b: Per-track patterns ✅ (0.21.0)
 
 - In each song entry a track follows the entry's pattern, plays a pattern of its own, or rests. The entry's pattern sets how long the entry lasts. A track's own pattern starts on the entry's first step; a shorter one starts over when it ends, a longer one is cut off when the entry ends.
 - A track's automation follows the pattern it plays. A ramp towards a point the entry never reaches holds its value to the entry's end; a resting track is at its knob values.
@@ -257,6 +257,23 @@ Known limits:
 - `↑` and `↓` now move between the song view's rows; changing an entry's pattern moved to `,` and `.`.
 - A track's own pattern always starts on the entry's first step; it cannot start part-way or carry on from the entry before.
 - The play column in the grid, piano roll and automation view shows the selected pattern only for tracks playing it.
+
+## Phase 8a: Hardware check
+
+- `tinvo loopback [AUDIO] [--input NAME]` plays five 0.1 s sweeps (500 Hz to 8 kHz, −12 dBFS) on an output and finds them in what an input hears, by cross-correlation summed over the whole train, so one sweep lost in noise cannot move the result. It shows that the output and the input work end to end and measures the round trip: from TINVO handing a frame to the output to the input handing it back. Each stream's clock is the median of its callbacks' times, so the scheduler's jitter does not move the result.
+- `tinvo probe` also reports the longest gap between callbacks, and says when it was longer than the buffer, where the output may have glitched.
+- Run on the development machine (Windows 11, Realtek on-board audio, WASAPI shared mode at 48 kHz with a 10 ms period):
+  - The Realtek speakers into the Realtek microphone: all five sweeps heard, 67.3 ms round trip, the same within 0.2 ms over four runs.
+  - The NVIDIA Broadcast virtual speakers into the Realtek microphone: 170.8 ms; its processing adds about 100 ms.
+  - The Realtek speakers into the NVIDIA Broadcast microphone: about 321 to 327 ms; its noise removal sometimes swallows a sweep, and then only the sweeps heard are counted.
+  - `--low-latency` on both devices: refused by the driver (smallest period equal to the 10 ms default), so the round trip stays 67.3 ms.
+  - `tinvo probe`: 48 000 frames/s within 0.35 % on both outputs, the longest gap between callbacks 10.8 to 11.7 ms against a 22 ms buffer.
+  - `tinvo bench --check`: mean callback cost 3.4 % (demo), 9.0 % (every strip stage), 6.1 % (synth) and 1.0 % (sampler) of a 128-frame period.
+
+Known limits:
+- The round trip includes the room: about 0.3 ms per 10 cm between the speaker and the microphone.
+- The output and the input must run at the same rate; `loopback` says so when they do not, as it does not resample.
+- No MIDI device and no second machine were available: WinMM, ALSA and CoreMIDI input have still never received a real message, and ALSA and CoreAudio still have not run on real hardware.
 
 ## Known limitations of the foundation
 
