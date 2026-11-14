@@ -1,0 +1,424 @@
+tinvo 11
+tempo 118
+swing 54
+pattern_length A 32
+pattern_length B 32
+pattern_length C 32
+master_gain_db 7
+song A B C B C
+marker 0 intro
+marker 1 main
+mix delay_time 6
+mix delay_feedback 0.32
+mix delay_tone 4200
+mix reverb_decay 2.4
+mix reverb_damping 6000
+mix chorus_depth 0.004
+mix limiter 1
+mix limiter_ceiling -1
+
+track kick
+name Kick
+gain_db -7
+pan 0
+mute false
+solo false
+param tune 0
+param decay 0.5
+param punch 0.7
+param click 0.35
+param eq_low_freq 60
+param eq_low_gain 2
+param send_key 0
+step 0 60 127 1 100 1 0 -
+step 4 60 115 1 100 1 0 -
+step 8 60 115 1 100 1 0 -
+step 12 60 115 1 100 1 0 -
+step 16 60 127 1 100 1 0 -
+step 20 60 115 1 100 1 0 -
+step 24 60 115 1 100 1 0 -
+step 28 60 115 1 100 1 0 -
+pattern B
+step 0 60 127 1 100 1 0 -
+step 4 60 115 1 100 1 0 -
+step 8 60 115 1 100 1 0 -
+step 12 60 115 1 100 1 0 -
+step 16 60 127 1 100 1 0 -
+step 20 60 115 1 100 1 0 -
+step 24 60 115 1 100 1 0 -
+step 28 60 115 1 100 1 0 -
+pattern C
+step 0 60 127 1 100 1 0 -
+step 4 60 115 1 100 1 0 -
+step 8 60 115 1 100 1 0 -
+step 12 60 115 1 100 1 0 -
+step 16 60 127 1 100 1 0 -
+step 20 60 115 1 100 1 0 -
+step 24 60 115 1 100 1 0 -
+step 28 60 115 1 100 1 0 -
+end
+
+track clap
+name Clap
+gain_db -2
+pan 0
+mute false
+solo false
+param tone 1300
+param decay 0.32
+param spread 0.012
+param hp_freq 250
+param send_reverb -8
+pattern B
+step 4 60 105 1 100 1 0 -
+step 12 60 105 1 100 1 0 -
+step 20 60 105 1 100 1 0 -
+step 28 60 105 1 100 1 0 -
+pattern C
+step 4 60 105 1 100 1 0 -
+step 12 60 105 1 100 1 0 -
+step 20 60 105 1 100 1 0 -
+step 28 60 105 1 100 1 0 -
+end
+
+track snare
+name Snare
+gain_db -11
+pan 0.05
+mute false
+solo false
+param tune 0
+param tone_decay 0.12
+param noise_decay 0.2
+param snappy 0.65
+param hp_freq 150
+param send_reverb -10
+pattern B
+step 15 60 55 1 100 1 0 -
+step 31 60 55 1 100 1 0 -
+pattern C
+step 15 60 55 1 100 1 0 -
+step 26 60 70 1 100 1 0 -
+step 27 60 80 1 100 2 0 -
+step 28 60 90 1 100 2 0 -
+step 29 60 100 1 100 3 0 -
+step 30 60 110 1 100 3 0 -
+step 31 60 120 1 100 4 0 -
+end
+
+track hat
+name Hat
+gain_db -3
+pan 0.25
+mute false
+solo false
+param tune 0
+param decay 0.045
+param tone 7500
+param hp_freq 700
+step 2 60 95 1 100 1 0 -
+step 6 60 95 1 100 1 0 -
+step 10 60 95 1 100 1 0 -
+step 14 60 95 1 100 1 0 -
+step 18 60 95 1 100 1 0 -
+step 22 60 95 1 100 1 0 -
+step 26 60 95 1 100 1 0 -
+step 30 60 95 1 100 1 0 -
+pattern B
+step 0 60 75 1 100 1 0 -
+step 1 60 60 1 100 1 0 -
+step 2 60 100 1 100 1 0 -
+step 3 60 60 1 100 1 0 -
+step 4 60 75 1 100 1 0 -
+step 5 60 60 1 100 1 0 -
+step 6 60 100 1 100 1 0 -
+step 7 60 60 1 100 1 0 -
+step 8 60 75 1 100 1 0 -
+step 9 60 60 1 100 1 0 -
+step 10 60 100 1 100 1 0 -
+step 11 60 60 1 100 1 0 -
+step 12 60 75 1 100 1 0 -
+step 13 60 60 1 100 1 0 -
+step 14 60 100 1 100 1 0 -
+step 15 60 60 1 100 1 0 -
+step 16 60 75 1 100 1 0 -
+step 17 60 60 1 100 1 0 -
+step 18 60 100 1 100 1 0 -
+step 19 60 60 1 100 1 0 -
+step 20 60 75 1 100 1 0 -
+step 21 60 60 1 100 1 0 -
+step 22 60 100 1 100 1 0 -
+step 23 60 60 1 100 1 0 -
+step 24 60 75 1 100 1 0 -
+step 25 60 60 1 100 1 0 -
+step 26 60 100 1 100 1 0 -
+step 27 60 60 1 100 1 0 -
+step 28 60 75 1 100 1 0 -
+step 29 60 60 1 100 1 0 -
+step 30 60 100 1 100 1 0 -
+step 31 60 60 1 100 1 0 -
+pattern C
+step 0 60 75 1 100 1 0 -
+step 1 60 60 1 100 1 0 -
+step 2 60 100 1 100 1 0 -
+step 3 60 60 1 100 1 0 -
+step 4 60 75 1 100 1 0 -
+step 5 60 60 1 100 1 0 -
+step 6 60 100 1 100 1 0 -
+step 7 60 60 1 100 1 0 -
+step 8 60 75 1 100 1 0 -
+step 9 60 60 1 100 1 0 -
+step 10 60 100 1 100 1 0 -
+step 11 60 60 1 100 1 0 -
+step 12 60 75 1 100 1 0 -
+step 13 60 60 1 100 1 0 -
+step 14 60 100 1 100 1 0 -
+step 15 60 60 1 100 1 0 -
+step 16 60 75 1 100 1 0 -
+step 17 60 60 1 100 1 0 -
+step 18 60 100 1 100 1 0 -
+step 19 60 60 1 100 1 0 -
+step 20 60 75 1 100 1 0 -
+step 21 60 60 1 100 1 0 -
+step 22 60 100 1 100 1 0 -
+step 23 60 60 1 100 1 0 -
+step 24 60 75 1 100 1 0 -
+step 25 60 60 1 100 1 0 -
+step 26 60 100 1 100 1 0 -
+step 27 60 60 1 100 1 0 -
+step 28 60 75 1 100 1 0 -
+step 29 60 60 1 100 1 0 -
+step 30 60 100 1 100 1 0 -
+step 31 60 60 1 100 1 0 -
+end
+
+track openhat
+name Open hat
+gain_db -8
+pan -0.25
+mute false
+solo false
+param tune 0
+param decay 0.4
+param tone 7000
+param hp_freq 600
+param send_delay -16
+pattern B
+step 14 60 90 1 100 1 0 -
+step 30 60 90 1 100 1 0 -
+pattern C
+step 14 60 90 1 100 1 0 -
+step 30 60 90 1 100 1 0 -
+end
+
+track synth
+name Bass
+gain_db -3
+pan 0
+mute false
+solo false
+param osc1_wave 0
+param osc2_wave 1
+param osc2_semi -12
+param osc2_fine 0
+param osc_mix 0.45
+param cutoff 320
+param resonance 0.4
+param filter_mode 0
+param env_amount 3.2
+param flt_attack 0.002
+param flt_decay 0.16
+param flt_sustain 0.1
+param flt_release 0.2
+param amp_attack 0.002
+param amp_decay 0.3
+param amp_sustain 0.8
+param amp_release 0.07
+param glide 0
+param lfo_wave 0
+param lfo_rate 5
+param lfo_pitch 0
+param lfo_cutoff 0
+param lfo_amp 0
+param vel_cutoff 1
+param pulse_width 0.5
+param lfo_pw 0
+param noise 0
+param unison 0
+param detune 12
+param comp_threshold -24
+param comp_ratio 4
+param comp_attack 0.003
+param comp_release 0.12
+param comp_makeup 3
+param comp_key 1
+param drive 5
+step 0 33 120 2 100 1 0 -
+step 3 33 95 1 100 1 0 -
+step 6 45 105 1 100 1 0 -
+step 8 33 115 2 100 1 0 -
+step 11 33 90 1 100 1 0 -
+step 14 45 110 1 100 1 0 -
+step 16 29 120 2 100 1 0 -
+step 19 29 95 1 100 1 0 -
+step 22 41 105 1 100 1 0 -
+step 24 29 115 2 100 1 0 -
+step 27 29 90 1 100 1 0 -
+step 30 41 110 1 100 1 0 -
+pattern B
+step 0 33 120 2 100 1 0 -
+step 3 33 95 1 100 1 0 -
+step 6 45 105 1 100 1 0 -
+step 8 33 115 2 100 1 0 -
+step 11 33 90 1 100 1 0 -
+step 14 45 110 1 100 1 0 -
+step 16 29 120 2 100 1 0 -
+step 19 29 95 1 100 1 0 -
+step 22 41 105 1 100 1 0 -
+step 24 29 115 2 100 1 0 -
+step 27 29 90 1 100 1 0 -
+step 30 41 110 1 100 1 0 -
+pattern C
+step 0 36 120 2 100 1 0 -
+step 3 36 95 1 100 1 0 -
+step 6 48 105 1 100 1 0 -
+step 8 36 115 2 100 1 0 -
+step 11 36 90 1 100 1 0 -
+step 14 48 110 1 100 1 0 -
+step 16 31 120 2 100 1 0 -
+step 19 31 95 1 100 1 0 -
+step 22 43 105 1 100 1 0 -
+step 24 31 115 2 100 1 0 -
+step 27 31 90 1 100 1 0 -
+step 30 43 110 1 100 1 0 -
+end
+
+track synth
+name Pad
+gain_db -5
+pan 0
+mute false
+solo false
+param osc1_wave 0
+param osc2_wave 0
+param osc2_semi 0
+param osc2_fine 9
+param osc_mix 0.5
+param cutoff 1600
+param resonance 0.15
+param filter_mode 0
+param env_amount 0.5
+param flt_attack 0.002
+param flt_decay 0.25
+param flt_sustain 0.2
+param flt_release 0.2
+param amp_attack 0.25
+param amp_decay 1
+param amp_sustain 0.85
+param amp_release 0.6
+param glide 0
+param lfo_wave 1
+param lfo_rate 0.3
+param lfo_pitch 0
+param lfo_cutoff 0.4
+param lfo_amp 0
+param vel_cutoff 0
+param pulse_width 0.5
+param lfo_pw 0
+param noise 0
+param unison 2
+param detune 18
+param hp_freq 180
+param comp_threshold -26
+param comp_ratio 3
+param comp_attack 0.005
+param comp_release 0.18
+param comp_key 1
+param send_reverb -6
+param send_chorus -4
+lane 0 cutoff ramp
+step 0 57 90 16 100 1 0 3,7,12
+step 16 53 90 16 100 1 0 4,7,12
+point 0 0 350
+point 0 31 1600
+pattern B
+step 0 57 90 16 100 1 0 3,7,12
+step 16 53 90 16 100 1 0 4,7,12
+pattern C
+step 0 55 90 16 100 1 0 5,9,12
+step 16 55 90 16 100 1 0 4,7,12
+end
+
+track synth
+name Arp
+gain_db -3
+pan -0.1
+mute false
+solo false
+param osc1_wave 1
+param osc2_wave 0
+param osc2_semi 0
+param osc2_fine 5
+param osc_mix 0.3
+param cutoff 2200
+param resonance 0.35
+param filter_mode 0
+param env_amount 1.8
+param flt_attack 0.002
+param flt_decay 0.12
+param flt_sustain 0.2
+param flt_release 0.2
+param amp_attack 0.002
+param amp_decay 0.18
+param amp_sustain 0.3
+param amp_release 0.1
+param glide 0
+param lfo_wave 0
+param lfo_rate 5
+param lfo_pitch 0
+param lfo_cutoff 0
+param lfo_amp 0
+param vel_cutoff 0
+param pulse_width 0.35
+param lfo_pw 0
+param noise 0
+param unison 0
+param detune 12
+param hp_freq 300
+param send_delay -6
+param send_reverb -14
+pattern B
+step 0 69 112 1 100 1 0 -
+step 2 76 92 1 100 1 0 -
+step 4 72 92 1 100 1 0 -
+step 6 81 92 1 100 1 0 -
+step 8 76 112 1 100 1 0 -
+step 10 72 92 1 100 1 0 -
+step 12 81 92 1 100 1 0 -
+step 14 76 92 1 100 1 0 -
+step 16 65 112 1 100 1 0 -
+step 18 72 92 1 100 1 0 -
+step 20 69 92 1 100 1 0 -
+step 22 77 92 1 100 1 0 -
+step 24 72 112 1 100 1 0 -
+step 26 69 92 1 100 1 0 -
+step 28 77 92 1 100 1 0 -
+step 30 72 92 1 100 1 0 -
+pattern C
+step 0 72 112 1 100 1 0 -
+step 2 79 92 1 100 1 0 -
+step 4 76 92 1 100 1 0 -
+step 6 84 92 1 100 1 0 -
+step 8 79 112 1 100 1 0 -
+step 10 76 92 1 100 1 0 -
+step 12 84 92 1 100 1 0 -
+step 14 79 92 1 100 1 0 -
+step 16 67 112 1 100 1 0 -
+step 18 74 92 1 100 1 0 -
+step 20 71 92 1 100 1 0 -
+step 22 79 92 1 100 1 0 -
+step 24 74 112 1 100 1 0 -
+step 26 71 92 1 100 1 0 -
+step 28 79 92 1 100 1 0 -
+step 30 74 92 1 100 1 0 -
+end

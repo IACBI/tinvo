@@ -1345,6 +1345,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_showcase_example_loads_and_round_trips() {
+        let text = include_str!("../examples/showcase.tvo");
+        let p = Project::from_text(text).expect("examples/showcase.tvo loads");
+        assert_eq!(p.tracks.len(), 8);
+        assert_eq!(p.song.len(), 5);
+        assert_eq!(Project::from_text(&p.to_text()).unwrap().to_text(), p.to_text());
+    }
+
+    #[test]
     fn text_round_trip_is_lossless() {
         let mut p = Project::demo();
         p.tracks[0].name = "Kick Ünïcode 808".into();
