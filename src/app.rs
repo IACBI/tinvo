@@ -164,6 +164,7 @@ type ClipTrack = ([Option<Step>; MAX_STEPS], [[Option<f32>; MAX_STEPS]; MAX_LANE
 struct Clip {
     len: u8,
     division: Division,
+    meter: Meter,
     tracks: Vec<ClipTrack>,
 }
 
@@ -1414,7 +1415,8 @@ impl App {
         let p = self.pattern;
         let tracks =
             self.project.tracks.iter().map(|t| (t.steps[p], std::array::from_fn(|k| t.lanes[k].points[p]))).collect();
-        self.clipboard = Some(Clip { len: self.project.pattern_lens[p], division: self.project.divisions[p], tracks });
+        let (len, division, meter) = (self.project.pattern_lens[p], self.project.divisions[p], self.project.meters[p]);
+        self.clipboard = Some(Clip { len, division, meter, tracks });
         self.set_status(format!("Copied pattern {}", pattern_name(p as u8)));
     }
 
@@ -1423,12 +1425,13 @@ impl App {
     /// matched by position; points go only to lanes that have a parameter.
     fn replace_pattern(&mut self, with: Option<Clip>, what: &'static str) {
         let (p, pattern) = (self.pattern, self.pattern as u8);
-        let (len, division) = (self.project.pattern_lens[p], self.project.divisions[p]);
-        let clip = with.unwrap_or(Clip { len, division, tracks: Vec::new() });
+        let (len, division, meter) = (self.project.pattern_lens[p], self.project.divisions[p], self.project.meters[p]);
+        let clip = with.unwrap_or(Clip { len, division, meter, tracks: Vec::new() });
         let empty = ([None; MAX_STEPS], [[None; MAX_STEPS]; MAX_LANES]);
         let mut edits = vec![
             Edit::SetPatternLength { pattern, len: clip.len },
             Edit::SetPatternDivision { pattern, division: clip.division },
+            Edit::SetPatternMeter { pattern, meter: clip.meter },
         ];
         for (t, track) in self.project.tracks.iter().enumerate() {
             let (steps, lanes) = clip.tracks.get(t).unwrap_or(&empty);
@@ -4727,7 +4730,12 @@ mod tests {
         assert_eq!(a.project.divisions[1], Division::SixteenthTriplet);
         keys(&mut a, &[Key::Char('u')]);
         assert_eq!(a.project.divisions[1], Division::Sixteenth);
-        // Clearing keeps it.
+        // The time signature goes with it.
+        keys(&mut a, &[Key::Char('N'), Key::Char('K'), Key::Char('y'), Key::Char('n'), Key::Char('Y')]);
+        assert_eq!(a.project.meters[1].name(), "5/4");
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.meters[1], Meter::default());
+        // Clearing keeps them.
         keys(&mut a, &[Key::Char('B'), Key::Char('X')]);
         assert_eq!(a.project.divisions[1], Division::EighthTriplet);
     }

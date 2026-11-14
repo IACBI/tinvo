@@ -8,8 +8,9 @@ Author: 𝓐.𝓒.𝓑
 
 ### Added
 - A step length per pattern: 1/8, 1/8 triplets, 1/16 (as before), 1/16 triplets or 1/32, set with `b` and `B` or the wheel over the top bar. The grid, the piano roll and the automation view draw beats and bars for it. A track playing its own pattern in a song entry plays it in that pattern's steps, cut where the entry ends. Swing moves the second step of each pair; triplet steps are not swung.
+- A time signature per pattern, 1 to 16 beats of /2, /4, /8 or /16 notes, set with `k` `K` (beats) and `J` (the beat's note value) or the wheel over the top bar. It places the beat and bar lines in the grid, the piano roll and the automation view, and leaves playback alone. Copy and paste carry a pattern's step length and time signature.
 - Up to 8 ratchets per step.
-- Project format 12: `pattern_division B 1/16T` for patterns whose steps are not 16ths. Older files load with 16th-note steps.
+- Project format 12: `pattern_division B 1/16T` for patterns whose steps are not 16ths and `pattern_meter B 6/8` for patterns not in 4/4. Older files load with 16th-note steps in 4/4.
 - `examples/showcase.tvo`, the song in the README's video: A minor at 118 BPM, an intro and two sections, with sidechained bass, a pad whose filter opens through the intro, a delayed arpeggio and a ratcheted snare fill.
 
 ## [0.22.0] - 2026-11-14
