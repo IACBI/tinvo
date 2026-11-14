@@ -61,7 +61,8 @@ AUDIO:
     --input NAME                        record from this audio input (I in the editor;
                                         default: the system default)
     --settings FILE                     read keys and colours from FILE instead of the
-                                        settings file (see tinvo settings)
+                                        settings file (see tinvo settings); the editor's
+                                        settings page (F2) writes its changes there
 ";
 
 fn main() -> ExitCode {
@@ -323,14 +324,14 @@ fn read_settings(file: Option<PathBuf>) -> Result<(Settings, Option<PathBuf>, bo
 fn cmd_edit(args: &[String]) -> Result<(), String> {
     // Settings first: a mistake in them is reported before any device opens.
     let (file, rest) = settings_option(args.to_vec())?;
-    let (settings, ..) = read_settings(file)?;
+    let (settings, settings_path, _) = read_settings(file)?;
     let (config, rest) = audio_options(&rest)?;
     let (midi_start, rest) = midi_option(rest)?;
     let (input, rest) = input_option(rest)?;
     match &rest[..] {
-        [] => tinvo::app::run(None, config, midi_start, input, settings),
+        [] => tinvo::app::run(None, config, midi_start, input, settings, settings_path),
         [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input, settings),
+        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input, settings, settings_path),
         _ => Err(format!("too many arguments\n\n{USAGE}")),
     }
 }

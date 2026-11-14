@@ -22,6 +22,9 @@ const ENTER_SEQ: &str = "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J";
 /// Windows consoles report the mouse through input records instead.
 #[cfg(not(windows))]
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// Undo `MOUSE_ON`.
+#[cfg(not(windows))]
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// Undo `ENTER_SEQ` and `MOUSE_ON`.
 const LEAVE_SEQ: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 
@@ -46,6 +49,14 @@ impl Terminal {
     /// Terminal size in columns and rows.
     pub fn size(&self) -> (u16, u16) {
         self.sys.size()
+    }
+
+    /// Starts or stops reporting the mouse.
+    pub fn set_mouse(&mut self, on: bool) -> io::Result<()> {
+        self.sys.set_mouse(on)?;
+        #[cfg(not(windows))]
+        self.write(if on { MOUSE_ON } else { MOUSE_OFF })?;
+        Ok(())
     }
 
     /// Waits up to `timeout` for the next event.
@@ -96,6 +107,13 @@ mod sys {
     const ENABLE_WINDOW_INPUT: u32 = 0x8;
     const ENABLE_MOUSE_INPUT: u32 = 0x10;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x80;
+
+    /// The console input mode: without `ENABLE_QUICK_EDIT_MODE` (cleared by
+    /// giving `ENABLE_EXTENDED_FLAGS` without it), so clicks do not freeze
+    /// output, and with mouse records when `mouse` is on.
+    fn input_flags(mouse: bool) -> u32 {
+        ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS | if mouse { ENABLE_MOUSE_INPUT } else { 0 }
+    }
     const KEY_EVENT: u16 = 0x1;
     const MOUSE_EVENT: u16 = 0x2;
     const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x4;
@@ -196,8 +214,7 @@ mod sys {
                 }
                 // No line buffering, echo or Ctrl+C processing; report resizes;
                 // disable QuickEdit so clicks do not freeze output.
-                let mouse_input = if mouse { ENABLE_MOUSE_INPUT } else { 0 };
-                if SetConsoleMode(input, ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS | mouse_input) == 0 {
+                if SetConsoleMode(input, input_flags(mouse)) == 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if SetConsoleMode(output, ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
@@ -207,6 +224,14 @@ mod sys {
                 }
                 Ok(Self { input, output, input_mode, output_mode, buttons: 0 })
             }
+        }
+
+        pub fn set_mouse(&mut self, on: bool) -> io::Result<()> {
+            // SAFETY: a console handle from `enable`.
+            if unsafe { SetConsoleMode(self.input, input_flags(on)) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         pub fn restore(&mut self) {
@@ -492,6 +517,11 @@ mod sys {
             Ok(m)
         }
 
+        /// The mouse is turned on and off with escape sequences.
+        pub fn set_mouse(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+
         pub fn restore(&mut self) {
             // SAFETY: restoring the attributes read in `enable`.
             unsafe { tcsetattr(STDIN, TCSANOW, &self.original) };
@@ -587,6 +617,9 @@ mod sys {
             Err(io::Error::other("terminal UI is not supported on this platform"))
         }
         pub fn restore(&mut self) {}
+        pub fn set_mouse(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
         pub fn size(&self) -> (u16, u16) {
             (80, 24)
         }

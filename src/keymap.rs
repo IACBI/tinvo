@@ -100,6 +100,7 @@ actions! {
     Play "play" Global [c(' ')] "play / stop";
     Focus "focus" Global [Tab, BackTab] "switch between the grid and the parameters";
     Help "help" Global [c('?'), F(1)] "this list";
+    Settings "settings" Global [F(2), c('P')] "settings: keys, colours and the mouse, saved to the settings file";
     Quit "quit" Global [c('q'), Ctrl('c'), Ctrl('q')] "quit (asks if there are unsaved changes)";
     Save "save" Global [Ctrl('s'), c('w')] "save";
     SaveAs "save_as" Global [c('W')] "save under a new name";
