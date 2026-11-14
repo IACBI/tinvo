@@ -103,7 +103,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `-` `=` / `/` | chance / ratchets |
 | `(` `)` | move the step earlier / later |
 | `c` | cycle chords (maj, min, 7, m7, maj7, sus4) |
-| `v` | piano roll for the track (`↑` `↓` pitch, `Enter` adds or removes a note) |
+| `v` | piano roll for the track (`↑` `↓` pitch, `Enter` adds or removes a note); its last line shows what the track plays in each song entry |
 | `u` `U` | undo / redo (also `Ctrl+Z` / `Ctrl+Y`) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
 | `n` `N` | next / previous pattern |
@@ -122,7 +122,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `F2` `P` | settings: keys, colours and the mouse |
 | `q` | quit |
 
-The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern and length in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
+The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point, and on their song line it opens the pattern the track plays in that entry. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern and length in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
 
 ### Configuration
 
@@ -250,7 +250,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `-` `=` / `/` | olasılık / ratchet |
 | `(` `)` | adımı erkene / geçe kaydır |
 | `c` | akorlar arasında dolaş (maj, min, 7, m7, maj7, sus4) |
-| `v` | kanalın piyano rulosu (`↑` `↓` perde, `Enter` nota ekler ya da siler) |
+| `v` | kanalın piyano rulosu (`↑` `↓` perde, `Enter` nota ekler ya da siler); son satırı kanalın her şarkı girişinde ne çaldığını gösterir |
 | `u` `U` | geri al / yinele (`Ctrl+Z` / `Ctrl+Y` de olur) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
 | `n` `N` | sonraki / önceki pattern |
@@ -269,7 +269,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `F2` `P` | ayarlar: tuşlar, renkler ve fare |
 | `q` | çık |
 
-Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern ve uzunluk, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
+Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler; bu iki görünümün şarkı satırında ise kanalın o girişte çaldığı pattern'i açar. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern ve uzunluk, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
 
 ### Yapılandırma
 

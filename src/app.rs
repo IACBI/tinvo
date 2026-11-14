@@ -45,6 +45,9 @@ const LEFT: u16 = 36;
 /// Where the song view's entry columns start, after the row labels.
 const SONG_LEFT: u16 = 15;
 const CELL: u16 = 3;
+/// The fewest rows the piano roll and the automation view need to end
+/// with the song line.
+const SONG_LINE_ROWS: u16 = 8;
 const PARAM_COL: u16 = 28;
 const MIN_W: u16 = 64;
 const MIN_H: u16 = 16;
@@ -549,6 +552,8 @@ enum Target {
     Entry(usize),
     /// What a track plays in a song entry: the entry and the track.
     Part(usize, usize),
+    /// A song entry on the song line under the piano roll and automation.
+    SongCell(usize),
     /// A name on the song's marker line, by its index.
     Marker(usize),
     /// The parameter panel, outside a parameter.
@@ -1329,6 +1334,16 @@ impl App {
         (usize::from(pattern) == self.pattern).then_some(usize::from(step))
     }
 
+    /// The pattern track `t` plays in song entry `e`, or `None` where it
+    /// rests.
+    fn entry_pattern(&self, t: usize, e: usize) -> Option<u8> {
+        match self.project.part(t, e) {
+            Part::Follow => self.project.song.get(e).copied(),
+            Part::Pattern(q) => Some(q),
+            Part::Rest => None,
+        }
+    }
+
     /// The track the song view's cursor is on, if any.
     /// A row past the last track (one was deleted) is the last track's, for
     /// the keys as on screen.
@@ -1696,6 +1711,15 @@ impl App {
             }
             Target::Entry(i) => (self.song_cursor, self.song_row) = (i, 0),
             Target::Part(i, t) => (self.song_cursor, self.song_row, self.track) = (i, t + 1, t),
+            Target::SongCell(e) => {
+                self.song_cursor = e;
+                match self.entry_pattern(self.track, e) {
+                    Some(q) => self.select_pattern(usize::from(q)),
+                    None => {
+                        self.set_status(format!("{} rests in entry {}", self.project.tracks[self.track].name, e + 1))
+                    }
+                }
+            }
             Target::Marker(i) => {
                 if let Some(m) = self.project.markers.get(i) {
                     self.song_cursor = usize::from(m.entry);
@@ -3106,9 +3130,13 @@ impl App {
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
         let held = self.held_notes();
+        let song_line = self.song_line_shown(rows);
+        if song_line {
+            self.draw_song_line(s, w, 1 + rows);
+        }
         // The view starts with the cursor pitch in the middle and scrolls
         // only as far as the cursor leaves it.
-        let rows = rows.min(128);
+        let rows = (rows - u16::from(song_line)).min(128);
         let note = u16::from(self.roll_note);
         let top = match self.roll_top.get().map(u16::from) {
             None => note + rows / 2,
@@ -3224,6 +3252,49 @@ impl App {
                 }
             };
             s.put(1, info_y, &info, self.style(Role::Beat));
+        }
+        if self.song_line_shown(rows) {
+            self.draw_song_line(s, w, 1 + rows);
+        }
+    }
+
+    /// Whether the piano roll and the automation view, given `rows` rows,
+    /// end with the song line.
+    fn song_line_shown(&self, rows: u16) -> bool {
+        rows >= SONG_LINE_ROWS && !self.project.song.is_empty()
+    }
+
+    /// The selected track through the song, on row `y`: the pattern it
+    /// plays in each entry (`-` a rest), bright where that is the pattern
+    /// being edited, the entry playing now in the play column's colour.
+    /// Entries are shown a screenful at a time, with the one playing, or
+    /// else the song cursor's.
+    fn draw_song_line(&self, s: &mut Screen, w: u16, y: u16) {
+        let p = &self.project;
+        let edited = self.pattern as u8;
+        let used = (0..p.song.len()).filter(|&e| self.entry_pattern(self.track, e) == Some(edited)).count();
+        let label = match used {
+            0 => format!("Song: {} in no entry", pattern_name(edited)),
+            n => format!("Song: {} in {n} of {} entries", pattern_name(edited), p.song.len()),
+        };
+        s.put(1, y, &label, self.style(Role::Beat));
+        s.put(LEFT - 1, y, "│", self.style(Role::Dim));
+        self.hit(0, y, LEFT, Target::Inert);
+        let cap = usize::from(w.saturating_sub(LEFT) / 2).max(1);
+        let playing = self.play_pos.and_then(|q| q.entry).map(usize::from);
+        let first = playing.unwrap_or(self.song_cursor).min(p.song.len() - 1) / cap * cap;
+        for (col, e) in (first..(first + cap).min(p.song.len())).enumerate() {
+            let x = LEFT + col as u16 * 2;
+            let (c, mut st) = match self.entry_pattern(self.track, e) {
+                Some(q) if q == edited => (pattern_name(q), self.style(Role::Entry)),
+                Some(q) => (pattern_name(q), self.style(Role::Dim)),
+                None => ('-', self.style(Role::Dim)),
+            };
+            if playing == Some(e) {
+                st.bg = self.style(Role::PlayColumn).bg;
+            }
+            s.put(x, y, &format!("{c} "), st);
+            self.hit(x, y, 2, Target::SongCell(e));
         }
     }
 
@@ -5343,6 +5414,87 @@ mod tests {
         assert_eq!((a.song_row, a.project.part(0, 1)), (1, Part::Pattern(4)));
         click(&mut a, Target::Entry(0));
         assert_eq!((a.song_cursor, a.song_row), (0, 0));
+    }
+
+    /// A synth track in the piano roll, through the song A C B -: it
+    /// follows the entries' A, A, B, then plays C of its own in the second
+    /// and rests in the fourth.
+    fn song_line_app() -> App {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('S')]);
+        keys(&mut a, &[Key::Enter, Key::Enter, Key::Enter, Key::Enter, Key::Char('S'), Key::Char('v')]);
+        a.project.song[2] = 1;
+        a.project.tracks[0].parts[1] = Part::Pattern(2);
+        a.project.tracks[0].parts[3] = Part::Rest;
+        assert!(a.roll_active());
+        a
+    }
+
+    /// The row the song line is drawn on.
+    fn song_line_row(s: &Screen) -> u16 {
+        (0..s.height()).find(|&y| s.row_text(y).trim_start().starts_with("Song: ")).expect("a song line")
+    }
+
+    #[test]
+    fn the_piano_roll_shows_the_track_through_the_song() {
+        let mut a = song_line_app();
+        let s = frame(&a);
+        let y = song_line_row(&s);
+        let row = s.row_text(y);
+        assert!(row.starts_with(" Song: A in 1 of 4 entries"), "{row}");
+        assert_eq!(&row[row.find('│').unwrap() + '│'.len_utf8()..].trim_end(), &"A C B -");
+        let x = |e: u16| LEFT + e * 2;
+        assert_eq!(s.style_at(x(0), y), a.style(Role::Entry), "the edited pattern stands out");
+        assert_eq!(s.style_at(x(1), y), a.style(Role::Dim));
+        // The entry playing now is marked, whatever the track plays there.
+        a.play_pos = Some(PlayPosition { entry: Some(2), pattern: 1, step: 0 });
+        let s = frame(&a);
+        assert_eq!(s.style_at(x(2), y).bg, a.style(Role::PlayColumn).bg);
+        assert_ne!(s.style_at(x(1), y).bg, a.style(Role::PlayColumn).bg);
+        // The pitches end above it: the line takes one of the roll's rows.
+        assert!(s.row_text(y - 1).contains('·'), "{}", s.row_text(y - 1));
+        // A click edits the pattern the track plays in that entry.
+        click(&mut a, Target::SongCell(1));
+        assert_eq!((a.pattern, a.song_cursor), (2, 1));
+        assert!(frame(&a).row_text(y).starts_with(" Song: C in 1 of 4 entries"), "{}", frame(&a).row_text(y));
+        click(&mut a, Target::SongCell(2));
+        assert_eq!(a.pattern, 1);
+        click(&mut a, Target::SongCell(3));
+        assert_eq!(a.pattern, 1, "a rest has no pattern to edit");
+        assert!(a.status_text().unwrap().ends_with("rests in entry 4"), "{:?}", a.status_text());
+        a.pattern = 5;
+        assert!(frame(&a).row_text(y).starts_with(" Song: F in no entry"), "{}", frame(&a).row_text(y));
+    }
+
+    #[test]
+    fn the_song_line_follows_the_playing_entry_and_leaves_small_views_alone() {
+        let mut a = song_line_app();
+        for _ in 4..100 {
+            a.project.song.push(0);
+        }
+        let s = frame(&a);
+        let y = song_line_row(&s);
+        let cap = usize::from((s.width() - LEFT) / 2);
+        assert!(a.hits.borrow().iter().any(|h| h.target == Target::SongCell(0)));
+        assert!(!a.hits.borrow().iter().any(|h| h.target == Target::SongCell(cap)), "a screenful at a time");
+        a.play_pos = Some(PlayPosition { entry: Some(cap as u16 + 1), pattern: 0, step: 0 });
+        frame(&a);
+        let hits = a.hits.borrow().clone();
+        let first = hits.iter().find(|h| h.y == y && matches!(h.target, Target::SongCell(_))).unwrap();
+        assert_eq!(first.target, Target::SongCell(cap), "the page with the playing entry");
+        // The automation view ends with it too.
+        a.play_pos = None;
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(a.auto_view);
+        assert_eq!(song_line_row(&frame(&a)), y);
+        // An empty song, or a view too small for it, has none.
+        a.project.song.clear();
+        let s = frame(&a);
+        assert!(!(0..s.height()).any(|y| s.row_text(y).trim_start().starts_with("Song: ")));
+        a.project.song.push(0);
+        let mut s = Screen::new(110, MIN_H);
+        a.draw(&mut s);
+        assert!(!(0..s.height()).any(|y| s.row_text(y).trim_start().starts_with("Song: ")), "{MIN_H} rows");
     }
 
     #[test]
