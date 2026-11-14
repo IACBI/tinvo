@@ -114,6 +114,8 @@ actions! {
     SwingUp "swing_up" Global [c('G')] "swing up (50-75 %)";
     PatternShorter "pattern_shorter" Global [c('l')] "pattern length down";
     PatternLonger "pattern_longer" Global [c('L')] "pattern length up";
+    StepsFiner "steps_finer" Global [c('b')] "shorter steps for the pattern: 1/8, 1/8T, 1/16, 1/16T, 1/32";
+    StepsCoarser "steps_coarser" Global [c('B')] "longer steps for the pattern";
     NextPattern "next_pattern" Global [c('n')] "next pattern (A-P); while a pattern plays, it plays next";
     PrevPattern "prev_pattern" Global [c('N')] "previous pattern";
     SongView "song_view" Global [c('S')] "song view / back to the grid";
@@ -154,7 +156,7 @@ actions! {
     Longer "longer" Step [c('}')] "length up";
     ChanceDown "chance_down" Step [c('-')] "chance down (yellow: below 100 %)";
     ChanceUp "chance_up" Step [c('=')] "chance up";
-    Ratchet "ratchet" Step [c('/')] "ratchet: 1-4 hits per step";
+    Ratchet "ratchet" Step [c('/')] "ratchet: 1-8 hits per step";
     RollOctaveUp "roll_octave_up" Roll [PageUp] "cursor pitch up an octave";
     RollOctaveDown "roll_octave_down" Roll [PageDown] "cursor pitch down an octave";
     PointDown "point_down" Auto [c('[')] "point value down";

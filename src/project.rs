@@ -7,6 +7,7 @@
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
+//! pattern_division B 1/16T   # only patterns whose steps are not 16th notes
 //! master_gain_db 0
 //! song A A A B               # only when the song is not empty
 //! loop 2 3                   # song entries, 0-based; only when set
@@ -38,13 +39,14 @@
 //! line; relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
-//! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers) and
-//! 10 (every track plays the entry's pattern) are still read.
+//! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers),
+//! 10 (every track plays the entry's pattern) and 11 (16th-note steps, up
+//! to 4 ratchets) are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
 use crate::engine::{
-    DEFAULT_PATTERN_LEN, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
+    DEFAULT_PATTERN_LEN, Division, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
     MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Part, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
@@ -53,7 +55,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -141,6 +143,8 @@ pub struct Project {
     /// Swing in percent (50 = straight).
     pub swing: f32,
     pub pattern_lens: [u8; MAX_PATTERNS],
+    /// How long each pattern's steps are.
+    pub divisions: [Division; MAX_PATTERNS],
     pub master_gain_db: f32,
     pub tracks: Vec<TrackData>,
     /// Pattern numbers in playing order.
@@ -247,6 +251,7 @@ impl Project {
             tempo: 120.0,
             swing: MIN_SWING,
             pattern_lens: [DEFAULT_PATTERN_LEN; MAX_PATTERNS],
+            divisions: [Division::Sixteenth; MAX_PATTERNS],
             master_gain_db: 0.0,
             tracks: Vec::new(),
             song: Vec::new(),
@@ -367,6 +372,10 @@ impl Project {
                 let len = len.clamp(1, MAX_STEPS as u8);
                 *slot = len;
                 Edit::SetPatternLength { pattern, len }
+            }
+            Edit::SetPatternDivision { pattern, division } => {
+                *self.divisions.get_mut(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))? = division;
+                Edit::SetPatternDivision { pattern, division }
             }
             Edit::InsertSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
@@ -567,8 +576,20 @@ impl Project {
     }
 
     /// Steps in one pass through the song (0 if it is empty).
-    pub fn song_steps(&self) -> u64 {
-        self.song.iter().map(|&p| u64::from(self.pattern_lens[usize::from(p)])).sum()
+    /// Clock pulses in one pass of `pattern` (see [`crate::engine::PULSES_PER_BEAT`]).
+    pub fn pattern_pulses(&self, pattern: u8) -> u64 {
+        let p = usize::from(pattern).min(MAX_PATTERNS - 1);
+        u64::from(self.pattern_lens[p]) * u64::from(self.divisions[p].pulses())
+    }
+
+    /// Clock pulses in song entries `a..=b`.
+    pub fn entries_pulses(&self, a: usize, b: usize) -> u64 {
+        self.song.get(a..=b).map_or(0, |e| e.iter().map(|&p| self.pattern_pulses(p)).sum())
+    }
+
+    /// Clock pulses in the whole song.
+    pub fn song_pulses(&self) -> u64 {
+        self.song.iter().map(|&p| self.pattern_pulses(p)).sum()
     }
 
     /// The loop region, if it lies inside the song.
@@ -678,6 +699,9 @@ impl Project {
         for (p, &len) in self.pattern_lens.iter().enumerate() {
             e.push(Edit::SetPatternLength { pattern: p as u8, len });
         }
+        for (p, &division) in self.divisions.iter().enumerate() {
+            e.push(Edit::SetPatternDivision { pattern: p as u8, division });
+        }
         for (i, &pattern) in self.song.iter().enumerate() {
             e.push(Edit::InsertSongEntry { index: i as u16, pattern });
         }
@@ -701,6 +725,10 @@ impl Project {
             Edit::SetPatternLength { pattern, .. } => {
                 let len = *self.pattern_lens.get(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
                 vec![Edit::SetPatternLength { pattern, len }]
+            }
+            Edit::SetPatternDivision { pattern, .. } => {
+                let division = *self.divisions.get(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
+                vec![Edit::SetPatternDivision { pattern, division }]
             }
             Edit::InsertSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
@@ -811,6 +839,11 @@ impl Project {
         for (p, &len) in self.pattern_lens.iter().enumerate() {
             if len != DEFAULT_PATTERN_LEN {
                 let _ = writeln!(s, "pattern_length {} {len}", pattern_name(p as u8));
+            }
+        }
+        for (p, &d) in self.divisions.iter().enumerate() {
+            if d != Division::Sixteenth {
+                let _ = writeln!(s, "pattern_division {} {}", pattern_name(p as u8), d.name());
             }
         }
         let _ = writeln!(s, "master_gain_db {}", self.master_gain_db);
@@ -1030,7 +1063,7 @@ impl Project {
                             st.offset = parse_num(f[6]).map_err(err)?;
                             st.chord = parse_chord(f[7]).map_err(err)?;
                         }
-                        if st.sanitized() != st {
+                        if st.sanitized() != st || (ver < 12 && st.ratchet > 4) {
                             return Err(err("step value out of range".into()));
                         }
                         t.steps[pattern][i] = Some(st);
@@ -1085,6 +1118,15 @@ impl Project {
                         return Err(err(format!("pattern length must be 1..={MAX_STEPS}")));
                     }
                     p.pattern_lens[usize::from(which)] = v;
+                }
+                "pattern_division" if ver >= 12 => {
+                    let (name, d) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| err("expected 'pattern_division <pattern> <division>'".into()))?;
+                    let which = parse_pattern(name).map_err(err)?;
+                    let names = Division::ALL.map(Division::name).join(", ");
+                    p.divisions[usize::from(which)] = Division::from_name(d.trim())
+                        .ok_or_else(|| err(format!("unknown division '{}' (one of {names})", d.trim())))?;
                 }
                 "song" if ver >= 5 => {
                     p.song = rest.split_whitespace().map(parse_pattern).collect::<Result<_, _>>().map_err(err)?;
@@ -1375,7 +1417,7 @@ mod tests {
         p.tracks[1].parts[3] = Part::Pattern(15);
         p.tracks[4].parts[4] = Part::Pattern(0);
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 11\n"));
+        assert!(text.starts_with("tinvo 12\n"));
         assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
         assert!(text.contains("\nparts . . . . A\n"), "{text}");
         assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
@@ -1770,7 +1812,7 @@ mod tests {
         assert_eq!(p.active_loop(), Some((2, 5)));
         p.apply(Edit::RemoveSongEntry(0)).unwrap();
         assert_eq!(&p.song[..3], &[1, 2, 3]);
-        assert_eq!(p.song_steps(), (MAX_SONG as u64 - 1) * 16);
+        assert_eq!(p.song_pulses(), (MAX_SONG as u64 - 1) * 16 * 6);
     }
 
     #[test]
@@ -1801,6 +1843,56 @@ mod tests {
         // In memory and in plain text the path is kept exactly.
         assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn step_divisions_round_trip_and_older_files_use_16ths() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::HatClosed)).unwrap();
+        p.apply(Edit::SetPatternDivision { pattern: 2, division: Division::EighthTriplet }).unwrap();
+        p.apply(Edit::SetPatternLength { pattern: 2, len: 12 }).unwrap();
+        p.tracks[0].steps[2][0] = Some(Step { ratchet: 8, ..Step::new(60, 99, 1) });
+        let text = p.to_text();
+        assert!(
+            text.contains(
+                "
+pattern_division C 1/8T
+"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("pattern_division").count(), 1, "only patterns that are not 1/16");
+        let q = Project::from_text(&text).unwrap();
+        assert_eq!(q.divisions[2], Division::EighthTriplet);
+        assert_eq!(q.tracks[0].steps[2][0].unwrap().ratchet, 8);
+        assert_eq!(q.pattern_pulses(2), 12 * 8);
+        assert_eq!(q.pattern_pulses(0), 16 * 6);
+        let err = Project::from_text(
+            "tinvo 12
+pattern_division A 1/4
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown division '1/4'") && err.contains("1/16T"), "{err}");
+        // Version 11 had 16th notes only and at most four ratchets.
+        let v11 = "tinvo 11
+track synth
+step 0 48 90 2 100 4 0 -
+end
+";
+        let p = Project::from_text(v11).unwrap();
+        assert!(p.divisions.iter().all(|&d| d == Division::Sixteenth));
+        assert_eq!(p.tracks[0].steps[0][0].unwrap().ratchet, 4);
+        assert!(Project::from_text(&v11.replace(" 4 0 -", " 5 0 -")).is_err());
+        assert!(
+            Project::from_text(
+                "tinvo 11
+pattern_division A 1/8
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]

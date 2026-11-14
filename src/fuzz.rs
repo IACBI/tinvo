@@ -31,7 +31,8 @@
 
 use crate::dsp::noise::Rng;
 use crate::engine::{
-    Command, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, target_spec,
+    Command, Division, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Part, Shared, Step,
+    target_spec,
 };
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
@@ -541,6 +542,8 @@ fn project_seeds() -> Vec<Vec<u8>> {
     rich.tracks[2].parts[0] = Part::Pattern(1);
     rich.pattern_lens[1] = 7;
     rich.pattern_lens[15] = 64;
+    rich.divisions[1] = Division::EighthTriplet;
+    rich.divisions[15] = Division::ThirtySecond;
     rich.swing = 62.5;
     rich.mix[mp::LIMITER] = MIX_PARAMS[mp::LIMITER].max;
     rich.mix[mp::REVERB_DECAY] = MIX_PARAMS[mp::REVERB_DECAY].max;
@@ -1065,7 +1068,7 @@ impl Script<'_> {
             velocity: self.byte(),
             length: self.byte(),
             chance: self.byte(),
-            ratchet: self.byte() % 6,
+            ratchet: self.byte() % 10,
             offset: self.byte() as i8,
             chord: [self.byte() % 40, self.byte() % 40, self.byte() % 40],
         })
@@ -1088,7 +1091,8 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let kind_of = |t: u8| p.tracks.get(usize::from(t)).map(|t| t.kind);
     let edit = match s.below(24) {
         0 => Edit::SetTempo(s.f32()),
-        1 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
+        1 if s.byte() & 1 == 0 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
+        1 => Edit::SetPatternDivision { pattern, division: Division::ALL[s.below(Division::ALL.len())] },
         2 => Edit::SetMasterGain(s.f32()),
         3 => Edit::SetSwing(s.f32()),
         4 => Edit::AddTrack(s.kind()),

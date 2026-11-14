@@ -27,8 +27,8 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 
 ### Features
 
-- 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
-- Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–4 hits) and micro-timing (up to half a step early or late).
+- 16 tracks, up to 64 steps per pattern, tempo 20–300 BPM, swing 50–75 %. Each pattern has its own step length: 1/8, 1/8 triplets, 1/16, 1/16 triplets or 1/32.
+- Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–8 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
 - 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. In any entry a track can play a pattern of its own or rest. Patterns switch at the end of the bar while playing.
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
@@ -110,6 +110,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `v` | piano roll for the track (`↑` `↓` pitch, `Enter` adds or removes a note); its last line shows what the track plays in each song entry |
 | `u` `U` | undo / redo (also `Ctrl+Z` / `Ctrl+Y`) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern length |
+| `b` `B` | shorter / longer steps for the pattern (1/8 to 1/32) |
 | `n` `N` | next / previous pattern |
 | `y` `Y` `X` | copy / paste / clear the pattern |
 | `S` | song view: entries across, tracks down (`←` `→` entry, `↑` `↓` the song's row or a track's, `,` `.` the entry's pattern, or on a track row its own pattern, the entry's or a rest; `Enter` repeat, `Del` remove the entry or make the track follow it, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section) |
@@ -126,7 +127,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `F2` `P` | settings: keys, colours and the mouse |
 | `q` | quit |
 
-The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point, and on their song line it opens the pattern the track plays in that entry. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern and length in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
+The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point, and on their song line it opens the pattern the track plays in that entry. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern, length and step length in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
 
 ### Configuration
 
@@ -178,8 +179,8 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 
 ### Özellikler
 
-- 16 kanal, 64'e kadar 16'lık adım, 20–300 BPM tempo, %50–75 swing.
-- Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–4 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
+- 16 kanal, pattern başına 64'e kadar adım, 20–300 BPM tempo, %50–75 swing. Her pattern'in kendi adım uzunluğu var: 1/8, 1/8 triole, 1/16, 1/16 triole ya da 1/32.
+- Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–8 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
 - 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Her girişte bir kanal kendi pattern'ini çalabilir ya da susabilir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
@@ -261,6 +262,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `v` | kanalın piyano rulosu (`↑` `↓` perde, `Enter` nota ekler ya da siler); son satırı kanalın her şarkı girişinde ne çaldığını gösterir |
 | `u` `U` | geri al / yinele (`Ctrl+Z` / `Ctrl+Y` de olur) |
 | `t` `T` / `g` `G` / `l` `L` | tempo / swing / pattern uzunluğu |
+| `b` `B` | pattern'in adımlarını kısaltır / uzatır (1/8'den 1/32'ye) |
 | `n` `N` | sonraki / önceki pattern |
 | `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
 | `S` | şarkı görünümü: girişler yan yana, kanallar alt alta (`←` `→` giriş, `↑` `↓` şarkı satırı ya da bir kanalın satırı, `,` `.` girişin pattern'i, kanal satırında ise kanalın kendi pattern'i, girişinki ya da sus; `Enter` tekrarla, `Del` girişi sil ya da kanalı girişe uydur, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al) |
@@ -277,7 +279,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `F2` `P` | ayarlar: tuşlar, renkler ve fare |
 | `q` | çık |
 
-Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler; bu iki görünümün şarkı satırında ise kanalın o girişte çaldığı pattern'i açar. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern ve uzunluk, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
+Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler; bu iki görünümün şarkı satırında ise kanalın o girişte çaldığı pattern'i açar. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern, uzunluk ve adım uzunluğu, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
 
 ### Yapılandırma
 
