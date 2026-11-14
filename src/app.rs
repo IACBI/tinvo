@@ -503,6 +503,9 @@ pub struct App {
     settings_page: SettingsPage,
     /// The settings page changed something not yet written.
     settings_changed: bool,
+    /// The settings as loaded or last written: what the page's changes are
+    /// measured from when they are merged into the file.
+    settings_saved: Settings,
     /// How many lines of the key list the last frame showed, so scrolling
     /// stops where the end is in view.
     help_rows: Cell<usize>,
@@ -660,6 +663,7 @@ impl App {
             settings_path: None,
             settings_page: SettingsPage::default(),
             settings_changed: false,
+            settings_saved: Settings::default(),
             help_rows: Cell::new(1),
             hits: RefCell::new(Vec::new()),
             roll_top: Cell::new(None),
@@ -670,6 +674,7 @@ impl App {
 
     /// Uses the key bindings and colours of `settings`.
     pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.settings_saved = settings.clone();
         self.keys = settings.keys;
         self.theme = settings.theme;
         self.theme_base = settings.base;
@@ -1963,8 +1968,16 @@ impl App {
     }
 
     /// The settings page: arrows, Enter, Del, `r` and Esc always work there
-    /// (so no binding can lock the page), and so do the cursor's own keys.
+    /// and come first, so no binding can lock the page; other keys work as
+    /// the settings and quit keys or the cursor's own keys.
     fn key_settings(&mut self, key: Key) {
+        enum Op {
+            Move(isize),
+            Tab(bool),
+            Enter,
+            Remove,
+            Reset,
+        }
         let page = &mut self.settings_page;
         if page.capture {
             page.capture = false;
@@ -1976,30 +1989,53 @@ impl App {
             }
             return;
         }
-        if key == Key::Esc || self.keys.is(Action::Quit, key) || self.keys.is(Action::Settings, key) {
-            self.close_settings();
-            return;
-        }
-        let a = self.keys.action(&[Context::Nav], key);
+        let fixed = match key {
+            Key::Esc => {
+                self.close_settings();
+                return;
+            }
+            Key::Up => Some(Op::Move(-1)),
+            Key::Down => Some(Op::Move(1)),
+            Key::PageUp => Some(Op::Move(-10)),
+            Key::PageDown => Some(Op::Move(10)),
+            Key::Home => Some(Op::Move(isize::MIN / 2)),
+            Key::End => Some(Op::Move(isize::MAX / 2)),
+            Key::Left | Key::BackTab => Some(Op::Tab(false)),
+            Key::Right | Key::Tab => Some(Op::Tab(true)),
+            Key::Enter => Some(Op::Enter),
+            Key::Delete | Key::Backspace => Some(Op::Remove),
+            Key::Char('r') => Some(Op::Reset),
+            _ => None,
+        };
+        let op = match fixed {
+            Some(op) => op,
+            None if self.keys.is(Action::Quit, key) || self.keys.is(Action::Settings, key) => {
+                self.close_settings();
+                return;
+            }
+            None => match self.keys.action(&[Context::Nav], key) {
+                Some(Action::Up) => Op::Move(-1),
+                Some(Action::Down) => Op::Move(1),
+                Some(Action::First) => Op::Move(isize::MIN / 2),
+                Some(Action::Last) => Op::Move(isize::MAX / 2),
+                Some(Action::Left) => Op::Tab(false),
+                Some(Action::Right) => Op::Tab(true),
+                Some(Action::Enter) => Op::Enter,
+                Some(Action::Clear) => Op::Remove,
+                _ => return,
+            },
+        };
         let tabs = SettingsTab::ALL.len();
         let tab = self.settings_page.tab as usize;
-        match (a, key) {
-            (Some(Action::Up), _) | (_, Key::Up) => self.settings_move(-1),
-            (Some(Action::Down), _) | (_, Key::Down) => self.settings_move(1),
-            (_, Key::PageUp) => self.settings_move(-10),
-            (_, Key::PageDown) => self.settings_move(10),
-            (Some(Action::First), _) | (_, Key::Home) => self.settings_move(isize::MIN / 2),
-            (Some(Action::Last), _) | (_, Key::End) => self.settings_move(isize::MAX / 2),
-            (Some(Action::Left), _) | (_, Key::Left | Key::BackTab) => {
-                self.settings_page.tab = SettingsTab::ALL[(tab + tabs - 1) % tabs];
+        match op {
+            Op::Move(by) => self.settings_move(by),
+            Op::Tab(next) => {
+                let to = if next { tab + 1 } else { tab + tabs - 1 };
+                self.settings_page.tab = SettingsTab::ALL[to % tabs];
             }
-            (Some(Action::Right), _) | (_, Key::Right | Key::Tab) => {
-                self.settings_page.tab = SettingsTab::ALL[(tab + 1) % tabs];
-            }
-            (Some(Action::Enter), _) | (_, Key::Enter) => self.settings_enter(),
-            (Some(Action::Clear), _) | (_, Key::Delete | Key::Backspace) => self.settings_remove(),
-            (_, Key::Char('r')) => self.settings_reset(),
-            _ => {}
+            Op::Enter => self.settings_enter(),
+            Op::Remove => self.settings_remove(),
+            Op::Reset => self.settings_reset(),
         }
     }
 
@@ -2025,6 +2061,15 @@ impl App {
         let mut list = self.keys.keys(a).to_vec();
         if list.contains(&key) {
             self.set_status(format!("{} is already a key of {}", crate::keymap::key_label(key), a.id()));
+            return;
+        }
+        // Some terminals send a key the settings file has no name for
+        // (Ctrl+M is Enter there, for one); it could not be saved.
+        if crate::keymap::parse_key(&crate::keymap::key_name(key)) != Ok(key) {
+            self.set_status(format!(
+                "Not changed: {} cannot be written in the settings file",
+                crate::keymap::key_label(key)
+            ));
             return;
         }
         list.push(key);
@@ -2133,23 +2178,35 @@ impl App {
         }
     }
 
-    /// Writes the settings in use into the settings file, keeping its
-    /// comments and the lines that did not change.
-    fn write_settings(&self) -> Result<String, String> {
-        let Some(path) = &self.settings_path else {
+    /// Writes what the settings page changed into the settings file, keeping
+    /// its comments, the lines that did not change and whatever another
+    /// session saved there meanwhile, which this session then takes up too.
+    fn write_settings(&mut self) -> Result<String, String> {
+        let Some(path) = self.settings_path.clone() else {
             return Ok("Settings apply until TINVO quits: there is no settings folder (no APPDATA or HOME)".into());
         };
-        let old = match std::fs::read_to_string(path) {
+        let old = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let text = settings_mod::update_text(&old, &self.settings())?;
+        let theirs = settings_mod::parse(&old)
+            .map_err(|e| format!("the settings file has a mistake ({e}); it was not changed"))?;
+        let ours = self.settings();
+        let merged = settings_mod::merge(&self.settings_saved, &ours, &theirs);
+        merged.keys.check().map_err(|e| format!("another session changed the settings file, and with it {e}"))?;
+        let text = settings_mod::update_text(&old, &merged)?;
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        crate::fsutil::write_atomic(path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(format!("Settings saved to {}", path.display()))
+        crate::fsutil::write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        let also = if merged == ours { "" } else { ", with what another session saved there" };
+        if merged.mouse != self.mouse {
+            self.mouse_request = Some(merged.mouse);
+        }
+        self.settings_saved = merged.clone();
+        (self.keys, self.theme, self.theme_base, self.mouse) = (merged.keys, merged.theme, merged.base, merged.mouse);
+        Ok(format!("Settings saved to {}{also}", path.display()))
     }
 
     fn rename_track(&mut self, text: &str) {
@@ -6383,6 +6440,67 @@ mod tests {
             a.status_text()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[keys]\nundoo = u\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_settings_page_s_own_keys_come_before_bindings() {
+        let mut a = app();
+        a.keys.bind(Action::Up, vec![Key::Enter]);
+        a.keys.bind(Action::Enter, vec![Key::F(11)]);
+        a.keys.check().unwrap();
+        keys(&mut a, &[Key::F(2)]);
+        to_action(&mut a, Action::Undo);
+        let row = a.settings_page.cursor[0];
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.settings_page.capture, "Enter still adds a key");
+        assert_eq!(a.settings_page.cursor[0], row);
+        keys(&mut a, &[Key::Esc, Key::F(11)]);
+        assert!(a.settings_page.capture, "and so does a key bound to enter");
+        // A key the settings file cannot name is refused.
+        keys(&mut a, &[Key::Ctrl('m')]);
+        assert_eq!(a.keys.keys(Action::Undo), Action::Undo.defaults());
+        assert!(
+            a.status_text().unwrap().ends_with("Ctrl+M cannot be written in the settings file"),
+            "{:?}",
+            a.status_text()
+        );
+    }
+
+    #[test]
+    fn closing_the_settings_page_keeps_what_another_session_saved() {
+        let dir = std::env::temp_dir().join(format!("tinvo-settings-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tinvo.conf");
+        let mut first = app().with_settings_file(Some(path.clone()));
+        let mut second = app().with_settings_file(Some(path.clone()));
+        keys(&mut first, &[Key::F(2), Key::Left, Key::Enter, Key::Esc]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[options]\nmouse = off\n");
+        keys(&mut second, &[Key::F(2)]);
+        to_action(&mut second, Action::Redo);
+        keys(&mut second, &[Key::Delete, Key::Esc]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[options]\nmouse = off\n\n[keys]\nredo = U\n");
+        assert!(
+            second.status_text().unwrap().ends_with("with what another session saved there"),
+            "{:?}",
+            second.status_text()
+        );
+        assert_eq!((second.mouse, second.take_mouse_request()), (false, Some(false)), "the second session takes it up");
+        // A change the other session saved that clashes with this one's is
+        // not written over.
+        let other = "[options]\nmouse = off\n\n[keys]\nredo = U f11\n";
+        std::fs::write(&path, other).unwrap();
+        keys(&mut first, &[Key::F(2)]);
+        first.settings_page.tab = SettingsTab::Keys;
+        to_action(&mut first, Action::Undo);
+        keys(&mut first, &[Key::Enter, Key::F(11), Key::Esc]);
+        let status = first.status_text().unwrap();
+        assert!(status.starts_with("Settings not saved"), "{status}");
+        assert!(
+            status.contains("another session changed the settings file, and with it f11 is bound to both"),
+            "{status}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), other);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

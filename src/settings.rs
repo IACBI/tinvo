@@ -220,6 +220,34 @@ impl Settings {
     }
 }
 
+/// `theirs` (the settings file as it is now) with the changes from `base`
+/// (as it was loaded) to `ours` (what this session made of it): a setting
+/// this session did not change keeps what another session may have written
+/// meanwhile. A colour counts as changed only if it differs from what a
+/// change of base theme alone gives.
+pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Settings {
+    let mut out = theirs.clone();
+    let mut rebased = base.clone();
+    if ours.base != base.base {
+        out.set_base(ours.base);
+        rebased.set_base(ours.base);
+    }
+    for &a in Action::ALL.iter() {
+        if ours.keys.keys(a) != base.keys.keys(a) {
+            out.keys.bind(a, ours.keys.keys(a).to_vec());
+        }
+    }
+    for &r in Role::ALL.iter() {
+        if ours.theme.get(r) != rebased.theme.get(r) {
+            out.theme.set(r, ours.theme.get(r));
+        }
+    }
+    if ours.mouse != base.mouse {
+        out.mouse = ours.mouse;
+    }
+    out
+}
+
 /// What a setting's line says, as the file writes it.
 fn keys_value(keys: &Keymap, a: Action) -> String {
     keys.keys(a).iter().map(|&k| keymap::key_name(k)).collect::<Vec<_>>().join(" ")
@@ -392,6 +420,31 @@ mod tests {
             t.set(Role::Cursor, Style::fg(Color::Green));
             t
         });
+    }
+
+    #[test]
+    fn a_merge_keeps_what_another_session_saved() {
+        let base = Settings::default();
+        let mut ours = base.clone();
+        ours.keys.bind(Action::Undo, vec![Key::Char('z')]);
+        ours.set_base("light");
+        ours.theme.set(Role::Cursor, Style::fg(Color::Red));
+        let mut theirs = base.clone();
+        theirs.mouse = false;
+        theirs.keys.bind(Action::Redo, vec![Key::Char('Z')]);
+        theirs.theme.set(Role::Title, Style::fg(Color::Green));
+        theirs.keys.bind(Action::Undo, vec![Key::Char('y')]);
+        let out = merge(&base, &ours, &theirs);
+        assert!(!out.mouse, "untouched here, so theirs");
+        assert_eq!(out.keys.keys(Action::Redo), [Key::Char('Z')]);
+        assert_eq!(out.keys.keys(Action::Undo), [Key::Char('z')], "changed here, so ours");
+        assert_eq!(out.base, "light");
+        assert_eq!(out.theme.get(Role::Cursor), Style::fg(Color::Red));
+        assert_eq!(out.theme.get(Role::Title), Style::fg(Color::Green), "their own colour survives the new base");
+        let light = Theme::built_in("light").unwrap();
+        assert_eq!(out.theme.get(Role::Header), light.get(Role::Header));
+        assert_eq!(merge(&base, &base, &theirs), theirs, "no change here leaves theirs");
+        assert_eq!(merge(&base, &ours, &base), ours, "no change there gives ours");
     }
 
     #[test]
