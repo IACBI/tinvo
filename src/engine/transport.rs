@@ -66,7 +66,10 @@ impl Transport {
 
     pub fn set_tempo(&mut self, bpm: f32, sample_rate: f32, now: u64) {
         if self.playing {
-            self.origin_step = self.position_at(now).min(self.next_step as f64);
+            // Swing delays an odd step past its straight position: the
+            // playhead may be anywhere up to the step's swung start.
+            let next = self.next_step as f64 + self.swing_of(self.next_step);
+            self.origin_step = self.position_at(now).min(next);
             self.origin_frame = now;
         }
         self.samples_per_step = Self::samples_per_step(bpm, sample_rate);
@@ -77,10 +80,14 @@ impl Transport {
         self.origin_step + frame.saturating_sub(self.origin_frame) as f64 / self.samples_per_step
     }
 
+    /// How far swing delays absolute step `step`, in steps.
+    fn swing_of(&self, step: u64) -> f64 {
+        if step % 2 == 1 { self.swing_delay } else { 0.0 }
+    }
+
     /// Frame at which absolute step `step` starts (including swing).
     pub fn frame_of_step(&self, step: u64) -> u64 {
-        let swing = if step % 2 == 1 { self.swing_delay } else { 0.0 };
-        let offset = ((step as f64 + swing - self.origin_step) * self.samples_per_step).round();
+        let offset = ((step as f64 + self.swing_of(step) - self.origin_step) * self.samples_per_step).round();
         self.origin_frame + offset.max(0.0) as u64
     }
 
@@ -126,6 +133,22 @@ mod tests {
             last = f;
             t.advance();
         }
+    }
+
+    #[test]
+    fn a_tempo_change_while_a_swung_step_waits_keeps_the_way_already_gone() {
+        // 120 BPM, 75 % swing: step 1 is due at 9000. At 7500 the playhead
+        // is three quarters of the way there; at twice the tempo the last
+        // quarter (1500 frames before) takes 750.
+        let mut t = Transport::new(120.0, 48_000.0);
+        t.set_swing(75.0);
+        t.start(0);
+        assert_eq!(t.advance(), 0);
+        assert_eq!(t.next_step_frame(), Some(9000));
+        t.set_tempo(240.0, 48_000.0, 7500);
+        assert_eq!(t.next_step_frame(), Some(8250));
+        t.advance();
+        assert_eq!(t.next_step_frame(), Some(8250 + 3000 - 1500), "step 2 is straight again");
     }
 
     #[test]

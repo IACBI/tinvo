@@ -241,8 +241,14 @@ impl Limiter {
         self.released = wanted.min(self.released + (1.0 - self.released) * (1.0 - self.release));
         let g = self.released;
 
-        // Running minimum over the last `window` frames.
+        // Running minimum over the last `window` frames. The frame leaving
+        // the window goes first, so a long rise in gain (a release) cannot
+        // fill the ring and overwrite the minimum.
         let n = self.window;
+        if self.min_len > 0 && self.min_frame[self.min_head] + n as u64 <= self.frame {
+            self.min_head = (self.min_head + 1) % n;
+            self.min_len -= 1;
+        }
         while self.min_len > 0 {
             let back = (self.min_head + self.min_len - 1) % n;
             if self.min_gain[back] < g {
@@ -254,10 +260,6 @@ impl Limiter {
         self.min_frame[slot] = self.frame;
         self.min_gain[slot] = g;
         self.min_len += 1;
-        if self.min_frame[self.min_head] + n as u64 <= self.frame {
-            self.min_head = (self.min_head + 1) % n;
-            self.min_len -= 1;
-        }
         let hold = self.min_gain[self.min_head];
         self.frame += 1;
 
@@ -380,6 +382,37 @@ mod tests {
         let worst = gains.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
         assert!(worst < 0.01, "{worst}");
         assert!(l.gain_reduction_db() > -0.1, "{}", l.gain_reduction_db());
+    }
+
+    #[test]
+    fn the_running_minimum_holds_through_a_long_release() {
+        // A slow release raises the gain on every frame for many windows:
+        // the minimum stays the true minimum of the last window, so a second
+        // hit is still held to the ceiling.
+        let mut l = Limiter::new(SR);
+        l.set(-1.0, 0.5);
+        l.set_enabled(true);
+        l.mix = 1.0;
+        let mut x = stereo_sine(200.0, 4.0, 0.0, 4800);
+        x.extend(stereo_sine(200.0, 0.05, 0.0, 48_000));
+        x.extend(stereo_sine(3000.0, 4.0, 0.3, 4800));
+        let mut y = x.clone();
+        let mut gains = Vec::new();
+        for c in y.chunks_mut(2) {
+            l.process(c);
+            assert!(l.min_len <= l.window, "{} entries in a ring of {}", l.min_len, l.window);
+            gains.push(l.released);
+        }
+        assert!(true_peak_db(&y) <= -1.0 + 0.05, "{}", true_peak_db(&y));
+        // The held gain is the least gain of the window, frame by frame.
+        let mut l2 = Limiter::new(SR);
+        l2.set(-1.0, 0.5);
+        for (i, f) in x.chunks(2).enumerate() {
+            l2.gain(f[0], f[1]);
+            let lo = i.saturating_sub(l2.window - 1);
+            let want = gains[lo..=i].iter().copied().fold(1.0f32, f32::min);
+            assert_eq!(l2.min_gain[l2.min_head], want, "frame {i}");
+        }
     }
 
     #[test]

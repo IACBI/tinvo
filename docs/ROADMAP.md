@@ -258,7 +258,7 @@ Known limits:
 - A track's own pattern always starts on the entry's first step; it cannot start part-way or carry on from the entry before.
 - The play column in the grid, piano roll and automation view shows the selected pattern only for tracks playing it. (The piano roll and the automation view show the rest of the song on their song line since phase 8d.)
 
-## Phase 8a: Hardware check
+## Phase 8a: Hardware check ✅ (0.22.0)
 
 - `tinvo loopback [AUDIO] [--input NAME]` plays five 0.1 s sweeps (500 Hz to 8 kHz, −12 dBFS) on an output and finds them in what an input hears, by cross-correlation summed over the whole train. It shows that the output and the input work end to end and measures the round trip: from TINVO handing a frame to the output to the input handing it back. Each stream's clock is the median of its callbacks' times, so the scheduler's jitter does not move the result.
 - The sweeps start at the marks of a Golomb ruler (0, 1, 4, 9 and 11 times 0.2 s), where no two pairs are the same distance apart: a train placed wrongly lines up with one sweep at most, so two sweeps heard where they belong fix where it is even when others are lost. A sweep counts as heard when it stands out and each of its halves (500 Hz to 2 kHz, 2 to 8 kHz) stands out on its own there, which a lone tone or click does not; at least two must be heard. Both channels of a stereo input are searched.
@@ -276,7 +276,7 @@ Known limits:
 - The output and the input must run at the same rate; `loopback` says so when they do not, as it does not resample.
 - No MIDI device and no second machine were available: WinMM, ALSA and CoreMIDI input have still never received a real message, and ALSA and CoreAudio still have not run on real hardware.
 
-## Phase 8b: Project lock
+## Phase 8b: Project lock ✅ (0.22.0)
 
 - A session holds `song.tvo.lock` next to its project: an exclusive `flock` on Linux and macOS, a handle that shares no writing on Windows. The system lets go of both when the process ends, however it ends, so a crash never leaves the project locked. The file names the process holding it. A symbolic link, a hard link or anything but a plain file at the lock's name is refused, never followed, so the lock cannot be made to overwrite another file.
 - Opening a project another session has open is refused, naming that process; so is saving over one. Saving under a new name moves the lock to the new file. Another spelling of the same path (`./song.tvo`) is the same project.
@@ -289,7 +289,7 @@ Known limits:
 - `flock` on a network file system may lock only on one machine, depending on the server; the Windows lock covers SMB shares.
 - `tinvo render` reads a project without locking it, so it can export one a session is editing; it reads the last saved file.
 
-## Phase 8c: Settings page
+## Phase 8c: Settings page ✅ (0.22.0)
 
 - `F2` (or `P`) opens a page with three tabs: Keys, every action by context with its keys; Colours, the base theme and each role's style with a sample; Options, the mouse. `Enter` adds a key (the next key pressed) or changes a value, `Del` removes an action's last key, `r` puts back the default, `Esc` closes. An entry that differs from the default is marked `*`.
 - A change works at once: a new key is bound, a colour is drawn, the mouse is turned on or off in the running terminal. A key that would be ambiguous, or a style that does not read, is refused with the same message the settings file gives, and nothing changes. The settings page and quit always keep one key.
@@ -301,7 +301,7 @@ Known limits:
 - Not tried by hand in a real console: the keys and drawing are unit-tested on a frame, and switching the mouse on and off at runtime is not checked in a real terminal.
 - A key the terminal does not send (some `Ctrl` and `Alt` combinations) cannot be added from the page, only typed into the file.
 
-## Phase 8d: The song in the piano roll
+## Phase 8d: The song in the piano roll ✅ (0.22.0)
 
 - The piano roll and the automation view end with a song line: the pattern the selected track plays in each song entry, after its own part, the entry's pattern or a rest (`-`). Entries where it plays the pattern being edited stand out, and the label says how many there are (`Song: B in 3 of 8 entries`). The entry playing now is in the play column's colour, so while the song plays it shows where the track is even when that is another pattern.
 - A click on an entry opens the pattern the track plays there; on a rest it says so.
@@ -311,6 +311,20 @@ Known limits:
 Known limits:
 - The line shows one track; the song view shows them all.
 - Markers and the loop region are not drawn on it.
+
+## Phase 8e: Review ✅ (0.22.0)
+
+A review of the whole project. Each finding was checked against the code and fixed with a test that fails without the fix:
+- Audio: the limiter's running minimum kept within its ring through long releases; send sums cleared whole, so a short block cannot leave old input for a longer one; buses and the master run segment by segment, so their automation lands on its frame at any buffer size; each synth voice has its own noise; a stepped strip setting jumps instead of gliding forever.
+- Timing and export: a tempo change keeps a swung step's position; the export tail waits until the delay, reverb and chorus are idle; stems drop lanes that would turn the limiter on.
+- Live input: closing or switching the MIDI input, or a release lost to a full queue, releases every live note and resets step entry.
+- Editing: loading a changed file again reaches every track using it; the parameter cursor is kept in range after a finished recording selects its track.
+- Security: control characters in error messages are escaped.
+- Screen: wide characters take two cells and combining marks none; the panel pages on small terminals; prompts keep the typed text in view; titles, bus parameter names and the settings page's messages fit.
+
+Known limits:
+- Character widths come from the common ranges (CJK, Hangul, full-width forms, emoji, combining marks), not Unicode's full tables; terminals also differ on some characters.
+- Closing a real MIDI input was not tried here (no MIDI device on the development machine); the release on closing and on a lost message are unit-tested.
 
 ## Known limitations of the foundation
 

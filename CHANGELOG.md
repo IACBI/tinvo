@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-14
+
 ### Added
 - `tinvo loopback [AUDIO] [--input NAME]` plays five short sweeps on an output and finds them in what an input hears, on either channel: it shows that both work end to end and measures the round-trip latency between them. At least two sweeps must be heard, each across its whole band.
 - `tinvo probe` reports the longest gap between callbacks, and warns when it was longer than the device's buffer.
@@ -16,6 +18,21 @@ Author: 𝓐.𝓒.𝓑
 
 ### Fixed
 - Two sessions on one project, or two untitled ones, no longer write the same autosave, and a session started while another runs is no longer offered the running one's autosave.
+- The master limiter's running minimum could overflow its ring during a long release, letting a later peak through and making the next attack scan thousands of entries on the audio thread.
+- A delay, reverb or chorus tail could replay old send input after a short audio block.
+- Automated bus and master settings changed up to a block early, depending on the buffer size; they now change on their own frame, in playback and export alike.
+- Synth noise in a chord depended on the buffer size, so playback and export differed.
+- Exports no longer end before a long delay's echo that follows a quiet spell.
+- Stems are never limited, even where a lane turns the limiter on.
+- A tempo change while a swung step was due moved that step late.
+- Loading a changed WAV file again now changes it for every track using it, in playback as in export.
+- Turning a MIDI input off or switching it, or a release lost to a full queue, no longer leaves notes held.
+- A finished recording that selects its track could leave the parameter cursor out of range and crash on the next key.
+- A stepped strip setting (the compressor's key) never settled, so the strip recomputed its filters for good.
+- Error messages escape control characters, so a crafted project file cannot send escape sequences to the terminal.
+- Wide characters (CJK, emoji) in names take two columns and combining marks none, so the screen stays aligned.
+- On a small terminal the parameter panel pages to the selected parameter instead of running off the screen, and a prompt keeps what is typed in view.
+- The piano roll and automation titles no longer cut the key back to the grid, bus parameter names are no longer cut, and the settings page no longer shows the last view's message.
 
 ## [0.21.0] - 2026-11-14
 
@@ -291,7 +308,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/IACBI/tinvo/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/IACBI/tinvo/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/IACBI/tinvo/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/IACBI/tinvo/compare/v0.18.0...v0.19.0

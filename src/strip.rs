@@ -13,7 +13,7 @@
 use crate::dsp::biquad::{Biquad, Coefs, Shape};
 use crate::dsp::drive::Drive;
 use crate::dsp::dynamics::Compressor;
-use crate::instrument::{InstrumentKind, ParamSpec, Unit};
+use crate::instrument::{InstrumentKind, ParamScale, ParamSpec, Unit};
 use crate::mix::{SEND_PARAMS, send};
 
 /// Parameter indices.
@@ -215,6 +215,12 @@ impl Strip {
         for (i, spec) in PARAMS.iter().enumerate() {
             let (c, t) = (self.current[i], self.target[i]);
             if c == t {
+                continue;
+            }
+            // A choice cannot glide: part-way it would round back to where
+            // it started, and the strip would never settle.
+            if let ParamScale::Stepped(_) = spec.scale {
+                self.current[i] = t;
                 continue;
             }
             // Glide in the parameter's own scale (log for frequencies).
@@ -507,6 +513,21 @@ mod tests {
         let mut y = vec![level; (seconds * SR) as usize];
         run(s, &mut y);
         y
+    }
+
+    #[test]
+    fn a_choice_settles_at_once() {
+        // Switching the compressor's key and back leaves a neutral strip
+        // that settles and drops out of the chain.
+        let mut s = Strip::new(SR);
+        s.snap();
+        s.set_param(sp::COMP_KEY, 1.0);
+        hold(&mut s, 0.1, 0.05);
+        assert!(s.settled && s.current[sp::COMP_KEY] == 1.0);
+        s.set_param(sp::COMP_KEY, 0.0);
+        hold(&mut s, 0.1, 0.05);
+        assert!(s.settled && s.current[sp::COMP_KEY] == 0.0);
+        assert!(!s.is_active(), "a neutral strip is bypassed again");
     }
 
     #[test]
