@@ -501,10 +501,10 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_loopback(args: &[String]) -> Result<(), String> {
-    use tinvo::loopback::{self, HEARD};
+    use tinvo::loopback::{self, MARKS, MIN_HEARD};
     use tinvo::record::{self as rec, Meter, RING_FRAMES};
     use tinvo::rt::spsc;
-    const SWEEPS: usize = 5;
+    const SWEEPS: usize = MARKS.len();
     const LEVEL: f32 = 0.25;
     let (config, args) = audio_options(args)?;
     let (input, rest) = input_option(args)?;
@@ -561,9 +561,8 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
     let played = Arc::new(AtomicU64::new(0));
     let p = played.clone();
     let outstream = audio::open_with(&config, move |rate| {
-        let r = u64::from(rate);
-        // Half a second to settle, then a sweep every 0.4 s.
-        let starts = std::array::from_fn(|k| r / 2 + k as u64 * (r * 2 / 5));
+        // Half a second to settle, then the sweeps at the ruler's marks.
+        let starts = loopback::offsets(rate).map(|o| u64::from(rate) / 2 + o as u64);
         Sweeps { sweep: loopback::sweep(rate, LEVEL), starts, frame: 0, times: out_tx, played: p }
     })?;
     let out_info = outstream.info().clone();
@@ -586,12 +585,14 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
     }
     println!("Playing {SWEEPS} short sweeps at -12 dBFS ...");
     let r = u64::from(rate);
-    let spacing = r * 2 / 5;
+    let offsets = loopback::offsets(rate);
     let sweep = loopback::sweep(rate, LEVEL);
     // Up to a second for the last sweep to come back.
-    let end = r / 2 + (SWEEPS as u64 - 1) * spacing + sweep.len() as u64 + r;
+    let end = r / 2 + offsets[SWEEPS - 1] as u64 + sweep.len() as u64 + r;
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut heard = Vec::new();
+    // Both channels: the signal may come into either of a stereo input.
+    let mut heard: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    let channels = usize::from(in_info.channels);
     while played.load(Ordering::Acquire) < end {
         if Instant::now() > deadline {
             return Err("the output stopped asking for audio".into());
@@ -600,14 +601,16 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
             return Err(format!("stream failed: {e}"));
         }
         while let Some(f) = rx.pop() {
-            heard.push(f[0]);
+            heard[0].push(f[0]);
+            heard[1].push(f[1]);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(outstream);
     drop(instream);
     while let Some(f) = rx.pop() {
-        heard.push(f[0]);
+        heard[0].push(f[0]);
+        heard[1].push(f[1]);
     }
     let (mut in_times, mut out_times) = (Vec::new(), Vec::new());
     while let Some(t) = in_rx.pop() {
@@ -630,32 +633,49 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
     let (Some(out_zero), Some(in_zero)) = (out_zero, in_zero) else {
         return Err("no audio came through".into());
     };
-    let peak = heard.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-    let peak_db = if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "silence".into() };
     let slack = rate as usize / 1000;
-    let train = loopback::find_train(&heard, &sweep, SWEEPS, spacing as usize, slack)
-        .ok_or("the input delivered too little audio")?;
-    let count = train.clarity.iter().filter(|&&c| c >= HEARD).count();
-    println!("Input peak {peak_db}; heard {count} of {SWEEPS} sweeps (clarity {:.0})", train.train_clarity);
-    if train.train_clarity < HEARD {
-        return Err(
-            "the sweeps were not heard: turn the output up, unmute the input, or move the microphone nearer".into()
-        );
+    // The channel that heard more of the sweeps, or more clearly.
+    let mut best = None;
+    for (c, samples) in heard.iter().enumerate().take(channels) {
+        let train =
+            loopback::find_train(samples, &sweep, &offsets, slack).ok_or("the input delivered too little audio")?;
+        let peak = samples.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let better = |(_, t, _): &(usize, loopback::Train, f32)| {
+            (train.heard_count(), train.train_clarity) > (t.heard_count(), t.train_clarity)
+        };
+        if best.as_ref().is_none_or(better) {
+            best = Some((c, train, peak));
+        }
     }
-    // A sweep the input's noise suppression swallowed has no peak of its own.
-    let all = count == 0;
-    let mut latencies: Vec<f64> = train
-        .starts
-        .iter()
-        .enumerate()
-        .filter(|&(k, _)| all || train.clarity[k] >= HEARD)
-        .map(|(k, &n)| {
-            let played_at = out_zero + (r / 2 + k as u64 * spacing) as f64 / fr;
-            in_zero + n as f64 / fr - played_at
+    let (channel, train, peak) = best.ok_or("the input has no channels")?;
+    let peak_db = if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "silence".into() };
+    let on = if channels > 1 { format!(" on input channel {}", channel + 1) } else { String::new() };
+    println!(
+        "Input peak {peak_db}; heard {} of {SWEEPS} sweeps{on} (clarity {:.0})",
+        train.heard_count(),
+        train.train_clarity
+    );
+    if !train.is_heard() {
+        return Err(format!(
+            "fewer than {MIN_HEARD} sweeps were heard: turn the output up, unmute the input, move the microphone nearer, or turn off the input's noise removal"
+        ));
+    }
+    // Only sweeps heard count: a lost one has no peak of its own.
+    let mut latencies: Vec<f64> = (0..SWEEPS)
+        .filter(|&k| train.heard(k))
+        .map(|k| {
+            let played_at = out_zero + (r / 2 + offsets[k] as u64) as f64 / fr;
+            in_zero + train.starts[k] as f64 / fr - played_at
         })
         .collect();
     let spread = latencies.iter().fold(f64::MIN, |m, &x| m.max(x)) - latencies.iter().fold(f64::MAX, |m, &x| m.min(x));
     let latency = loopback::median(&mut latencies).unwrap_or(0.0);
+    if latency < 0.0 {
+        return Err(format!(
+            "the sweeps were heard {:.1} ms before they were played: something else made them",
+            -latency * 1000.0
+        ));
+    }
     println!(
         "Round trip: {:.1} ms ({:.0} frames); the sweeps agree within {:.2} ms",
         latency * 1000.0,

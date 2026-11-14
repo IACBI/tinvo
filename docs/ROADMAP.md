@@ -260,12 +260,13 @@ Known limits:
 
 ## Phase 8a: Hardware check
 
-- `tinvo loopback [AUDIO] [--input NAME]` plays five 0.1 s sweeps (500 Hz to 8 kHz, −12 dBFS) on an output and finds them in what an input hears, by cross-correlation summed over the whole train, so one sweep lost in noise cannot move the result. It shows that the output and the input work end to end and measures the round trip: from TINVO handing a frame to the output to the input handing it back. Each stream's clock is the median of its callbacks' times, so the scheduler's jitter does not move the result.
+- `tinvo loopback [AUDIO] [--input NAME]` plays five 0.1 s sweeps (500 Hz to 8 kHz, −12 dBFS) on an output and finds them in what an input hears, by cross-correlation summed over the whole train. It shows that the output and the input work end to end and measures the round trip: from TINVO handing a frame to the output to the input handing it back. Each stream's clock is the median of its callbacks' times, so the scheduler's jitter does not move the result.
+- The sweeps start at the marks of a Golomb ruler (0, 1, 4, 9 and 11 times 0.2 s), where no two pairs are the same distance apart: a train placed wrongly lines up with one sweep at most, so two sweeps heard where they belong fix where it is even when others are lost. A sweep counts as heard when it stands out and each of its halves (500 Hz to 2 kHz, 2 to 8 kHz) stands out on its own there, which a lone tone or click does not; at least two must be heard. Both channels of a stereo input are searched.
 - `tinvo probe` also reports the longest gap between callbacks, and says when it was longer than the buffer, where the output may have glitched.
 - Run on the development machine (Windows 11, Realtek on-board audio, WASAPI shared mode at 48 kHz with a 10 ms period):
-  - The Realtek speakers into the Realtek microphone: all five sweeps heard, 67.3 ms round trip, the same within 0.2 ms over four runs.
-  - The NVIDIA Broadcast virtual speakers into the Realtek microphone: 170.8 ms; its processing adds about 100 ms.
-  - The Realtek speakers into the NVIDIA Broadcast microphone: about 321 to 327 ms; its noise removal sometimes swallows a sweep, and then only the sweeps heard are counted.
+  - The Realtek speakers into the Realtek microphone: all five sweeps heard, 67.1 to 67.5 ms round trip over seven runs, the sweeps of one run agreeing within 0.5 ms.
+  - The NVIDIA Broadcast virtual speakers into the Realtek microphone: 162 to 171 ms; its processing adds about 100 ms.
+  - The Realtek speakers into the NVIDIA Broadcast microphone: about 321 to 327 ms when heard. Its noise removal takes out parts of the sweeps, more or less from one run to the next: one run heard four of five, another only one, which is reported as not heard.
   - `--low-latency` on both devices: refused by the driver (smallest period equal to the 10 ms default), so the round trip stays 67.3 ms.
   - `tinvo probe`: 48 000 frames/s within 0.35 % on both outputs, the longest gap between callbacks 10.8 to 11.7 ms against a 22 ms buffer.
   - `tinvo bench --check`: mean callback cost 3.4 % (demo), 9.0 % (every strip stage), 6.1 % (synth) and 1.0 % (sampler) of a 128-frame period.

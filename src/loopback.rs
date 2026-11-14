@@ -3,9 +3,12 @@
 //! measures the latency between them.
 //!
 //! Each sweep is found by matched filtering (cross-correlation through the
-//! FFT). The sweeps go out a fixed number of frames apart, so the
-//! correlation is summed over the whole train before the peak is picked;
-//! one sweep lost in noise cannot move the result.
+//! FFT). The sweeps go out at the marks of a Golomb ruler, where no two
+//! pairs are the same distance apart, and the correlation is summed over
+//! the whole train before its place is picked. A train placed wrongly lines
+//! up with one sweep at most, so two sweeps heard where they belong fix
+//! where it is, even when the input's noise removal swallows others; and a
+//! lone sound that happens to stand out is never taken for the train.
 
 use crate::dsp::fft::fft;
 use std::f64::consts::PI;
@@ -69,6 +72,19 @@ pub fn correlate(signal: &[f32], template: &[f32]) -> Vec<f64> {
     sr
 }
 
+/// When each sweep starts, in units of [`UNIT_SECONDS`] after the first:
+/// an optimal Golomb ruler of five marks, so every pair of sweeps is a
+/// different distance apart.
+pub const MARKS: [u32; 5] = [0, 1, 4, 9, 11];
+/// The ruler's unit: longer than a sweep with its echoes.
+pub const UNIT_SECONDS: f64 = 0.2;
+
+/// Where each sweep starts at `sample_rate`, in frames after the first.
+pub fn offsets(sample_rate: u32) -> [usize; MARKS.len()] {
+    let unit = (UNIT_SECONDS * f64::from(sample_rate)).round() as usize;
+    MARKS.map(|m| m as usize * unit)
+}
+
 /// How far `peak` stands above the values around it, in standard
 /// deviations of `values`. Noise alone stays below about 6 in a few
 /// seconds of audio.
@@ -81,45 +97,80 @@ fn clarity(values: &[f64], peak: f64) -> f64 {
 
 /// The least clarity that counts as heard.
 pub const HEARD: f64 = 10.0;
+/// The least clarity each half of a sweep (500 Hz to 2 kHz, then 2 to
+/// 8 kHz) must have on its own where the sweep is. A short sound can stand
+/// out as clearly as a sweep, but it is in one band, not both, one after
+/// the other.
+pub const HALF_HEARD: f64 = 7.0;
+/// Sweeps that must be heard: one alone could be anything that stands out.
+pub const MIN_HEARD: usize = 2;
 
 /// A train of sweeps found in a recording.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Train {
     /// Where each sweep starts in the recording, in frames.
     pub starts: Vec<usize>,
-    /// How clearly each sweep stands out ([`HEARD`] or more is heard).
+    /// How clearly each sweep stands out ([`HEARD`] or more).
     pub clarity: Vec<f64>,
+    /// How clearly each half of each sweep stands out there on its own
+    /// ([`HALF_HEARD`] or more).
+    pub halves: Vec<(f64, f64)>,
     /// How clearly the train as a whole stands out.
     pub train_clarity: f64,
 }
 
-/// Finds `count` copies of `template`, `spacing` frames apart, in
-/// `signal`. Each copy is then placed on its own correlation peak within
-/// `slack` frames of where the train puts it, so a drift between the
-/// output's and the input's clocks shows. `None` if the signal is too
-/// short to hold the train.
-pub fn find_train(signal: &[f32], template: &[f32], count: usize, spacing: usize, slack: usize) -> Option<Train> {
-    if count == 0 {
+impl Train {
+    /// Whether sweep `k` was heard: clear, and both its halves too.
+    pub fn heard(&self, k: usize) -> bool {
+        let (low, high) = self.halves[k];
+        self.clarity[k] >= HEARD && low >= HALF_HEARD && high >= HALF_HEARD
+    }
+
+    /// How many sweeps were heard.
+    pub fn heard_count(&self) -> usize {
+        (0..self.starts.len()).filter(|&k| self.heard(k)).count()
+    }
+
+    /// Whether enough sweeps were heard to place the train.
+    pub fn is_heard(&self) -> bool {
+        self.heard_count() >= MIN_HEARD
+    }
+}
+
+/// Finds copies of `template` starting `offsets` frames after the first
+/// (the first offset 0) in `signal`. Each copy is then placed on its own
+/// correlation peak within `slack` frames of where the train puts it, so a
+/// drift between the output's and the input's clocks shows. `None` if the
+/// signal is too short to hold the train.
+pub fn find_train(signal: &[f32], template: &[f32], offsets: &[usize], slack: usize) -> Option<Train> {
+    let span = *offsets.iter().max()?;
+    let signed = correlate(signal, template);
+    if signed.len() <= span {
         return None;
     }
-    let corr: Vec<f64> = correlate(signal, template).into_iter().map(f64::abs).collect();
-    let span = (count - 1) * spacing;
-    if corr.len() <= span {
-        return None;
-    }
-    let summed: Vec<f64> = (0..corr.len() - span).map(|n| (0..count).map(|k| corr[n + k * spacing]).sum()).collect();
+    let corr: Vec<f64> = signed.iter().map(|c| c.abs()).collect();
+    let summed: Vec<f64> = (0..corr.len() - span).map(|n| offsets.iter().map(|&o| corr[n + o]).sum()).collect();
     let (first, &peak) = summed.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
-    let mut starts = Vec::with_capacity(count);
-    let mut each = Vec::with_capacity(count);
-    for k in 0..count {
-        let at = first + k * spacing;
-        let lo = at.saturating_sub(slack);
-        let hi = (at + slack).min(corr.len() - 1);
-        let (i, &v) = corr[lo..=hi].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
-        starts.push(lo + i);
-        each.push(clarity(&corr, v));
+    // The strongest of `values` within `slack` of `at`: where and how clear.
+    let local = |values: &[f64], at: usize| -> Option<(usize, f64)> {
+        let lo = at.saturating_sub(slack).min(values.len() - 1);
+        let hi = (at + slack).min(values.len() - 1);
+        let (i, &v) = values[lo..=hi].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+        Some((lo + i, clarity(values, v)))
+    };
+    let half = template.len() / 2;
+    let abs = |c: Vec<f64>| -> Vec<f64> { c.into_iter().map(f64::abs).collect() };
+    let low = abs(correlate(signal, &template[..half]));
+    let high = abs(correlate(signal, &template[half..]));
+    let mut train = Train { starts: Vec::new(), clarity: Vec::new(), halves: Vec::new(), train_clarity: 0.0 };
+    for &o in offsets {
+        let (n, c) = local(&corr, first + o)?;
+        train.starts.push(n);
+        train.clarity.push(c);
+        train.halves.push((local(&low, n)?.1, local(&high, n + half)?.1));
     }
-    Some(Train { starts, clarity: each, train_clarity: clarity(&summed, peak) })
+    train.train_clarity = clarity(&summed, peak);
+    Some(train)
 }
 
 /// The middle value (the mean of the two middle ones for an even count).
@@ -172,58 +223,105 @@ mod tests {
         assert!(correlate(&signal, &[]).is_empty());
     }
 
-    /// Five sweeps 0.4 s apart, played into a room: delayed, quieter,
-    /// echoed and buried in noise louder than they are.
-    fn room(delay: usize, gain: f32, noise: f32, drift: usize) -> (Vec<f32>, Vec<f32>) {
-        let rate = 48_000;
-        let s = sweep(rate, 0.25);
+    const RATE: u32 = 48_000;
+
+    /// The sweeps `played` (of the five), into a room: delayed, quieter,
+    /// echoed and buried in noise louder than they are, the input's clock
+    /// running `drift` frames per unit of the ruler fast.
+    fn room(delay: usize, gain: f32, noise: f32, drift: usize, played: &[usize]) -> Vec<f32> {
+        let s = sweep(RATE, 0.25);
         let mut rng = Rng::new(11);
-        let mut heard: Vec<f32> = (0..rate as usize * 3).map(|_| noise * rng.bipolar()).collect();
-        for k in 0..5 {
-            let at = delay + k * 19_200 + k * drift;
+        let mut heard: Vec<f32> = (0..RATE as usize * 4).map(|_| noise * rng.bipolar()).collect();
+        for &k in played {
+            let at = delay + offsets(RATE)[k] + MARKS[k] as usize * drift;
             for (i, &x) in s.iter().enumerate() {
                 heard[at + i] += gain * x;
                 heard[at + i + 700] += 0.5 * gain * x;
             }
         }
-        (heard, s)
+        heard
+    }
+
+    fn find(signal: &[f32]) -> Train {
+        find_train(signal, &sweep(RATE, 0.25), &offsets(RATE), 48).unwrap()
+    }
+
+    #[test]
+    fn no_two_sweeps_are_as_far_apart_as_two_others() {
+        let mut gaps: Vec<u32> =
+            MARKS.iter().flat_map(|a| MARKS.iter().filter(move |b| *b > a).map(move |b| b - a)).collect();
+        gaps.sort_unstable();
+        assert_eq!(gaps.len(), 10);
+        gaps.dedup();
+        assert_eq!(gaps.len(), 10);
+        assert_eq!(offsets(RATE), [0, 9_600, 38_400, 86_400, 105_600]);
     }
 
     #[test]
     fn a_train_is_found_under_noise_and_echo() {
-        let (heard, s) = room(2_074, 0.05, 0.05, 0);
-        let t = find_train(&heard, &s, 5, 19_200, 48).unwrap();
-        assert_eq!(t.starts, [2_074, 21_274, 40_474, 59_674, 78_874]);
-        assert!(t.train_clarity > HEARD && t.clarity.iter().all(|&c| c > HEARD), "{t:?}");
+        let t = find(&room(2_074, 0.05, 0.05, 0, &[0, 1, 2, 3, 4]));
+        assert_eq!(t.starts, offsets(RATE).map(|o| o + 2_074));
+        assert_eq!(t.heard_count(), 5, "{t:?}");
+        assert!(t.train_clarity > HEARD && t.is_heard());
+    }
+
+    #[test]
+    fn a_train_is_placed_by_the_sweeps_heard_when_others_are_lost() {
+        for lost in [vec![0], vec![0, 1], vec![4], vec![0, 2, 4]] {
+            let played: Vec<usize> = (0..5).filter(|k| !lost.contains(k)).collect();
+            let t = find(&room(3_000, 0.1, 0.02, 0, &played));
+            // A lost sweep's start is wherever the noise peaks near it.
+            for &k in &played {
+                assert_eq!(t.starts[k], offsets(RATE)[k] + 3_000, "lost {lost:?}");
+            }
+            assert_eq!((0..5).filter(|&k| t.heard(k)).collect::<Vec<_>>(), played, "lost {lost:?}: {t:?}");
+        }
+        // One sweep alone cannot place the train.
+        assert!(!find(&room(3_000, 0.1, 0.02, 0, &[2])).is_heard());
     }
 
     #[test]
     fn each_sweep_finds_its_own_peak_when_the_clocks_drift() {
-        let (heard, s) = room(500, 0.1, 0.01, 3);
-        let t = find_train(&heard, &s, 5, 19_200, 48).unwrap();
-        let drift: Vec<usize> = t.starts.windows(2).map(|w| w[1] - w[0]).collect();
-        assert_eq!(drift, [19_203; 4]);
+        let t = find(&room(500, 0.1, 0.01, 3, &[0, 1, 2, 3, 4]));
+        let expected: Vec<usize> = (0..5).map(|k| 500 + offsets(RATE)[k] + 3 * MARKS[k] as usize).collect();
+        assert_eq!(t.starts, expected);
     }
 
     #[test]
-    fn noise_alone_is_not_heard() {
+    fn noise_silence_and_other_sounds_are_not_heard() {
         for seed in 0..4 {
             let mut rng = Rng::new(seed);
-            let noise: Vec<f32> = (0..144_000).map(|_| 0.1 * rng.bipolar()).collect();
-            let t = find_train(&noise, &sweep(48_000, 0.25), 5, 19_200, 48).unwrap();
-            assert!(t.train_clarity < HEARD, "seed {seed}: {}", t.train_clarity);
-            assert!(t.clarity.iter().all(|&c| c < HEARD), "seed {seed}: {:?}", t.clarity);
+            let noise: Vec<f32> = (0..192_000).map(|_| 0.1 * rng.bipolar()).collect();
+            let t = find(&noise);
+            assert!(t.train_clarity < HEARD && t.heard_count() == 0, "seed {seed}: {t:?}");
         }
-        let silence = vec![0.0; 144_000];
-        let t = find_train(&silence, &sweep(48_000, 0.25), 5, 19_200, 48).unwrap();
-        assert_eq!(t.train_clarity, 0.0);
+        let silence = vec![0.0; 192_000];
+        let t = find(&silence);
+        assert_eq!((t.train_clarity, t.heard_count()), (0.0, 0));
+        // Short tones, alone or a ruler's distance apart, stand out clearly
+        // but are in one band of the sweep only.
+        for hz in [1000.0, 5000.0] {
+            let mut rng = Rng::new(7);
+            let mut tones: Vec<f32> = (0..192_000).map(|_| 0.001 * rng.bipolar()).collect();
+            let tone = |at: usize, v: &mut Vec<f32>| {
+                for i in 0..480 {
+                    v[at + i] += 0.3 * (2.0 * PI * hz * i as f64 / 48_000.0).sin() as f32;
+                }
+            };
+            tone(32_000, &mut tones);
+            assert!(!find(&tones).is_heard(), "{hz} Hz");
+            tone(32_000 + offsets(RATE)[3], &mut tones);
+            let t = find(&tones);
+            assert!(t.clarity.iter().filter(|&&c| c >= HEARD).count() >= 2, "{hz} Hz: they stand out: {t:?}");
+            assert_eq!(t.heard_count(), 0, "{hz} Hz: {t:?}");
+        }
     }
 
     #[test]
     fn a_short_recording_cannot_hold_the_train() {
-        let s = sweep(48_000, 0.25);
-        assert_eq!(find_train(&vec![0.0; 50_000], &s, 5, 19_200, 48), None);
-        assert_eq!(find_train(&vec![0.0; 50_000], &s, 0, 19_200, 48), None);
+        let s = sweep(RATE, 0.25);
+        assert_eq!(find_train(&vec![0.0; 100_000], &s, &offsets(RATE), 48), None);
+        assert_eq!(find_train(&vec![0.0; 100_000], &s, &[], 48), None);
     }
 
     #[test]
