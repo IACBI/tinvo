@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-14
+
 ### Added
 - `tinvo loopback [AUDIO] [--input NAME]` plays five short sweeps on an output and finds them in what an input hears, on either channel: it shows that both work end to end and measures the round-trip latency between them. At least two sweeps must be heard, each across its whole band.
 - `tinvo probe` reports the longest gap between callbacks, and warns when it was longer than the device's buffer.
@@ -306,7 +308,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/IACBI/tinvo/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/IACBI/tinvo/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/IACBI/tinvo/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/IACBI/tinvo/compare/v0.18.0...v0.19.0
