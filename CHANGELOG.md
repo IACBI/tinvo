@@ -6,6 +6,10 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- `tinvo loopback [AUDIO] [--input NAME]` plays five short sweeps on an output and finds them in what an input hears, on either channel: it shows that both work end to end and measures the round-trip latency between them. At least two sweeps must be heard, each across its whole band.
+- `tinvo probe` reports the longest gap between callbacks, and warns when it was longer than the device's buffer.
+
 ## [0.21.0] - 2026-11-14
 
 ### Added
