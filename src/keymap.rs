@@ -177,6 +177,10 @@ actions! {
     PrevMarker "prev_marker" Song [PageUp] "to the previous marker";
     NextMarker "next_marker" Song [PageDown] "to the next marker";
     LoopSection "loop_section" Song [c('=')] "loop the section: from the marker before the entry to the next one";
+    TempoPointDown "tempo_point_down" Song [c('{')] "tempo point on the entry down (adds one at the tempo there)";
+    TempoPointUp "tempo_point_up" Song [c('}')] "tempo point on the entry up";
+    TempoPointClear "tempo_point_clear" Song [c('0')] "remove the entry's tempo point";
+    TempoRamp "tempo_ramp" Song [c('/')] "hold each tempo point or ramp from one to the next";
     CoarseUp "coarse_up" Params [PageUp] "value up, coarse";
     CoarseDown "coarse_down" Params [PageDown] "value down, coarse";
     Default "default" Params [c('0')] "back to the default value";

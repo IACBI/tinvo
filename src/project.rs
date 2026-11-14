@@ -49,8 +49,9 @@
 //! and loading is lossless.
 
 use crate::engine::{
-    DEFAULT_PATTERN_LEN, Division, Edit, entry_tempo, span_frames, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, loop_region, target_spec,
+    DEFAULT_PATTERN_LEN, Division, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, entry_tempo, loop_region, span_frames,
+    target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
@@ -1271,7 +1272,8 @@ impl Project {
                     if !(MIN_TEMPO..=MAX_TEMPO).contains(&bpm) {
                         return Err(err(format!("tempo must be {MIN_TEMPO}..={MAX_TEMPO}")));
                     }
-                    let slot = p.tempo_points.get_mut(usize::from(entry)).ok_or_else(|| err("no such song entry".into()))?;
+                    let slot =
+                        p.tempo_points.get_mut(usize::from(entry)).ok_or_else(|| err("no such song entry".into()))?;
                     if slot.replace(bpm).is_some() {
                         return Err(err(format!("song entry {entry} has two tempo points")));
                     }
@@ -2051,6 +2053,60 @@ pattern_division A 1/8
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tempo_points_round_trip_follow_their_entries_and_invert() {
+        let mut p = Project::new();
+        for index in 0..4 {
+            p.apply(Edit::InsertSongEntry { index, pattern: 0 }).unwrap();
+        }
+        p.apply(Edit::SetTempoPoint { index: 1, bpm: Some(90.0) }).unwrap();
+        p.apply(Edit::SetTempoPoint { index: 3, bpm: Some(150.0) }).unwrap();
+        let text = p.to_text();
+        assert!(text.contains("\ntempo_point 1 90\ntempo_point 3 150\n"), "{text}");
+        assert!(!text.contains("tempo_ramp"), "only when set");
+        p.apply(Edit::SetTempoRamp(true)).unwrap();
+        let q = Project::from_text(&p.to_text()).unwrap();
+        assert_eq!(q.tempo_points[..4], [None, Some(90.0), None, Some(150.0)]);
+        assert!(q.tempo_ramp);
+        // Before the first point the set tempo holds; a ramp keeps one slope
+        // across the entries between two points.
+        assert_eq!(q.entry_tempo(0), (120.0, 0.0));
+        assert_eq!(q.entry_tempo(1), (90.0, 1.875));
+        assert_eq!(q.entry_tempo(2), (120.0, 1.875));
+        assert_eq!(q.entry_tempo(3), (150.0, 0.0));
+        assert_eq!(q.tempo_in_entry(2, 48), 135.0);
+        // Points move with their entries, and undo brings a removed one back.
+        let mut r = q.clone();
+        r.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        assert_eq!(r.tempo_points[..5], [None, None, Some(90.0), None, Some(150.0)]);
+        let undo = r.inverse(&Edit::RemoveSongEntry(2)).unwrap();
+        r.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(r.tempo_points[..5], [None, None, None, Some(150.0), None]);
+        for e in undo {
+            r.apply(e).unwrap();
+        }
+        assert_eq!(r.tempo_points[..5], [None, None, Some(90.0), None, Some(150.0)]);
+        // Out-of-range tempos are clamped, and NaN changes nothing.
+        r.apply(Edit::SetTempoPoint { index: 0, bpm: Some(1e9) }).unwrap();
+        assert_eq!(r.tempo_points[0], Some(MAX_TEMPO));
+        r.apply(Edit::SetTempoPoint { index: 0, bpm: Some(f32::NAN) }).unwrap();
+        assert_eq!(r.tempo_points[0], Some(MAX_TEMPO));
+        assert!(r.apply(Edit::SetTempoPoint { index: 5, bpm: Some(100.0) }).is_err());
+        // The song's length follows the tempo: 16 16ths at 120, then 90 to
+        // 150 over 32 and 16 at 150.
+        let secs = q.song_seconds();
+        let want = 2.0 + 15.0 / 1.875 * (1.0f64 + 1.875 * 32.0 / 90.0).ln() + 1.6;
+        assert!((secs - want).abs() < 1e-9, "{secs} vs {want}");
+        // Files.
+        let err = Project::from_text("tinvo 12\nsong A A\ntempo_point 2 100\n").unwrap_err().to_string();
+        assert!(err.contains("tempo point 2 is past the end of the song"), "{err}");
+        let err = Project::from_text("tinvo 12\nsong A A\ntempo_point 1 100\ntempo_point 1 90\n").unwrap_err();
+        assert!(err.to_string().contains("two tempo points"), "{err}");
+        assert!(Project::from_text("tinvo 12\nsong A\ntempo_point 0 5000\n").is_err());
+        assert!(Project::from_text("tinvo 11\nsong A\ntempo_point 0 100\n").is_err());
+        assert!(Project::from_text("tinvo 11\nsong A\ntempo_ramp true\n").is_err());
     }
 
     #[test]

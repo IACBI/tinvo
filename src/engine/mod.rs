@@ -2839,6 +2839,82 @@ mod tests {
         assert_eq!(onsets(&run(&mut e, 20_000), 1000), [8000 - 1000]);
     }
 
+    /// Three entries of four 16ths with a hat on each step, and tempo points.
+    fn tempo_song(points: &[(u16, f32)], ramp: bool) -> Vec<Edit> {
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[0, 1, 2, 3]);
+        for index in 0..3 {
+            edits.push(Edit::InsertSongEntry { index, pattern: 0 });
+        }
+        for &(index, bpm) in points {
+            edits.push(Edit::SetTempoPoint { index, bpm: Some(bpm) });
+        }
+        edits.push(Edit::SetTempoRamp(ramp));
+        edits
+    }
+
+    fn assert_near(got: &[usize], want: &[f64]) {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        for (&g, &w) in got.iter().zip(want) {
+            assert!((g as f64 - w).abs() <= 1.0, "{got:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn a_tempo_point_holds_until_the_next_and_the_song_wraps_to_the_set_tempo() {
+        let mut e = engine(&tempo_song(&[(1, 60.0)], false));
+        e.handle(Command::PlaySong { entry: 0 });
+        let out = run(&mut e, 128_000);
+        // 6000-frame steps at 120, then 12 000 at 60 from entry 1 on, then
+        // 120 again from the top.
+        let want = [
+            0, 6000, 12_000, 18_000, 24_000, 36_000, 48_000, 60_000, 72_000, 84_000, 96_000, 108_000, 120_000, 126_000,
+        ];
+        assert_eq!(onsets(&out, 200), want);
+    }
+
+    #[test]
+    fn a_tempo_ramp_lands_each_step_on_the_integral_of_its_tempo() {
+        use crate::engine::transport::span_frames;
+        let mut e = engine(&tempo_song(&[(0, 120.0), (2, 60.0)], true));
+        e.handle(Command::PlaySong { entry: 0 });
+        let out = run(&mut e, 140_000);
+        // 120 to 60 over the eight 16ths of entries 0 and 1, then 60 held.
+        let ramp: Vec<f64> = (0..=8).map(|n| span_frames(120.0, -7.5, f64::from(n), SR)).collect();
+        let start = ramp[8];
+        let mut want = ramp;
+        want.extend((1..4).map(|n| start + f64::from(n) * 12_000.0));
+        let end = start + 48_000.0;
+        want.extend((0..4).map(|n| end + span_frames(120.0, -7.5, f64::from(n), SR)));
+        assert_near(&onsets(&out, 200), &want);
+        assert!(e.shared.position().unwrap().entry == Some(0));
+    }
+
+    #[test]
+    fn a_tempo_ramp_is_independent_of_buffer_size() {
+        let mut edits = tempo_song(&[(0, 97.0), (2, 171.0)], true);
+        edits.extend([
+            Edit::SetSwing(63.0),
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(Step { ratchet: 3, ..Step::new(60, 100, 1) }) },
+        ]);
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            run(&mut e, 150_000)
+        };
+        for size in [1usize, 17, 64, 500, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            let mut got = Vec::new();
+            let mut left = 150_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            assert!(got == reference, "buffer size {size}");
+        }
+    }
+
     #[test]
     fn ratchets_stop_where_a_cut_step_s_entry_ends() {
         // At 60 BPM a 32nd entry is 6000 frames; the track's own 8th

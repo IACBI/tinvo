@@ -334,7 +334,7 @@ TINVO is at home with pattern-based electronic music: techno, house, electro, sy
 
 For triplet and shuffle feels (6/8 and 12/8 grooves, jazz-influenced hip-hop), 32nd-note hat rolls, and songs whose tempo moves.
 
-Done so far, not yet released: the step division and the time signature per pattern, the tempo-synced LFO, 8 ratchets and project format 12. All rows of a pattern share its division; parts in different divisions play together through song entries and per-track parts.
+Done, not yet released: all of it. All rows of a pattern share its division; parts in different divisions play together through song entries and per-track parts.
 - A step division per pattern: 1/8, 1/8T, 1/16 (today's grid), 1/16T or 1/32. A pattern still holds up to 64 steps, so a 1/32 pattern is two bars long. Micro-timing keeps its 24 ticks per step.
 - A time signature per pattern, which places the bar and beat lines in the grid and the piano roll.
 - Tempo automation: a song-level lane that holds or ramps. The transport integrates a ramp exactly, so playback and export agree at any buffer size.

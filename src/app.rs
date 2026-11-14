@@ -9,7 +9,6 @@ use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::autosave::{self, Autosave};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
-use crate::engine::transport::Transport;
 use crate::engine::{
     Command, Division, Edit, Engine, LIVE_QUEUE, LiveNote, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
     MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, part_position,
@@ -203,6 +202,7 @@ struct Change {
 fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
     Some(match *e {
         Edit::SetTempo(_) => (0, 0, 0, 0),
+        Edit::SetTempoPoint { index, .. } => (0, 1, (index >> 8) as u8, index as u8),
         Edit::SetSwing(_) => (1, 0, 0, 0),
         Edit::SetMasterGain(_) => (2, 0, 0, 0),
         Edit::SetPatternLength { pattern, .. } => (3, pattern, 0, 0),
@@ -239,6 +239,8 @@ fn cycle_part(p: Part, up: bool) -> Part {
 fn describe(e: &Edit) -> &'static str {
     match e {
         Edit::SetTempo(_) => "tempo",
+        Edit::SetTempoPoint { .. } => "tempo point",
+        Edit::SetTempoRamp(_) => "tempo ramp",
         Edit::SetSwing(_) => "swing",
         Edit::SetMasterGain(_) => "master level",
         Edit::SetPatternLength { .. } => "pattern length",
@@ -564,6 +566,8 @@ enum Target {
     Point(usize, usize),
     /// A song entry.
     Entry(usize),
+    /// A song entry's tempo point, on the song view's tempo row.
+    TempoPoint(usize),
     /// What a track plays in a song entry: the entry and the track.
     Part(usize, usize),
     /// A song entry on the song line under the piano roll and automation.
@@ -1775,7 +1779,7 @@ impl App {
                     self.auto_action(Some(Action::Enter));
                 }
             }
-            Target::Entry(i) => (self.song_cursor, self.song_row) = (i, 0),
+            Target::Entry(i) | Target::TempoPoint(i) => (self.song_cursor, self.song_row) = (i, 0),
             Target::Part(i, t) => (self.song_cursor, self.song_row, self.track) = (i, t + 1, t),
             Target::SongCell(e) => {
                 self.song_cursor = e;
@@ -1841,6 +1845,10 @@ impl App {
             Target::Entry(i) => {
                 (self.song_cursor, self.song_row) = (i, 0);
                 self.key_song(pick(Action::SongPrev, Action::SongNext));
+            }
+            Target::TempoPoint(i) => {
+                self.song_cursor = i;
+                self.key_song(pick(Action::TempoPointDown, Action::TempoPointUp));
             }
             Target::Part(i, t) => {
                 (self.song_cursor, self.song_row, self.track) = (i, t + 1, t);
@@ -2806,6 +2814,17 @@ impl App {
                     self.edit(Edit::SetLoop(Some(region)));
                 }
             }
+            Action::TempoPointDown | Action::TempoPointUp if n > 0 => {
+                let d = if a == Action::TempoPointUp { 1.0 } else { -1.0 };
+                let here = self.project.tempo_points[c].unwrap_or_else(|| self.project.tempo_in_entry(c, 0) as f32);
+                self.edit_with(Edit::SetTempoPoint { index, bpm: Some(here.round() + d) }, true);
+            }
+            Action::TempoPointClear if n > 0 => {
+                self.edit(Edit::SetTempoPoint { index, bpm: None });
+            }
+            Action::TempoRamp => {
+                self.edit(Edit::SetTempoRamp(!self.project.tempo_ramp));
+            }
             _ => return false,
         }
         true
@@ -3136,7 +3155,7 @@ impl App {
         };
         let dirty = if self.dirty { "*" } else { "" };
         for (text, target) in [
-            (format!(" {:.0} BPM  ", self.project.tempo), Target::Tempo),
+            (self.tempo_label(), Target::Tempo),
             (swing, Target::Swing),
             (format!("pattern {}", pattern_name(self.pattern as u8)), Target::Pattern),
             (format!(" · {} steps", self.pattern_len()), Target::Length),
@@ -3171,6 +3190,24 @@ impl App {
         self.hit(rx, 0, w - rx, Target::Inert);
         let peak = self.master_meter[0].max(self.master_meter[1]);
         self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
+    }
+
+    /// The tempo in the top bar: the set tempo, and while the song's tempo
+    /// points set another, that one first.
+    fn tempo_label(&self) -> String {
+        let p = &self.project;
+        let playing = match self.play_pos {
+            Some(PlayPosition { entry: Some(e), pulse, .. })
+                if p.has_tempo_points() && usize::from(e) < p.song.len() =>
+            {
+                Some(p.tempo_in_entry(usize::from(e), u64::from(pulse)))
+            }
+            _ => None,
+        };
+        match playing {
+            Some(bpm) if (bpm - f64::from(p.tempo)).abs() >= 0.5 => format!(" {bpm:.0} BPM (set {:.0})  ", p.tempo),
+            _ => format!(" {:.0} BPM  ", p.tempo),
+        }
     }
 
     fn visible_steps(&self, w: u16) -> (usize, usize) {
@@ -3396,7 +3433,7 @@ impl App {
     /// mark the loop region, `|` a marker.
     fn draw_song(&self, s: &mut Screen, w: u16, rows: u16) {
         let p = &self.project;
-        let secs = p.song_pulses() as f64 / 6.0 * Transport::samples_per_step(p.tempo, 1.0);
+        let secs = p.song_seconds();
         let lp = match p.loop_region {
             Some((a, b)) if p.active_loop().is_some() => format!("loop {}-{}", a + 1, b + 1),
             Some(_) => "loop region past the end".into(),
@@ -3412,10 +3449,19 @@ impl App {
         if let Some(m) = section.and_then(|(a, _)| p.marker_at(a)) {
             title.push_str(&format!(" · in {}", m.name));
         }
+        if p.has_tempo_points() && self.song_cursor < p.song.len() {
+            let (bpm, slope) = p.entry_tempo(self.song_cursor);
+            let end = bpm + slope * p.pattern_pulses(p.song[self.song_cursor]) as f64 / 6.0;
+            if slope == 0.0 {
+                title.push_str(&format!(" · {bpm:.0} BPM"));
+            } else {
+                title.push_str(&format!(" · {bpm:.0}→{end:.0} BPM"));
+            }
+        }
         s.put(1, 1, &title, self.style(Role::Title));
         let k = &self.keys;
         let keys = format!(
-            "{} row  {} pattern  {} repeat  {} remove  {} loop  {} no loop  {} marker  {} jump  {} loop section  {} play  {} grid",
+            "{} row  {} pattern  {} repeat  {} remove  {} loop  {} no loop  {} marker  {} jump  {} loop section  {} tempo  {} no tempo  {} ramp  {} play  {} grid",
             k.labels(&[Action::Up, Action::Down]),
             k.labels(&[Action::SongPrev, Action::SongNext]),
             k.label(Action::Enter),
@@ -3425,6 +3471,9 @@ impl App {
             k.label(Action::Marker),
             k.labels(&[Action::PrevMarker, Action::NextMarker]),
             k.label(Action::LoopSection),
+            k.labels(&[Action::TempoPointDown, Action::TempoPointUp]),
+            k.label(Action::TempoPointClear),
+            k.label(Action::TempoRamp),
             k.label(Action::Play),
             k.label(Action::SongView),
         );
@@ -3464,11 +3513,25 @@ impl App {
         let label = |r: usize| if r == row { Role::SelectedName } else { Role::Text };
         s.put(0, 3, if row == 0 { "▸" } else { " " }, self.style(Role::Selected));
         s.put(1, 3, "   Song", self.style(label(0)));
+        s.put(1, 4, if p.tempo_ramp { "   Tempo ramp" } else { "   Tempo" }, self.style(Role::Text));
+        for (col, i) in (first..last).enumerate() {
+            let x = SONG_LEFT + col as u16 * 4;
+            let (text, mut st) = match p.tempo_points[i] {
+                Some(bpm) => (format!("{bpm:>3.0} "), self.style(Role::Entry)),
+                None if p.entry_tempo(i).1 != 0.0 => (" ~ ".to_string(), dim),
+                None => (" · ".to_string(), dim),
+            };
+            if playing == Some(i) {
+                st.bg = self.style(Role::PlayColumn).bg;
+            }
+            s.put(x, 4, &text, st);
+            self.hit(x, 4, 4, Target::TempoPoint(i));
+        }
         // The track rows below the song's, scrolled to keep the cursor's.
-        let visible = usize::from(rows.saturating_sub(3));
+        let visible = usize::from(rows.saturating_sub(4));
         let top = row.saturating_sub(visible).min(self.track_count().saturating_sub(visible));
         for (k, t) in (top..self.track_count().min(top + visible)).enumerate() {
-            let y = 4 + k as u16;
+            let y = 5 + k as u16;
             s.put(0, y, if row == t + 1 { "▸" } else { " " }, self.style(Role::Selected));
             s.put(1, y, &format!("{:>2} {:<10.10}", t + 1, p.tracks[t].name), self.style(label(t + 1)));
             for (col, i) in (first..last).enumerate() {
@@ -5690,12 +5753,43 @@ mod tests {
         a.track = 1;
         keys(&mut a, &[Key::Char('S'), Key::Char('D'), Key::Char('y'), Key::Char('S'), Key::Home, Key::Char('.')]);
         assert_eq!(a.track_count(), 1);
-        assert!(frame(&a).row_text(4).starts_with("▸ 1 Kick"), "{}", frame(&a).row_text(4));
+        assert!(frame(&a).row_text(5).starts_with("▸ 1 Kick"), "{}", frame(&a).row_text(5));
         assert_eq!((a.project.song.as_slice(), a.project.part(0, 0)), ([0, 1, 0].as_slice(), Part::Pattern(0)));
         keys(&mut a, &[Key::Delete]);
         assert_eq!((a.project.song.len(), a.project.part(0, 0)), (3, Part::Follow), "Delete resets the part");
         keys(&mut a, &[Key::Up]);
         assert_eq!(a.song_row, 0);
+    }
+
+    #[test]
+    fn the_song_view_sets_tempo_points_and_the_ramp() {
+        let mut a = parted_app();
+        let rows = |a: &App| -> Vec<String> {
+            let s = frame(a);
+            (0..30).map(|y| s.row_text(y)).collect()
+        };
+        // } and { start from the tempo there; quick repeats are one undo step.
+        keys(&mut a, &[Key::Right, Key::Char('}'), Key::Char('}')]);
+        assert_eq!(a.project.tempo_points[..3], [None, Some(122.0), None]);
+        let text = rows(&a);
+        assert!(text[4].starts_with("    Tempo       ·  122  ·   "), "{}", text[4]);
+        assert!(text.iter().any(|l| l.contains(" · 122 BPM")), "the title names the entry's tempo");
+        keys(&mut a, &[Key::Char('/'), Key::Right, Key::Char('{')]);
+        assert!(a.project.tempo_ramp);
+        assert_eq!(a.project.tempo_points[..3], [None, Some(122.0), Some(121.0)]);
+        assert!(rows(&a)[4].starts_with("    Tempo ramp  ·  122 121 "), "{}", rows(&a)[4]);
+        keys(&mut a, &[Key::Char('0')]);
+        assert_eq!(a.project.tempo_points[2], None);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.tempo_points[2], Some(121.0));
+        keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
+        assert!(!a.project.tempo_ramp);
+        keys(&mut a, &[Key::Char('u')]);
+        assert!(!a.project.has_tempo_points());
+        // The wheel on the tempo row nudges the entry's point.
+        let at = spot(&a, Target::TempoPoint(0));
+        mouse(&mut a, MouseKind::ScrollUp, at);
+        assert_eq!((a.song_cursor, a.project.tempo_points[0]), (0, Some(121.0)));
     }
 
     #[test]
@@ -5721,8 +5815,9 @@ mod tests {
         a.project.tracks[1].parts[2] = Part::Rest;
         let s = frame(&a);
         assert!(s.row_text(3).starts_with("▸   Song"), "{}", s.row_text(3));
-        assert!(s.row_text(4).contains(" 1 Kick        ·   D   · "), "{}", s.row_text(4));
-        assert!(s.row_text(5).contains(" 2 Snare       ·   ·   - "), "{}", s.row_text(5));
+        assert!(s.row_text(4).starts_with("    Tempo       ·   ·   · "), "{}", s.row_text(4));
+        assert!(s.row_text(5).contains(" 1 Kick        ·   D   · "), "{}", s.row_text(5));
+        assert!(s.row_text(6).contains(" 2 Snare       ·   ·   - "), "{}", s.row_text(6));
         click(&mut a, Target::Part(2, 1));
         assert_eq!((a.song_cursor, a.song_row, a.track), (2, 2, 1));
         let at = spot(&a, Target::Part(1, 0));
@@ -6801,10 +6896,9 @@ mod tests {
         let Mode::Help(top) = a.mode else { panic!("{:?}", a.mode) };
         assert_eq!(top, a.help_lines().len() - 38);
         a.draw(&mut s);
-        let text: Vec<String> = (0..40).map(|y| s.row_text(y)).collect();
-        let line = |id: &str| text.iter().find(|l| l.contains(&format!(" {id} "))).cloned().unwrap_or_default();
-        assert!(line("velocity_down").trim_start().starts_with('ö'), "{}", line("velocity_down"));
         assert!(s.row_text(39).contains("export prompt"), "{}", s.row_text(39));
+        let vel = a.help_lines().into_iter().find(|l| l.text.starts_with("velocity_down ")).unwrap();
+        assert!(vel.keys.starts_with('ö'), "{}", vel.keys);
         a.handle_key(Key::Up);
         assert_eq!(a.mode, Mode::Help(top - 1));
         a.handle_key(Key::Char('x'));

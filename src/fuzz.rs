@@ -535,6 +535,9 @@ fn project_seeds() -> Vec<Vec<u8>> {
     let mut rich = Project::demo();
     rich.song = vec![0, 1, 2, 1, 15];
     rich.loop_region = Some((1, 2));
+    rich.tempo_points[1] = Some(100.0);
+    rich.tempo_points[3] = Some(140.5);
+    rich.tempo_ramp = true;
     rich.set_marker(0, "intro").expect("an entry");
     rich.set_marker(3, "drop é").expect("an entry");
     rich.tracks[0].parts[1] = Part::Pattern(15);
@@ -1109,6 +1112,13 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
         10 => Edit::InsertSongEntry { index: entry, pattern },
         11 => Edit::RemoveSongEntry(entry),
         12 => Edit::SetSongEntry { index: entry, pattern },
+        13 if s.byte() < 64 => {
+            if s.byte() & 1 == 0 {
+                Edit::SetTempoRamp(s.byte() & 1 == 1)
+            } else {
+                Edit::SetTempoPoint { index: entry, bpm: (s.byte() & 3 != 0).then(|| s.f32()) }
+            }
+        }
         13 => Edit::SetLoop(if s.below(4) == 0 { None } else { Some((entry, s.u16() % (MAX_SONG as u16 + 2))) }),
         14 => {
             let target = match s.below(4) {

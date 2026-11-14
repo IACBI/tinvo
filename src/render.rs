@@ -68,10 +68,24 @@ pub fn source_pulses(project: &Project, source: Source) -> u64 {
 }
 
 /// Frames covered by `opts.loops` passes of the source, before the tail.
+/// The song and a region follow the song's tempo points.
 pub fn main_frames(project: &Project, opts: &RenderOptions) -> u64 {
-    let sps = Transport::samples_per_step(project.tempo, opts.sample_rate as f32);
-    let sixteenths = (source_pulses(project, opts.source) * u64::from(opts.loops)) as f64 / 6.0;
-    (sps * sixteenths).round() as u64
+    let sr = opts.sample_rate as f32;
+    let entries = match resolve(project, opts.source) {
+        Source::Song => Some((0, project.song.len().saturating_sub(1))),
+        Source::Region => project.active_loop().map(|(a, b)| (usize::from(a), usize::from(b))),
+        _ => None,
+    };
+    match entries {
+        Some((a, b)) if project.has_tempo_points() => {
+            (project.entries_frames(a, b, sr) * f64::from(opts.loops)).round() as u64
+        }
+        _ => {
+            let sps = Transport::samples_per_step(project.tempo, sr);
+            let sixteenths = (source_pulses(project, opts.source) * u64::from(opts.loops)) as f64 / 6.0;
+            (sps * sixteenths).round() as u64
+        }
+    }
 }
 
 /// Frames the engine renders per call while exporting.
@@ -343,6 +357,27 @@ mod tests {
         let opts = RenderOptions { loops: 2, max_tail_seconds: 0.0, source: Source::Region, ..Default::default() };
         assert_eq!(onsets(&render(&p, &[], &opts)), [0, 24_000, 48_000, 72_000]);
         assert_eq!(quick(&p, Source::Song), [12_000, 24_000, 48_000, 84_000]);
+    }
+
+    #[test]
+    fn a_song_with_tempo_points_renders_as_long_as_the_engine_plays_it() {
+        let mut p = two_patterns();
+        p.song = vec![0, 0, 0];
+        p.tempo_points[0] = Some(120.0);
+        p.tempo_points[2] = Some(60.0);
+        p.tempo_ramp = true;
+        let opts = |loops| RenderOptions { loops, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
+        let one = main_frames(&p, &opts(1));
+        assert_eq!(one, p.entries_frames(0, 2, 48_000.0).round() as u64);
+        let out = render(&p, &[], &opts(2));
+        assert_eq!(out.len() as u64 / 2, main_frames(&p, &opts(2)));
+        // The second pass starts where the first one's length says.
+        let hits = onsets(&out);
+        assert_eq!(hits.len(), 6, "{hits:?}");
+        assert!(hits[3].abs_diff(one as usize) <= 1, "{hits:?} vs {one}");
+        for k in 0..3 {
+            assert!(hits[k + 3].abs_diff(hits[k] + one as usize) <= 1, "{hits:?}");
+        }
     }
 
     #[test]
