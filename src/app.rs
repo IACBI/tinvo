@@ -1399,6 +1399,15 @@ impl App {
         self.project.meters[self.pattern].beat_at(pulse)
     }
 
+    /// The bar and beat starting at each of steps `first..last`, with the
+    /// column each is drawn at.
+    fn beats(&self, first: usize, last: usize) -> Vec<(u16, u32, u32)> {
+        (first..last)
+            .enumerate()
+            .filter_map(|(col, i)| self.beat_at(i).map(|(bar, beat)| (LEFT + col as u16 * CELL, bar, beat)))
+            .collect()
+    }
+
     fn pattern_len(&self) -> usize {
         usize::from(self.project.pattern_lens[self.pattern])
     }
@@ -3176,12 +3185,11 @@ impl App {
         s.put(LEFT - 1, 1, "│", self.style(Role::Dim));
         let (first, last) = self.visible_steps(w);
         self.hit(LEFT, 1, (last - first) as u16 * CELL, Target::Ruler);
+        for (x, label) in ruler_labels(&self.beats(first, last)) {
+            s.put(x, 1, &label, self.style(Role::Beat));
+        }
         for (col, i) in (first..last).enumerate() {
             let x = LEFT + col as u16 * CELL;
-            if let Some((bar, beat)) = self.beat_at(i) {
-                let label = format!("{bar}.{beat}");
-                s.put(x, 1, &label, self.style(Role::Beat));
-            }
             if self.play_step(self.track) == Some(i) {
                 s.put(x + 2, 1, "▼", self.style(Role::Playhead));
             }
@@ -4614,6 +4622,30 @@ fn ask_recovery(
     }
 }
 
+/// The ruler's labels for `beats` (column, bar, beat), with a space between
+/// any two. Every bar is labelled, as its bar number alone where `bar.1`
+/// would run into the next bar; beats are labelled where they fit.
+fn ruler_labels(beats: &[(u16, u32, u32)]) -> Vec<(u16, String)> {
+    let bars: Vec<(u16, u32)> = beats.iter().filter(|b| b.2 == 1).map(|&(x, bar, _)| (x, bar)).collect();
+    let mut out: Vec<(u16, String)> = bars
+        .iter()
+        .enumerate()
+        .map(|(k, &(x, bar))| {
+            let next = bars.get(k + 1).map_or(u16::MAX, |b| b.0);
+            let full = format!("{bar}.1");
+            (x, if x + (full.len() as u16) < next { full } else { bar.to_string() })
+        })
+        .collect();
+    for &(x, bar, beat) in beats.iter().filter(|b| b.2 != 1) {
+        let label = format!("{bar}.{beat}");
+        let end = x + label.len() as u16;
+        if out.iter().all(|(o, l)| end < *o || x > o + l.len() as u16) {
+            out.push((x, label));
+        }
+    }
+    out
+}
+
 /// The title of the piano roll or automation view: the view, the track's
 /// name cut to fit and the key back to the grid, all left of the step
 /// columns.
@@ -4720,6 +4752,37 @@ mod tests {
         keys(&mut a, &[Key::Char('u')]);
         assert_eq!(meter(&a), "4/4");
         assert_eq!(a.project.pattern_lens[a.pattern], 16);
+    }
+
+    #[test]
+    fn ruler_labels_never_run_into_each_other() {
+        // 16/16 in 16ths: a beat on every step, with two-digit beats from
+        // the tenth; 1/16 in 16ths: a bar on every step.
+        let beats: Vec<(u16, u32, u32)> =
+            (0..20).map(|i| (i * CELL, 1 + u32::from(i) / 16, 1 + u32::from(i) % 16)).collect();
+        let labels = ruler_labels(&beats);
+        let mut row = String::new();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        for (x, l) in &sorted {
+            assert!(row.is_empty() || row.len() < usize::from(*x), "{sorted:?}");
+            row.push_str(&" ".repeat(usize::from(*x) - row.len()));
+            row.push_str(l);
+        }
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["1.1", "1.3", "1.5", "1.7", "1.9", "1.11", "1.13", "1.15", "2.1", "2.3"]
+        );
+        let bars: Vec<(u16, u32, u32)> = (0..12).map(|i| (i * CELL, 1 + u32::from(i), 1)).collect();
+        let labels = ruler_labels(&bars);
+        assert_eq!(labels.len(), 12, "every bar is labelled");
+        assert_eq!(labels[10], (30, "11".to_string()));
+        assert_eq!(labels[11], (33, "12.1".to_string()), "the last bar has room");
+        // Room to spare keeps the full labels.
+        assert_eq!(
+            ruler_labels(&[(0, 1, 1), (6, 1, 2), (12, 2, 1)]),
+            [(0, "1.1".to_string()), (12, "2.1".to_string()), (6, "1.2".to_string())]
+        );
     }
 
     #[test]
