@@ -209,11 +209,12 @@ impl Mix {
         self.limiter.set_enabled(v[mp::LIMITER] >= 1.0);
     }
 
-    /// Clears the send sums for a block of `frames`.
-    pub fn begin(&mut self, frames: usize) {
+    /// Clears the send sums before a block. A fed sum is cleared whole, not
+    /// just this block's length: a longer block later reads past it.
+    pub fn begin(&mut self) {
         for (input, fed) in self.inputs.iter_mut().zip(&mut self.fed) {
             if *fed {
-                input[..2 * frames].fill(0.0);
+                input.fill(0.0);
                 *fed = false;
             }
         }
@@ -235,8 +236,10 @@ impl Mix {
         [delay.as_mut_slice(), reverb.as_mut_slice(), chorus.as_mut_slice()]
     }
 
-    /// Adds the returns of the first `frames` frames to the mix.
-    pub fn add_returns(&mut self, mix_l: &mut [f32], mix_r: &mut [f32], frames: usize) {
+    /// Adds the returns to the mix for the frames of the block from frame
+    /// `from`, as many as `mix_l` holds.
+    pub fn add_returns(&mut self, mix_l: &mut [f32], mix_r: &mut [f32], from: usize) {
+        let frames = mix_l.len();
         for bus in 0..send::BUSES {
             let idle = match bus {
                 send::DELAY => self.echo.is_idle(),
@@ -246,7 +249,7 @@ impl Mix {
             if !self.fed[bus] && idle {
                 continue;
             }
-            let input = &self.inputs[bus][..2 * frames];
+            let input = &self.inputs[bus][2 * from..2 * (from + frames)];
             let wet = &mut self.wet[..2 * frames];
             wet.fill(0.0);
             match bus {
@@ -261,6 +264,11 @@ impl Mix {
                 mix_r[i] += f[1] * g;
             }
         }
+    }
+
+    /// Whether the delay, reverb and chorus hold nothing more to play.
+    pub fn effects_idle(&self) -> bool {
+        self.echo.is_idle() && self.reverb.is_idle() && self.chorus.is_idle()
     }
 
     /// Runs the master limiter over interleaved output.
@@ -304,17 +312,33 @@ mod tests {
         let mut r = vec![0.0f32; 64];
         let mut first = None;
         for block in 0..400 {
-            m.begin(64);
+            m.begin();
             if block == 0 {
                 m.input(send::DELAY)[0] = 1.0;
             }
             l.fill(0.0);
             r.fill(0.0);
-            m.add_returns(&mut l, &mut r, 64);
+            m.add_returns(&mut l, &mut r, 0);
             if let Some(i) = l.iter().chain(&r).position(|v| v.abs() > 1e-6) {
                 first.get_or_insert(block * 64 + i % 64);
             }
         }
         assert_eq!(first, Some(18_000));
+    }
+
+    #[test]
+    fn a_short_block_leaves_no_old_send_for_a_longer_one() {
+        // Sends stop after a full block; a short block, then a full one, run
+        // the delay's tail on silence only.
+        let mut m = Mix::new(48_000.0, 120.0, 64);
+        let (mut l, mut r) = (vec![0.0f32; 64], vec![0.0f32; 64]);
+        m.begin();
+        m.input(send::DELAY)[..128].fill(1.0);
+        m.add_returns(&mut l, &mut r, 0);
+        for n in [1, 64] {
+            m.begin();
+            m.add_returns(&mut l[..n], &mut r[..n], 0);
+            assert!(m.inputs[send::DELAY].iter().all(|&v| v == 0.0), "after a block of {n}");
+        }
     }
 }

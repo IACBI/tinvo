@@ -78,6 +78,12 @@ pub struct LiveNote {
     pub velocity: u8,
 }
 
+impl LiveNote {
+    /// Releases every live note: the input they came from is gone, or a
+    /// release was lost.
+    pub const ALL_OFF: LiveNote = LiveNote { note: u8::MAX, velocity: 0 };
+}
+
 /// A live note sounding on a track.
 #[derive(Clone, Copy)]
 struct Held {
@@ -965,6 +971,12 @@ impl Engine {
         self.track_count
     }
 
+    /// Whether the delay, reverb and chorus have nothing more to play: until
+    /// then a quiet output may still be followed by an echo.
+    pub fn effects_idle(&self) -> bool {
+        self.mix.effects_idle()
+    }
+
     pub fn is_playing(&self) -> bool {
         self.transport.is_playing()
     }
@@ -1033,7 +1045,9 @@ impl Engine {
         let Some(live) = self.live.take() else { return };
         for _ in 0..LIVE_BUDGET {
             let Some(n) = live.pop() else { break };
-            if n.velocity == 0 {
+            if n == LiveNote::ALL_OFF {
+                self.release_live();
+            } else if n.velocity == 0 {
                 self.live_off(n.note);
             } else {
                 self.live_on(n.note, n.velocity);
@@ -1513,7 +1527,7 @@ impl Engine {
         debug_assert!(n <= BLOCK && out.len() % 2 == 0);
         self.mix_l[..n].fill(0.0);
         self.mix_r[..n].fill(0.0);
-        self.mix.begin(n);
+        self.mix.begin();
         let start = self.now;
         let end = start + n as u64;
         let mut pos = start;
@@ -1534,18 +1548,20 @@ impl Engine {
             }
             // fire_due consumed everything at `pos`, so `next > pos`.
             debug_assert!(next > pos);
-            self.render_segment((pos - start) as usize, (next - start) as usize);
+            let (a, b) = ((pos - start) as usize, (next - start) as usize);
+            self.render_segment(a, b);
+            // The buses and master run segment by segment too, so an
+            // automated bus or master setting changes on its own frame.
+            self.mix.add_returns(&mut self.mix_l[a..b], &mut self.mix_r[a..b], a);
+            for i in a..b {
+                let g = self.master.tick();
+                out[2 * i] = self.mix_l[i] * g;
+                out[2 * i + 1] = self.mix_r[i] * g;
+            }
+            self.mix.master(&mut out[2 * a..2 * b]);
             pos = next;
         }
         self.now = end;
-        self.mix.add_returns(&mut self.mix_l[..n], &mut self.mix_r[..n], n);
-
-        for i in 0..n {
-            let g = self.master.tick();
-            out[2 * i] = self.mix_l[i] * g;
-            out[2 * i + 1] = self.mix_r[i] * g;
-        }
-        self.mix.master(out);
         self.loudness.push(out);
         // Reductions are read once a block: a meter needs no more. Strict
         // comparisons keep -0.0, whose bits would win `fetch_max`, out.
@@ -1947,6 +1963,19 @@ mod tests {
 
     fn press(live: &Mailbox<LiveNote>, note: u8, velocity: u8) {
         live.push(LiveNote { note, velocity }).unwrap();
+    }
+
+    #[test]
+    fn all_off_releases_every_live_note() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        press(&live, 60, 100);
+        press(&live, 64, 100);
+        run(&mut e, 256);
+        assert_eq!(e.held_count, 2);
+        live.push(LiveNote::ALL_OFF).unwrap();
+        run(&mut e, 256);
+        assert_eq!(e.held_count, 0);
+        assert!(energy(&run(&mut e, 48_000)[2 * 40_000..]) < 1e-9, "the notes die away");
     }
 
     #[test]
@@ -2740,8 +2769,21 @@ mod tests {
 
     #[test]
     fn automation_is_independent_of_buffer_size() {
+        use crate::mix::mp;
         let mut edits = automated_synth();
         edits.push(Edit::SetSwing(62.0));
+        // Bus and master settings too: a held ceiling that starts limiting
+        // part-way, and a ramped delay return the synth sends to.
+        let n = InstrumentKind::Synth.params().len();
+        let point = |lane, step, value| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(value) };
+        edits.extend([
+            Edit::SetParam { track: 0, index: (n + strip::sp::COUNT + send::DELAY) as u8, value: 0.0 },
+            Edit::SetLane { track: 0, lane: 1, target: Some(MIX_TARGET + mp::LIMITER_CEILING as u8), ramp: false },
+            Edit::SetLane { track: 0, lane: 3, target: Some(MIX_TARGET + mp::DELAY_RETURN as u8), ramp: true },
+            point(1, 3, -20.0),
+            point(3, 0, SILENT_DB),
+            point(3, 5, 0.0),
+        ]);
         let reference = {
             let mut e = engine(&edits);
             e.handle(Command::Play);

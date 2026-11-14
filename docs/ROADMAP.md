@@ -312,6 +312,20 @@ Known limits:
 - The line shows one track; the song view shows them all.
 - Markers and the loop region are not drawn on it.
 
+## Phase 8e: Review
+
+A review of the whole project. Each finding was checked against the code and fixed with a test that fails without the fix:
+- Audio: the limiter's running minimum kept within its ring through long releases; send sums cleared whole, so a short block cannot leave old input for a longer one; buses and the master run segment by segment, so their automation lands on its frame at any buffer size; each synth voice has its own noise; a stepped strip setting jumps instead of gliding forever.
+- Timing and export: a tempo change keeps a swung step's position; the export tail waits until the delay, reverb and chorus are idle; stems drop lanes that would turn the limiter on.
+- Live input: closing or switching the MIDI input, or a release lost to a full queue, releases every live note and resets step entry.
+- Editing: loading a changed file again reaches every track using it; the parameter cursor is kept in range after a finished recording selects its track.
+- Security: control characters in error messages are escaped.
+- Screen: wide characters take two cells and combining marks none; the panel pages on small terminals; prompts keep the typed text in view; titles, bus parameter names and the settings page's messages fit.
+
+Known limits:
+- Character widths come from the common ranges (CJK, Hangul, full-width forms, emoji, combining marks), not Unicode's full tables; terminals also differ on some characters.
+- Closing a real MIDI input was not tried here (no MIDI device on the development machine); the release on closing and on a lost message are unit-tested.
+
 ## Known limitations of the foundation
 
 - Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.

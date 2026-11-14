@@ -119,6 +119,9 @@ struct Voice {
     filter: Svf,
     amp: Adsr,
     fenv: Adsr,
+    /// The voice's own noise, so what it draws does not depend on how the
+    /// other voices' samples are interleaved with its own.
+    noise: Rng,
 }
 
 impl Voice {
@@ -136,6 +139,7 @@ impl Voice {
             filter: Svf::new(),
             amp: Adsr::new(),
             fenv: Adsr::new(),
+            noise: Rng::new(0),
         }
     }
 }
@@ -194,7 +198,7 @@ pub struct PolySynth {
     unison_ratio: [f32; MAX_UNISON],
     /// Keeps the summed copies at about the level of one.
     unison_gain: f32,
-    /// Noise source and unison start phases.
+    /// Seeds of the voices' noise, and unison start phases.
     rng: Rng,
 }
 
@@ -293,7 +297,9 @@ impl PolySynth {
         for ph in phases.iter_mut().skip(1) {
             *ph = f64::from(self.rng.next_f32());
         }
+        let seed = self.rng.next_u64();
         let v = &mut self.voices[idx];
+        v.noise = Rng::new(seed);
         if !v.amp.is_active() {
             for (k, &ph) in phases.iter().enumerate() {
                 v.osc1[k].reset(ph);
@@ -374,7 +380,6 @@ impl PolySynth {
             *l = self.lfo.tick(shape, inc);
         }
 
-        let rng = &mut self.rng;
         for v in self.voices.iter_mut().filter(|v| v.amp.is_active()) {
             let gain = v.vel_gain * VOICE_GAIN;
             let target = f32::from(v.note);
@@ -402,7 +407,7 @@ impl PolySynth {
                 }
                 s *= uni_gain;
                 if noise > 0.0 {
-                    s += noise * rng.bipolar();
+                    s += noise * v.noise.bipolar();
                 }
                 let fe = v.fenv.tick();
                 v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
@@ -600,6 +605,25 @@ mod tests {
         let (clean, noisy) = (sine(0.0), sine(0.5));
         assert!(hf(&noisy) > 20.0 * hf(&clean).max(1e-6), "{} vs {}", hf(&noisy), hf(&clean));
         assert!(noisy.iter().all(|x| x.is_finite() && x.abs() < 1.0));
+    }
+
+    #[test]
+    fn a_noisy_chord_does_not_depend_on_the_block_size() {
+        let render = |block: usize| {
+            let mut s = sine_synth();
+            s.set_param(p::NOISE, 0.5);
+            s.note_on(45, 127);
+            s.note_on(52, 100);
+            let mut b = vec![0.0f32; 4800];
+            for c in b.chunks_mut(block) {
+                s.render(c);
+            }
+            b
+        };
+        let whole = render(4800);
+        for block in [1, 7, 64] {
+            assert_eq!(render(block), whole, "blocks of {block}");
+        }
     }
 
     #[test]

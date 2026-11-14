@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const COMMAND_QUEUE: usize = 4096;
@@ -49,6 +49,10 @@ const CELL: u16 = 3;
 /// with the song line.
 const SONG_LINE_ROWS: u16 = 8;
 const PARAM_COL: u16 = 28;
+/// Columns a text prompt keeps for what is typed.
+const MIN_INPUT: usize = 24;
+/// Rows the grid keeps however many parameters the panel has.
+const MIN_GRID_ROWS: u16 = 3;
 const MIN_W: u16 = 64;
 const MIN_H: u16 = 16;
 const HISTORY_LIMIT: usize = 1000;
@@ -877,6 +881,12 @@ impl App {
     /// Handles a message from the MIDI input (the engine has already played
     /// it): with step entry on, notes write the step under the cursor.
     /// Keys pressed together make a chord; releasing them all moves on.
+    /// Forgets the keys held for step entry: their releases will not come.
+    fn midi_reset(&mut self) {
+        self.entry_held.clear();
+        self.entry_notes.clear();
+    }
+
     pub fn midi_message(&mut self, m: Message) {
         self.midi_seen = Some(Instant::now());
         let entering = self.step_entry
@@ -1209,10 +1219,20 @@ impl App {
         let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
         self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
-        self.bank.insert(key.clone(), loaded);
+        let reloaded = self.bank.insert(key.clone(), loaded).is_some();
         let meta_before = self.meta();
-        self.project.tracks[self.track].sample = Some(key);
+        self.project.tracks[self.track].sample = Some(key.clone());
         self.send_sample(self.track);
+        // The file as loaded now is what every track using it plays, as an
+        // export and the saved project would have it.
+        if reloaded {
+            let others: Vec<usize> = (0..self.track_count())
+                .filter(|&i| i != self.track && self.project.tracks[i].sample.as_deref() == Some(key.as_str()))
+                .collect();
+            for &i in &others {
+                self.send_sample(i);
+            }
+        }
         self.touch();
         self.redo.clear();
         let meta_after = self.meta();
@@ -1440,6 +1460,8 @@ impl App {
     pub fn tick(&mut self) {
         self.tick_autosave(Instant::now());
         self.tick_recording();
+        // A finished take may have selected its track.
+        self.clamp_cursor();
         if self.link.is_some() && self.live_track_sent != Some(self.track) {
             self.send(Command::SetLiveTrack(self.track.min(usize::from(u8::MAX)) as u8));
             self.live_track_sent = Some(self.track);
@@ -2336,6 +2358,8 @@ impl App {
             Action::Help => self.mode = Mode::Help(0),
             Action::Settings => {
                 self.settings_page.capture = false;
+                // The page shows only its own messages.
+                self.status = None;
                 self.mode = Mode::Settings;
             }
             Action::MidiInputs => match midi::inputs() {
@@ -3004,7 +3028,7 @@ impl App {
             return;
         }
         self.draw_header(s, w);
-        let params_rows = self.params_rows(w);
+        let params_rows = self.params_rows(w, h);
         // header, ruler, separator, params block, status line
         let track_rows = h.saturating_sub(2 + 1 + params_rows + 1).max(1);
         if self.song_view {
@@ -3125,7 +3149,7 @@ impl App {
     fn draw_roll(&self, s: &mut Screen, w: u16, rows: u16) {
         let dim = self.style(Role::Dim);
         let t = &self.project.tracks[self.track];
-        let title = format!("Piano roll · {:<16.16} {}: grid", t.name, self.k(Action::PianoRoll));
+        let title = view_title("Piano roll", &t.name, &self.k(Action::PianoRoll));
         s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
@@ -3194,7 +3218,7 @@ impl App {
         const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let t = &self.project.tracks[self.track];
         let dim = self.style(Role::Dim);
-        let title = format!("Automation · {:<16.16} {}: grid", t.name, self.k(Action::Automate));
+        let title = view_title("Automation", &t.name, &self.k(Action::Automate));
         s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
@@ -3494,17 +3518,34 @@ impl App {
         }
     }
 
-    fn params_rows(&self, w: u16) -> u16 {
+    /// Rows of the panel, its title included, on a `w` by `h` screen: all
+    /// its parameters, or as many as leave the grid its rows.
+    fn params_rows(&self, w: u16, h: u16) -> u16 {
         let cols = (w / PARAM_COL).max(1) as usize;
-        (self.page_params().len().div_ceil(cols)) as u16 + 1
+        let needed = self.page_params().len().div_ceil(cols) as u16 + 1;
+        // header, ruler, the grid's rows, a blank line, the status line
+        needed.min(h.saturating_sub(2 + MIN_GRID_ROWS + 2).max(2))
     }
 
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
         let dim = self.style(Role::Dim);
         s.fill(0, y, w, '─', dim);
-        for row in y..y + self.params_rows(w) {
+        let rows = self.params_rows(w, s.height());
+        for row in y..y + rows {
             self.hit(0, row, w, Target::Panel);
         }
+        // Parameters that do not fit are shown a screenful of rows at a
+        // time, the one with the selected parameter.
+        let cols = (w / PARAM_COL).max(1) as usize;
+        let params = self.page_params();
+        let (shown, total) = (usize::from(rows - 1).max(1), params.len().div_ceil(cols));
+        let selected_row = params.iter().position(|&i| i == self.param).unwrap_or(0) / cols;
+        let first_row = selected_row / shown * shown;
+        let part = if total > shown {
+            format!("· {}/{} ", first_row / shown + 1, total.div_ceil(shown))
+        } else {
+            String::new()
+        };
         let track = self.project.tracks.get(self.track);
         let title = match (self.page, track) {
             // Shared by all tracks, so shown with or without one.
@@ -3541,7 +3582,8 @@ impl App {
             }
         };
         let title_style = self.style(if self.focus == Focus::Params { Role::PanelFocus } else { Role::Panel });
-        s.put(2, y, &title, title_style);
+        let x = s.put(2, y, &title, title_style);
+        s.put(2 + x, y, &part, title_style);
         if let Some(t) = track.filter(|_| self.page != Page::Mix) {
             let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
                 Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
@@ -3549,13 +3591,15 @@ impl App {
             };
             s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
         }
-        let cols = (w / PARAM_COL).max(1) as usize;
-        for (slot, i) in self.page_params().into_iter().enumerate() {
+        for (slot, i) in params.into_iter().enumerate() {
             let (row, col) = (slot / cols, slot % cols);
+            if !(first_row..first_row + shown).contains(&row) {
+                continue;
+            }
             let x = col as u16 * PARAM_COL + 1;
-            let yy = y + 1 + row as u16;
+            let yy = y + 1 + (row - first_row) as u16;
             let spec = self.param_spec(i);
-            let text = format!("{:<12.12}{:>13.13}", spec.label, spec.format(self.param_value(i)));
+            let text = format!("{:<15.15} {:>9.9}", spec.label, spec.format(self.param_value(i)));
             let role = if i == self.param && self.focus == Focus::Params {
                 Role::Cursor
             } else if i == self.param {
@@ -3613,6 +3657,19 @@ impl App {
         }
     }
 
+    /// A text prompt from column `x` to `w`: the label, cut if it would
+    /// leave the text less than [`MIN_INPUT`] columns, then the end of the
+    /// text (where typing goes) and the cursor.
+    fn draw_input(&self, s: &mut Screen, x: u16, y: u16, w: u16, label: &str, text: &str) {
+        let room = usize::from(w.saturating_sub(x));
+        let label: String = label.chars().take(room.saturating_sub(MIN_INPUT)).collect();
+        let x = x + s.put(x, y, &label, self.style(Role::Prompt));
+        let fits = usize::from(w.saturating_sub(x)).saturating_sub(1);
+        let tail: String = text.chars().skip(text.chars().count().saturating_sub(fits)).collect();
+        let x = x + s.put(x, y, &tail, self.style(Role::Input));
+        s.put(x, y, "█", self.style(Role::Input));
+    }
+
     fn draw_status(&self, s: &mut Screen, w: u16, y: u16) {
         s.fill(0, y, w, ' ', self.style(Role::StatusBar));
         let prompt = self.style(Role::Prompt);
@@ -3626,16 +3683,19 @@ impl App {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
                     }
                     PromptKind::Style(r) => style_prompt(*r),
-                    PromptKind::Export => format!(
-                        "Export [{}, {} ×{}] (←→ what, Tab format, ↑↓ repeats) file: ",
-                        self.export_format.label(),
-                        self.export_source_label(),
-                        self.export_loops,
-                    ),
+                    PromptKind::Export => {
+                        let what = format!(
+                            "Export [{}, {} ×{}]",
+                            self.export_format.label(),
+                            self.export_source_label(),
+                            self.export_loops
+                        );
+                        let long = format!("{what} (←→ what, Tab format, ↑↓ repeats) file: ");
+                        // The keys' help goes first when the line is short.
+                        if long.chars().count() + MIN_INPUT <= usize::from(w) { long } else { format!("{what} file: ") }
+                    }
                 };
-                let x = s.put(0, y, &label, prompt);
-                let x2 = s.put(x, y, text, self.style(Role::Input));
-                s.put(x + x2, y, "█", self.style(Role::Input));
+                self.draw_input(s, 0, y, w, &label, text);
             }
             Mode::Confirm(Confirm::Quit) => {
                 s.put(0, y, "Unsaved changes. Quit anyway? (y/n)", prompt);
@@ -3800,10 +3860,7 @@ impl App {
             s.put(2, h.saturating_sub(3), msg, self.style(Role::Message));
         }
         if let Mode::Prompt(PromptKind::Style(r), text) = &self.mode {
-            let y = h.saturating_sub(2);
-            let x = 2 + s.put(2, y, &style_prompt(*r), self.style(Role::Prompt));
-            let x2 = s.put(x, y, text, self.style(Role::Input));
-            s.put(x + x2, y, "█", self.style(Role::Input));
+            self.draw_input(s, 2, h.saturating_sub(2), s.width(), &style_prompt(*r), text);
             return;
         }
         let hint = if page.capture {
@@ -4144,17 +4201,28 @@ struct MidiSession {
     input: Option<midi::Input>,
     live: Arc<Mailbox<LiveNote>>,
     ui: Arc<Mailbox<Message>>,
+    /// Set by the handler when a mailbox had no room for a message.
+    lost: Arc<AtomicBool>,
+    /// Every held note is to be let go (`LiveNote::ALL_OFF` not yet sent).
+    release: bool,
 }
 
 impl MidiSession {
     fn new() -> Self {
-        Self { input: None, live: Arc::new(Mailbox::new(LIVE_QUEUE)), ui: Arc::new(Mailbox::new(LIVE_QUEUE)) }
+        Self {
+            input: None,
+            live: Arc::new(Mailbox::new(LIVE_QUEUE)),
+            ui: Arc::new(Mailbox::new(LIVE_QUEUE)),
+            lost: Arc::new(AtomicBool::new(false)),
+            release: false,
+        }
     }
 
     /// Opens the input with `id` (`None`: closes MIDI). Returns a status.
     fn open(&mut self, app: &mut App, id: Option<String>) -> String {
-        // Close first: a port can be open only once.
-        self.input = None;
+        // Close first: a port can be open only once. The keys held on it
+        // will never send their releases.
+        self.release |= self.input.take().is_some();
         app.midi_input = None;
         let Some(id) = id else { return "MIDI input off".into() };
         match midi::open(&id, self.handler()) {
@@ -4170,15 +4238,17 @@ impl MidiSession {
 
     /// What runs on the MIDI thread for each message.
     fn handler(&self) -> impl FnMut(Message) + Send + 'static {
-        let (live, ui) = (self.live.clone(), self.ui.clone());
+        let (live, ui, lost) = (self.live.clone(), self.ui.clone(), self.lost.clone());
         move |m: Message| {
             let note = match m {
                 Message::NoteOn { note, velocity, .. } => LiveNote { note, velocity },
                 Message::NoteOff { note, .. } => LiveNote { note, velocity: 0 },
             };
-            // A full mailbox drops the note rather than block this thread.
-            let _ = live.push(note);
-            let _ = ui.push(m);
+            // A full mailbox drops the note rather than block this thread,
+            // and says so: a lost release would leave a note held.
+            if live.push(note).is_err() | ui.push(m).is_err() {
+                lost.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -4190,6 +4260,14 @@ impl MidiSession {
         }
         while let Some(m) = self.ui.pop() {
             app.midi_message(m);
+        }
+        if self.lost.swap(false, Ordering::Relaxed) {
+            self.release = true;
+        }
+        if self.release {
+            app.midi_reset();
+            // Tried again next frame if the mailbox is full or busy.
+            self.release = self.live.push(LiveNote::ALL_OFF).is_err();
         }
     }
 }
@@ -4474,6 +4552,16 @@ fn ask_recovery(
             }
         }
     }
+}
+
+/// The title of the piano roll or automation view: the view, the track's
+/// name cut to fit and the key back to the grid, all left of the step
+/// columns.
+fn view_title(view: &str, name: &str, key: &str) -> String {
+    let tail = format!(" {key}: grid");
+    let room = usize::from(LEFT - 2).saturating_sub(view.chars().count() + 3 + tail.chars().count());
+    let name: String = name.chars().take(room).collect();
+    format!("{view} · {name:<room$}{tail}")
 }
 
 #[cfg(test)]
@@ -4962,6 +5050,42 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_changed_file_again_changes_it_for_every_track_using_it() {
+        let dir = std::env::temp_dir().join(format!("tinvo-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.wav");
+        let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.06).sin() * 0.8).collect();
+        wav::write_file(&path, &tone, 1, 48_000, SampleFormat::Float32).unwrap();
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(Project::new(), None, Some(link), 48_000, "test".into());
+        let mut load = |a: &mut App, track: usize| {
+            a.track = track;
+            a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+            keys(a, &[Key::Enter]);
+            let mut v = Vec::new();
+            while let Some(cmd) = rx.pop() {
+                if let Command::SetSample { track, sample: Some(s) } = cmd {
+                    v.push((track, s.audio()[10]));
+                }
+            }
+            v
+        };
+        keys(&mut a, &[Key::Char('a'), Key::Char('7'), Key::Char('a'), Key::Char('7')]);
+        assert_eq!(load(&mut a, 0).len(), 1);
+        let quieter: Vec<f32> = tone.iter().map(|x| x * 0.5).collect();
+        wav::write_file(&path, &quieter, 1, 48_000, SampleFormat::Float32).unwrap();
+        // Track 1 loads the file as it is now; track 0, which uses the same
+        // file, plays it too, as the export does.
+        let sent = load(&mut a, 1);
+        assert_eq!(sent.iter().map(|&(t, _)| t).collect::<Vec<_>>(), [1, 0]);
+        assert!(sent.iter().all(|&(_, x)| x == quieter[10]), "{sent:?}");
+        let samples = a.track_samples();
+        assert!(Arc::ptr_eq(samples[0].as_ref().unwrap(), samples[1].as_ref().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn samples_nothing_can_bring_back_are_freed() {
         let dir = std::env::temp_dir().join(format!("tinvo-bank-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5433,6 +5557,108 @@ mod tests {
     /// The row the song line is drawn on.
     fn song_line_row(s: &Screen) -> u16 {
         (0..s.height()).find(|&y| s.row_text(y).trim_start().starts_with("Song: ")).expect("a song line")
+    }
+
+    #[test]
+    fn a_track_changed_between_keys_keeps_the_parameter_cursor_in_range() {
+        // A finished recording selects its sampler track from `tick`, with
+        // the cursor still on a parameter only the synth has.
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('a'), Key::Char('7'), Key::Up, Key::Char('f')]);
+        let synth_last = *a.page_params().last().unwrap();
+        a.param = synth_last;
+        a.track = 1;
+        assert!(!a.page_params().contains(&synth_last), "the sampler has fewer parameters");
+        a.tick();
+        assert!(a.page_params().contains(&a.param));
+        keys(&mut a, &[Key::Right, Key::Down]);
+        frame(&a);
+    }
+
+    #[test]
+    fn a_long_panel_on_a_small_screen_pages_to_the_selected_parameter() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Tab]);
+        assert_eq!(a.focus, Focus::Params);
+        let draw = |a: &App| {
+            let mut s = Screen::new(MIN_W, MIN_H);
+            a.draw(&mut s);
+            let shown: Vec<usize> = a
+                .hits
+                .borrow()
+                .iter()
+                .filter_map(|h| if let Target::Param(i) = h.target { Some(i) } else { None })
+                .collect();
+            (s, shown)
+        };
+        let (s, shown) = draw(&a);
+        assert!(shown.contains(&a.param) && shown.len() < a.page_params().len(), "{shown:?}");
+        assert!((2..5).all(|y| s.row_text(y).contains('│')), "the grid keeps its rows");
+        assert!(s.row_text(5).starts_with("──"), "{}", s.row_text(5));
+        assert!(s.row_text(5).contains("· 1/"), "{}", s.row_text(5));
+        let last = *a.page_params().last().unwrap();
+        while a.param != last {
+            keys(&mut a, &[Key::Down]);
+        }
+        let (s, shown) = draw(&a);
+        assert!(shown.contains(&last), "{shown:?}");
+        assert!((0..MIN_H).all(|y| !s.row_text(y).is_empty()));
+        // A large screen shows them all, with no part number.
+        frame(&a);
+        let all = a.hits.borrow().iter().filter(|h| matches!(h.target, Target::Param(_))).count();
+        assert_eq!(all, a.page_params().len());
+    }
+
+    #[test]
+    fn a_prompt_keeps_what_is_typed_in_view() {
+        let mut a = app();
+        keys(&mut a, &[Key::Char('e')]);
+        let typed = "a-rather-long-file-name-for-the-export";
+        if let Mode::Prompt(k, _) = a.mode.clone() {
+            a.mode = Mode::Prompt(k, typed.into());
+        }
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        let line = s.row_text(MIN_H - 1);
+        assert!(line.starts_with("Export [24-bit, song ×4] file: "), "{line}");
+        assert!(line.ends_with("export█"), "the end of the name and the cursor: {line}");
+        // A wide screen has room for the keys' help.
+        assert!(
+            frame(&a).row_text(29).contains("(←→ what, Tab format, ↑↓ repeats) file: a-rather"),
+            "{}",
+            frame(&a).row_text(29)
+        );
+    }
+
+    #[test]
+    fn view_titles_keep_the_key_back_to_the_grid() {
+        let full = view_title("Automation", "A long track name here", "A");
+        assert_eq!(full, "Automation · A long track  A: grid");
+        assert_eq!(full.chars().count(), usize::from(LEFT - 2));
+        assert_eq!(view_title("Piano roll", "Bass", "v"), "Piano roll · Bass          v: grid");
+        let s = frame(&song_line_app());
+        assert!(s.row_text(1).starts_with(" Piano roll · Synth"), "{}", s.row_text(1));
+        assert!(s.row_text(1).contains("v: grid│"), "{}", s.row_text(1));
+    }
+
+    #[test]
+    fn every_parameter_fits_its_panel_cell() {
+        let mut specs: Vec<&ParamSpec> = vec![&VOLUME, &PAN];
+        specs.extend(mix::MIX_PARAMS.iter());
+        for kind in InstrumentKind::ALL {
+            specs.extend((0..strip::track_param_count(kind)).filter_map(|i| track_param(kind, i)));
+        }
+        for spec in specs {
+            assert!(spec.label.chars().count() <= 15, "{}", spec.label);
+            for k in 0..=40 {
+                let v = spec.from_unit(k as f32 / 40.0);
+                for value in [v, spec.min, spec.max, spec.default, spec.nudge(v, -1, false)] {
+                    let text = spec.format(value);
+                    assert!(text.chars().count() <= 9, "{} = {text}", spec.label);
+                }
+            }
+        }
     }
 
     #[test]
@@ -5986,6 +6212,34 @@ mod tests {
         assert_eq!(a.project.tracks[bass].steps[0][2].map(|s| s.note), Some(60));
         assert_eq!(a.step, 3);
         assert_eq!(session.ui.pop(), None);
+    }
+
+    #[test]
+    fn closing_the_input_or_losing_a_release_lets_every_note_go() {
+        let mut session = MidiSession::new();
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        (a.track, a.step_entry) = (bass, true);
+        let mut handler = session.handler();
+        handler(note_on(60, 99));
+        session.poll(&mut a);
+        assert_eq!(a.entry_held, [60]);
+        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 99 }));
+        // A full mailbox loses the release: everything is let go instead.
+        for _ in 0..LIVE_QUEUE {
+            session.live.push(LiveNote { note: 1, velocity: 1 }).unwrap();
+        }
+        handler(note_off(60));
+        session.poll(&mut a);
+        assert!(a.entry_held.is_empty() && a.entry_notes.is_empty());
+        assert!(session.release, "waits for room");
+        session.live.clear();
+        session.poll(&mut a);
+        assert_eq!((session.live.pop(), session.release), (Some(LiveNote::ALL_OFF), false));
+        // With no input open, turning MIDI off has nothing to let go.
+        session.open(&mut a, None);
+        session.poll(&mut a);
+        assert_eq!(session.live.pop(), None);
     }
 
     #[test]
@@ -6659,6 +6913,7 @@ mod tests {
     #[test]
     fn the_settings_page_draws_and_clicks() {
         let mut a = app();
+        a.set_status("a message from the grid");
         a.keys.bind(Action::Undo, vec![Key::Char('z')]);
         keys(&mut a, &[Key::F(2)]);
         let f = frame(&a);
@@ -6667,6 +6922,7 @@ mod tests {
         assert!(f.row_text(5).starts_with("  ") && f.row_text(5).contains("play"), "{}", f.row_text(5));
         let text: Vec<String> = (4..27).map(|y| f.row_text(y)).collect();
         assert!(text.iter().any(|l| l.contains("* undo               z")), "{text:#?}");
+        assert!(!(0..30).any(|y| f.row_text(y).contains("a message from the grid")), "the grid's message stays behind");
         click(&mut a, Target::SettingsTab(1));
         assert_eq!(a.settings_page.tab, SettingsTab::Colours);
         let f = frame(&a);

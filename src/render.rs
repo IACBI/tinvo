@@ -137,13 +137,15 @@ pub fn render_into(
         engine.handle(Command::Stop);
     }
 
-    // The tail ends after `quiet_needed` frames of silence, which are not
-    // part of the result: quiet blocks wait in `held` until sound follows.
+    // The tail ends after `quiet_needed` frames of silence once the effects
+    // hold nothing more (a long delay's echo can follow a quiet spell). The
+    // silence is not part of the result: quiet blocks wait in `held` until
+    // sound follows.
     let max_tail = (opts.max_tail_seconds.max(0.0) * sr as f32) as usize;
     let quiet_needed = (TAIL_QUIET_SECONDS * sr as f32) as usize;
     let mut held: Vec<f32> = Vec::new();
     let mut tail = 0usize;
-    while tail < max_tail && held.len() / 2 < quiet_needed {
+    while tail < max_tail && (held.len() / 2 < quiet_needed || !engine.effects_idle()) {
         let n = 512.min(max_tail - tail);
         let b = &mut buf[..n * 2];
         engine.process(b);
@@ -192,6 +194,13 @@ pub fn stem_project(project: &Project, i: usize) -> Project {
         t.solo = false;
     }
     solo.mix[crate::mix::mp::LIMITER] = 0.0;
+    // A lane could switch the limiter back on.
+    let limiter = crate::engine::MIX_TARGET + crate::mix::mp::LIMITER as u8;
+    for lane in solo.tracks.iter_mut().flat_map(|t| t.lanes.iter_mut()) {
+        if lane.target == Some(limiter) {
+            *lane = crate::project::LaneData::new(None, false);
+        }
+    }
     solo
 }
 
@@ -227,7 +236,9 @@ mod tests {
         assert_eq!(a, b);
         let main = main_frames(&p, &opts) as usize;
         assert!(a.len() / 2 >= main);
-        assert!(a.len() / 2 < main + 48_000 * 2, "tail too long: {}", a.len() / 2 - main);
+        // The demo's delay repeats every 0.49 s at 35 % feedback: its last
+        // repeat above the tail's threshold (-90 dB) ends about 2.3 s on.
+        assert!(a.len() / 2 < main + 48_000 * 3, "tail too long: {}", a.len() / 2 - main);
         let peak = a.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(peak > 0.1 && peak <= 1.0, "peak {peak}");
         assert!(a.iter().all(|x| x.is_finite()));
@@ -274,6 +285,27 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn the_tail_keeps_an_echo_that_follows_a_quiet_spell() {
+        use crate::mix::mp;
+        // One short hat at 60 BPM into a half-note delay: the echo comes
+        // 2 s after the hit, long after the pattern's 1 s is over.
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::HatClosed)).unwrap();
+        p.apply(Edit::SetPatternLength { pattern: 0, len: 4 }).unwrap();
+        p.tracks[0].steps[0][0] = Some(Step::new(60, 127, 1));
+        p.tempo = 60.0;
+        let delay_send = InstrumentKind::HatClosed.params().len() + crate::strip::sp::COUNT + crate::mix::send::DELAY;
+        p.apply(Edit::SetParam { track: 0, index: delay_send as u8, value: 0.0 }).unwrap();
+        p.mix[mp::DELAY_TIME] = (crate::mix::DIVISIONS.len() - 1) as f32;
+        p.mix[mp::DELAY_FEEDBACK] = 0.0;
+        let opts = RenderOptions { loops: 1, source: Source::Pattern(0), ..Default::default() };
+        let out = render(&p, &[], &opts);
+        assert!(out.len() / 2 > 96_000, "{} frames", out.len() / 2);
+        let echo = out[2 * 95_000..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(echo > 0.01, "{echo}");
     }
 
     /// A short closed hat on step 0 of pattern A and step 2 of pattern B
@@ -333,6 +365,30 @@ mod tests {
             render(&Project { tracks: Project::demo().tracks, ..q.clone() }, &[], &opts),
             "the parts are heard"
         );
+    }
+
+    #[test]
+    fn a_stem_has_no_limiter_even_where_a_lane_turns_it_on() {
+        use crate::mix::mp;
+        let mut p = two_patterns();
+        p.mix[mp::LIMITER] = 0.0;
+        p.mix[mp::LIMITER_CEILING] = -30.0;
+        let plain = p.clone();
+        p.apply(Edit::SetLane {
+            track: 0,
+            lane: 1,
+            target: Some(crate::engine::MIX_TARGET + mp::LIMITER as u8),
+            ramp: false,
+        })
+        .unwrap();
+        p.apply(Edit::SetPoint { track: 0, lane: 1, pattern: 0, step: 0, value: Some(1.0) }).unwrap();
+        let stem = stem_project(&p, 0);
+        assert!(stem.tracks.iter().all(|t| t.lanes.iter().all(|l| l.target.is_none())));
+        // The hat goes well past the -30 dB ceiling, unlimited.
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Pattern(0), ..Default::default() };
+        let out = render(&stem, &[], &opts);
+        assert_eq!(out, render(&stem_project(&plain, 0), &[], &opts));
+        assert!(out.iter().fold(0.0f32, |m, x| m.max(x.abs())) > 0.1);
     }
 
     #[test]
