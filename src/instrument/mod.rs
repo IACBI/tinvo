@@ -14,6 +14,11 @@ pub use sampler::{SAMPLER_VOICES, Sampler};
 use std::sync::Arc;
 pub use synth::{PolySynth, SYNTH_VOICES};
 
+/// The index of the synth's LFO sync parameter.
+pub const fn synth_lfo_sync() -> usize {
+    synth::p::LFO_SYNC
+}
+
 /// The kinds of instrument a track can host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InstrumentKind {
@@ -325,6 +330,20 @@ impl Instrument {
             Instrument::Synth(s) => s.note_off(id),
             Instrument::Sampler(s) => s.note_off(id),
             Instrument::Drum(_) => {}
+        }
+    }
+
+    /// The song's tempo, for a synth's synced LFO.
+    pub fn set_tempo(&mut self, bpm: f32) {
+        if let Instrument::Synth(s) = self {
+            s.set_tempo(bpm);
+        }
+    }
+
+    /// Playback starts.
+    pub fn start(&mut self) {
+        if let Instrument::Synth(s) = self {
+            s.start();
         }
     }
 

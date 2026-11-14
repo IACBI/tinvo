@@ -35,7 +35,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
-- 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level), and velocity → cutoff.
+- 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
 - An 8-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
@@ -188,7 +188,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
-- 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye) ve velocity → cutoff.
+- 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
 - WAV dosyalarını windowed-sinc interpolasyonla çalan 8 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.

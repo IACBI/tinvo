@@ -1209,6 +1209,9 @@ impl Engine {
         self.transport.start(self.now);
         let e = self.entry;
         self.conductor = Some(self.tick_at(None, &e, 0));
+        for t in &mut self.tracks[..self.track_count] {
+            t.instrument.start();
+        }
         for t in 0..self.track_count {
             self.tracks[t].clock = Some(self.tick_at(Some(t), &e, 0));
             self.tracks[t].early_for = None;
@@ -1443,6 +1446,9 @@ impl Engine {
                 let pending = self.pending_position();
                 self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
                 self.mix.set_tempo(self.tempo);
+                for t in &mut self.tracks {
+                    t.instrument.set_tempo(self.tempo);
+                }
             }
             Edit::SetPatternLength { pattern, len } => {
                 if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
@@ -1509,6 +1515,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
+                    self.tracks[n].instrument.set_tempo(self.tempo);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
@@ -1526,6 +1533,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
+                    self.tracks[n].instrument.set_tempo(self.tempo);
                     self.track_count += 1;
                     self.update_gains();
                     if self.transport.is_playing() {

@@ -25,10 +25,18 @@ const WAVES: &[&str] = &["saw", "square", "tri", "sine"];
 const FILTERS: &[&str] = &["lowpass", "bandpass", "highpass"];
 const LFO_WAVES: &[&str] = &["sine", "tri", "saw", "square", "s&h"];
 const UNISON: &[&str] = &["1", "2", "3", "4"];
+/// The LFO's rate: free (in Hz) or one cycle per note value, the delay's
+/// values followed by whole notes.
+const LFO_SYNC: &[&str] = &[
+    "free", "1/32", "1/16T", "1/16", "1/16D", "1/8T", "1/8", "1/8D", "1/4T", "1/4", "1/4D", "1/2", "1/1", "2/1", "4/1",
+];
+/// Beats in one LFO cycle for each synced value of [`LFO_SYNC`].
+const LFO_SYNC_BEATS: [f32; 14] =
+    [0.125, 1.0 / 6.0, 0.25, 0.375, 1.0 / 3.0, 0.5, 0.75, 2.0 / 3.0, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
 const MIN_PW: f32 = 0.05;
 const MAX_PW: f32 = 0.95;
 
-mod p {
+pub(crate) mod p {
     pub const WAVE1: usize = 0;
     pub const WAVE2: usize = 1;
     pub const SEMI: usize = 2;
@@ -60,7 +68,9 @@ mod p {
     pub const NOISE: usize = 26;
     pub const UNISON: usize = 27;
     pub const DETUNE: usize = 28;
-    pub const COUNT: usize = 29;
+    // Added in format 12.
+    pub const LFO_SYNC: usize = 29;
+    pub const COUNT: usize = 30;
 }
 
 /// Semitone-sized steps for frequencies, ~10 % steps for times.
@@ -97,6 +107,7 @@ pub static PARAMS: [ParamSpec; p::COUNT] = [
     ParamSpec::linear("noise", "Noise", 0.0, 1.0, 0.0, 0.01, Unit::None),
     ParamSpec::stepped("unison", "Unison", UNISON, 0.0),
     ParamSpec::linear("detune", "Detune", 0.0, 50.0, 12.0, 1.0, Unit::Cents),
+    ParamSpec::stepped("lfo_sync", "LFO sync", LFO_SYNC, 0.0),
 ];
 
 /// Glide covers 99 % of the interval in the glide time.
@@ -188,6 +199,8 @@ pub struct PolySynth {
     /// Pitch of the most recent note, where glides start from.
     last_note: Option<u8>,
     lfo: Lfo,
+    /// For a synced LFO.
+    tempo: f32,
     wave1: Waveform,
     wave2: Waveform,
     osc2_ratio: f32,
@@ -212,6 +225,7 @@ impl PolySynth {
             clock: 0,
             last_note: None,
             lfo: Lfo { phase: 0.0, held: 0.0, rng: Rng::new(0x1F0) },
+            tempo: 120.0,
             wave1: Waveform::Saw,
             wave2: Waveform::Saw,
             osc2_ratio: 1.0,
@@ -238,6 +252,25 @@ impl PolySynth {
 
     pub fn param(&self, index: usize) -> Option<f32> {
         self.params.get(index).copied()
+    }
+
+    pub fn set_tempo(&mut self, bpm: f32) {
+        self.tempo = bpm;
+    }
+
+    /// Playback starts: a synced LFO starts its cycle on the first beat.
+    pub fn start(&mut self) {
+        if self.params[p::LFO_SYNC] >= 1.0 {
+            self.lfo.phase = 0.0;
+        }
+    }
+
+    /// The LFO's rate in Hz.
+    fn lfo_hz(&self) -> f32 {
+        match self.params[p::LFO_SYNC] as usize {
+            0 => self.params[p::LFO_RATE],
+            s => self.tempo / 60.0 / LFO_SYNC_BEATS[(s - 1).min(LFO_SYNC_BEATS.len() - 1)],
+        }
     }
 
     fn update_derived(&mut self) {
@@ -375,7 +408,7 @@ impl PolySynth {
         // of time only.
         let mut lfo = [0.0f32; CHUNK];
         let shape = pr[p::LFO_WAVE] as usize;
-        let inc = f64::from(pr[p::LFO_RATE] / sr);
+        let inc = f64::from(self.lfo_hz() / sr);
         for l in lfo[..out.len()].iter_mut() {
             *l = self.lfo.tick(shape, inc);
         }
@@ -427,6 +460,52 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn a_synced_lfo_takes_its_rate_from_the_tempo() {
+        assert_eq!(LFO_SYNC.len(), LFO_SYNC_BEATS.len() + 1);
+        assert_eq!(LFO_SYNC[1..12], crate::mix::DIVISIONS, "the delay's values first");
+        let mut s = PolySynth::new(SR);
+        s.set_param(p::LFO_RATE, 3.0);
+        assert_eq!(s.lfo_hz(), 3.0, "free");
+        s.set_tempo(120.0);
+        for (name, hz) in [("1/4", 2.0), ("1/8T", 6.0), ("1/16", 8.0), ("1/1", 0.5), ("4/1", 0.125)] {
+            s.set_param(p::LFO_SYNC, LFO_SYNC.iter().position(|&n| n == name).unwrap() as f32);
+            assert!((s.lfo_hz() - hz).abs() < 1e-6, "{name}: {}", s.lfo_hz());
+        }
+        s.set_tempo(90.0);
+        assert!((s.lfo_hz() - 1.5 / 16.0).abs() < 1e-6, "4/1 at 90 BPM");
+    }
+
+    #[test]
+    fn a_synced_lfo_completes_its_cycles_on_the_beat() {
+        // A square LFO on the level, one cycle per quarter at 120 BPM: the
+        // level drops for the second half of every beat (24 000 frames).
+        let mut s = sine_synth();
+        s.set_param(p::LFO_WAVE, 3.0);
+        s.set_param(p::LFO_AMP, 1.0);
+        s.set_param(p::LFO_SYNC, 9.0);
+        s.set_tempo(120.0);
+        // Running before Play leaves the phase anywhere; Play resets it.
+        let mut pre = vec![0.0; 7777];
+        s.render(&mut pre);
+        s.start();
+        s.note_on(69, 127);
+        let mut out = vec![0.0; 96_000];
+        s.render(&mut out);
+        let rms = |a: usize, b: usize| (out[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt();
+        for beat in 1..4 {
+            let b = beat * 24_000;
+            let (on, off) = (rms(b + 1000, b + 11_000), rms(b + 13_000, b + 23_000));
+            assert!(off < on * 0.05, "beat {beat}: {on} {off}");
+        }
+        // A free LFO is not reset by Play.
+        let mut s = PolySynth::new(SR);
+        s.render(&mut pre);
+        let phase = s.lfo.phase;
+        s.start();
+        assert_eq!(s.lfo.phase, phase);
+    }
 
     /// A pure sine through an open filter: makes pitch directly measurable.
     fn sine_synth() -> PolySynth {

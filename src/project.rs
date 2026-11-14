@@ -1911,6 +1911,13 @@ pattern_division C 1/8T
         let err = Project::from_text("tinvo 12\npattern_meter A 4/3\n").unwrap_err().to_string();
         assert!(err.contains("unknown time signature '4/3'"), "{err}");
         assert!(Project::from_text("tinvo 11\npattern_meter A 3/4\n").is_err());
+        // The synth's LFO sync arrived in format 12 too.
+        let synced = "tinvo 12\ntrack synth\nparam lfo_sync 9\nend\n";
+        let p = Project::from_text(synced).unwrap();
+        let i = InstrumentKind::Synth.params().iter().position(|s| s.id == "lfo_sync").unwrap();
+        assert_eq!(p.tracks[0].params[i], 9.0);
+        assert_eq!(Project::from_text(&p.to_text()).unwrap().tracks[0].params[i], 9.0);
+        assert!(Project::from_text(&synced.replace("tinvo 12", "tinvo 11")).is_err());
         let err = Project::from_text(
             "tinvo 12
 pattern_division A 1/4
