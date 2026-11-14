@@ -8,6 +8,7 @@
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
 //! pattern_division B 1/16T   # only patterns whose steps are not 16th notes
+//! pattern_meter B 6/8         # only patterns that are not in 4/4
 //! master_gain_db 0
 //! song A A A B               # only when the song is not empty
 //! loop 2 3                   # song entries, 0-based; only when set
@@ -47,7 +48,7 @@
 
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Part, Step, loop_region, target_spec,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, loop_region, target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
@@ -145,6 +146,8 @@ pub struct Project {
     pub pattern_lens: [u8; MAX_PATTERNS],
     /// How long each pattern's steps are.
     pub divisions: [Division; MAX_PATTERNS],
+    /// Each pattern's time signature.
+    pub meters: [Meter; MAX_PATTERNS],
     pub master_gain_db: f32,
     pub tracks: Vec<TrackData>,
     /// Pattern numbers in playing order.
@@ -252,6 +255,7 @@ impl Project {
             swing: MIN_SWING,
             pattern_lens: [DEFAULT_PATTERN_LEN; MAX_PATTERNS],
             divisions: [Division::Sixteenth; MAX_PATTERNS],
+            meters: [Meter::default(); MAX_PATTERNS],
             master_gain_db: 0.0,
             tracks: Vec::new(),
             song: Vec::new(),
@@ -376,6 +380,10 @@ impl Project {
             Edit::SetPatternDivision { pattern, division } => {
                 *self.divisions.get_mut(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))? = division;
                 Edit::SetPatternDivision { pattern, division }
+            }
+            Edit::SetPatternMeter { pattern, meter } => {
+                *self.meters.get_mut(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))? = meter;
+                Edit::SetPatternMeter { pattern, meter }
             }
             Edit::InsertSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
@@ -702,6 +710,9 @@ impl Project {
         for (p, &division) in self.divisions.iter().enumerate() {
             e.push(Edit::SetPatternDivision { pattern: p as u8, division });
         }
+        for (p, &meter) in self.meters.iter().enumerate() {
+            e.push(Edit::SetPatternMeter { pattern: p as u8, meter });
+        }
         for (i, &pattern) in self.song.iter().enumerate() {
             e.push(Edit::InsertSongEntry { index: i as u16, pattern });
         }
@@ -729,6 +740,10 @@ impl Project {
             Edit::SetPatternDivision { pattern, .. } => {
                 let division = *self.divisions.get(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
                 vec![Edit::SetPatternDivision { pattern, division }]
+            }
+            Edit::SetPatternMeter { pattern, .. } => {
+                let meter = *self.meters.get(usize::from(pattern)).ok_or(EditError::NoSuchPattern(pattern))?;
+                vec![Edit::SetPatternMeter { pattern, meter }]
             }
             Edit::InsertSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
@@ -844,6 +859,11 @@ impl Project {
         for (p, &d) in self.divisions.iter().enumerate() {
             if d != Division::Sixteenth {
                 let _ = writeln!(s, "pattern_division {} {}", pattern_name(p as u8), d.name());
+            }
+        }
+        for (p, &m) in self.meters.iter().enumerate() {
+            if m != Meter::default() {
+                let _ = writeln!(s, "pattern_meter {} {}", pattern_name(p as u8), m.name());
             }
         }
         let _ = writeln!(s, "master_gain_db {}", self.master_gain_db);
@@ -1118,6 +1138,19 @@ impl Project {
                         return Err(err(format!("pattern length must be 1..={MAX_STEPS}")));
                     }
                     p.pattern_lens[usize::from(which)] = v;
+                }
+                "pattern_meter" if ver >= 12 => {
+                    let (name, m) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| err("expected 'pattern_meter <pattern> <beats>/<unit>'".into()))?;
+                    let which = parse_pattern(name).map_err(err)?;
+                    p.meters[usize::from(which)] = Meter::from_name(m.trim()).ok_or_else(|| {
+                        err(format!(
+                            "unknown time signature '{}' (1 to {} beats of 2, 4, 8 or 16, such as 6/8)",
+                            m.trim(),
+                            Meter::MAX_BEATS
+                        ))
+                    })?;
                 }
                 "pattern_division" if ver >= 12 => {
                     let (name, d) = rest
@@ -1867,6 +1900,17 @@ pattern_division C 1/8T
         assert_eq!(q.tracks[0].steps[2][0].unwrap().ratchet, 8);
         assert_eq!(q.pattern_pulses(2), 12 * 8);
         assert_eq!(q.pattern_pulses(0), 16 * 6);
+        // Time signatures, likewise only where they are not 4/4.
+        let mut m = q.clone();
+        m.apply(Edit::SetPatternMeter { pattern: 1, meter: Meter::new(7, 8).unwrap() }).unwrap();
+        let text = m.to_text();
+        assert!(text.contains("\npattern_meter B 7/8\n"), "{text}");
+        assert_eq!(text.matches("pattern_meter").count(), 1);
+        assert_eq!(Project::from_text(&text).unwrap().meters[1].name(), "7/8");
+        assert_eq!(q.meters, [Meter::default(); MAX_PATTERNS]);
+        let err = Project::from_text("tinvo 12\npattern_meter A 4/3\n").unwrap_err().to_string();
+        assert!(err.contains("unknown time signature '4/3'"), "{err}");
+        assert!(Project::from_text("tinvo 11\npattern_meter A 3/4\n").is_err());
         let err = Project::from_text(
             "tinvo 12
 pattern_division A 1/4

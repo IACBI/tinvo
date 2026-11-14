@@ -116,6 +116,9 @@ actions! {
     PatternLonger "pattern_longer" Global [c('L')] "pattern length up";
     StepsFiner "steps_finer" Global [c('b')] "shorter steps for the pattern: 1/8, 1/8T, 1/16, 1/16T, 1/32";
     StepsCoarser "steps_coarser" Global [c('B')] "longer steps for the pattern";
+    BeatsDown "beats_down" Global [c('k')] "fewer beats to the pattern's bar (its time signature, which places beat and bar lines)";
+    BeatsUp "beats_up" Global [c('K')] "more beats to the bar (up to 16)";
+    BeatUnit "beat_unit" Global [c('J')] "the beat's note value: /4, /8, /16, /2";
     NextPattern "next_pattern" Global [c('n')] "next pattern (A-P); while a pattern plays, it plays next";
     PrevPattern "prev_pattern" Global [c('N')] "previous pattern";
     SongView "song_view" Global [c('S')] "song view / back to the grid";
