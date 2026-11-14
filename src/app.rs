@@ -25,9 +25,9 @@ use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
-use crate::settings::Settings;
+use crate::settings::{self as settings_mod, Settings};
 use crate::strip::{self, track_param};
-use crate::theme::{Role, Theme};
+use crate::theme::{self as theme_mod, Role, Theme};
 use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal};
 use crate::wav::{self, SampleFormat};
 use std::cell::{Cell, RefCell};
@@ -295,6 +295,8 @@ pub enum PromptKind {
     LoadSample,
     /// The name of the marker on the song entry under the cursor.
     Marker,
+    /// A colour role's style, on the settings page.
+    Style(Role),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +309,56 @@ pub enum Mode {
     Prompt(PromptKind, String),
     Devices(DevicePicker),
     MidiInputs(MidiPicker),
+    /// The settings page; where it is lives in [`App::settings_page`].
+    Settings,
+}
+
+/// The settings page's tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsTab {
+    Keys,
+    Colours,
+    Options,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 3] = [SettingsTab::Keys, SettingsTab::Colours, SettingsTab::Options];
+
+    fn title(self) -> &'static str {
+        match self {
+            SettingsTab::Keys => " Keys ",
+            SettingsTab::Colours => " Colours ",
+            SettingsTab::Options => " Options ",
+        }
+    }
+}
+
+/// Where the settings page is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsPage {
+    pub tab: SettingsTab,
+    /// The cursor on each tab: an action, a row of colours (0 is the base
+    /// theme), an option.
+    pub cursor: [usize; 3],
+    /// Waiting for the key to add to the action under the cursor.
+    pub capture: bool,
+}
+
+impl Default for SettingsPage {
+    fn default() -> Self {
+        SettingsPage { tab: SettingsTab::Keys, cursor: [0; 3], capture: false }
+    }
+}
+
+/// What the settings page asks when a colour is changed.
+fn style_prompt(r: Role) -> String {
+    format!("Colour of {} ([colour] [on colour] [bold], Esc keeps it): ", r.id())
+}
+
+/// The actions in the order the settings page and the key list show them:
+/// by context.
+fn actions_by_context() -> Vec<Action> {
+    Context::ALL.iter().flat_map(|&c| Action::ALL.iter().copied().filter(move |a| a.context() == c)).collect()
 }
 
 /// The MIDI input list `M` shows. Entry 0 turns MIDI off.
@@ -440,6 +492,17 @@ pub struct App {
     play_pos: Option<PlayPosition>,
     pub keys: Keymap,
     pub theme: Theme,
+    /// The built-in theme the colours start from.
+    theme_base: &'static str,
+    /// Whether the editor takes the mouse.
+    pub mouse: bool,
+    /// A change of [`App::mouse`] for the run loop to make in the terminal.
+    mouse_request: Option<bool>,
+    /// The settings file the settings page writes (`None`: there is none).
+    settings_path: Option<PathBuf>,
+    settings_page: SettingsPage,
+    /// The settings page changed something not yet written.
+    settings_changed: bool,
     /// How many lines of the key list the last frame showed, so scrolling
     /// stops where the end is in view.
     help_rows: Cell<usize>,
@@ -492,6 +555,8 @@ enum Target {
     Item(usize),
     /// A device picker page: the input page or the output page.
     Tab(bool),
+    /// A settings page tab, by its index.
+    SettingsTab(usize),
 }
 
 /// A span of one screen row and what it shows.
@@ -589,6 +654,12 @@ impl App {
             play_pos: None,
             keys: Keymap::default(),
             theme: Theme::default(),
+            theme_base: theme_mod::BUILT_IN[0],
+            mouse: true,
+            mouse_request: None,
+            settings_path: None,
+            settings_page: SettingsPage::default(),
+            settings_changed: false,
             help_rows: Cell::new(1),
             hits: RefCell::new(Vec::new()),
             roll_top: Cell::new(None),
@@ -601,7 +672,25 @@ impl App {
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.keys = settings.keys;
         self.theme = settings.theme;
+        self.theme_base = settings.base;
+        self.mouse = settings.mouse;
         self
+    }
+
+    /// The settings file the settings page writes to.
+    pub fn with_settings_file(mut self, path: Option<PathBuf>) -> Self {
+        self.settings_path = path;
+        self
+    }
+
+    /// The settings in use.
+    pub fn settings(&self) -> Settings {
+        Settings { keys: self.keys.clone(), base: self.theme_base, theme: self.theme.clone(), mouse: self.mouse }
+    }
+
+    /// A change to the terminal's mouse reporting the run loop must make.
+    pub fn take_mouse_request(&mut self) -> Option<bool> {
+        self.mouse_request.take()
     }
 
     /// The first key of `a`, for hints in messages.
@@ -1433,6 +1522,7 @@ impl App {
             Mode::Prompt(kind, text) => self.key_prompt(kind, text, key),
             Mode::Devices(p) => self.key_devices(p, key),
             Mode::MidiInputs(p) => self.key_midi(p, key),
+            Mode::Settings => self.key_settings(key),
             Mode::Normal => self.key_normal(key),
         }
         self.clamp_cursor();
@@ -1480,6 +1570,19 @@ impl App {
                 }
                 (MouseKind::ScrollUp, _) => self.midi_action(p, Some(Action::Up)),
                 (MouseKind::ScrollDown, _) => self.midi_action(p, Some(Action::Down)),
+                _ => {}
+            },
+            Mode::Settings => match (m.kind, target) {
+                (MouseKind::Press(Button::Left), Some(Target::SettingsTab(i))) => {
+                    self.settings_page.tab = SettingsTab::ALL[i];
+                    self.settings_page.capture = false;
+                }
+                (MouseKind::Press(Button::Left), Some(Target::Item(i))) if !self.settings_page.capture => {
+                    let tab = self.settings_page.tab as usize;
+                    self.settings_page.cursor[tab] = i.min(self.settings_rows() - 1);
+                }
+                (MouseKind::ScrollUp, _) => self.settings_move(-1),
+                (MouseKind::ScrollDown, _) => self.settings_move(1),
                 _ => {}
             },
             Mode::Normal => self.mouse_normal(m, target),
@@ -1795,13 +1898,15 @@ impl App {
     }
 
     fn key_prompt(&mut self, kind: PromptKind, mut text: String, key: Key) {
+        // A colour is asked for on the settings page, which it returns to.
+        let after = if let PromptKind::Style(_) = kind { Mode::Settings } else { Mode::Normal };
         match key {
             Key::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = after;
                 return;
             }
             Key::Enter => {
-                self.mode = Mode::Normal;
+                self.mode = after;
                 let text = text.trim().to_string();
                 // An empty marker name removes the marker.
                 if text.is_empty() && kind != PromptKind::Marker {
@@ -1813,6 +1918,7 @@ impl App {
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => self.load_sample(&text),
                     PromptKind::Marker => self.set_marker(&text),
+                    PromptKind::Style(role) => self.set_style(role, &text),
                 }
                 return;
             }
@@ -1839,6 +1945,211 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Prompt(kind, text);
+    }
+
+    /// How many rows the settings page's current tab has.
+    fn settings_rows(&self) -> usize {
+        match self.settings_page.tab {
+            SettingsTab::Keys => Action::ALL.len(),
+            SettingsTab::Colours => 1 + Role::ALL.len(),
+            SettingsTab::Options => 1,
+        }
+    }
+
+    fn settings_move(&mut self, by: isize) {
+        let last = self.settings_rows() - 1;
+        let c = &mut self.settings_page.cursor[self.settings_page.tab as usize];
+        *c = c.saturating_add_signed(by).min(last);
+    }
+
+    /// The settings page: arrows, Enter, Del, `r` and Esc always work there
+    /// (so no binding can lock the page), and so do the cursor's own keys.
+    fn key_settings(&mut self, key: Key) {
+        let page = &mut self.settings_page;
+        if page.capture {
+            page.capture = false;
+            if key == Key::Esc {
+                self.set_status("No key added");
+            } else {
+                let a = actions_by_context()[page.cursor[0]];
+                self.settings_add_key(a, key);
+            }
+            return;
+        }
+        if key == Key::Esc || self.keys.is(Action::Quit, key) || self.keys.is(Action::Settings, key) {
+            self.close_settings();
+            return;
+        }
+        let a = self.keys.action(&[Context::Nav], key);
+        let tabs = SettingsTab::ALL.len();
+        let tab = self.settings_page.tab as usize;
+        match (a, key) {
+            (Some(Action::Up), _) | (_, Key::Up) => self.settings_move(-1),
+            (Some(Action::Down), _) | (_, Key::Down) => self.settings_move(1),
+            (_, Key::PageUp) => self.settings_move(-10),
+            (_, Key::PageDown) => self.settings_move(10),
+            (Some(Action::First), _) | (_, Key::Home) => self.settings_move(isize::MIN / 2),
+            (Some(Action::Last), _) | (_, Key::End) => self.settings_move(isize::MAX / 2),
+            (Some(Action::Left), _) | (_, Key::Left | Key::BackTab) => {
+                self.settings_page.tab = SettingsTab::ALL[(tab + tabs - 1) % tabs];
+            }
+            (Some(Action::Right), _) | (_, Key::Right | Key::Tab) => {
+                self.settings_page.tab = SettingsTab::ALL[(tab + 1) % tabs];
+            }
+            (Some(Action::Enter), _) | (_, Key::Enter) => self.settings_enter(),
+            (Some(Action::Clear), _) | (_, Key::Delete | Key::Backspace) => self.settings_remove(),
+            (_, Key::Char('r')) => self.settings_reset(),
+            _ => {}
+        }
+    }
+
+    fn settings_enter(&mut self) {
+        let row = self.settings_page.cursor[self.settings_page.tab as usize];
+        match self.settings_page.tab {
+            SettingsTab::Keys => self.settings_page.capture = true,
+            SettingsTab::Colours if row == 0 => {
+                let i = theme_mod::BUILT_IN.iter().position(|&b| b == self.theme_base).unwrap_or(0);
+                self.set_theme_base(theme_mod::BUILT_IN[(i + 1) % theme_mod::BUILT_IN.len()]);
+            }
+            SettingsTab::Colours => {
+                let role = Role::ALL[row - 1];
+                let text = theme_mod::style_name(self.theme.get(role));
+                self.mode = Mode::Prompt(PromptKind::Style(role), text);
+            }
+            SettingsTab::Options => self.set_mouse(!self.mouse),
+        }
+    }
+
+    /// Gives action `a` the key `key` as well, unless it would clash.
+    fn settings_add_key(&mut self, a: Action, key: Key) {
+        let mut list = self.keys.keys(a).to_vec();
+        if list.contains(&key) {
+            self.set_status(format!("{} is already a key of {}", crate::keymap::key_label(key), a.id()));
+            return;
+        }
+        list.push(key);
+        self.settings_bind(a, list);
+    }
+
+    /// Gives `a` exactly `keys`, if no key then starts two actions at once.
+    fn settings_bind(&mut self, a: Action, keys: Vec<Key>) {
+        let mut map = self.keys.clone();
+        map.bind(a, keys);
+        if let Err(e) = map.check() {
+            self.set_status(format!("Not changed: {e}"));
+            return;
+        }
+        self.keys = map;
+        self.settings_changed = true;
+        self.set_status(format!("{}: {}", a.id(), self.keys.all_labels(a)));
+    }
+
+    fn settings_remove(&mut self) {
+        let row = self.settings_page.cursor[self.settings_page.tab as usize];
+        match self.settings_page.tab {
+            SettingsTab::Keys => {
+                let a = actions_by_context()[row];
+                let mut list = self.keys.keys(a).to_vec();
+                if list.is_empty() {
+                    self.set_status(format!("{} has no key", a.id()));
+                    return;
+                }
+                // Without a key, this page could not be opened again, or
+                // TINVO not be quit.
+                if list.len() == 1 && matches!(a, Action::Settings | Action::Quit) {
+                    self.set_status(format!("{} keeps at least one key", a.id()));
+                    return;
+                }
+                list.pop();
+                self.settings_bind(a, list);
+            }
+            _ => self.settings_reset(),
+        }
+    }
+
+    /// Puts the setting under the cursor back to its default.
+    fn settings_reset(&mut self) {
+        let row = self.settings_page.cursor[self.settings_page.tab as usize];
+        match self.settings_page.tab {
+            SettingsTab::Keys => {
+                let a = actions_by_context()[row];
+                self.settings_bind(a, a.defaults().to_vec());
+            }
+            SettingsTab::Colours if row == 0 => self.set_theme_base(theme_mod::BUILT_IN[0]),
+            SettingsTab::Colours => {
+                let role = Role::ALL[row - 1];
+                let base = Theme::built_in(self.theme_base).unwrap_or_default();
+                self.set_role(role, base.get(role));
+            }
+            SettingsTab::Options => self.set_mouse(true),
+        }
+    }
+
+    fn set_theme_base(&mut self, base: &'static str) {
+        let mut s = self.settings();
+        s.set_base(base);
+        self.theme_base = s.base;
+        self.theme = s.theme;
+        self.settings_changed = true;
+        self.set_status(format!("Colours start from the {base} theme"));
+    }
+
+    fn set_role(&mut self, role: Role, style: Style) {
+        self.theme.set(role, style);
+        self.settings_changed = true;
+        self.set_status(format!("{}: {}", role.id(), theme_mod::style_name(style)));
+    }
+
+    fn set_style(&mut self, role: Role, text: &str) {
+        match theme_mod::parse_style(text) {
+            Ok(style) => self.set_role(role, style),
+            Err(e) => self.set_status(format!("Not changed: {e}")),
+        }
+    }
+
+    fn set_mouse(&mut self, on: bool) {
+        if self.mouse != on {
+            self.mouse = on;
+            self.mouse_request = Some(on);
+            self.settings_changed = true;
+        }
+        self.set_status(if on { "The mouse works in the editor" } else { "The terminal keeps the mouse" });
+    }
+
+    /// Leaves the settings page, writing what it changed to the settings
+    /// file.
+    fn close_settings(&mut self) {
+        self.mode = Mode::Normal;
+        self.settings_page.capture = false;
+        if !self.settings_changed {
+            return;
+        }
+        match self.write_settings() {
+            Ok(msg) => {
+                self.settings_changed = false;
+                self.set_status(msg);
+            }
+            Err(e) => self.set_status(format!("Settings not saved (they apply until TINVO quits): {e}")),
+        }
+    }
+
+    /// Writes the settings in use into the settings file, keeping its
+    /// comments and the lines that did not change.
+    fn write_settings(&self) -> Result<String, String> {
+        let Some(path) = &self.settings_path else {
+            return Ok("Settings apply until TINVO quits: there is no settings folder (no APPDATA or HOME)".into());
+        };
+        let old = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let text = settings_mod::update_text(&old, &self.settings())?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        crate::fsutil::write_atomic(path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(format!("Settings saved to {}", path.display()))
     }
 
     fn rename_track(&mut self, text: &str) {
@@ -1942,6 +2253,10 @@ impl App {
                 self.focus = if self.focus == Focus::Grid { Focus::Params } else { Focus::Grid };
             }
             Action::Help => self.mode = Mode::Help(0),
+            Action::Settings => {
+                self.settings_page.capture = false;
+                self.mode = Mode::Settings;
+            }
             Action::MidiInputs => match midi::inputs() {
                 Ok(ports) => self.open_midi_picker(ports),
                 Err(e) => self.set_status(format!("Cannot list MIDI inputs: {e}")),
@@ -2603,6 +2918,10 @@ impl App {
             self.draw_midi(s, p);
             return;
         }
+        if matches!(self.mode, Mode::Settings | Mode::Prompt(PromptKind::Style(_), _)) {
+            self.draw_settings(s);
+            return;
+        }
         self.draw_header(s, w);
         let params_rows = self.params_rows(w);
         // header, ruler, separator, params block, status line
@@ -3178,6 +3497,7 @@ impl App {
                     PromptKind::Marker => {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
                     }
+                    PromptKind::Style(r) => style_prompt(*r),
                     PromptKind::Export => format!(
                         "Export [{}, {} ×{}] (←→ what, Tab format, ↑↓ repeats) file: ",
                         self.export_format.label(),
@@ -3285,6 +3605,93 @@ impl App {
         s.put(2, h.saturating_sub(2), &hint, off);
     }
 
+    fn draw_settings(&self, s: &mut Screen) {
+        let h = s.height();
+        let page = &self.settings_page;
+        let (on, off) = (self.style(Role::TabOn), self.style(Role::Dim));
+        let mut x = 2;
+        for (i, tab) in SettingsTab::ALL.iter().enumerate() {
+            let n = s.put(x, 1, tab.title(), if *tab == page.tab { on } else { off });
+            self.hit(x, 1, n, Target::SettingsTab(i));
+            x += n + 1;
+        }
+        let file = match &self.settings_path {
+            Some(p) => format!("Changes apply at once and are saved to {} when this page closes", p.display()),
+            None => "Changes apply until TINVO quits: there is no settings folder".to_string(),
+        };
+        s.put(2, 2, &file, off);
+        let cursor = page.cursor[page.tab as usize];
+        let text = self.style(Role::Text);
+        // Each row: what it says, its style, and the entry it is (headings
+        // are none), with a sample of a colour role after it.
+        let mut rows: Vec<(String, Style, Option<usize>, Option<Role>)> = Vec::new();
+        match page.tab {
+            SettingsTab::Keys => {
+                let mut context = None;
+                for (i, a) in actions_by_context().into_iter().enumerate() {
+                    if context != Some(a.context()) {
+                        context = Some(a.context());
+                        rows.push((a.context().title().to_string(), self.style(Role::Title), None, None));
+                    }
+                    let mark = if self.keys.keys(a) == a.defaults() { ' ' } else { '*' };
+                    let keys = self.keys.all_labels(a);
+                    rows.push((format!("{mark} {:<18} {keys:<20} {}", a.id(), a.help()), text, Some(i), None));
+                }
+            }
+            SettingsTab::Colours => {
+                rows.push((format!("  {:<18} {}", "base theme", self.theme_base), text, Some(0), None));
+                let base = Theme::built_in(self.theme_base).unwrap_or_default();
+                for (i, &r) in Role::ALL.iter().enumerate() {
+                    let mark = if self.theme.get(r) == base.get(r) { ' ' } else { '*' };
+                    let name = theme_mod::style_name(self.theme.get(r));
+                    rows.push((format!("{mark} {:<18} {name:<28}", r.id()), text, Some(i + 1), Some(r)));
+                }
+            }
+            SettingsTab::Options => {
+                let mouse = if self.mouse { "on" } else { "off" };
+                let what = "on: clicks, drags and the wheel work in the editor; off: the terminal keeps the mouse";
+                rows.push((format!("  {:<18} {mouse:<4} {what}", "mouse"), text, Some(0), None));
+            }
+        }
+        let visible = usize::from(h.saturating_sub(7)).max(1);
+        let at = rows.iter().position(|r| r.2 == Some(cursor)).unwrap_or(0);
+        // The heading above the first entry stays in view with it.
+        let first = at.saturating_sub(visible - 1);
+        for (y, (line, style, item, role)) in rows.iter().skip(first).take(visible).enumerate() {
+            let y = 4 + y as u16;
+            let st = if *item == Some(cursor) { self.style(Role::ListCursor) } else { *style };
+            let n = s.put(2, y, line, st);
+            if let Some(i) = item {
+                self.hit(2, y, n, Target::Item(*i));
+            }
+            if let Some(r) = role {
+                s.put(3 + n, y, " Sample ", self.style(*r));
+            }
+        }
+        if let Some(msg) = self.status_text() {
+            s.put(2, h.saturating_sub(3), msg, self.style(Role::Message));
+        }
+        if let Mode::Prompt(PromptKind::Style(r), text) = &self.mode {
+            let y = h.saturating_sub(2);
+            let x = 2 + s.put(2, y, &style_prompt(*r), self.style(Role::Prompt));
+            let x2 = s.put(x, y, text, self.style(Role::Input));
+            s.put(x + x2, y, "█", self.style(Role::Input));
+            return;
+        }
+        let hint = if page.capture {
+            let a = actions_by_context()[page.cursor[0]];
+            format!("Press the key to add to {} (Esc: none)", a.id())
+        } else {
+            let what = match page.tab {
+                SettingsTab::Keys => "Enter add a key  Del remove the last",
+                SettingsTab::Colours => "Enter change (the base: next theme)",
+                SettingsTab::Options => "Enter switch",
+            };
+            format!("←→ page  ↑↓ choose  {what}  r default  Esc close")
+        };
+        s.put(2, h.saturating_sub(2), &hint, off);
+    }
+
     /// A list's entries from row 4 down to above the hint line, keeping the
     /// cursor's row on screen; `●` marks the one in use.
     fn draw_list(&self, s: &mut Screen, entries: &[(String, bool)], cursor: usize) {
@@ -3315,6 +3722,7 @@ impl App {
             ("y n", "answer a question (quit, delete a track)"),
             ("1-7", "the type of a new track, after add_track"),
             ("Esc", "cancel a prompt, close a list"),
+            ("Enter Del r Esc", "on the settings page: add a key or change a setting, remove a key, default, close"),
             ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
         ] {
             lines.push(HelpLine { keys: keys.to_string(), text: text.to_string(), heading: false });
@@ -3329,11 +3737,12 @@ impl App {
         let top = top.min(lines.len().saturating_sub(rows));
         let more = if top + rows < lines.len() { "  ↓ more" } else { "" };
         let title = format!(
-            "TINVO keys ({}-{} of {}{more}). {} PgUp PgDn scroll, other keys close. Change them: tinvo settings",
+            "TINVO keys ({}-{} of {}{more}). {} PgUp PgDn scroll, other keys close. Change them: {}",
             top + 1,
             (top + rows).min(lines.len()),
             lines.len(),
             self.keys.labels(&[Action::Up, Action::Down]),
+            self.k(Action::Settings),
         );
         s.put(1, 0, &title, self.style(Role::Title));
         for (row, line) in lines.iter().skip(top).take(rows).enumerate() {
@@ -3664,6 +4073,7 @@ pub fn run(
     midi_start: MidiStart,
     input: Option<String>,
     settings: Settings,
+    settings_path: Option<PathBuf>,
 ) -> Result<(), String> {
     let (play, help) = (settings.keys.label(Action::Play), settings.keys.label(Action::Help));
     // The lock comes first, before an autosave is taken for a crashed
@@ -3730,8 +4140,10 @@ pub fn run(
     if let Some(first) = errors.first() {
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
-    let mut app =
-        App::new(project, path, None, 48_000, "no audio".into()).with_samples(samples).with_settings(settings);
+    let mut app = App::new(project, path, None, 48_000, "no audio".into())
+        .with_samples(samples)
+        .with_settings(settings)
+        .with_settings_file(settings_path);
     if recovered {
         // Unsaved until the user saves; the autosave is rewritten from it.
         app.touch();
@@ -3786,6 +4198,11 @@ pub fn run(
             app.tick();
             if app.quit {
                 return Ok(());
+            }
+            if let Some(on) = app.take_mouse_request() {
+                if let Err(e) = term.set_mouse(on) {
+                    app.set_status(format!("The terminal did not take the mouse setting: {e}"));
+                }
             }
             let (w, h) = term.size();
             screen.resize(w, h);
@@ -5659,7 +6076,8 @@ mod tests {
             Raw(Key::Char('n')),
         ]);
         let mut by_default = app();
-        let mut moved = app().with_settings(Settings { keys: moved_keys(), ..Settings::default() });
+        let mut moved = app()
+            .with_settings(crate::settings::Settings { keys: moved_keys(), ..crate::settings::Settings::default() });
         for (n, press) in script.iter().enumerate() {
             let (d, m) = match *press {
                 Do(a) => (a.defaults()[0], moved.keys.keys(a)[0]),
@@ -5825,6 +6243,176 @@ mod tests {
         let at = spot(a, t);
         mouse(a, MouseKind::Press(Button::Left), at);
         mouse(a, MouseKind::Release, at);
+    }
+
+    /// Moves the settings page's cursor to action `a`.
+    fn to_action(a: &mut App, action: Action) {
+        a.settings_page.cursor[0] = actions_by_context().iter().position(|&x| x == action).unwrap();
+    }
+
+    #[test]
+    fn the_settings_page_adds_and_removes_keys() {
+        let mut a = app();
+        keys(&mut a, &[Key::F(2)]);
+        assert_eq!((a.mode.clone(), a.settings_page.tab), (Mode::Settings, SettingsTab::Keys));
+        // Enter waits for a key, which is added to the action.
+        to_action(&mut a, Action::Undo);
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.settings_page.capture);
+        assert!(frame(&a).row_text(28).contains("Press the key to add to undo"), "{}", frame(&a).row_text(28));
+        keys(&mut a, &[Key::Char('z')]);
+        assert_eq!(a.keys.keys(Action::Undo), [Key::Char('u'), Key::Ctrl('z'), Key::Char('z')]);
+        assert!(a.settings_changed && !a.settings_page.capture);
+        // A key another action has where both work is refused.
+        keys(&mut a, &[Key::Enter, Key::Char('n')]);
+        assert_eq!(a.keys.keys(Action::Undo).len(), 3);
+        assert!(a.status_text().unwrap().starts_with("Not changed: n is bound to both"), "{:?}", a.status_text());
+        // Even keys that mean something on this page can be given.
+        keys(&mut a, &[Key::Enter, Key::Char('r')]);
+        assert!(a.status_text().unwrap().contains("bound to both"), "r renames tracks: {:?}", a.status_text());
+        keys(&mut a, &[Key::Enter, Key::Esc]);
+        assert_eq!(a.status_text(), Some("No key added"));
+        assert_eq!(a.mode, Mode::Settings, "Esc while waiting only cancels the wait");
+        // Del removes the last key, r puts the defaults back.
+        keys(&mut a, &[Key::Delete, Key::Delete]);
+        assert_eq!(a.keys.keys(Action::Undo), [Key::Char('u')]);
+        keys(&mut a, &[Key::Char('r')]);
+        assert_eq!(a.keys.keys(Action::Undo), Action::Undo.defaults());
+        // The keys that open this page and quit keep one key each.
+        for action in [Action::Settings, Action::Quit] {
+            to_action(&mut a, action);
+            for _ in 0..4 {
+                keys(&mut a, &[Key::Delete]);
+            }
+            assert_eq!(a.keys.keys(action).len(), 1, "{action:?}");
+            assert!(a.status_text().unwrap().ends_with("keeps at least one key"), "{:?}", a.status_text());
+        }
+        // The new keys work at once: a new key for the settings page closes it.
+        keys(&mut a, &[Key::Char('r')]);
+        to_action(&mut a, Action::Settings);
+        keys(&mut a, &[Key::Enter, Key::F(9), Key::F(9)]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(
+            a.status_text().unwrap().contains("apply until TINVO quits"),
+            "no settings file: {:?}",
+            a.status_text()
+        );
+        keys(&mut a, &[Key::F(9)]);
+        assert_eq!(a.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn the_settings_page_changes_colours_and_the_mouse() {
+        let mut a = app();
+        keys(&mut a, &[Key::Char('P'), Key::Right]);
+        assert_eq!(a.settings_page.tab, SettingsTab::Colours);
+        // The base theme cycles; a colour of one's own stays.
+        let cursor_row = 1 + Role::ALL.iter().position(|&r| r == Role::Cursor).unwrap();
+        a.settings_page.cursor[1] = cursor_row;
+        keys(&mut a, &[Key::Enter]);
+        assert!(matches!(&a.mode, Mode::Prompt(PromptKind::Style(Role::Cursor), _)));
+        assert!(frame(&a).row_text(28).starts_with("  Colour of cursor"), "the page stays: {}", frame(&a).row_text(28));
+        if let Mode::Prompt(k, _) = a.mode.clone() {
+            a.mode = Mode::Prompt(k, "green on black bold".into());
+        }
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.mode, Mode::Settings);
+        assert_eq!(a.theme.get(Role::Cursor), Style::fg(Color::Green).on(Color::Black).bold());
+        a.settings_page.cursor[1] = 0;
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.theme_base, "light");
+        assert_eq!(a.theme.get(Role::Title), Theme::built_in("light").unwrap().get(Role::Title));
+        assert_eq!(a.theme.get(Role::Cursor), Style::fg(Color::Green).on(Color::Black).bold());
+        // A mistake in a colour changes nothing; Esc keeps it.
+        a.settings_page.cursor[1] = cursor_row;
+        keys(&mut a, &[Key::Enter]);
+        if let Mode::Prompt(k, _) = a.mode.clone() {
+            a.mode = Mode::Prompt(k, "pink".into());
+        }
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Not changed: unknown colour 'pink'"), "{:?}", a.status_text());
+        keys(&mut a, &[Key::Enter, Key::Esc]);
+        assert_eq!(a.mode, Mode::Settings);
+        assert_eq!(a.theme.get(Role::Cursor), Style::fg(Color::Green).on(Color::Black).bold());
+        // r puts the base theme's colour back.
+        keys(&mut a, &[Key::Char('r')]);
+        assert_eq!(a.theme.get(Role::Cursor), Theme::built_in("light").unwrap().get(Role::Cursor));
+        // The mouse: off asks the terminal to let go of it.
+        keys(&mut a, &[Key::Right, Key::Enter]);
+        assert_eq!(a.settings_page.tab, SettingsTab::Options);
+        assert!(!a.mouse);
+        assert_eq!(a.take_mouse_request(), Some(false));
+        keys(&mut a, &[Key::Char('r')]);
+        assert_eq!((a.mouse, a.take_mouse_request()), (true, Some(true)));
+        keys(&mut a, &[Key::Right]);
+        assert_eq!(a.settings_page.tab, SettingsTab::Keys, "the tabs wrap");
+    }
+
+    #[test]
+    fn closing_the_settings_page_writes_the_changes_into_the_file() {
+        let dir = std::env::temp_dir().join(format!("tinvo-settings-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("tinvo.conf");
+        let mut a = app().with_settings_file(Some(path.clone()));
+        // Nothing changed, nothing written.
+        keys(&mut a, &[Key::F(2), Key::Esc]);
+        assert!(!path.exists());
+        keys(&mut a, &[Key::F(2)]);
+        to_action(&mut a, Action::Redo);
+        keys(&mut a, &[Key::Delete, Key::Right, Key::Right, Key::Enter, Key::Char('q')]);
+        assert_eq!(a.mode, Mode::Normal, "the quit key closes the page");
+        assert_eq!(a.status_text(), Some(format!("Settings saved to {}", path.display()).as_str()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[keys]\nredo = U\n\n[options]\nmouse = off\n");
+        assert_eq!(settings_mod::parse(&text).unwrap(), a.settings());
+        // An existing file keeps its comments and other lines.
+        std::fs::write(&path, "# mine\n[theme]\n# warm\nbase = light\n\n[options]\nmouse = off\n").unwrap();
+        let mut a = app().with_settings(settings_mod::load(&path).unwrap().0).with_settings_file(Some(path.clone()));
+        keys(&mut a, &[Key::F(2), Key::Left, Key::Enter, Key::Esc]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# mine\n[theme]\n# warm\nbase = light\n\n[options]\nmouse = on\n"
+        );
+        // A file that no longer reads is left alone; the settings still apply.
+        std::fs::write(&path, "[keys]\nundoo = u\n").unwrap();
+        keys(&mut a, &[Key::F(2), Key::Enter, Key::Esc]);
+        assert!(!a.mouse);
+        assert!(
+            a.status_text().unwrap().starts_with("Settings not saved (they apply until TINVO quits)"),
+            "{:?}",
+            a.status_text()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[keys]\nundoo = u\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_settings_page_draws_and_clicks() {
+        let mut a = app();
+        a.keys.bind(Action::Undo, vec![Key::Char('z')]);
+        keys(&mut a, &[Key::F(2)]);
+        let f = frame(&a);
+        assert!(f.row_text(1).contains(" Keys   Colours   Options "), "{}", f.row_text(1));
+        assert!(f.row_text(4).contains("Anywhere"), "{}", f.row_text(4));
+        assert!(f.row_text(5).starts_with("  ") && f.row_text(5).contains("play"), "{}", f.row_text(5));
+        let text: Vec<String> = (4..27).map(|y| f.row_text(y)).collect();
+        assert!(text.iter().any(|l| l.contains("* undo               z")), "{text:#?}");
+        click(&mut a, Target::SettingsTab(1));
+        assert_eq!(a.settings_page.tab, SettingsTab::Colours);
+        let f = frame(&a);
+        assert!(f.row_text(4).contains("base theme         default"), "{}", f.row_text(4));
+        assert!(f.row_text(5).contains(" Sample "), "{}", f.row_text(5));
+        click(&mut a, Target::Item(3));
+        assert_eq!(a.settings_page.cursor[1], 3);
+        let at = spot(&a, Target::Item(3));
+        mouse(&mut a, MouseKind::ScrollDown, at);
+        assert_eq!(a.settings_page.cursor[1], 4);
+        // The key list scrolls to keep the cursor in view.
+        click(&mut a, Target::SettingsTab(0));
+        a.settings_page.cursor[0] = Action::ALL.len() - 1;
+        let f = frame(&a);
+        let last = actions_by_context()[Action::ALL.len() - 1];
+        assert!((4..27).any(|y| f.row_text(y).contains(last.id())), "the last action is in view");
     }
 
     fn filled(a: &App, track: usize) -> Vec<usize> {

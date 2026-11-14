@@ -19,7 +19,8 @@
 //! above has none); the others keep their defaults. `base` picks the
 //! built-in theme the colours start from. `mouse = off` leaves the mouse
 //! to the terminal. `tinvo settings` prints every action and role with
-//! what it has.
+//! what it has, and the editor's settings page changes them in place
+//! ([`update_text`]), keeping the file's comments and order.
 
 use crate::keymap::{self, Action, Context, Keymap};
 use crate::theme::{self, Role, Theme};
@@ -199,10 +200,205 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// The colour roles set apart from the base theme.
+    fn own_colours(&self) -> Vec<Role> {
+        let base = Theme::built_in(self.base).unwrap_or_default();
+        Role::ALL.iter().copied().filter(|&r| self.theme.get(r) != base.get(r)).collect()
+    }
+
+    /// Starts the colours from the built-in theme `base`, keeping the roles
+    /// set apart from the old one.
+    pub fn set_base(&mut self, base: &'static str) {
+        let own: Vec<(Role, crate::tui::Style)> =
+            self.own_colours().into_iter().map(|r| (r, self.theme.get(r))).collect();
+        self.base = base;
+        self.theme = Theme::built_in(base).unwrap_or_default();
+        for (r, st) in own {
+            self.theme.set(r, st);
+        }
+    }
+}
+
+/// What a setting's line says, as the file writes it.
+fn keys_value(keys: &Keymap, a: Action) -> String {
+    keys.keys(a).iter().map(|&k| keymap::key_name(k)).collect::<Vec<_>>().join(" ")
+}
+
+/// The settings file `old` (its text; empty for none) changed to give
+/// `new`: the line of each setting that changes is rewritten in place, a
+/// setting with no line that now differs from its default gets one at the
+/// end of its section (and the section is added if missing), and every
+/// other line, comments included, stays as it was. Fails if `old` does not
+/// read (it changed since it was loaded) or, as a safeguard, if the result
+/// would not read back as `new`.
+pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
+    parse(old).map_err(|e| format!("the settings file has a mistake ({e}); it was not changed"))?;
+    let base_theme = Theme::built_in(new.base).unwrap_or_default();
+    let mut lines: Vec<String> = old.lines().map(str::to_string).collect();
+    // Which settings have a line, and where each section's lines end.
+    let mut has_key = vec![false; Action::ALL.len()];
+    let mut has_role = vec![false; Role::ALL.len()];
+    let (mut has_base, mut has_mouse) = (false, false);
+    let mut ends: [Option<usize>; 3] = [None; 3];
+    let mut section = Section::None;
+    for (i, line) in lines.iter_mut().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = t.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = match name.trim() {
+                "keys" => Section::Keys,
+                "theme" => Section::Theme,
+                _ => Section::Options,
+            };
+        } else if let Some((name, _)) = t.split_once('=') {
+            let name = name.trim().to_string();
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            let value = match section {
+                Section::Keys => Action::from_id(&name).map(|a| {
+                    has_key[a as usize] = true;
+                    keys_value(&new.keys, a)
+                }),
+                Section::Theme if name == "base" => {
+                    has_base = true;
+                    Some(new.base.to_string())
+                }
+                Section::Theme => Role::from_id(&name).map(|r| {
+                    has_role[r as usize] = true;
+                    theme::style_name(new.theme.get(r))
+                }),
+                Section::Options => {
+                    has_mouse = true;
+                    Some(if new.mouse { "on" } else { "off" }.to_string())
+                }
+                Section::None => None,
+            };
+            if let Some(v) = value {
+                *line = if v.is_empty() { format!("{indent}{name} =") } else { format!("{indent}{name} = {v}") };
+            }
+        }
+        let slot = match section {
+            Section::Keys => 0,
+            Section::Theme => 1,
+            Section::Options => 2,
+            Section::None => continue,
+        };
+        ends[slot] = Some(i + 1);
+    }
+    // Lines for settings without one that now differ from their default.
+    let mut add: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for &a in Action::ALL {
+        if !has_key[a as usize] && new.keys.keys(a) != a.defaults() {
+            let v = keys_value(&new.keys, a);
+            add[0].push(if v.is_empty() { format!("{} =", a.id()) } else { format!("{} = {v}", a.id()) });
+        }
+    }
+    if !has_base && new.base != theme::BUILT_IN[0] {
+        add[1].push(format!("base = {}", new.base));
+    }
+    for &r in Role::ALL {
+        if !has_role[r as usize] && new.theme.get(r) != base_theme.get(r) {
+            add[1].push(format!("{} = {}", r.id(), theme::style_name(new.theme.get(r))));
+        }
+    }
+    if !has_mouse && !new.mouse {
+        add[2].push("mouse = off".into());
+    }
+    // From the last section in the file back, so earlier positions hold.
+    let mut order: Vec<usize> = (0..3).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(ends[i]));
+    for i in order {
+        let new_lines = std::mem::take(&mut add[i]);
+        if new_lines.is_empty() {
+            continue;
+        }
+        match ends[i] {
+            Some(at) => {
+                lines.splice(at..at, new_lines);
+            }
+            None => {
+                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(["[keys]", "[theme]", "[options]"][i].to_string());
+                lines.extend(new_lines);
+            }
+        }
+    }
+    let mut text = lines.join("\n");
+    if !lines.is_empty() {
+        text.push('\n');
+    }
+    match parse(&text) {
+        Ok(read) if read == *new => Ok(text),
+        Ok(_) => Err("the settings could not be written so that they read back the same".into()),
+        Err(e) => Err(format!("the settings could not be written ({e})")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::{Color, Key, Style};
+
+    #[test]
+    fn changes_are_written_in_place_keeping_the_rest() {
+        let old = "# my settings\n[keys]\n# moving\n  left = h left\nundo = u\n\n[theme]\nbase = light\n# warm\ncursor = black on 214 bold\n";
+        let mut new = parse(old).unwrap();
+        new.keys.bind(Action::Left, vec![Key::Char('j')]);
+        new.keys.bind(Action::Redo, vec![]);
+        new.theme.set(Role::Title, Style::fg(Color::Red));
+        new.mouse = false;
+        let text = update_text(old, &new).unwrap();
+        assert_eq!(
+            text,
+            "# my settings\n[keys]\n# moving\n  left = j\nundo = u\nredo =\n\n[theme]\nbase = light\n# warm\ncursor = black on 214 bold\ntitle = red\n\n[options]\nmouse = off\n"
+        );
+        assert_eq!(parse(&text), Ok(new.clone()));
+        // Nothing changed, nothing moves.
+        assert_eq!(update_text(&text, &new).unwrap(), text);
+        // Back to a default: the line stays, saying the default.
+        let mut back = new.clone();
+        back.keys.bind(Action::Left, Action::Left.defaults().to_vec());
+        assert!(update_text(&text, &back).unwrap().contains("\n  left = left\n"));
+    }
+
+    #[test]
+    fn a_new_file_holds_only_what_differs() {
+        assert_eq!(update_text("", &Settings::default()).unwrap(), "");
+        let mut s = Settings::default();
+        s.keys.bind(Action::Undo, vec![Key::Char('z'), Key::Ctrl('z')]);
+        s.set_base("light");
+        let text = update_text("", &s).unwrap();
+        assert_eq!(text, "[keys]\nundo = z ctrl+z\n\n[theme]\nbase = light\n");
+        assert_eq!(parse(&text), Ok(s));
+    }
+
+    #[test]
+    fn a_new_base_keeps_the_colours_set_apart() {
+        let mut s = Settings::default();
+        s.theme.set(Role::Cursor, Style::fg(Color::Green));
+        s.set_base("light");
+        let light = Theme::built_in("light").unwrap();
+        assert_eq!(s.theme.get(Role::Cursor), Style::fg(Color::Green));
+        assert_eq!(s.theme.get(Role::Title), light.get(Role::Title));
+        let text = update_text("[theme]\ncursor = green\n", &s).unwrap();
+        assert_eq!(parse(&text), Ok(s.clone()));
+        s.set_base("default");
+        assert_eq!(s.theme, {
+            let mut t = Theme::default();
+            t.set(Role::Cursor, Style::fg(Color::Green));
+            t
+        });
+    }
+
+    #[test]
+    fn a_file_that_no_longer_reads_is_left_alone() {
+        let err = update_text("[keys]\nundoo = u\n", &Settings::default()).unwrap_err();
+        assert!(err.contains("line 2: unknown action 'undoo'") && err.contains("not changed"), "{err}");
+    }
 
     #[test]
     fn an_empty_file_gives_the_defaults() {

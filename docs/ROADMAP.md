@@ -289,6 +289,17 @@ Known limits:
 - `flock` on a network file system may lock only on one machine, depending on the server; the Windows lock covers SMB shares.
 - `tinvo render` reads a project without locking it, so it can export one a session is editing; it reads the last saved file.
 
+## Phase 8c: Settings page
+
+- `F2` (or `P`) opens a page with three tabs: Keys, every action by context with its keys; Colours, the base theme and each role's style with a sample; Options, the mouse. `Enter` adds a key (the next key pressed) or changes a value, `Del` removes an action's last key, `r` puts back the default, `Esc` closes. An entry that differs from the default is marked `*`.
+- A change works at once: a new key is bound, a colour is drawn, the mouse is turned on or off in the running terminal. A key that would be ambiguous, or a style that does not read, is refused with the same message the settings file gives, and nothing changes. The settings page and quit always keep one key.
+- Closing the page writes the changes into the settings file (`--settings`, or the default one), changing only the lines whose values changed and adding the rest to their section, so comments and the order of the file stay. The result is read back and compared before it is written, atomically. A file that no longer reads is left alone, and the settings apply until TINVO quits.
+- Unit tests cover adding, refusing and removing keys, the guarded keys, a new key working at once, colours and the base theme, a mistake in a colour, the mouse request, writing a new file and an existing one with its comments, a file that no longer reads, drawing, scrolling and clicks.
+
+Known limits:
+- Not tried by hand in a real console: the keys and drawing are unit-tested on a frame, and switching the mouse on and off at runtime is not checked in a real terminal.
+- A key the terminal does not send (some `Ctrl` and `Alt` combinations) cannot be added from the page, only typed into the file.
+
 ## Known limitations of the foundation
 
 - Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.
