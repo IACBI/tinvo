@@ -256,7 +256,7 @@ Known limits:
 Known limits:
 - `↑` and `↓` now move between the song view's rows; changing an entry's pattern moved to `,` and `.`.
 - A track's own pattern always starts on the entry's first step; it cannot start part-way or carry on from the entry before.
-- The play column in the grid, piano roll and automation view shows the selected pattern only for tracks playing it.
+- The play column in the grid, piano roll and automation view shows the selected pattern only for tracks playing it. (The piano roll and the automation view show the rest of the song on their song line since phase 8d.)
 
 ## Phase 8a: Hardware check
 
@@ -300,6 +300,17 @@ Known limits:
 Known limits:
 - Not tried by hand in a real console: the keys and drawing are unit-tested on a frame, and switching the mouse on and off at runtime is not checked in a real terminal.
 - A key the terminal does not send (some `Ctrl` and `Alt` combinations) cannot be added from the page, only typed into the file.
+
+## Phase 8d: The song in the piano roll
+
+- The piano roll and the automation view end with a song line: the pattern the selected track plays in each song entry, after its own part, the entry's pattern or a rest (`-`). Entries where it plays the pattern being edited stand out, and the label says how many there are (`Song: B in 3 of 8 entries`). The entry playing now is in the play column's colour, so while the song plays it shows where the track is even when that is another pattern.
+- A click on an entry opens the pattern the track plays there; on a rest it says so.
+- Entries are shown a screenful at a time, with the one playing, or else the song cursor's. The line takes the last of the view's rows when there are at least eight and the song is not empty.
+- Unit tests cover what the line shows for followed, own and rested entries, the edited pattern standing out, the playing entry and its page, clicks, the automation view, and an empty song or a small terminal leaving the view as it was.
+
+Known limits:
+- The line shows one track; the song view shows them all.
+- Markers and the loop region are not drawn on it.
 
 ## Known limitations of the foundation
 
