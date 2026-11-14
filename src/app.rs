@@ -163,6 +163,7 @@ type ClipTrack = ([Option<Step>; MAX_STEPS], [[Option<f32>; MAX_STEPS]; MAX_LANE
 #[derive(Clone)]
 struct Clip {
     len: u8,
+    division: Division,
     tracks: Vec<ClipTrack>,
 }
 
@@ -1396,7 +1397,7 @@ impl App {
         let p = self.pattern;
         let tracks =
             self.project.tracks.iter().map(|t| (t.steps[p], std::array::from_fn(|k| t.lanes[k].points[p]))).collect();
-        self.clipboard = Some(Clip { len: self.project.pattern_lens[p], tracks });
+        self.clipboard = Some(Clip { len: self.project.pattern_lens[p], division: self.project.divisions[p], tracks });
         self.set_status(format!("Copied pattern {}", pattern_name(p as u8)));
     }
 
@@ -1405,9 +1406,13 @@ impl App {
     /// matched by position; points go only to lanes that have a parameter.
     fn replace_pattern(&mut self, with: Option<Clip>, what: &'static str) {
         let (p, pattern) = (self.pattern, self.pattern as u8);
-        let clip = with.unwrap_or(Clip { len: self.project.pattern_lens[p], tracks: Vec::new() });
+        let (len, division) = (self.project.pattern_lens[p], self.project.divisions[p]);
+        let clip = with.unwrap_or(Clip { len, division, tracks: Vec::new() });
         let empty = ([None; MAX_STEPS], [[None; MAX_STEPS]; MAX_LANES]);
-        let mut edits = vec![Edit::SetPatternLength { pattern, len: clip.len }];
+        let mut edits = vec![
+            Edit::SetPatternLength { pattern, len: clip.len },
+            Edit::SetPatternDivision { pattern, division: clip.division },
+        ];
         for (t, track) in self.project.tracks.iter().enumerate() {
             let (steps, lanes) = clip.tracks.get(t).unwrap_or(&empty);
             for (i, &value) in steps.iter().enumerate() {
@@ -4655,6 +4660,19 @@ mod tests {
         assert_eq!(div(&a), Division::EighthTriplet);
         keys(&mut a, &[Key::Char('u')]);
         assert_eq!(div(&a), Division::Eighth);
+    }
+
+    #[test]
+    fn copying_a_pattern_keeps_its_step_length() {
+        let mut a = app();
+        keys(&mut a, &[Key::Char('b'), Key::Char('y'), Key::Char('n'), Key::Char('Y')]);
+        assert_eq!(a.pattern, 1);
+        assert_eq!(a.project.divisions[1], Division::SixteenthTriplet);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.divisions[1], Division::Sixteenth);
+        // Clearing keeps it.
+        keys(&mut a, &[Key::Char('B'), Key::Char('X')]);
+        assert_eq!(a.project.divisions[1], Division::EighthTriplet);
     }
 
     #[test]
