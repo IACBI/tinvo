@@ -6,6 +6,10 @@
 //! an origin rather than accumulated, so timing never drifts however long
 //! playback runs. Tempo changes move the origin to the current position,
 //! keeping the playhead continuous.
+//!
+//! The tempo is constant from the origin, or ramps: it changes by a fixed
+//! number of BPM per 16th note. A ramp's frames are its exact integral, so
+//! a step lands where the ramp puts it whatever the buffer size.
 
 /// Clock resolution: pulses per quarter note.
 pub const PULSES_PER_BEAT: u32 = 24;
@@ -137,11 +141,55 @@ impl Meter {
     }
 }
 
+/// The tempo at the start of song entry `i` (of `len`) and how it changes
+/// across it, in BPM per 16th note. It holds from the last point at or
+/// before the entry, or is `base` before any. With `ramp` it moves in a
+/// straight line over the pulses from one point to the next, so a ramp
+/// spanning several entries keeps one slope.
+pub fn entry_tempo(
+    i: usize,
+    len: usize,
+    ramp: bool,
+    base: f32,
+    point: impl Fn(usize) -> Option<f32>,
+    pulses: impl Fn(usize) -> u64,
+) -> (f64, f64) {
+    let Some((a, va)) = (0..=i.min(len.saturating_sub(1))).rev().find_map(|j| point(j).map(|v| (j, v))) else {
+        return (f64::from(base), 0.0);
+    };
+    if ramp {
+        if let Some((b, vb)) = (i + 1..len).find_map(|j| point(j).map(|v| (j, v))) {
+            let total: u64 = (a..b).map(&pulses).sum();
+            let done: u64 = (a..i).map(&pulses).sum();
+            if total > 0 {
+                let per_pulse = f64::from(vb - va) / total as f64;
+                return (f64::from(va) + per_pulse * done as f64, per_pulse * f64::from(PULSES_PER_16TH));
+            }
+        }
+    }
+    (f64::from(va), 0.0)
+}
+
+/// Frames that `sixteenths` take starting at `bpm` and changing by `slope`
+/// BPM per 16th note: the integral of the time per 16th, `15 sr / bpm`.
+pub fn span_frames(bpm: f64, slope: f64, sixteenths: f64, sample_rate: f32) -> f64 {
+    let k = f64::from(sample_rate) * 15.0;
+    if slope == 0.0 { sixteenths * k / bpm } else { k / slope * (slope * sixteenths / bpm).ln_1p() }
+}
+
 #[derive(Clone, Debug)]
 pub struct Transport {
     playing: bool,
+    sample_rate: f32,
+    /// Frames in a 16th note at `bpm`, the tempo at the origin.
     samples_per_step: f64,
+    bpm: f64,
+    /// BPM gained per 16th note after the origin.
+    slope: f64,
     origin_frame: u64,
+    /// Where between `origin_frame` and the next frame the origin falls; a
+    /// ramp's end is rarely on a whole frame.
+    origin_frac: f64,
     /// Position at `origin_frame`, in 16th notes.
     origin: f64,
     /// Delay of a swung step as a fraction of a step, in `[0, 0.5]`.
@@ -152,8 +200,12 @@ impl Transport {
     pub fn new(bpm: f32, sample_rate: f32) -> Self {
         Self {
             playing: false,
+            sample_rate,
             samples_per_step: Self::samples_per_step(bpm, sample_rate),
+            bpm: f64::from(bpm),
+            slope: 0.0,
             origin_frame: 0,
+            origin_frac: 0.0,
             origin: 0.0,
             swing_delay: 0.0,
         }
@@ -172,9 +224,23 @@ impl Transport {
         f64::from(sample_rate) * 60.0 / (f64::from(bpm) * 4.0)
     }
 
-    /// Length of an unswung 16th note at the current tempo, in frames.
-    pub fn step_frames(&self) -> f64 {
-        self.samples_per_step
+    /// Length of an unswung 16th note at `position`, in frames.
+    pub fn step_frames(&self, position: f64) -> f64 {
+        if self.slope == 0.0 {
+            self.samples_per_step
+        } else {
+            f64::from(self.sample_rate) * 15.0 / self.bpm_at(position)
+        }
+    }
+
+    /// The tempo at `position`.
+    pub fn bpm_at(&self, position: f64) -> f64 {
+        self.bpm + self.slope * (position - self.origin).max(0.0)
+    }
+
+    /// The tempo at the origin and how it changes, as for [`span_frames`].
+    pub fn tempo(&self) -> (f64, f64) {
+        (self.bpm, self.slope)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -185,6 +251,7 @@ impl Transport {
     pub fn start(&mut self, now: u64) {
         self.playing = true;
         self.origin_frame = now;
+        self.origin_frac = 0.0;
         self.origin = 0.0;
     }
 
@@ -197,17 +264,66 @@ impl Transport {
     /// step past its straight position, so the playhead may be anywhere up
     /// to it, but never past it.
     pub fn set_tempo(&mut self, bpm: f32, sample_rate: f32, now: u64, pending: f64) {
+        self.move_origin(now, pending);
+        self.sample_rate = sample_rate;
+        self.samples_per_step = Self::samples_per_step(bpm, sample_rate);
+        self.bpm = f64::from(bpm);
+        self.slope = 0.0;
+    }
+
+    /// Like [`Self::set_tempo`], for a tempo `bpm` that then changes by
+    /// `slope` BPM per 16th note.
+    pub fn set_ramp(&mut self, bpm: f64, slope: f64, now: u64, pending: f64) {
+        self.move_origin(now, pending);
+        self.set_rate(bpm, slope);
+    }
+
+    /// Moves the origin to `position`, exactly where the current tempo puts
+    /// it, and sets the tempo from there.
+    pub fn set_segment(&mut self, position: f64, bpm: f64, slope: f64) {
+        if self.playing {
+            let at = self.origin_frac + self.offset(position - self.origin).max(0.0);
+            let whole = at.floor();
+            self.origin_frame += whole as u64;
+            self.origin_frac = at - whole;
+            self.origin = position;
+        }
+        self.set_rate(bpm, slope);
+    }
+
+    fn move_origin(&mut self, now: u64, pending: f64) {
         if self.playing {
             self.origin = self.position_at(now).min(pending);
             self.origin_frame = now;
+            self.origin_frac = 0.0;
         }
-        self.samples_per_step = Self::samples_per_step(bpm, sample_rate);
+    }
+
+    fn set_rate(&mut self, bpm: f64, slope: f64) {
+        self.samples_per_step = f64::from(self.sample_rate) * 60.0 / (bpm * 4.0);
+        self.bpm = bpm;
+        self.slope = slope;
+    }
+
+    /// Frames from the origin to `sixteenths` after it.
+    fn offset(&self, sixteenths: f64) -> f64 {
+        if self.slope == 0.0 {
+            sixteenths * self.samples_per_step
+        } else {
+            span_frames(self.bpm, self.slope, sixteenths, self.sample_rate)
+        }
     }
 
     /// Position at `frame` (which must not precede the origin), in 16th
     /// notes.
     pub fn position_at(&self, frame: u64) -> f64 {
-        self.origin + frame.saturating_sub(self.origin_frame) as f64 / self.samples_per_step
+        let frames = frame.saturating_sub(self.origin_frame) as f64 - self.origin_frac;
+        if self.slope == 0.0 {
+            self.origin + frames / self.samples_per_step
+        } else {
+            let k = f64::from(self.sample_rate) * 15.0;
+            self.origin + self.bpm * (frames * self.slope / k).exp_m1() / self.slope
+        }
     }
 
     /// Where a step of `division` starting at `pulse` sounds, in 16th notes:
@@ -222,7 +338,7 @@ impl Transport {
 
     /// The frame of a position in 16th notes.
     pub fn frame_at(&self, position: f64) -> u64 {
-        let offset = ((position - self.origin) * self.samples_per_step).round();
+        let offset = (self.origin_frac + self.offset(position - self.origin)).round();
         self.origin_frame + offset.max(0.0) as u64
     }
 
@@ -251,6 +367,54 @@ mod tests {
         }
         assert_eq!(Division::default(), D16);
         assert_eq!(Division::from_name("1/4"), None);
+    }
+
+    #[test]
+    fn a_ramp_lands_each_step_on_its_integral() {
+        // 120 to 240 BPM over 16 16ths at 48 kHz: the time to 16th d is
+        // the integral of 15 sr / (120 + 7.5 x) from 0 to d.
+        let mut t = Transport::new(120.0, 48_000.0);
+        t.start(0);
+        t.set_segment(0.0, 120.0, 7.5);
+        let k = 48_000.0 * 15.0;
+        for d in 0..=16u64 {
+            let exact = k / 7.5 * (1.0 + 7.5 * d as f64 / 120.0).ln();
+            assert_eq!(t.step_frame(6 * d, D16), exact.round() as u64, "step {d}");
+            let pos = t.position_at(exact.round() as u64);
+            assert!((pos - d as f64).abs() < 1e-3, "{d} {pos}");
+        }
+        // Twice the tempo by the end: the last step is half as long as the
+        // first.
+        let first = t.step_frame(6, D16) - t.step_frame(0, D16);
+        let last = t.step_frame(96, D16) - t.step_frame(90, D16);
+        assert!((first as f64 / last as f64 - 2.0).abs() < 0.1, "{first} {last}");
+        assert!((t.bpm_at(16.0) - 240.0).abs() < 1e-9);
+        // Held after the ramp, from its exact end: no frame is lost.
+        let end = k / 7.5 * 2f64.ln();
+        t.set_segment(16.0, 240.0, 0.0);
+        assert_eq!(t.step_frame(96, D16), end.round() as u64);
+        assert_eq!(t.step_frame(96 + 6 * 100, D16), (end + 100.0 * 3000.0).round() as u64);
+        // A tempo the slope barely moves is the straight line.
+        assert!((span_frames(120.0, 1e-12, 16.0, 48_000.0) - 96_000.0).abs() < 1e-3);
+        assert_eq!(span_frames(120.0, 0.0, 16.0, 48_000.0), 96_000.0);
+    }
+
+    #[test]
+    fn entry_tempo_holds_and_ramps_between_points() {
+        // Entries of 96 pulses; points at entries 1 (100) and 3 (140).
+        let points = [None, Some(100.0), None, Some(140.0), None];
+        let point = |j: usize| points[j];
+        let pulses = |_| 96;
+        let hold: Vec<_> = (0..5).map(|i| entry_tempo(i, 5, false, 120.0, point, pulses)).collect();
+        assert_eq!(hold, [(120.0, 0.0), (100.0, 0.0), (100.0, 0.0), (140.0, 0.0), (140.0, 0.0)]);
+        let ramp: Vec<_> = (0..5).map(|i| entry_tempo(i, 5, true, 120.0, point, pulses)).collect();
+        // 40 BPM over 192 pulses (32 16ths): 1.25 BPM per 16th.
+        assert_eq!(ramp, [(120.0, 0.0), (100.0, 1.25), (120.0, 1.25), (140.0, 0.0), (140.0, 0.0)]);
+        // Unequal entries share the slope by their pulses.
+        let lens = [96, 48, 144, 96, 96];
+        let (t2, s2) = entry_tempo(2, 5, true, 120.0, point, |j| lens[j]);
+        assert_eq!((t2, s2), (100.0 + 40.0 * 48.0 / 192.0, 40.0 / 192.0 * 6.0));
+        assert_eq!(entry_tempo(0, 0, true, 90.0, |_| None, pulses), (90.0, 0.0));
     }
 
     #[test]
