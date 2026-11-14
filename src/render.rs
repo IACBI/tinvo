@@ -54,16 +54,15 @@ pub fn resolve(project: &Project, source: Source) -> Source {
     }
 }
 
-/// Steps in one pass of `source`.
-pub fn source_steps(project: &Project, source: Source) -> u64 {
+/// Clock pulses in one pass of `source`.
+pub fn source_pulses(project: &Project, source: Source) -> u64 {
     match resolve(project, source) {
-        Source::Song => project.song_steps(),
+        Source::Song => project.song_pulses(),
         Source::Region => {
             let (a, b) = project.active_loop().unwrap_or((0, 0));
-            let lens = &project.pattern_lens;
-            project.song[usize::from(a)..=usize::from(b)].iter().map(|&p| u64::from(lens[usize::from(p)])).sum()
+            project.entries_pulses(usize::from(a), usize::from(b))
         }
-        Source::Pattern(p) => u64::from(project.pattern_lens[usize::from(p)]),
+        Source::Pattern(p) => project.pattern_pulses(p),
         Source::Auto => unreachable!("resolved above"),
     }
 }
@@ -71,7 +70,8 @@ pub fn source_steps(project: &Project, source: Source) -> u64 {
 /// Frames covered by `opts.loops` passes of the source, before the tail.
 pub fn main_frames(project: &Project, opts: &RenderOptions) -> u64 {
     let sps = Transport::samples_per_step(project.tempo, opts.sample_rate as f32);
-    (sps * (source_steps(project, opts.source) * u64::from(opts.loops)) as f64).round() as u64
+    let sixteenths = (source_pulses(project, opts.source) * u64::from(opts.loops)) as f64 / 6.0;
+    (sps * sixteenths).round() as u64
 }
 
 /// Frames the engine renders per call while exporting.
@@ -224,7 +224,7 @@ pub fn render_stems(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Step;
+    use crate::engine::{Division, Step};
     use crate::instrument::InstrumentKind;
 
     #[test]
@@ -264,6 +264,11 @@ mod tests {
         assert_eq!(main_frames(&p, &opts(1, Source::Song)), 36 * 6000);
         assert_eq!(main_frames(&p, &opts(2, Source::Region)), 2 * 12 * 6000);
         assert_eq!(main_frames(&p, &opts(1, Source::Pattern(2))), 4 * 6000);
+        // Steps of other lengths: eight triplet eighths are 8000 frames each.
+        p.divisions[2] = Division::EighthTriplet;
+        assert_eq!(main_frames(&p, &opts(1, Source::Pattern(2))), 4 * 8000);
+        assert_eq!(main_frames(&p, &opts(1, Source::Song)), 32 * 6000 + 4 * 8000);
+        p.divisions[2] = Division::Sixteenth;
         // A region past the end of the song is not active.
         p.loop_region = Some((2, 9));
         assert_eq!(resolve(&p, Source::Region), Source::Pattern(0));

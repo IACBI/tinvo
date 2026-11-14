@@ -28,6 +28,7 @@ use crate::strip::{self, Strip, track_param};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
+pub use transport::{Division, PULSES_PER_BEAT};
 
 pub const MAX_TRACKS: usize = 16;
 pub const MAX_STEPS: usize = 64;
@@ -104,7 +105,7 @@ const SMOOTHING_TIME: f32 = 0.005;
 const REMOVE_FADE_TIME: f32 = 0.010;
 
 /// Most repeats a single step can be divided into.
-pub const MAX_RATCHET: u8 = 4;
+pub const MAX_RATCHET: u8 = 8;
 /// Swing range, as the position of the off-beat 16th within its 8th note
 /// (50 % = straight, 66.7 % = triplet feel, 75 % = dotted).
 pub const MIN_SWING: f32 = 50.0;
@@ -112,7 +113,7 @@ pub const MAX_SWING: f32 = 75.0;
 /// Most notes a step can sound at once.
 pub const MAX_CHORD: usize = 4;
 /// Micro-timing resolution: a step is divided into this many ticks
-/// (96 per quarter note).
+/// (96 per quarter note in 16th-note steps).
 pub const TICKS_PER_STEP: i8 = 24;
 /// Furthest a step can be moved early or late, in ticks (half a step).
 pub const MAX_OFFSET: i8 = TICKS_PER_STEP / 2;
@@ -253,14 +254,22 @@ pub enum Part {
 
 /// The pattern and step a track plays at `pos` when its part in that entry
 /// is `part`, or `None` while it rests. Outside the song every track
-/// follows.
-pub fn part_position(part: Part, pos: PlayPosition, pattern_lens: &[u8; MAX_PATTERNS]) -> Option<(u8, u8)> {
+/// follows. A pattern of its own runs on its own steps, which may be
+/// longer or shorter than the entry's.
+pub fn part_position(
+    part: Part,
+    pos: PlayPosition,
+    pattern_lens: &[u8; MAX_PATTERNS],
+    divisions: &[Division; MAX_PATTERNS],
+) -> Option<(u8, u8)> {
     match part {
         _ if pos.entry.is_none() => Some((pos.pattern, pos.step)),
         Part::Follow => Some((pos.pattern, pos.step)),
         Part::Pattern(p) => {
-            let len = pattern_lens.get(usize::from(p)).copied().unwrap_or(DEFAULT_PATTERN_LEN).max(1);
-            Some((p, pos.step % len))
+            let i = usize::from(p).min(MAX_PATTERNS - 1);
+            let len = u32::from(pattern_lens[i].max(1));
+            let n = u32::from(pos.pulse) / divisions[i].pulses();
+            Some((p, (n % len) as u8))
         }
         Part::Rest => None,
     }
@@ -275,6 +284,11 @@ pub enum Edit {
     SetPatternLength {
         pattern: u8,
         len: u8,
+    },
+    /// How long `pattern`'s steps are.
+    SetPatternDivision {
+        pattern: u8,
+        division: Division,
     },
     SetMasterGain(f32),
     /// Swing in percent (`MIN_SWING..=MAX_SWING`).
@@ -371,9 +385,9 @@ pub enum Command {
         entry: u16,
     },
     /// The pattern `Play` starts with. While a pattern plays, the cued one
-    /// takes over when the current one ends; a cue that arrives during the
-    /// last step of a pattern takes effect one pattern later, because the
-    /// next step's early hits are already queued by then.
+    /// takes over when the current one ends; a cue that arrives after a
+    /// track has queued the early hits of the next pattern's first step
+    /// (during its last step) takes effect one pattern later.
     Cue(u8),
     /// Stop playback and release all notes.
     Stop,
@@ -430,23 +444,51 @@ pub struct PlayPosition {
     /// The song entry, when the song is playing.
     pub entry: Option<u16>,
     pub pattern: u8,
+    /// The step of `pattern`.
     pub step: u8,
+    /// Clock pulses since the entry (or the pattern's pass) began.
+    pub pulse: u16,
 }
 
 impl PlayPosition {
-    /// One word, so the UI never sees a half-updated position.
+    /// One word, so the UI never sees a half-updated position: 9 bits of
+    /// entry, 4 of pattern, 6 of step and 10 of pulse (a pass is at most
+    /// 64 eighths, 768 pulses).
     fn pack(self) -> u32 {
         let entry = self.entry.map_or(0, |e| u32::from(e) + 1);
-        entry << 16 | u32::from(self.pattern) << 8 | u32::from(self.step)
+        entry << 20
+            | u32::from(self.pattern & 0xF) << 16
+            | u32::from(self.step & 0x3F) << 10
+            | u32::from(self.pulse & 0x3FF)
     }
 
     fn unpack(v: u32) -> Option<Self> {
         (v != u32::MAX).then(|| Self {
-            entry: (v >> 16).checked_sub(1).map(|e| e as u16),
-            pattern: (v >> 8) as u8,
-            step: v as u8,
+            entry: (v >> 20).checked_sub(1).map(|e| e as u16),
+            pattern: ((v >> 16) & 0xF) as u8,
+            step: ((v >> 10) & 0x3F) as u8,
+            pulse: (v & 0x3FF) as u16,
         })
     }
+}
+
+/// A song entry, or one pass of the pattern loop, and the pulse it began on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntryPos {
+    entry: Option<u16>,
+    pattern: u8,
+    start: u64,
+}
+
+/// A step still to come on a track, or on the entry's own grid: where it
+/// starts, in pulses since Play, and what it plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tick {
+    pulse: u64,
+    /// The pattern played; `None` for a rest, which keeps the entry's grid.
+    pattern: Option<u8>,
+    idx: u8,
+    division: Division,
 }
 
 /// State published by the audio thread for the UI.
@@ -461,6 +503,9 @@ pub struct Shared {
     /// Deepest compressor gain reduction per track since the UI last took
     /// it, in dB as a positive number.
     pub track_reduction: [AtomicF32; MAX_TRACKS],
+    /// The pattern and step each track played last, packed by
+    /// [`pack_track_step`], or `u32::MAX`.
+    track_steps: [AtomicU32; MAX_TRACKS],
     /// The same for the master limiter.
     pub limiter_reduction: AtomicF32,
     /// Momentary, short-term and integrated loudness of the output since
@@ -484,6 +529,7 @@ impl Shared {
             track_peaks: std::array::from_fn(|_| AtomicF32::new(0.0)),
             master_peaks: [AtomicF32::new(0.0), AtomicF32::new(0.0)],
             track_reduction: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            track_steps: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
             limiter_reduction: AtomicF32::new(0.0),
             loudness: std::array::from_fn(|_| AtomicF32::new(f32::NAN)),
             load: AtomicF32::new(0.0),
@@ -496,6 +542,16 @@ impl Shared {
     pub fn position(&self) -> Option<PlayPosition> {
         PlayPosition::unpack(self.position.load(Ordering::Relaxed))
     }
+
+    /// The pattern and step track `t` played last, while it plays one.
+    pub fn track_step(&self, t: usize) -> Option<(u8, u8)> {
+        let v = self.track_steps.get(t)?.load(Ordering::Relaxed);
+        (v != u32::MAX).then_some(((v >> 8) as u8, v as u8))
+    }
+}
+
+fn pack_track_step(s: Option<(u8, u8)>) -> u32 {
+    s.map_or(u32::MAX, |(p, i)| u32::from(p) << 8 | u32::from(i))
 }
 
 /// Fader position in dB to linear gain, with the bottom of the range muted.
@@ -594,6 +650,14 @@ struct Track {
     peak: f32,
     /// Deepest compressor gain reduction since last published (dB, >= 0).
     reduction: f32,
+    /// The track's next step while playing; `None` until it joins.
+    clock: Option<Tick>,
+    /// Pulse of the step whose early (negative offset) hits are queued.
+    early_for: Option<u64>,
+    /// The pattern and step it played last, for the UI.
+    shown: Option<(u8, u8)>,
+    /// Whether one of its lanes is ramping.
+    ramping: bool,
 }
 
 impl Track {
@@ -620,6 +684,10 @@ impl Track {
             on_count: 0,
             peak: 0.0,
             reduction: 0.0,
+            clock: None,
+            early_for: None,
+            shown: None,
+            ramping: false,
         }
     }
 
@@ -647,6 +715,10 @@ impl Track {
         self.on_count = 0;
         self.peak = 0.0;
         self.reduction = 0.0;
+        self.clock = None;
+        self.early_for = None;
+        self.shown = None;
+        self.ramping = false;
     }
 
     /// Writes an automation value (`None`: the base value) to `target`.
@@ -793,15 +865,22 @@ pub struct Engine {
     transport: Transport,
     tempo: f32,
     pattern_lens: [u8; MAX_PATTERNS],
+    divisions: [Division; MAX_PATTERNS],
     song: [u8; MAX_SONG],
     song_len: usize,
     loop_region: Option<(u16, u16)>,
     /// Pattern that `Play` starts with and that follows the current one.
     cue: u8,
     song_mode: bool,
-    /// The step the next transport step plays.
-    next_pos: PlayPosition,
+    /// The entry playing, or the pattern loop's pass.
+    entry: EntryPos,
+    /// The entry and pattern after it, once a track needed to know.
+    upcoming: Option<(Option<u16>, u8)>,
+    /// The next step of the entry's own grid, which moves the playhead.
+    conductor: Option<Tick>,
     current: Option<PlayPosition>,
+    /// The pulse the entry or pass `current` is in began on.
+    current_start: u64,
     /// Whether any lane is ramping, so automation needs regular updates.
     ramping: bool,
     tracks: Box<[Track]>,
@@ -828,8 +907,6 @@ pub struct Engine {
     /// Decides step chances. Re-seeded on every Play so a pattern with
     /// chance steps plays (and exports) identically each time from the start.
     rng: Rng,
-    /// Absolute step whose early (negative offset) hits are already queued.
-    early_queued: Option<u64>,
     /// Where released samples go; `None` when not running in real time.
     retired: Option<Producer<Arc<Sample>>>,
     /// Loudness of the output since playback started.
@@ -863,13 +940,17 @@ impl Engine {
             transport: Transport::new(120.0, sample_rate),
             tempo: 120.0,
             pattern_lens: [DEFAULT_PATTERN_LEN; MAX_PATTERNS],
+            divisions: [Division::Sixteenth; MAX_PATTERNS],
             song: [0; MAX_SONG],
             song_len: 0,
             loop_region: None,
             cue: 0,
             song_mode: false,
-            next_pos: PlayPosition { entry: None, pattern: 0, step: 0 },
+            entry: EntryPos { entry: None, pattern: 0, start: 0 },
+            upcoming: None,
+            conductor: None,
             current: None,
+            current_start: 0,
             ramping: false,
             tracks: tracks.into_boxed_slice(),
             track_count: 0,
@@ -889,7 +970,6 @@ impl Engine {
             commands,
             shared,
             rng: Rng::new(CHANCE_SEED),
-            early_queued: None,
             retired: None,
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
@@ -1015,9 +1095,14 @@ impl Engine {
             Command::Stop => {
                 self.transport.stop();
                 self.current = None;
+                self.conductor = None;
+                self.upcoming = None;
                 self.held_count = 0;
                 for t in &mut self.tracks[..self.track_count] {
                     t.release_all();
+                    t.clock = None;
+                    t.shown = None;
+                    t.ramping = false;
                     for l in &mut t.lanes {
                         l.segment = None;
                     }
@@ -1108,35 +1193,63 @@ impl Engine {
         }
         self.song_mode = entry.is_some() && self.song_len > 0;
         let entry = entry.map_or(0, |e| usize::from(e).min(self.song_len.saturating_sub(1)));
-        self.next_pos = if self.song_mode {
-            PlayPosition { entry: Some(entry as u16), pattern: self.song[entry], step: 0 }
+        self.entry = if self.song_mode {
+            EntryPos { entry: Some(entry as u16), pattern: self.song[entry], start: 0 }
         } else {
-            PlayPosition { entry: None, pattern: self.cue, step: 0 }
+            EntryPos { entry: None, pattern: self.cue, start: 0 }
         };
+        self.upcoming = None;
         self.rng = Rng::new(CHANCE_SEED);
-        self.early_queued = None;
         self.loudness.reset();
         self.transport.start(self.now);
-    }
-
-    /// `pos`, corrected for edits made since it was computed (a shorter
-    /// pattern or song, a changed song entry).
-    fn checked(&self, pos: PlayPosition) -> PlayPosition {
-        let pattern = match pos.entry {
-            Some(e) if self.song_mode => self.song[usize::from(e).min(self.song_len.saturating_sub(1))],
-            _ => pos.pattern,
-        };
-        let entry = pos.entry.filter(|_| self.song_mode).map(|e| e.min(self.song_len.saturating_sub(1) as u16));
-        let step = if pos.step < self.pattern_lens[usize::from(pattern)] { pos.step } else { 0 };
-        PlayPosition { entry, pattern, step }
-    }
-
-    /// The step that follows `pos`.
-    fn following(&self, pos: PlayPosition) -> PlayPosition {
-        if pos.step + 1 < self.pattern_lens[usize::from(pos.pattern)] {
-            return PlayPosition { step: pos.step + 1, ..pos };
+        let e = self.entry;
+        self.conductor = Some(self.tick_at(None, &e, 0));
+        for t in 0..self.track_count {
+            self.tracks[t].clock = Some(self.tick_at(Some(t), &e, 0));
+            self.tracks[t].early_for = None;
         }
-        match pos.entry {
+    }
+
+    /// The current entry, corrected for edits made since it began (a
+    /// changed, shorter or emptied song).
+    fn entry_now(&self) -> EntryPos {
+        let mut e = self.entry;
+        if self.song_mode {
+            let i = usize::from(e.entry.unwrap_or(0)).min(self.song_len.saturating_sub(1));
+            e.entry = Some(i as u16);
+            e.pattern = self.song[i];
+        } else {
+            e.entry = None;
+        }
+        e
+    }
+
+    /// Pulses in one pass of `pattern`.
+    fn pattern_pulses(&self, pattern: u8) -> u64 {
+        let p = usize::from(pattern);
+        u64::from(self.pattern_lens[p]) * u64::from(self.divisions[p].pulses())
+    }
+
+    /// The pulse the current entry ends on.
+    fn entry_end(&self) -> u64 {
+        let e = self.entry_now();
+        e.start + self.pattern_pulses(e.pattern)
+    }
+
+    /// What follows the current entry: the next song entry (or the loop
+    /// region's start), or the cued pattern. It is decided the first time a
+    /// track needs it, so every track agrees on it.
+    fn upcoming(&mut self) -> EntryPos {
+        let u = self.peek_upcoming();
+        self.upcoming = Some((u.entry, u.pattern));
+        u
+    }
+
+    /// What [`Self::upcoming`] would decide now, leaving it undecided.
+    fn peek_upcoming(&self) -> EntryPos {
+        let now = self.entry_now();
+        let start = now.start + self.pattern_pulses(now.pattern);
+        let (entry, pattern) = self.upcoming.unwrap_or_else(|| match now.entry {
             Some(e) if self.song_mode => {
                 let e = usize::from(e);
                 let next = match self.loop_region {
@@ -1144,9 +1257,174 @@ impl Engine {
                     _ if e + 1 < self.song_len => e + 1,
                     _ => 0,
                 };
-                PlayPosition { entry: Some(next as u16), pattern: self.song[next], step: 0 }
+                (Some(next as u16), self.song[next])
             }
-            _ => PlayPosition { entry: None, pattern: self.cue, step: 0 },
+            _ => (None, self.cue),
+        });
+        EntryPos { entry, pattern, start }
+    }
+
+    /// The pattern track `t` plays in entry `e`; `None` while it rests.
+    fn track_pattern(&self, t: usize, e: &EntryPos) -> Option<u8> {
+        match e.entry {
+            Some(i) if self.song_mode => match self.tracks[t].parts[usize::from(i)] {
+                Part::Follow => Some(e.pattern),
+                Part::Pattern(p) => Some(p),
+                Part::Rest => None,
+            },
+            _ => Some(e.pattern),
+        }
+    }
+
+    /// The step at `pulse` (inside entry `e`) of track `t`, or of the
+    /// entry's own grid for `None`. A rest keeps the entry's grid.
+    fn tick_at(&self, t: Option<usize>, e: &EntryPos, pulse: u64) -> Tick {
+        let pattern = t.and_then(|t| self.track_pattern(t, e));
+        let grid = usize::from(pattern.unwrap_or(e.pattern));
+        let division = self.divisions[grid];
+        let n = pulse.saturating_sub(e.start) / u64::from(division.pulses());
+        let idx = (n % u64::from(self.pattern_lens[grid].max(1))) as u8;
+        Tick { pulse, pattern, idx, division }
+    }
+
+    /// The step after `k`: the next one on its grid, or the first of the
+    /// following entry where the current one ends first (cutting off a
+    /// longer pattern of a track's own).
+    fn next_tick(&mut self, t: Option<usize>, k: Tick) -> Tick {
+        let e = self.entry_now();
+        let end = e.start + self.pattern_pulses(e.pattern);
+        let pulse = k.pulse + u64::from(k.division.pulses());
+        if pulse < end {
+            self.tick_at(t, &e, pulse)
+        } else {
+            let u = self.upcoming();
+            self.tick_at(t, &u, u.start)
+        }
+    }
+
+    /// The step after `k`, which may be in the following entry too; `None`
+    /// past that entry. It leaves the following entry undecided.
+    fn peek_after(&self, t: Option<usize>, k: Tick) -> Option<Tick> {
+        let e = self.entry_now();
+        let end = e.start + self.pattern_pulses(e.pattern);
+        let pulse = k.pulse + u64::from(k.division.pulses());
+        if pulse < end {
+            return Some(self.tick_at(t, &e, pulse));
+        }
+        let u = self.peek_upcoming();
+        if k.pulse < end {
+            return Some(self.tick_at(t, &u, u.start));
+        }
+        (pulse < u.start + self.pattern_pulses(u.pattern)).then(|| self.tick_at(t, &u, pulse))
+    }
+
+    /// Where track `t` (or the entry's grid, for `None`) comes in when it
+    /// joins while playing, or its grid changed: the first step of its grid
+    /// not yet passed.
+    fn join_tick(&mut self, t: Option<usize>) -> Tick {
+        let e = self.entry_now();
+        let division = self.tick_at(t, &e, e.start).division;
+        let p = f64::from(division.pulses());
+        let gone = self.transport.position_at(self.now) * 6.0 - e.start as f64;
+        let pulse = e.start + ((gone / p).ceil().max(0.0) * p) as u64;
+        if pulse < self.entry_end() {
+            self.tick_at(t, &e, pulse)
+        } else {
+            let u = self.upcoming();
+            self.tick_at(t, &u, u.start)
+        }
+    }
+
+    /// Puts the clocks an edit left off their grid (a pattern's division,
+    /// or the pattern a track plays in this entry, changed) on the first
+    /// step of their grid not yet passed. Other clocks are left alone.
+    fn realign(&mut self) {
+        if !self.transport.is_playing() {
+            return;
+        }
+        let e = self.entry_now();
+        let end = self.entry_end();
+        let off = |s: &Self, t: Option<usize>, k: Tick| {
+            let d = s.tick_at(t, &e, k.pulse).division;
+            (e.start..end).contains(&k.pulse) && (d != k.division || (k.pulse - e.start) % u64::from(d.pulses()) != 0)
+        };
+        if self.conductor.is_some_and(|k| off(self, None, k)) {
+            self.conductor = Some(self.join_tick(None));
+        }
+        for t in 0..self.track_count {
+            if self.tracks[t].clock.is_some_and(|k| off(self, Some(t), k)) {
+                self.tracks[t].clock = Some(self.join_tick(Some(t)));
+            }
+        }
+    }
+
+    /// Queues the early hits of track `t`'s step `n`, and of the steps after
+    /// it whose early hits reach back past the step before them (longer
+    /// steps following shorter ones), so no early hit is queued too late.
+    fn queue_early(&mut self, t: usize, mut n: Tick) {
+        loop {
+            if self.tracks[t].early_for.is_none_or(|p| p < n.pulse) {
+                self.queue_hits(t, n, Some(true));
+                self.tracks[t].early_for = Some(n.pulse);
+            }
+            let Some(after) = self.peek_after(Some(t), n) else { break };
+            let tr = &self.transport;
+            let reach = f64::from(MAX_OFFSET) / f64::from(TICKS_PER_STEP) * after.division.sixteenths();
+            // The margin keeps float noise from looking ahead when the step
+            // before is exactly as long as the reach (maximum swing).
+            if tr.step_position(after.pulse, after.division) - reach >= tr.step_position(n.pulse, n.division) - 1e-9 {
+                break;
+            }
+            // Its early hits are queued now, so what follows is decided now.
+            if after.pulse >= self.entry_end() {
+                self.upcoming();
+            }
+            n = after;
+        }
+    }
+
+    /// Every step still to come: the entry's grid and each track's.
+    fn clocks(&self) -> impl Iterator<Item = Tick> + '_ {
+        self.conductor.into_iter().chain(self.tracks[..self.track_count].iter().filter_map(|t| t.clock))
+    }
+
+    /// The frame of the next step or entry change while playing, and
+    /// whether it is the entry change. Steps inside the entry come before
+    /// the change on the same frame, steps of the next entry after it.
+    fn next_event(&self) -> Option<(u64, bool)> {
+        if !self.transport.is_playing() {
+            return None;
+        }
+        let end = self.entry_end();
+        let tr = &self.transport;
+        let boundary = tr.pulse_frame(end);
+        let step = self.clocks().filter(|k| k.pulse < end).map(|k| tr.step_frame(k.pulse, k.division)).min();
+        match step {
+            Some(f) if f <= boundary => Some((f, false)),
+            _ => Some((boundary, true)),
+        }
+    }
+
+    /// Where the earliest event still to come sounds, in 16th notes: a tempo
+    /// change must not move the playhead past it.
+    fn pending_position(&self) -> f64 {
+        let tr = &self.transport;
+        let end = self.entry_end() as f64 / 6.0;
+        self.clocks().map(|k| tr.step_position(k.pulse, k.division)).fold(end, f64::min)
+    }
+
+    /// Moves on to the following entry. If edits made the current one
+    /// shorter than the way already gone, it starts over at the next step
+    /// of its grid instead.
+    fn cross_boundary(&mut self) {
+        let end = self.entry_end();
+        let next = self.conductor.map_or(end, |c| c.pulse);
+        self.entry = if next > end { EntryPos { start: next, ..self.entry_now() } } else { self.upcoming() };
+        self.upcoming = None;
+        let e = self.entry_now();
+        self.conductor = Some(self.tick_at(None, &e, e.start));
+        for t in 0..self.track_count {
+            self.tracks[t].clock = Some(self.tick_at(Some(t), &e, e.start));
         }
     }
 
@@ -1157,12 +1435,19 @@ impl Engine {
         match edit {
             Edit::SetTempo(bpm) => {
                 self.tempo = bpm.clamp(MIN_TEMPO, MAX_TEMPO);
-                self.transport.set_tempo(self.tempo, self.sample_rate, self.now);
+                let pending = self.pending_position();
+                self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
                 self.mix.set_tempo(self.tempo);
             }
             Edit::SetPatternLength { pattern, len } => {
                 if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
                     *l = len.clamp(1, MAX_STEPS as u8);
+                }
+            }
+            Edit::SetPatternDivision { pattern, division } => {
+                if let Some(d) = self.divisions.get_mut(usize::from(pattern)) {
+                    *d = division;
+                    self.realign();
                 }
             }
             Edit::InsertSongEntry { index, pattern } => {
@@ -1175,6 +1460,7 @@ impl Engine {
                         t.parts[i] = Part::Follow;
                     }
                     self.song_len += 1;
+                    self.realign();
                 }
             }
             Edit::RemoveSongEntry(index) => {
@@ -1188,11 +1474,13 @@ impl Engine {
                     self.song_len -= 1;
                     // Nothing left to chain: the cued pattern follows.
                     self.song_mode &= self.song_len > 0;
+                    self.realign();
                 }
             }
             Edit::SetSongEntry { index, pattern } => {
                 if usize::from(index) < self.song_len && usize::from(pattern) < MAX_PATTERNS {
                     self.song[usize::from(index)] = pattern;
+                    self.realign();
                 }
             }
             Edit::SetPart { track, index, part } => {
@@ -1203,6 +1491,7 @@ impl Engine {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
                     if valid && usize::from(index) < self.song_len {
                         t.parts[usize::from(index)] = part;
+                        self.realign();
                     }
                 }
             }
@@ -1217,6 +1506,9 @@ impl Engine {
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
+                    if self.transport.is_playing() {
+                        self.tracks[i].clock = Some(self.join_tick(Some(i)));
+                    }
                 }
             }
             Edit::SetMasterGain(db) => {
@@ -1230,6 +1522,9 @@ impl Engine {
                     self.tracks[n].reset(kind, self.sample_rate);
                     self.track_count += 1;
                     self.update_gains();
+                    if self.transport.is_playing() {
+                        self.tracks[n].clock = Some(self.join_tick(Some(n)));
+                    }
                 }
             }
             Edit::RemoveTrack(i) => {
@@ -1359,6 +1654,10 @@ impl Engine {
         let s = &self.shared;
         s.playing.store(self.transport.is_playing(), Ordering::Relaxed);
         s.position.store(self.current.map_or(u32::MAX, PlayPosition::pack), Ordering::Relaxed);
+        for (i, slot) in s.track_steps.iter().enumerate() {
+            let shown = self.tracks[..self.track_count].get(i).and_then(|t| t.shown);
+            slot.store(pack_track_step(shown), Ordering::Relaxed);
+        }
         for (i, t) in self.tracks[..self.track_count].iter_mut().enumerate() {
             s.track_peaks[i].fetch_max_non_negative(t.peak);
             s.track_reduction[i].fetch_max_non_negative(t.reduction);
@@ -1391,73 +1690,112 @@ impl Engine {
             for t in tracks.iter_mut() {
                 t.fire_ons(frame);
             }
-            match self.transport.next_step_frame() {
-                // The step only queues hits; the next pass fires the ones
-                // due now, after the closed-hat choke check.
-                Some(f) if f <= frame => self.fire_step(frame),
+            match self.next_event() {
+                // A step only queues hits; the next pass fires the ones due
+                // now, after the closed-hat choke check.
+                Some((f, true)) if f <= frame => self.cross_boundary(),
+                Some((f, false)) if f <= frame => self.fire_steps(f, frame),
                 _ => break,
             }
         }
     }
 
-    /// Advances to the next step and queues its hits: on-time and late ones
-    /// for this step, and early ones for the step after it (they fall inside
-    /// this step). Early hits of the very first step after Play cannot be
-    /// played early, so they play at once.
-    fn fire_step(&mut self, frame: u64) {
-        let abs = self.transport.advance();
-        let pos = self.checked(self.next_pos);
-        self.current = Some(pos);
-        // Before the step's hits fire, so a point shapes the hit on its step.
-        self.update_segments(abs, pos);
+    /// Fires every step due on frame `at`, on the entry's grid and on each
+    /// track. A track's step queues its on-time and late hits, and the early
+    /// ones of its next step (they fall inside this one). Early hits of a
+    /// track's first step after Play, or after it joined, cannot be played
+    /// early, so they play on time.
+    fn fire_steps(&mut self, at: u64, frame: u64) {
+        let n = self.track_count;
+        let e = self.entry_now();
+        let end = e.start + self.pattern_pulses(e.pattern);
+        let due = |k: &Tick, tr: &Transport| k.pulse < end && tr.step_frame(k.pulse, k.division) == at;
+        let mut group = [false; MAX_TRACKS];
+        for (t, fired) in group.iter_mut().enumerate().take(n) {
+            let Some(k) = self.tracks[t].clock.filter(|k| due(k, &self.transport)) else { continue };
+            // Parts, patterns and divisions may have changed since the step
+            // was worked out.
+            let k = self.tick_at(Some(t), &e, k.pulse);
+            self.tracks[t].clock = Some(k);
+            self.tracks[t].shown = k.pattern.map(|p| (p, k.idx));
+            *fired = true;
+            // Before the step's hits fire, so a point shapes the hit on its
+            // step.
+            self.update_segments(t, k, end);
+        }
+        self.ramping = self.tracks[..n].iter().any(|t| t.ramping);
         self.automate(frame);
-        let first = self.early_queued != Some(abs);
-        self.queue_hits(abs, pos, if first { None } else { Some(false) });
-        let next = self.following(pos);
-        self.queue_hits(abs + 1, next, Some(true));
-        self.early_queued = Some(abs + 1);
-        self.next_pos = next;
+        let mut latest = None;
+        for t in (0..n).filter(|&t| group[t]) {
+            let Some(k) = self.tracks[t].clock else { continue };
+            let first = self.tracks[t].early_for.is_none_or(|p| p < k.pulse);
+            self.queue_hits(t, k, if first { None } else { Some(false) });
+            latest = latest.max(Some(k.pulse));
+        }
+        for t in (0..n).filter(|&t| group[t]) {
+            let Some(k) = self.tracks[t].clock else { continue };
+            let next = self.next_tick(Some(t), k);
+            self.queue_early(t, next);
+            self.tracks[t].clock = Some(next);
+        }
+        let same_entry =
+            self.current.filter(|c| self.current_start == e.start && (c.entry, c.pattern) == (e.entry, e.pattern));
+        let mut shown = same_entry.map(|c| e.start + u64::from(c.pulse));
+        let mut step = same_entry.map(|c| c.step);
+        if let Some(k) = self.conductor.filter(|k| due(k, &self.transport)) {
+            let k = self.tick_at(None, &e, k.pulse);
+            (shown, step) = (shown.max(Some(k.pulse)), Some(k.idx));
+            self.conductor = Some(self.next_tick(None, k));
+        }
+        // A track finer than the entry's grid moves the playhead's pulse
+        // between the grid's steps; the entry's step changes only when the
+        // grid's own step plays (later, when it is swung).
+        if let Some(pulse) = shown.max(latest) {
+            let step = step.unwrap_or_else(|| self.tick_at(None, &e, pulse).idx);
+            let pulse = u16::try_from(pulse - e.start).unwrap_or(u16::MAX);
+            self.current = Some(PlayPosition { entry: e.entry, pattern: e.pattern, step, pulse });
+            self.current_start = e.start;
+        }
     }
 
-    /// Sets every lane's segment for absolute step `abs`, which plays `pos`:
-    /// the last point at or before the step holds, or ramps towards the next
+    /// Sets the segment of each of track `t`'s lanes for its step `k`: the
+    /// last point at or before the step holds, or ramps towards the next
     /// point in the pattern. Without an earlier point in the pattern the
-    /// parameter is at its base value.
-    fn update_segments(&mut self, abs: u64, pos: PlayPosition) {
-        // Steps of the entry still to come, this one included: a ramp of a
-        // track playing a longer pattern ends where the entry does.
-        let left = usize::from(self.pattern_lens[usize::from(pos.pattern)]) - usize::from(pos.step);
-        let entry = pos.entry.map(usize::from);
+    /// parameter is at its base value. A ramp ends where the entry (which
+    /// ends on pulse `end`) does.
+    fn update_segments(&mut self, t: usize, k: Tick, end: u64) {
+        let div = u64::from(k.division.pulses());
+        // Steps of the entry still to come on the track's grid, this one
+        // included.
+        let left = end.saturating_sub(k.pulse).div_ceil(div).max(1) as usize;
+        let s = usize::from(k.idx);
         let (transport, lens) = (&self.transport, &self.pattern_lens);
+        let track = &mut self.tracks[t];
+        let kind = track.instrument.kind();
         let mut ramping = false;
-        for t in &mut self.tracks[..self.track_count] {
-            let kind = t.instrument.kind();
-            let part = entry.map_or(Part::Follow, |e| t.parts[e]);
-            let at = part_position(part, pos, lens);
-            for l in &mut t.lanes {
-                let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { continue };
-                let Some((pattern, s)) = at.map(|(p, s)| (usize::from(p), usize::from(s))) else {
-                    l.segment = None;
-                    continue;
-                };
-                let end = usize::from(lens[pattern]).min(s + left);
-                let pts = &l.points[pattern];
-                l.segment = (0..=s).rev().find(|&i| !pts[i].is_nan()).map(|i| {
-                    let v0 = spec.clamp(pts[i]);
-                    match (s + 1..end).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
-                        Some(j) => Segment {
-                            f0: transport.frame_of_step(abs.saturating_sub((s - i) as u64)),
-                            v0,
-                            f1: transport.frame_of_step(abs + (j - s) as u64),
-                            v1: spec.clamp(pts[j]),
-                        },
-                        None => Segment { f0: 0, v0, f1: 0, v1: v0 },
-                    }
-                });
-                ramping |= l.segment.is_some_and(|g| g.f1 > g.f0);
-            }
+        for l in &mut track.lanes {
+            let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { continue };
+            let Some(pattern) = k.pattern.map(usize::from) else {
+                l.segment = None;
+                continue;
+            };
+            let stop = usize::from(lens[pattern]).min(s + left);
+            let pts = &l.points[pattern];
+            l.segment = (0..=s).rev().find(|&i| !pts[i].is_nan()).map(|i| {
+                let v0 = spec.clamp(pts[i]);
+                match (s + 1..stop).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
+                    Some(j) => Segment {
+                        f0: transport.step_frame(k.pulse.saturating_sub((s - i) as u64 * div), k.division),
+                        v0,
+                        f1: transport.step_frame(k.pulse + (j - s) as u64 * div, k.division),
+                        v1: spec.clamp(pts[j]),
+                    },
+                    None => Segment { f0: 0, v0, f1: 0, v1: v0 },
+                }
+            });
+            ramping |= l.segment.is_some_and(|g| g.f1 > g.f0);
         }
-        self.ramping = ramping;
+        track.ramping = ramping;
     }
 
     /// Brings every automated parameter to its value at `frame`. Ramps are
@@ -1487,38 +1825,47 @@ impl Engine {
         }
     }
 
-    /// Queues the hits of absolute step `abs`, which plays `pos`, on every
-    /// track: all of them (`early` is `None`), only the early ones, or only
-    /// the others.
-    fn queue_hits(&mut self, abs: u64, pos: PlayPosition, early: Option<bool>) {
-        let entry = pos.entry.map(usize::from);
-        let start = self.transport.frame_of_step(abs);
-        let span = self.transport.frame_of_step(abs + 1).saturating_sub(start).max(1);
+    /// Queues the hits of track `t`'s step `k`: all of them (`early` is
+    /// `None`), only the early ones, or only the others.
+    fn queue_hits(&mut self, t: usize, k: Tick, early: Option<bool>) {
+        let Some(pattern) = k.pattern else { return };
+        let Some(step) = self.tracks[t].steps[usize::from(pattern)][usize::from(k.idx)] else { return };
+        if early.is_some_and(|e| e != (step.offset < 0)) {
+            return;
+        }
+        if step.chance < 100 && self.rng.next_f32() * 100.0 >= f32::from(step.chance) {
+            return;
+        }
+        let entry_end = if k.pulse < self.entry_end() {
+            self.entry_end()
+        } else {
+            let u = self.peek_upcoming();
+            u.start + self.pattern_pulses(u.pattern)
+        };
+        let tr = &self.transport;
+        let div = u64::from(k.division.pulses());
+        let start = tr.step_frame(k.pulse, k.division);
+        // A step cut short by the end of its entry keeps its ratchets inside
+        // the entry.
+        let step_end = if k.pulse + div > entry_end {
+            tr.pulse_frame(entry_end)
+        } else {
+            tr.step_frame(k.pulse + div, k.division)
+        };
+        let span = step_end.saturating_sub(start).max(1);
         // Ticks are a fraction of a straight step, so the earliest offset
         // never reaches back past the (possibly swing-shortened) step before.
-        let tick = self.transport.step_frames() / f64::from(TICKS_PER_STEP);
-        let now = self.now;
-        for t in &mut self.tracks[..self.track_count] {
-            let part = entry.map_or(Part::Follow, |e| t.parts[e]);
-            let Some((pattern, idx)) = part_position(part, pos, &self.pattern_lens) else { continue };
-            let Some(step) = t.steps[usize::from(pattern)][usize::from(idx)] else { continue };
-            if early.is_some_and(|e| e != (step.offset < 0)) {
-                continue;
-            }
-            if step.chance < 100 && self.rng.next_f32() * 100.0 >= f32::from(step.chance) {
-                continue;
-            }
-            let shift = (f64::from(step.offset) * tick).round() as i64;
-            let at = start.saturating_add_signed(shift).max(now);
-            let r = u64::from(step.ratchet);
-            let gate = if r > 1 {
-                (span / r).max(1)
-            } else {
-                self.transport.frame_of_step(abs + u64::from(step.length)).saturating_sub(start).max(1)
-            };
-            for k in 0..r {
-                t.schedule_on(PendingOn { frame: at + span * k / r, step, gate });
-            }
+        let tick = tr.step_frames() * k.division.sixteenths() / f64::from(TICKS_PER_STEP);
+        let shift = (f64::from(step.offset) * tick).round() as i64;
+        let at = start.saturating_add_signed(shift).max(self.now);
+        let r = u64::from(step.ratchet);
+        let gate = if r > 1 {
+            (span / r).max(1)
+        } else {
+            tr.step_frame(k.pulse + u64::from(step.length) * div, k.division).saturating_sub(start).max(1)
+        };
+        for i in 0..r {
+            self.tracks[t].schedule_on(PendingOn { frame: at + span * i / r, step, gate });
         }
     }
 
@@ -1538,7 +1885,7 @@ impl Engine {
                 self.automate(pos);
                 next = next.min((pos / AUTOMATION_TICK + 1) * AUTOMATION_TICK);
             }
-            if let Some(f) = self.transport.next_step_frame() {
+            if let Some((f, _)) = self.next_event() {
                 next = next.min(f);
             }
             for t in &self.tracks[..self.track_count] {
@@ -1863,7 +2210,7 @@ mod tests {
         e.handle(Command::Play);
         run(&mut e, 1000);
         assert!(shared.playing.load(Ordering::Relaxed));
-        assert_eq!(shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0 }));
+        assert_eq!(shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0, pulse: 0 }));
         assert!(shared.track_peaks[0].take() > 0.0);
         e.handle(Command::Stop);
         // Default release is 120 ms; after 1 s everything is silent.
@@ -2145,6 +2492,310 @@ mod tests {
         assert_eq!(onsets(&out, 600), vec![9000, 10_500]);
     }
 
+    fn hat_hits(division: Division, len: u8, hits: &[u8]) -> Vec<Edit> {
+        let mut edits = vec![
+            Edit::AddTrack(InstrumentKind::HatClosed),
+            Edit::SetParam { track: 0, index: 1, value: 0.01 },
+            Edit::SetPatternLength { pattern: 0, len },
+            Edit::SetPatternDivision { pattern: 0, division },
+        ];
+        for &h in hits {
+            edits.push(Edit::SetStep { track: 0, pattern: 0, step: h, value: step(60) });
+        }
+        edits
+    }
+
+    #[test]
+    fn each_division_places_steps_on_its_fraction_of_a_beat() {
+        // 120 BPM at 48 kHz: a quarter note is 24 000 frames.
+        for (d, frames) in [
+            (Division::Eighth, 12_000),
+            (Division::EighthTriplet, 8000),
+            (Division::Sixteenth, 6000),
+            (Division::SixteenthTriplet, 4000),
+            (Division::ThirtySecond, 3000),
+        ] {
+            let mut e = engine(&hat_hits(d, 4, &[0, 1, 2, 3]));
+            e.handle(Command::Play);
+            let out = run(&mut e, 4 * frames + frames / 2);
+            assert_eq!(onsets(&out, 200), [0, frames, 2 * frames, 3 * frames, 4 * frames], "{}", d.name());
+            let pos = e.shared.position().unwrap();
+            assert_eq!((pos.step, u32::from(pos.pulse)), (0, 0), "{} loops after 4 steps", d.name());
+        }
+    }
+
+    #[test]
+    fn the_position_counts_pulses_on_the_pattern_grid() {
+        let mut e = engine(&hat_hits(Division::EighthTriplet, 6, &[0]));
+        e.handle(Command::Play);
+        run(&mut e, 2 * 8000 + 100);
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 2, pulse: 16 }));
+    }
+
+    #[test]
+    fn a_pattern_loops_after_its_own_steps() {
+        // Three triplet eighths are one beat.
+        let mut e = engine(&hat_hits(Division::EighthTriplet, 3, &[0]));
+        e.handle(Command::Play);
+        assert_eq!(onsets(&run(&mut e, 60_000), 1000), [0, 24_000, 48_000]);
+    }
+
+    #[test]
+    fn swing_moves_the_second_eighth_and_leaves_triplets_straight() {
+        let mut edits = hat_hits(Division::Eighth, 4, &[0, 1, 2]);
+        edits.push(Edit::SetSwing(75.0));
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        assert_eq!(onsets(&run(&mut e, 30_000), 1000), [0, 18_000, 24_000]);
+        let mut edits = hat_hits(Division::EighthTriplet, 3, &[0, 1, 2]);
+        edits.push(Edit::SetSwing(75.0));
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        assert_eq!(onsets(&run(&mut e, 20_000), 1000), [0, 8000, 16_000]);
+    }
+
+    #[test]
+    fn eight_ratchets_split_the_step_evenly() {
+        // At 60 BPM a step is 12 000 frames, so the hits are 1500 apart: far
+        // enough for the hat to fall silent between them.
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[]);
+        edits.push(Edit::SetTempo(60.0));
+        edits.push(Edit::SetStep {
+            track: 0,
+            pattern: 0,
+            step: 0,
+            value: Some(Step { ratchet: 8, ..Step::new(60, 127, 1) }),
+        });
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        assert_eq!(onsets(&run(&mut e, 12_000), 200), (0..8).map(|k| k * 1500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn song_entries_keep_their_own_divisions() {
+        // A: four 16ths with a hit on 0. D: three triplet eighths with hits
+        // on 0 and 1.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[0]);
+        edits.push(Edit::SetPatternLength { pattern: 3, len: 3 });
+        edits.push(Edit::SetPatternDivision { pattern: 3, division: Division::EighthTriplet });
+        for h in [0, 1] {
+            edits.push(Edit::SetStep { track: 0, pattern: 3, step: h, value: step(60) });
+        }
+        edits.push(Edit::InsertSongEntry { index: 0, pattern: 0 });
+        edits.push(Edit::InsertSongEntry { index: 1, pattern: 3 });
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 90_000), 1000), [0, 24_000, 32_000, 48_000, 72_000, 80_000]);
+    }
+
+    #[test]
+    fn a_track_plays_its_own_pattern_on_that_pattern_s_division() {
+        // As in `parted_song`, but B's steps are triplet eighths (8000
+        // frames): its hit on 2 lands 16 000 frames into entry 1, and the
+        // one on 6 (48 000) is past the entry's end.
+        let mut edits = parted_song();
+        edits.push(Edit::SetPatternDivision { pattern: 1, division: Division::EighthTriplet });
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 120_000), 1000), [0, 40_000, 54_000, 66_000, 96_000]);
+    }
+
+    #[test]
+    fn an_early_hit_after_shorter_steps_is_queued_in_time() {
+        // Four 32nds (3000 frames each) end at 12 000; the next entry's
+        // 8th (12 000 frames) is half a step early: due at 6000, before the
+        // last 32nd at 9000.
+        let mut edits = hat_hits(Division::ThirtySecond, 4, &[]);
+        edits.extend([
+            Edit::SetPatternDivision { pattern: 1, division: Division::Eighth },
+            Edit::SetStep { track: 0, pattern: 1, step: 0, value: Some(Step { offset: -12, ..Step::new(60, 127, 1) }) },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 1 },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 13_000), 500), [6000]);
+    }
+
+    #[test]
+    fn the_position_follows_a_track_finer_than_the_entry() {
+        // The entry steps in 8ths; the track plays its own pattern in 32nds.
+        let mut edits = hat_hits(Division::Eighth, 2, &[]);
+        edits.extend([
+            Edit::SetPatternLength { pattern: 1, len: 8 },
+            Edit::SetPatternDivision { pattern: 1, division: Division::ThirtySecond },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        let at = |e: &mut Engine, frames| {
+            run(e, frames);
+            e.shared.position().map(|p| (p.step, p.pulse))
+        };
+        assert_eq!(at(&mut e, 100), Some((0, 0)));
+        assert_eq!(at(&mut e, 3000), Some((0, 3)));
+        assert_eq!(at(&mut e, 6000), Some((0, 9)));
+        assert_eq!(at(&mut e, 3000), Some((1, 12)));
+    }
+
+    #[test]
+    fn a_track_added_while_playing_plays_its_next_step() {
+        let mut e = engine(&[]);
+        e.handle(Command::Play);
+        run(&mut e, 1);
+        e.apply(Edit::AddTrack(InstrumentKind::HatClosed));
+        e.apply(Edit::SetStep { track: 0, pattern: 0, step: 1, value: step(60) });
+        assert_eq!(first_sound(&run(&mut e, 10_000)), Some(6000 - 1));
+        // Between steps of a finer grid of its own, too.
+        let mut e = engine(&[Edit::SetPatternDivision { pattern: 0, division: Division::SixteenthTriplet }]);
+        e.handle(Command::Play);
+        run(&mut e, 4500);
+        e.apply(Edit::InsertTrack { index: 0, kind: InstrumentKind::HatClosed });
+        e.apply(Edit::SetStep { track: 0, pattern: 0, step: 2, value: step(60) });
+        assert_eq!(first_sound(&run(&mut e, 10_000)), Some(8000 - 4500));
+    }
+
+    #[test]
+    fn the_entry_s_step_waits_for_its_swung_step() {
+        // A swung 8th entry: its second step is due at 18 000 although a
+        // track's own 32nds reach pulse 12 at 12 000.
+        let mut edits = hat_hits(Division::Eighth, 2, &[]);
+        edits.extend([
+            Edit::SetSwing(75.0),
+            Edit::SetPatternLength { pattern: 1, len: 8 },
+            Edit::SetPatternDivision { pattern: 1, division: Division::ThirtySecond },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 12_100);
+        assert_eq!(e.shared.position().map(|p| (p.step, p.pulse)), Some((0, 12)));
+        // At 18 000 the entry's step 1 and the track's pulse 18 play together.
+        run(&mut e, 6000);
+        assert_eq!(e.shared.position().map(|p| (p.step, p.pulse)), Some((1, 18)));
+    }
+
+    #[test]
+    fn looking_ahead_leaves_the_next_pattern_open_to_a_cue() {
+        // B's hit is on step 2; A's on step 0. A cue during A's 15th step
+        // still makes B follow.
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[0]);
+        edits.push(Edit::SetStep { track: 0, pattern: 1, step: 2, value: step(60) });
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        run(&mut e, 85_000);
+        e.handle(Command::Cue(1));
+        assert_eq!(onsets(&run(&mut e, 30_000), 1000), [108_000 - 85_000]);
+    }
+
+    #[test]
+    fn a_division_changed_while_playing_moves_the_steps_to_come() {
+        // Step 0 sounds at 0; after 1/16 becomes 1/8, step 1 comes at 12 000
+        // and step 0 does not sound again until the pattern repeats.
+        let mut e = engine(&hat_hits(Division::Sixteenth, 16, &[0, 1]));
+        e.handle(Command::Play);
+        let mut out = run(&mut e, 1);
+        e.apply(Edit::SetPatternDivision { pattern: 0, division: Division::Eighth });
+        out.extend(run(&mut e, 30_000));
+        assert_eq!(onsets(&out, 1000), [0, 12_000]);
+        // So does a track's part changing to a pattern of other steps.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.extend([
+            Edit::SetPatternLength { pattern: 1, len: 4 },
+            Edit::SetPatternDivision { pattern: 1, division: Division::EighthTriplet },
+            Edit::SetStep { track: 0, pattern: 1, step: 1, value: step(60) },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 1000);
+        e.apply(Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) });
+        assert_eq!(onsets(&run(&mut e, 20_000), 1000), [8000 - 1000]);
+    }
+
+    #[test]
+    fn ratchets_stop_where_a_cut_step_s_entry_ends() {
+        // At 60 BPM a 32nd entry is 6000 frames; the track's own 8th
+        // (24 000) with four ratchets fits them into those 6000, and the
+        // next entry rests.
+        let mut edits = hat_hits(Division::ThirtySecond, 1, &[]);
+        edits.extend([
+            Edit::SetTempo(60.0),
+            Edit::SetPatternDivision { pattern: 1, division: Division::Eighth },
+            Edit::SetStep { track: 0, pattern: 1, step: 0, value: Some(Step { ratchet: 4, ..Step::new(60, 127, 1) }) },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) },
+            Edit::SetPart { track: 0, index: 1, part: Part::Rest },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 11_000), 200), [0, 1500, 3000, 4500]);
+    }
+
+    #[test]
+    fn each_track_publishes_the_step_it_played() {
+        // A 16th entry; the track plays its own swung 8ths, whose step 1
+        // sounds at 18 000 although the entry is at pulse 12 by 12 000.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.extend([
+            Edit::SetSwing(75.0),
+            Edit::SetPatternLength { pattern: 1, len: 2 },
+            Edit::SetPatternDivision { pattern: 1, division: Division::Eighth },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 12_100);
+        assert_eq!(e.shared.track_step(0), Some((1, 0)));
+        assert_eq!(e.shared.position().map(|p| p.pulse), Some(12));
+        run(&mut e, 6000);
+        assert_eq!(e.shared.track_step(0), Some((1, 1)));
+        assert_eq!(e.shared.track_step(1), None);
+        e.handle(Command::Stop);
+        run(&mut e, 64);
+        assert_eq!(e.shared.track_step(0), None);
+    }
+
+    #[test]
+    fn mixed_divisions_are_independent_of_buffer_size() {
+        let mut edits = parted_song();
+        edits.extend([
+            Edit::SetTempo(127.0),
+            Edit::SetSwing(61.0),
+            Edit::SetPatternDivision { pattern: 1, division: Division::EighthTriplet },
+            Edit::SetPatternDivision { pattern: 2, division: Division::ThirtySecond },
+            Edit::SetStep {
+                track: 0,
+                pattern: 2,
+                step: 0,
+                value: Some(Step { ratchet: 7, offset: 5, ..Step::new(60, 100, 1) }),
+            },
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 1, pattern: 0, step: 1, value: Some(Step { offset: -9, ..Step::new(45, 100, 3) }) },
+        ]);
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            run(&mut e, 150_000)
+        };
+        for size in [1usize, 17, 64, 500, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            let mut got = Vec::new();
+            let mut left = 150_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            assert!(got == reference, "buffer size {size}");
+        }
+    }
+
     #[test]
     fn a_callback_spends_a_bounded_budget_on_commands() {
         let (mut tx, rx) = spsc::channel(8192);
@@ -2390,7 +3041,7 @@ mod tests {
         e.handle(Command::Cue(1));
         out.extend(run(&mut e, 71_000));
         assert_eq!(onsets(&out, 1000), [0, 36_000, 60_000]);
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 3 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 3, pulse: 18 }));
         // Cued during the last step: the next step's early hits are already
         // queued, so A plays once more first.
         let mut e = engine(&edits);
@@ -2413,7 +3064,7 @@ mod tests {
         let mut e = engine(&edits);
         e.handle(Command::PlaySong { entry: 0 });
         let first = run(&mut e, 1);
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 0, step: 0 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 0, step: 0, pulse: 0 }));
         let mut out = first;
         out.extend(run(&mut e, 129_999));
         // Entries: A 0-3, B 4-7, A 8-11, B 12-15, then the region again.
@@ -2523,20 +3174,20 @@ mod tests {
             e.apply(edit);
             run(&mut e, 7000);
         }
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 1, step: 0 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: Some(0), pattern: 1, step: 0, pulse: 0 }));
         // Emptying the song while it plays falls back to the cued pattern
         // (A). The step after the edit was already queued, so it still plays.
         e.apply(Edit::RemoveSongEntry(0));
         run(&mut e, 6000);
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0, pulse: 0 }));
         run(&mut e, 6000);
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 0, step: 0, pulse: 0 }));
         // Song mode on an empty song plays the cued pattern instead.
         e.handle(Command::Stop);
         e.handle(Command::Cue(1));
         e.handle(Command::PlaySong { entry: 0 });
         run(&mut e, 10);
-        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0 }));
+        assert_eq!(e.shared.position(), Some(PlayPosition { entry: None, pattern: 1, step: 0, pulse: 0 }));
     }
 
     /// A synth whose cutoff (panel index 7) ramps from 1 kHz at step 2 to
@@ -2829,9 +3480,9 @@ mod tests {
     #[test]
     fn positions_pack_losslessly() {
         for pos in [
-            PlayPosition { entry: None, pattern: 0, step: 0 },
-            PlayPosition { entry: Some(0), pattern: 15, step: 63 },
-            PlayPosition { entry: Some(MAX_SONG as u16 - 1), pattern: 7, step: 1 },
+            PlayPosition { entry: None, pattern: 0, step: 0, pulse: 0 },
+            PlayPosition { entry: Some(0), pattern: 15, step: 63, pulse: 767 },
+            PlayPosition { entry: Some(MAX_SONG as u16 - 1), pattern: 7, step: 1, pulse: 6 },
         ] {
             assert_eq!(PlayPosition::unpack(pos.pack()), Some(pos));
         }
