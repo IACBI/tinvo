@@ -9,6 +9,11 @@ Author: 𝓐.𝓒.𝓑
 ### Added
 - `tinvo loopback [AUDIO] [--input NAME]` plays five short sweeps on an output and finds them in what an input hears, on either channel: it shows that both work end to end and measures the round-trip latency between them. At least two sweeps must be heard, each across its whole band.
 - `tinvo probe` reports the longest gap between callbacks, and warns when it was longer than the device's buffer.
+- A project is open in one session at a time. A second session opening it, or saving over it, is refused with the process that has it; the system releases the lock when a session ends, also in a crash.
+- Untitled sessions autosave apart (`untitled.tvo.autosave`, `untitled-2.tvo.autosave`, ...), and one left by a crash is offered to the next untitled session.
+
+### Fixed
+- Two sessions on one project, or two untitled ones, no longer write the same autosave, and a session started while another runs is no longer offered the running one's autosave.
 
 ## [0.21.0] - 2026-11-14
 

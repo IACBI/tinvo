@@ -16,6 +16,7 @@ use crate::engine::{
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
+use crate::lock::{self, Lock};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, VOLUME, pattern_name};
@@ -358,6 +359,9 @@ pub struct App {
     pub autosave: Autosave,
     /// A failed autosave was reported; stays quiet until one succeeds.
     autosave_failed: bool,
+    /// Keeps other sessions off the project; `None` where it could not be
+    /// taken (and in tests until a save takes one).
+    lock: Option<Lock>,
     pub track: usize,
     pub step: usize,
     pub param: usize,
@@ -534,6 +538,7 @@ impl App {
             revision: 0,
             autosave: Autosave::default(),
             autosave_failed: false,
+            lock: None,
             track: 0,
             step: 0,
             param: 0,
@@ -2472,12 +2477,30 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
+        // Saving to another file moves the session there, lock and all; a
+        // file another session has open is refused.
+        let mut lock = None;
+        if self.lock.as_ref().is_none_or(|l| !l.is_for(&path)) {
+            match Lock::acquire(&path) {
+                Ok(l) => lock = Some(l),
+                Err(e @ lock::Error::Held(_)) => {
+                    self.set_status(format!("Not saved: {}", e.describe(&path)));
+                    return;
+                }
+                // Saving matters more than locking; the save reports a
+                // directory it cannot write to.
+                Err(lock::Error::Io(_)) => {}
+            }
+        }
         match self.project.save(&path) {
             Ok(()) => {
                 self.dirty = false;
                 self.autosave.saved(&path, self.revision);
                 self.set_status(format!("Saved {}", path.display()));
                 self.path = Some(path);
+                if lock.is_some() {
+                    self.lock = lock;
+                }
             }
             Err(e) => self.set_status(format!("Save failed: {}: {e}", path.display())),
         }
@@ -3637,6 +3660,9 @@ pub fn run(
     settings: Settings,
 ) -> Result<(), String> {
     let (play, help) = (settings.keys.label(Action::Play), settings.keys.label(Action::Help));
+    // The lock comes first, before an autosave is taken for a crashed
+    // session's: a running session's autosave is not one to recover.
+    let (base, lock, lock_notice) = session_lock(path.as_deref(), autosave::state_dir().as_deref())?;
     let (project, path, mut message) = match path {
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
@@ -3664,8 +3690,8 @@ pub fn run(
 
     // What happened to an autosave; shown ahead of the other start-up news,
     // which audio or MIDI trouble may replace.
-    let mut notice = None;
-    let (project, recovered) = match autosave::find(path.as_deref()) {
+    let mut notice = lock_notice;
+    let (project, recovered) = match base.as_deref().and_then(|b| autosave::find(Some(b))) {
         None => (project, false),
         Some(found) => match &found.project {
             Ok(saved) => match ask_recovery(&mut term, &mut screen, &mut out, &found, &settings.theme)? {
@@ -3704,7 +3730,11 @@ pub fn run(
         // Unsaved until the user saves; the autosave is rewritten from it.
         app.touch();
     }
-    app.autosave = Autosave::new(app.path.as_deref(), 0);
+    app.autosave = match &base {
+        Some(b) => Autosave::new(Some(b), 0),
+        None => Autosave::default(),
+    };
+    app.lock = lock;
     app.input_device = input;
     let mut midi = MidiSession::new();
     let mut output = Output::new(config, Some(midi.live.clone()));
@@ -3784,6 +3814,43 @@ pub fn run(
     drop(midi);
     drop(output);
     Ok(())
+}
+
+/// Where a session autosaves, its lock, and news for the status line.
+type SessionLock = (Option<PathBuf>, Option<Lock>, Option<String>);
+
+/// Locks the project at `path`, or else an untitled session's slot in
+/// `state` (TINVO's state directory). Returns where the session's autosave
+/// goes, as if its project were saved there (`None`: nowhere), the lock,
+/// and news for the status line. Fails when another session has the
+/// project open.
+fn session_lock(path: Option<&Path>, state: Option<&Path>) -> Result<SessionLock, String> {
+    let unlocked =
+        |e: &lock::Error, p: &Path| Some(format!("Warning: {}; another session could open it too.", e.describe(p)));
+    if let Some(p) = path {
+        return match Lock::acquire(p) {
+            Ok(l) => Ok((Some(p.to_path_buf()), Some(l), None)),
+            Err(e @ lock::Error::Held(_)) => Err(e.describe(p)),
+            Err(e) => Ok((Some(p.to_path_buf()), None, unlocked(&e, p))),
+        };
+    }
+    let Some(dir) = state else { return Ok((None, None, None)) };
+    let first = autosave::untitled_in(dir, 1);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Ok((Some(first.clone()), None, unlocked(&lock::Error::Io(e), &first)));
+    }
+    // A free slot with an autosave was left by a session that crashed, so
+    // it comes first; then the first free one.
+    let slots = || (1..=autosave::UNTITLED_SLOTS).map(|s| autosave::untitled_in(dir, s));
+    let left = slots().filter(|b| autosave::path_for(Some(b)).is_some_and(|a| a.is_file()));
+    for base in left.chain(slots()) {
+        match Lock::acquire(&base) {
+            Ok(l) => return Ok((Some(base), Some(l), None)),
+            Err(lock::Error::Held(_)) => {}
+            Err(e) => return Ok((Some(base.clone()), None, unlocked(&e, &base))),
+        }
+    }
+    Err(format!("{} untitled sessions are running already; open a project file instead", autosave::UNTITLED_SLOTS))
 }
 
 /// The answer to the recovery question.
@@ -4960,6 +5027,67 @@ mod tests {
         let saved = dir.join("song.tvo");
         assert_eq!(a.path.as_deref(), Some(saved.as_path()));
         assert_eq!(Project::load(&saved).unwrap(), a.project);
+        drop(a);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_takes_the_file_s_lock_and_refuses_one_held_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("tinvo-save-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a_tvo, b_tvo) = (dir.join("a.tvo"), dir.join("b.tvo"));
+        let mut a = app();
+        a.save_to(a_tvo.clone());
+        assert_eq!(a.lock.as_ref().map(Lock::project), Some(a_tvo.as_path()));
+        assert!(matches!(Lock::acquire(&a_tvo), Err(lock::Error::Held(_))), "held while the session has it");
+        // Saving again, also by another spelling of the path, keeps it.
+        a.save_to(a_tvo.clone());
+        a.save_to(dir.join(".").join("a.tvo"));
+        assert_eq!(a.status_text(), Some(format!("Saved {}", dir.join(".").join("a.tvo").display()).as_str()));
+        assert_eq!(a.lock.as_ref().map(Lock::project), Some(a_tvo.as_path()));
+        // A file another session holds is not written.
+        let other = Lock::acquire(&b_tvo).unwrap();
+        keys(&mut a, &[Key::Enter]);
+        a.save_to(b_tvo.clone());
+        assert!(a.status_text().unwrap().starts_with("Not saved: "), "{:?}", a.status_text());
+        assert!(!b_tvo.exists() && a.dirty);
+        drop(other);
+        // Saving under a new name moves the lock: the old file is free.
+        a.save_to(b_tvo.clone());
+        assert!(b_tvo.exists() && !a.dirty);
+        assert_eq!(a.lock.as_ref().map(Lock::project), Some(b_tvo.as_path()));
+        drop(Lock::acquire(&a_tvo).expect("the old file is free"));
+        drop(a);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sessions_lock_their_project_and_untitled_ones_take_a_free_slot() {
+        let dir = std::env::temp_dir().join(format!("tinvo-session-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state");
+        let song = dir.join("song.tvo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, held, news) = session_lock(Some(&song), Some(&state)).unwrap();
+        assert_eq!((base.as_deref(), news), (Some(song.as_path()), None));
+        let err = session_lock(Some(&song), Some(&state)).err().unwrap();
+        assert!(err.contains("is open in another TINVO session"), "{err}");
+        drop(held);
+        // Untitled sessions: the first free slot, made in the state
+        // directory; a free slot with an autosave first.
+        let (one, l1, _) = session_lock(None, Some(&state)).unwrap();
+        assert_eq!(one, Some(state.join("untitled.tvo")));
+        let (two, l2, _) = session_lock(None, Some(&state)).unwrap();
+        assert_eq!(two, Some(state.join("untitled-2.tvo")));
+        std::fs::write(state.join("untitled-3.tvo.autosave"), "left by a crash").unwrap();
+        drop(l1);
+        let (three, l3, _) = session_lock(None, Some(&state)).unwrap();
+        assert_eq!(three, Some(state.join("untitled-3.tvo")), "the crashed session's slot");
+        let (again, l1, _) = session_lock(None, Some(&state)).unwrap();
+        assert_eq!(again, Some(state.join("untitled.tvo")));
+        assert_eq!(session_lock(None, None).unwrap().0, None, "no state directory, no autosave");
+        drop((l1, l2, l3));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5334,6 +5462,7 @@ mod tests {
         keys(&mut a, &[Key::Right, Key::Enter]);
         a.autosave_now();
         assert!(file.exists(), "an abnormal end writes at once");
+        drop(a);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

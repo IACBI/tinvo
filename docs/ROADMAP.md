@@ -163,7 +163,7 @@ Known limits:
 
 Known limits:
 - Up to 5 seconds of edits can be lost if the process is killed. Within that window nothing is written, so a crash costs at most that much.
-- Two TINVO sessions on the same project, or two untitled ones, share one autosave file: the one that writes last wins, and a session started while another runs is offered the running one's autosave. Nothing locks the project file either.
+- Two TINVO sessions on the same project, or two untitled ones, share one autosave file: the one that writes last wins, and a session started while another runs is offered the running one's autosave. Nothing locks the project file either. (Fixed in phase 8b.)
 - The autosave is renamed into place but its directory is not synced afterwards, so after a power failure (not a crash of TINVO) some file systems may come back with the previous autosave or none.
 - The flow was run end to end on Linux in a pseudo-terminal: edits, `kill -9`, the recovery question, recovering and saving (the saved file equals the autosave byte for byte), and discarding. The writes on a terminal error and on a panic are covered by unit tests of the pieces, not by a run that actually fails mid-session. The recovery screen has not been tried by hand in a Windows console.
 
@@ -275,6 +275,19 @@ Known limits:
 - The round trip includes the room: about 0.3 ms per 10 cm between the speaker and the microphone.
 - The output and the input must run at the same rate; `loopback` says so when they do not, as it does not resample.
 - No MIDI device and no second machine were available: WinMM, ALSA and CoreMIDI input have still never received a real message, and ALSA and CoreAudio still have not run on real hardware.
+
+## Phase 8b: Project lock
+
+- A session holds `song.tvo.lock` next to its project: an exclusive `flock` on Linux and macOS, a handle that shares no writing on Windows. The system lets go of both when the process ends, however it ends, so a crash never leaves the project locked. The file names the process holding it.
+- Opening a project another session has open is refused, naming that process; so is saving over one. Saving under a new name moves the lock to the new file. Another spelling of the same path (`./song.tvo`) is the same project.
+- Untitled sessions each take a slot in the state directory (`untitled.tvo`, `untitled-2.tvo`, up to 16), with its own autosave. A free slot whose autosave was left by a crash is taken first, so it is offered for recovery.
+- The lock is taken before the autosave is looked for, so a running session's autosave is never offered as a crashed one's.
+- Tested on Windows in a real console: a second `tinvo song.tvo` (and `tinvo ./song.tvo`) is refused with the first one's process id, and once that console is closed the lock file is gone and the project opens. Unit tests cover a lock held by another process that is then killed, a lock file left by a crash, slots, and saving.
+
+Known limits:
+- Where the lock file cannot be made (a read-only directory), the project opens unlocked, with a warning.
+- `flock` on a network file system may lock only on one machine, depending on the server; the Windows lock covers SMB shares.
+- `tinvo render` reads a project without locking it, so it can export one a session is editing; it reads the last saved file.
 
 ## Known limitations of the foundation
 
