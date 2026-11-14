@@ -278,7 +278,7 @@ Known limits:
 
 ## Phase 8b: Project lock
 
-- A session holds `song.tvo.lock` next to its project: an exclusive `flock` on Linux and macOS, a handle that shares no writing on Windows. The system lets go of both when the process ends, however it ends, so a crash never leaves the project locked. The file names the process holding it.
+- A session holds `song.tvo.lock` next to its project: an exclusive `flock` on Linux and macOS, a handle that shares no writing on Windows. The system lets go of both when the process ends, however it ends, so a crash never leaves the project locked. The file names the process holding it. A symbolic link, a hard link or anything but a plain file at the lock's name is refused, never followed, so the lock cannot be made to overwrite another file.
 - Opening a project another session has open is refused, naming that process; so is saving over one. Saving under a new name moves the lock to the new file. Another spelling of the same path (`./song.tvo`) is the same project.
 - Untitled sessions each take a slot in the state directory (`untitled.tvo`, `untitled-2.tvo`, up to 16), with its own autosave. A free slot whose autosave was left by a crash is taken first, so it is offered for recovery.
 - The lock is taken before the autosave is looked for, so a running session's autosave is never offered as a crashed one's.

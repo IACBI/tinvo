@@ -11,6 +11,12 @@
 //! Linux and macOS the holder deletes it before letting go, and a session
 //! that wins the lock checks that the file it locked is still the one at
 //! the path, so a lock on a file just deleted counts for nothing.
+//!
+//! The lock file is emptied and written, so a symbolic link or a hard link
+//! planted at its name could make that land on another file, such as the
+//! project. Such a name is never followed: the file is opened without
+//! following links and must be a plain file with no other name, or the
+//! lock is refused with a message to remove it.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -66,8 +72,9 @@ impl Lock {
         let path = path_for(project)
             .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "the path names no file")))?;
         let mut file = sys::open_locked(&path)?;
-        // Who holds it, for the message another session shows. The lock is
-        // held whether or not this is written.
+        // Who holds it, for the message another session shows; emptied
+        // first, now that it is known to be a plain file of its own. The
+        // lock is held whether or not this is written.
         let _ = file
             .set_len(0)
             .and_then(|()| writeln!(file, "tinvo {} pid {}", env!("CARGO_PKG_VERSION"), std::process::id()));
@@ -101,6 +108,22 @@ impl Drop for Lock {
     }
 }
 
+/// The refusal for a lock file that is a link or not a plain file.
+fn not_plain(path: &Path) -> Error {
+    Error::Io(io::Error::other(format!("{} is not a plain file; remove it", path.display())))
+}
+
+/// Refuses a symbolic link (or anything but a plain file) at `path` before
+/// it is opened.
+fn check_name(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.file_type().is_file() => Err(not_plain(path)),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 /// The process id a lock file names.
 fn owner(path: &Path) -> Option<u32> {
     let mut text = String::new();
@@ -112,16 +135,33 @@ fn owner(path: &Path) -> Option<u32> {
 
 #[cfg(unix)]
 mod sys {
-    use super::{Error, owner};
+    use super::{Error, check_name, not_plain, owner};
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::raw::c_int;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
 
     const LOCK_EX: c_int = 2;
     const LOCK_NB: c_int = 4;
+    // From each platform's <fcntl.h>. Were it wrong, the checks after
+    // opening still refuse a link before anything is written.
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: c_int = 0x0100;
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64")
+    ))]
+    const O_NOFOLLOW: c_int = 0o100_000;
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc", target_arch = "powerpc64")
+        )
+    )))]
+    const O_NOFOLLOW: c_int = 0o400_000;
 
     unsafe extern "C" {
         fn flock(fd: c_int, operation: c_int) -> c_int;
@@ -131,8 +171,15 @@ mod sys {
         // A holder deletes the file just before letting go: a session that
         // locked the deleted file tries again on the new one.
         for _ in 0..64 {
-            let file =
-                OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(Error::Io)?;
+            check_name(path)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(O_NOFOLLOW)
+                .open(path)
+                .map_err(Error::Io)?;
             // SAFETY: the descriptor is open for the call's duration.
             if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
                 let e = io::Error::last_os_error();
@@ -142,7 +189,10 @@ mod sys {
                 });
             }
             let held = file.metadata().map_err(Error::Io)?;
-            match std::fs::metadata(path) {
+            if !held.file_type().is_file() || held.nlink() != 1 {
+                return Err(not_plain(path));
+            }
+            match std::fs::symlink_metadata(path) {
                 Ok(m) if m.dev() == held.dev() && m.ino() == held.ino() => return Ok(file),
                 Ok(_) => continue,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -155,12 +205,34 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use super::{Error, owner};
+    use super::{Error, check_name, not_plain, owner};
+    use std::ffi::c_void;
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::time::Duration;
+
+    /// `BY_HANDLE_FILE_INFORMATION`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileInformation {
+        attributes: u32,
+        times: [u32; 6],
+        volume_serial: u32,
+        size: [u32; 2],
+        links: u32,
+        index: [u32; 2],
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut c_void, info: *mut FileInformation) -> i32;
+    }
+
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -174,20 +246,34 @@ mod sys {
     pub fn open_locked(path: &Path) -> Result<File, Error> {
         let mut last = None;
         for _ in 0..20 {
+            check_name(path)?;
             // Sharing no writing is the lock: another session asking to
             // write is refused while this handle is open. Reading is shared
             // so it can say who holds the lock, and deleting because
-            // delete-on-close requires every handle to share it.
+            // delete-on-close requires every handle to share it. A link
+            // planted at the name is opened itself, not followed, so
+            // delete-on-close can only ever remove this name.
             let opened = OpenOptions::new()
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(false)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path);
             match opened {
-                Ok(f) => return Ok(f),
+                Ok(f) => {
+                    let mut info = FileInformation::default();
+                    // SAFETY: a valid handle and a properly laid out out-pointer.
+                    if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+                        return Err(Error::Io(io::Error::last_os_error()));
+                    }
+                    let odd = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+                    if info.attributes & odd != 0 || info.links != 1 {
+                        return Err(not_plain(path));
+                    }
+                    return Ok(f);
+                }
                 Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => return Err(Error::Held(owner(path))),
                 // The holder is letting go: the file is waiting to be
                 // deleted, and cannot be opened until it is.
@@ -266,6 +352,38 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("song.tvo.lock")).unwrap();
         assert!(text.contains(&format!("pid {}", std::process::id())), "{text}");
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_at_the_lock_s_name_is_refused_and_its_target_kept() {
+        let dir = temp_dir("link");
+        let song = dir.join("song.tvo");
+        std::fs::write(&song, "the project").unwrap();
+        let lock_path = dir.join("song.tvo.lock");
+        // A hard link to the project.
+        std::fs::hard_link(&song, &lock_path).unwrap();
+        match Lock::acquire(&song) {
+            Err(Error::Io(e)) => assert!(e.to_string().contains("is not a plain file; remove it"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&song).unwrap(), "the project");
+        let _ = std::fs::remove_file(&lock_path);
+        // A symbolic link to it, where the system allows making one.
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&song, &lock_path).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&song, &lock_path).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let made = false;
+        if made {
+            assert!(matches!(Lock::acquire(&song), Err(Error::Io(_))));
+            assert_eq!(std::fs::read_to_string(&song).unwrap(), "the project");
+        }
+        // A directory.
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(matches!(Lock::acquire(&song), Err(Error::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

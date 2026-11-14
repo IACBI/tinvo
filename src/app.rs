@@ -2479,8 +2479,9 @@ impl App {
     pub fn save_to(&mut self, path: PathBuf) {
         // Saving to another file moves the session there, lock and all; a
         // file another session has open is refused.
-        let mut lock = None;
-        if self.lock.as_ref().is_none_or(|l| !l.is_for(&path)) {
+        let moving = self.lock.as_ref().is_none_or(|l| !l.is_for(&path));
+        let (mut lock, mut unlocked) = (None, None);
+        if moving {
             match Lock::acquire(&path) {
                 Ok(l) => lock = Some(l),
                 Err(e @ lock::Error::Held(_)) => {
@@ -2489,16 +2490,21 @@ impl App {
                 }
                 // Saving matters more than locking; the save reports a
                 // directory it cannot write to.
-                Err(lock::Error::Io(_)) => {}
+                Err(e) => unlocked = Some(e.describe(&path)),
             }
         }
         match self.project.save(&path) {
             Ok(()) => {
                 self.dirty = false;
                 self.autosave.saved(&path, self.revision);
-                self.set_status(format!("Saved {}", path.display()));
+                self.set_status(match unlocked {
+                    Some(why) => format!("Saved {}, but {why}; another session could open it too", path.display()),
+                    None => format!("Saved {}", path.display()),
+                });
                 self.path = Some(path);
-                if lock.is_some() {
+                // The old project is let go of even if the new one could
+                // not be locked.
+                if moving {
                     self.lock = lock;
                 }
             }
@@ -5058,6 +5064,15 @@ mod tests {
         assert!(b_tvo.exists() && !a.dirty);
         assert_eq!(a.lock.as_ref().map(Lock::project), Some(b_tvo.as_path()));
         drop(Lock::acquire(&a_tvo).expect("the old file is free"));
+        // Also when the new file cannot be locked (a directory is in the
+        // lock's way): it is saved, the old one is let go of.
+        let c_tvo = dir.join("c.tvo");
+        std::fs::create_dir(dir.join("c.tvo.lock")).unwrap();
+        keys(&mut a, &[Key::Enter]);
+        a.save_to(c_tvo.clone());
+        assert!(c_tvo.exists() && !a.dirty && a.lock.is_none());
+        assert!(a.status_text().unwrap().contains("another session could open it too"), "{:?}", a.status_text());
+        drop(Lock::acquire(&b_tvo).expect("the old file is free"));
         drop(a);
         std::fs::remove_dir_all(&dir).unwrap();
     }
