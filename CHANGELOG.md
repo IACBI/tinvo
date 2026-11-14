@@ -6,6 +6,9 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- `examples/showcase.tvo`, the song in the README's video: A minor at 118 BPM, an intro and two sections, with sidechained bass, a pad whose filter opens through the intro, a delayed arpeggio and a ratcheted snare fill.
+
 ## [0.22.0] - 2026-11-14
 
 ### Added

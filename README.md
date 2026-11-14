@@ -21,6 +21,10 @@ TINVO is a step-sequencer DAW that runs in a terminal window. Everything is writ
 
 The audio thread never allocates, locks or blocks. WAV export runs the same engine as playback, so what you hear is what you export.
 
+https://github.com/user-attachments/assets/46029a57-69c3-407c-a1af-21c34194486d
+
+TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is that project's own `tinvo render` export, laid under the screen recording in sync; export and playback run the same engine. To hear it alone: [showcase.mp3](docs/media/showcase.mp3). To open it yourself: `tinvo examples/showcase.tvo`.
+
 ### Features
 
 - 16 tracks, up to 64 sixteenth-note steps, tempo 20–300 BPM, swing 50–75 %.
@@ -167,6 +171,10 @@ MIT. See [LICENSE](LICENSE). Author: 𝓐.𝓒.𝓑
 TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, JACK, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si yaklaşık 0,5 MB.
 
 Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa aktarma çalmayla aynı motoru kullanır: ne duyuyorsan dosyaya o yazılır.
+
+https://github.com/user-attachments/assets/46029a57-69c3-407c-a1af-21c34194486d
+
+TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses, aynı projenin `tinvo render` ile alınmış export'u ve ekran kaydının altına senkron yerleştirildi; export ile çalma aynı motoru kullanıyor. Yalnızca sesi dinlemek için: [showcase.mp3](docs/media/showcase.mp3). Kendin açmak için: `tinvo examples/showcase.tvo`.
 
 ### Özellikler
 
