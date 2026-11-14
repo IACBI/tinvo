@@ -499,6 +499,8 @@ pub struct App {
     cpu: f32,
     playing: bool,
     play_pos: Option<PlayPosition>,
+    /// The pattern and step each track played last.
+    track_play: [Option<(u8, u8)>; MAX_TRACKS],
     pub keys: Keymap,
     pub theme: Theme,
     /// The built-in theme the colours start from.
@@ -667,6 +669,7 @@ impl App {
             cpu: 0.0,
             playing: false,
             play_pos: None,
+            track_play: [None; MAX_TRACKS],
             keys: Keymap::default(),
             theme: Theme::default(),
             theme_base: theme_mod::BUILT_IN[0],
@@ -1355,7 +1358,11 @@ impl App {
     fn play_step(&self, t: usize) -> Option<usize> {
         let pos = self.play_pos?;
         let part = pos.entry.map_or(Part::Follow, |e| self.project.part(t, usize::from(e)));
-        let (pattern, step) = part_position(part, pos, &self.project.pattern_lens, &self.project.divisions)?;
+        // A track's own pattern may step apart from the entry's grid (other
+        // steps, swung later), so the step it played is its own.
+        let own = matches!(part, Part::Pattern(_)).then(|| self.track_play.get(t).copied().flatten()).flatten();
+        let (pattern, step) =
+            own.or_else(|| part_position(part, pos, &self.project.pattern_lens, &self.project.divisions))?;
         (usize::from(pattern) == self.pattern).then_some(usize::from(step))
     }
 
@@ -1485,6 +1492,7 @@ impl App {
         let s = &link.shared;
         self.playing = s.playing.load(Ordering::Relaxed);
         self.play_pos = s.position();
+        self.track_play = std::array::from_fn(|t| s.track_step(t));
         for (m, p) in self.meters.iter_mut().zip(&s.track_peaks) {
             *m = p.take().max(*m * 0.85);
         }
@@ -5798,6 +5806,12 @@ mod tests {
         assert_eq!((a.play_step(0), a.play_step(1)), (None, Some(5)));
         a.pattern = 2;
         assert_eq!((a.play_step(0), a.play_step(1)), (Some(1), None));
+        // The step a track's own pattern played, once the engine says it.
+        a.track_play[0] = Some((2, 0));
+        assert_eq!(a.play_step(0), Some(0), "a swung step not yet played");
+        a.track_play[1] = Some((2, 3));
+        assert_eq!(a.play_step(1), None, "a following track keeps the entry's step");
+        a.track_play = [None; MAX_TRACKS];
         a.play_pos = Some(PlayPosition { entry: Some(2), pattern: 0, step: 5, pulse: 30 });
         a.pattern = 0;
         assert_eq!((a.play_step(0), a.play_step(1)), (Some(5), None), "a resting track plays nothing");
