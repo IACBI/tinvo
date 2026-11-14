@@ -1231,8 +1231,10 @@ impl App {
     }
 
     /// The track the song view's cursor is on, if any.
+    /// A row past the last track (one was deleted) is the last track's, for
+    /// the keys as on screen.
     fn song_track(&self) -> Option<usize> {
-        self.song_row.checked_sub(1).filter(|&t| t < self.track_count())
+        self.song_row.min(self.track_count()).checked_sub(1)
     }
 
     fn pattern_len(&self) -> usize {
@@ -2257,7 +2259,13 @@ impl App {
                 // Repeat the entry under the cursor with its tracks' parts,
                 // or start with the pattern being edited.
                 let (at, pattern) = if n == 0 { (0, self.pattern as u8) } else { (c + 1, self.project.song[c]) };
-                let mut edits = vec![Edit::InsertSongEntry { index: at as u16, pattern }];
+                let insert = Edit::InsertSongEntry { index: at as u16, pattern };
+                // The parts below would land on the entry already there.
+                if let Err(err) = self.project.inverse(&insert) {
+                    self.set_status(format!("Cannot do that: {err}"));
+                    return true;
+                }
+                let mut edits = vec![insert];
                 for t in 0..self.track_count() {
                     let part = self.project.part(t, c);
                     if n > 0 && part != Part::Follow {
@@ -4742,12 +4750,34 @@ mod tests {
         keys(&mut a, &[Key::Char('u')]);
         assert_eq!(parts(&a, 0), [Part::Follow, Part::Pattern(2), Part::Follow]);
         assert_eq!(parts(&a, 1), [Part::Follow, Part::Rest, Part::Follow]);
-        // A removed track takes its row with it.
+        // When the selected row's track is deleted, the keys act on the
+        // last track's row, which is the one drawn selected.
         a.song_row = 2;
         a.track = 1;
-        keys(&mut a, &[Key::Char('S'), Key::Char('D'), Key::Char('y'), Key::Char('S'), Key::Char('.')]);
+        keys(&mut a, &[Key::Char('S'), Key::Char('D'), Key::Char('y'), Key::Char('S'), Key::Home, Key::Char('.')]);
         assert_eq!(a.track_count(), 1);
-        assert_eq!(a.project.song, [0, 2, 0], "past the last track the song's row takes the keys");
+        assert!(frame(&a).row_text(4).starts_with("▸ 1 Kick"), "{}", frame(&a).row_text(4));
+        assert_eq!((a.project.song.as_slice(), a.project.part(0, 0)), ([0, 1, 0].as_slice(), Part::Pattern(0)));
+        keys(&mut a, &[Key::Delete]);
+        assert_eq!((a.project.song.len(), a.project.part(0, 0)), (3, Part::Follow), "Delete resets the part");
+        keys(&mut a, &[Key::Up]);
+        assert_eq!(a.song_row, 0);
+    }
+
+    #[test]
+    fn repeating_an_entry_of_a_full_song_changes_nothing() {
+        let mut a = parted_app();
+        for _ in 3..crate::engine::MAX_SONG {
+            keys(&mut a, &[Key::Enter]);
+        }
+        assert_eq!(a.project.song.len(), crate::engine::MAX_SONG);
+        a.project.tracks[0].parts[0] = Part::Rest;
+        let before = a.project.clone();
+        let undo = a.undo.len();
+        keys(&mut a, &[Key::Home, Key::Enter]);
+        assert_eq!(a.project, before, "the next entry keeps its parts");
+        assert_eq!(a.undo.len(), undo);
+        assert!(a.status_text().unwrap().starts_with("Cannot do that"), "{:?}", a.status_text());
     }
 
     #[test]
