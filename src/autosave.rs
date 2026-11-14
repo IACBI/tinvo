@@ -3,7 +3,8 @@
 //! While a project has unsaved edits, the editor writes it every
 //! [`INTERVAL`] to an autosave file: `song.tvo.autosave` next to
 //! `song.tvo`, or `untitled.tvo.autosave` in TINVO's state directory for a
-//! project that has never been saved. The write is atomic (a temporary file,
+//! project that has never been saved (`untitled-2.tvo.autosave` and so on
+//! while other untitled sessions run). The write is atomic (a temporary file,
 //! synced, then renamed), so the autosave is always a whole project. Saving
 //! the project or quitting normally deletes it, so an autosave found at
 //! start-up means the last session ended without saving: crashed, killed, or
@@ -36,7 +37,23 @@ pub fn state_dir() -> Option<PathBuf> {
     Some(base.join("tinvo"))
 }
 
-/// The autosave file for a project at `project` (`None`: never saved).
+/// How many untitled sessions can run at once, each autosaving apart.
+pub const UNTITLED_SLOTS: u32 = 16;
+
+/// Where untitled session `slot` (from 1) keeps its autosave and lock, as
+/// if its project were saved there: `untitled.tvo` in the state directory
+/// for the first, then `untitled-2.tvo` and so on.
+pub fn untitled(slot: u32) -> Option<PathBuf> {
+    Some(untitled_in(&state_dir()?, slot))
+}
+
+/// [`untitled`] in the directory `dir`.
+pub fn untitled_in(dir: &Path, slot: u32) -> PathBuf {
+    dir.join(if slot <= 1 { UNTITLED.to_string() } else { format!("untitled-{slot}.tvo") })
+}
+
+/// The autosave file for a project at `project` (`None`: never saved, the
+/// first untitled session's).
 pub fn path_for(project: Option<&Path>) -> Option<PathBuf> {
     match project {
         Some(p) => {
@@ -44,7 +61,7 @@ pub fn path_for(project: Option<&Path>) -> Option<PathBuf> {
             name.push(SUFFIX);
             Some(p.with_file_name(name))
         }
-        None => Some(state_dir()?.join(format!("{UNTITLED}{SUFFIX}"))),
+        None => path_for(Some(&untitled(1)?)),
     }
 }
 
@@ -163,6 +180,8 @@ mod tests {
         if let Some(dir) = state_dir() {
             assert!(dir.is_absolute() && dir.ends_with("tinvo"), "{dir:?}");
             assert_eq!(path_for(None), Some(dir.join("untitled.tvo.autosave")));
+            assert_eq!(untitled(1), Some(dir.join("untitled.tvo")));
+            assert_eq!(path_for(untitled(3).as_deref()), Some(dir.join("untitled-3.tvo.autosave")));
         }
     }
 

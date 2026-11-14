@@ -38,6 +38,7 @@ The audio thread never allocates, locks or blocks. WAV export runs the same engi
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
 - Autosave every 5 seconds while there are unsaved edits. If TINVO crashes or is killed, the next start offers to recover them.
+- A project is open in one TINVO session at a time: a second one is refused with the process that has it, and a crash never leaves it locked.
 - The editor's keys and colours can be changed in a settings file. A light theme is built in.
 - Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
@@ -181,6 +182,7 @@ Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa ak
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
 - Kaydedilmemiş değişiklik varken 5 saniyede bir otomatik yedek. TINVO çökerse ya da öldürülürse, bir sonraki açılışta bu değişiklikleri geri yüklemeyi önerir.
+- Bir proje aynı anda tek bir TINVO oturumunda açık olur. İkinci oturum, projeyi tutan sürecin numarasıyla birlikte reddedilir. Çökme projeyi kilitli bırakmaz.
 - Editörün tuşları ve renkleri bir ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
 - Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
