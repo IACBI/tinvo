@@ -287,6 +287,7 @@ mod tests {
     fn records_from_the_default_input_if_there_is_one() {
         let dir = temp_dir("device");
         let path = dir.join("device.wav");
+        let opened = std::time::Instant::now();
         let Ok(mut r) = Recorder::start(None, &path) else {
             eprintln!("no input device; skipping");
             let _ = std::fs::remove_dir_all(&dir);
@@ -298,8 +299,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         let rec = r.finish().unwrap();
-        // Half a second of capture, give or take the device's buffering.
-        assert!((0.3..0.8).contains(&rec.seconds()), "{rec:?}");
+        // At least most of the half second, and no more than the device was
+        // open, give or take its buffering: a busy machine can take longer
+        // than asked to stop it.
+        let open = opened.elapsed().as_secs_f64();
+        assert!(rec.seconds() > 0.3 && rec.seconds() < open + 0.15, "{rec:?} in {open:.3} s");
         assert_eq!(rec.dropped, 0);
         let back = crate::wav::decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(back.samples.len() as u64, rec.frames * u64::from(rec.channels));
