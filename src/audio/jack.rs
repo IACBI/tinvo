@@ -62,7 +62,7 @@ struct Lib {
     port_name: unsafe extern "C" fn(*const c_void) -> *const c_char,
     get_ports: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_ulong) -> *mut *const c_char,
     connect: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     disconnect: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     free: unsafe extern "C" fn(*mut c_void),
 }
@@ -120,6 +120,7 @@ fn load() -> Result<Lib, String> {
             port_name: symbol(handle, c"jack_port_name")?,
             get_ports: symbol(handle, c"jack_get_ports")?,
             connect: symbol(handle, c"jack_connect")?,
+            #[cfg(test)]
             disconnect: symbol(handle, c"jack_disconnect")?,
             free: symbol(handle, c"jack_free")?,
         })

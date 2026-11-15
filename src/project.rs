@@ -64,6 +64,9 @@ pub const FORMAT_VERSION: u32 = 12;
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
 const MAX_NAME_CHARS: usize = 32;
+/// The largest project file read. The largest project TINVO writes is a
+/// few MiB.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
 
 /// Mixer parameters presented alongside instrument parameters.
 pub use crate::engine::{PAN, VOLUME};
@@ -1087,7 +1090,7 @@ impl Project {
                     "solo" => t.solo = parse_bool(rest).map_err(err)?,
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
                     "lane" if ver >= 6 => {
-                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let f = fields(rest, 3);
                         let [k, id, mode] = f[..] else {
                             return Err(err("expected 'lane <lane> <parameter> <hold|ramp>'".into()));
                         };
@@ -1118,7 +1121,7 @@ impl Project {
                         t.lanes[k] = LaneData::new(Some(target), ramp);
                     }
                     "point" if ver >= 6 => {
-                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let f = fields(rest, 3);
                         let [k, i, v] = f[..] else { return Err(err("expected 'point <lane> <step> <value>'".into())) };
                         let (k, i): (usize, usize) = (parse_num(k).map_err(err)?, parse_num(i).map_err(err)?);
                         let spec = t
@@ -1144,7 +1147,7 @@ impl Project {
                         t.params[i] = parse_in(value.trim(), spec).map_err(err)?;
                     }
                     "step" => {
-                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let f = fields(rest, 8);
                         let (expected, form) = match ver {
                             1 => (4, "<index> <note> <velocity> <length>"),
                             2 => (6, "<index> <note> <velocity> <length> <chance> <ratchet>"),
@@ -1177,7 +1180,7 @@ impl Project {
                         t.steps[pattern][i] = Some(st);
                     }
                     "parts" if ver >= 11 => {
-                        let words: Vec<&str> = rest.split_whitespace().collect();
+                        let words = fields(rest, MAX_SONG);
                         if words.len() > MAX_SONG {
                             return Err(err(format!("a song has at most {MAX_SONG} entries")));
                         }
@@ -1250,13 +1253,14 @@ impl Project {
                         .ok_or_else(|| err(format!("unknown division '{}' (one of {names})", d.trim())))?;
                 }
                 "song" if ver >= 5 => {
-                    p.song = rest.split_whitespace().map(parse_pattern).collect::<Result<_, _>>().map_err(err)?;
+                    p.song =
+                        fields(rest, MAX_SONG).into_iter().map(parse_pattern).collect::<Result<_, _>>().map_err(err)?;
                     if p.song.len() > MAX_SONG {
                         return Err(err(format!("a song has at most {MAX_SONG} entries")));
                     }
                 }
                 "loop" if ver >= 5 => {
-                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    let f = fields(rest, 2);
                     let [a, b] = f[..] else { return Err(err("expected 'loop <start> <end>'".into())) };
                     let r = (parse_num(a).map_err(err)?, parse_num(b).map_err(err)?);
                     if loop_region(r) != Some(r) {
@@ -1265,7 +1269,7 @@ impl Project {
                     p.loop_region = Some(r);
                 }
                 "tempo_point" if ver >= 12 => {
-                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    let f = fields(rest, 2);
                     let [entry, bpm] = f[..] else { return Err(err("expected 'tempo_point <entry> <bpm>'".into())) };
                     let entry: u16 = parse_num(entry).map_err(err)?;
                     let bpm: f32 = parse_num(bpm).map_err(err)?;
@@ -1356,12 +1360,19 @@ impl Project {
     /// for tracks without a sample or whose file failed) and the errors.
     pub fn load_samples(&self) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
         let mut errors = Vec::new();
+        // Tracks playing one file share it, read once.
+        let mut loaded = std::collections::HashMap::new();
         let samples = self
             .tracks
             .iter()
             .map(|t| {
-                let path = t.sample.as_ref()?;
-                crate::sample::load(Path::new(path)).map(std::sync::Arc::new).map_err(|e| errors.push(e)).ok()
+                let path = t.sample.as_deref()?;
+                loaded
+                    .entry(path)
+                    .or_insert_with(|| {
+                        crate::sample::load(Path::new(path)).map(std::sync::Arc::new).map_err(|e| errors.push(e)).ok()
+                    })
+                    .clone()
             })
             .collect();
         (samples, errors)
@@ -1369,7 +1380,7 @@ impl Project {
 
     /// Loads a project file; sample paths come back absolute.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = crate::fsutil::read_text(path, MAX_FILE_BYTES).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut p = Self::from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let dir = project_dir(path);
         for t in &mut p.tracks {
@@ -1431,12 +1442,19 @@ fn chord_text(st: &Step) -> String {
     if ivs.is_empty() { "-".into() } else { ivs.join(",") }
 }
 
+/// The words of `rest`, at most `max + 1` of them: enough to tell a line
+/// with too many from one with `max`, without collecting every word of a
+/// huge line.
+fn fields(rest: &str, max: usize) -> Vec<&str> {
+    rest.split_whitespace().take(max + 1).collect()
+}
+
 fn parse_chord(text: &str) -> Result<[u8; MAX_CHORD - 1], String> {
     let mut chord = [0u8; MAX_CHORD - 1];
     if text == "-" {
         return Ok(chord);
     }
-    let parts: Vec<&str> = text.split(',').collect();
+    let parts: Vec<&str> = text.split(',').take(chord.len() + 1).collect();
     if parts.len() > chord.len() {
         return Err(format!("a chord has at most {MAX_CHORD} notes"));
     }
@@ -2288,6 +2306,39 @@ pattern_division A 1/8
             let e = Project::from_text(text).unwrap_err();
             assert_eq!(e.line, line, "{text:?}: {e}");
             assert!(e.message.contains(needle), "{text:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn tracks_playing_one_file_share_it() {
+        let dir = std::env::temp_dir().join(format!("tinvo-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("hit.wav");
+        crate::wav::write_file(&wav, &[0.5; 64], 1, 48_000, crate::wav::SampleFormat::Float32).unwrap();
+        let track = |path: &Path| format!("track sampler\nsample {}\nend\n", path.display());
+        let gone = dir.join("gone.wav");
+        let text = format!("tinvo 4\n{}{}{}{}", track(&wav), track(&gone), track(&wav), track(&gone));
+        let (samples, errors) = Project::from_text(&text).unwrap().load_samples();
+        let (a, b) = (samples[0].as_ref().unwrap(), samples[2].as_ref().unwrap());
+        assert!(std::sync::Arc::ptr_eq(a, b));
+        assert!(samples[1].is_none() && samples[3].is_none());
+        assert_eq!(errors.len(), 1, "a missing file is reported once: {errors:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn huge_lines_are_refused_by_their_first_words() {
+        let many = |word: &str, n: usize| vec![word; n].join(" ");
+        let chord = vec!["1"; 1 << 20].join(",");
+        for (text, needle) in [
+            (format!("tinvo 5\nsong {}", many("A", 1 << 20)), "at most 256"),
+            (format!("tinvo 11\nsong A\ntrack kick\nparts {}\nend", many(".", 1 << 20)), "at most 256"),
+            (format!("tinvo 3\ntrack kick\nstep {}\nend", many("0", 1 << 20)), "expected 'step"),
+            (format!("tinvo 5\nloop {}", many("0", 1 << 20)), "expected 'loop"),
+            (format!("tinvo 3\ntrack synth\nstep 0 60 100 1 100 1 0 {chord}\nend"), "at most"),
+        ] {
+            let e = Project::from_text(&text).unwrap_err();
+            assert!(e.message.contains(needle), "{}: {e}", &text[..40]);
         }
     }
 

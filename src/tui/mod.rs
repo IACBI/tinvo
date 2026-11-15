@@ -24,11 +24,19 @@ pub fn printable(text: &str) -> String {
     out
 }
 
+/// Like [`printable`], with line breaks escaped too: for text from outside
+/// that is meant to be one line (a device's name or id, a path) among
+/// TINVO's own lines.
+pub fn printable_line(text: &str) -> String {
+    printable(text).replace('\n', "\\n")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn printable_escapes_control_characters() {
         let text = "a\u{1b}]52;c;VEVTVA==\u{7}\nb\tç";
         assert_eq!(super::printable(text), "a\\u{1b}]52;c;VEVTVA==\\u{7}\nb\\tç");
+        assert_eq!(super::printable_line("a\u{1b}[2J\nb"), "a\\u{1b}[2J\\nb");
     }
 }

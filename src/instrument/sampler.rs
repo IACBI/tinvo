@@ -145,10 +145,6 @@ impl Sampler {
         std::mem::replace(&mut self.sample, sample)
     }
 
-    pub fn sample(&self) -> Option<&Arc<Sample>> {
-        self.sample.as_ref()
-    }
-
     pub fn set_param(&mut self, index: usize, value: f32) {
         if let Some(spec) = PARAMS.get(index) {
             self.params[index] = spec.clamp(value);

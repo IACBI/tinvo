@@ -272,12 +272,18 @@ where
                     match r {
                         // The kernel FIFO overran and was cleared; events
                         // were lost, and what follows is valid again.
-                        _ if r == -ENOSPC => continue,
+                        _ if r == -ENOSPC => {
+                            handler(Message::Lost);
+                            continue;
+                        }
                         // Nothing more until the next poll.
                         _ if r == -EAGAIN => break,
                         // Anything else would be reported again by every
                         // poll, spinning this thread; give up instead.
-                        _ if r < 0 => return,
+                        _ if r < 0 => {
+                            handler(Message::Lost);
+                            return;
+                        }
                         _ if ev.is_null() => break,
                         _ => {}
                     }

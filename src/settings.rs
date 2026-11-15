@@ -29,6 +29,8 @@ use crate::theme::{self, Role, Theme};
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "tinvo.conf";
+/// The largest settings file read.
+pub const MAX_FILE_BYTES: u64 = 1 << 20;
 
 /// Everything the settings file sets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,7 +139,7 @@ pub fn default_path() -> Option<PathBuf> {
 /// Reads the settings at `path`; a file that does not exist gives the
 /// defaults, and `false` for whether one was read.
 pub fn load(path: &Path) -> Result<(Settings, bool), String> {
-    match std::fs::read_to_string(path) {
+    match crate::fsutil::read_text(path, MAX_FILE_BYTES) {
         Ok(text) => parse(&text).map(|s| (s, true)).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Settings::default(), false)),
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -205,8 +207,12 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                     return Err(at(format!("{name} is set twice")));
                 }
                 bound.push(a);
-                let list = value.split_whitespace().map(keymap::parse_key).collect::<Result<Vec<_>, _>>();
-                keys.bind(a, list.map_err(at)?);
+                let list = value.split_whitespace().take(keymap::MAX_KEYS + 1);
+                let list = list.map(keymap::parse_key).collect::<Result<Vec<_>, _>>().map_err(at)?;
+                if list.len() > keymap::MAX_KEYS {
+                    return Err(at(format!("{name} has more than {} keys", keymap::MAX_KEYS)));
+                }
+                keys.bind(a, list);
             }
             Section::Theme if name == "base" => {
                 if base.is_some() {
@@ -579,10 +585,26 @@ mod tests {
             ("[theme]\ncursor = pink", "line 2: unknown colour 'pink'"),
             ("[theme]\ncursr = red", "line 2: unknown colour role 'cursr'"),
             ("[theme]\nbase = light\nbase = light", "line 3: base is set twice"),
+            ("[keys]\nundo = 1 2 3 4 5 6 7 8 9", "line 2: undo has more than 8 keys"),
         ] {
             let err = parse(text).unwrap_err();
             assert!(err.contains(want), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_settings_file_too_large_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tinvo-conf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let mut text = "[keys]\nundo = u\n".to_string();
+        text.push_str(&"#".repeat(MAX_FILE_BYTES as usize - text.len()));
+        std::fs::write(&path, &text).unwrap();
+        assert!(load(&path).unwrap().1);
+        text.push('#');
+        std::fs::write(&path, &text).unwrap();
+        assert!(load(&path).unwrap_err().ends_with("larger than 1 MiB"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
