@@ -199,6 +199,8 @@ pub struct PolySynth {
     /// Pitch of the most recent note, where glides start from.
     last_note: Option<u8>,
     lfo: Lfo,
+    /// Playback started and no sample has been rendered since.
+    lfo_restart: bool,
     /// For a synced LFO.
     tempo: f32,
     wave1: Waveform,
@@ -225,6 +227,7 @@ impl PolySynth {
             clock: 0,
             last_note: None,
             lfo: Lfo { phase: 0.0, held: 0.0, rng: Rng::new(0x1F0) },
+            lfo_restart: false,
             tempo: 120.0,
             wave1: Waveform::Saw,
             wave2: Waveform::Saw,
@@ -259,10 +262,10 @@ impl PolySynth {
     }
 
     /// Playback starts: a synced LFO starts its cycle on the first beat.
+    /// Whether it is synced is decided at the first sample, after the first
+    /// step's automation may have set it.
     pub fn start(&mut self) {
-        if self.params[p::LFO_SYNC] >= 1.0 {
-            self.lfo.phase = 0.0;
-        }
+        self.lfo_restart = true;
     }
 
     /// The LFO's rate in Hz.
@@ -381,6 +384,12 @@ impl PolySynth {
     }
 
     pub fn render(&mut self, out: &mut [f32]) {
+        if self.lfo_restart && !out.is_empty() {
+            self.lfo_restart = false;
+            if self.params[p::LFO_SYNC] >= 1.0 {
+                self.lfo.phase = 0.0;
+            }
+        }
         for chunk in out.chunks_mut(CHUNK) {
             self.render_chunk(chunk);
         }
@@ -504,7 +513,9 @@ mod tests {
         s.render(&mut pre);
         let phase = s.lfo.phase;
         s.start();
-        assert_eq!(s.lfo.phase, phase);
+        s.render(&mut [0.0; 1]);
+        assert_ne!(s.lfo.phase, 0.0);
+        assert!((s.lfo.phase - phase - f64::from(s.lfo_hz() / SR)).abs() < 1e-12);
     }
 
     /// A pure sine through an open filter: makes pitch directly measurable.
