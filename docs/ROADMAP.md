@@ -326,22 +326,45 @@ Known limits:
 - Character widths come from the common ranges (CJK, Hangul, full-width forms, emoji, combining marks), not Unicode's full tables; terminals also differ on some characters.
 - Closing a real MIDI input was not tried here (no MIDI device on the development machine); the release on closing and on a lost message are unit-tested.
 
+## Phase 9a: Step divisions ✅ (0.23.0)
+
+- A step length per pattern: 1/8, 1/8T, 1/16 (as before), 1/16T or 1/32. The transport counts 24 pulses per quarter note, so every division is a whole number of pulses; for 16ths the frame arithmetic is the one from before, and 16th-note projects play bit for bit as they did.
+- Each track keeps its own next step on the division of the pattern it plays, so song entries and per-track parts of different divisions play together. A track's own pattern is cut where the entry ends, its ratchets with it. Swing moves the second step of each pair; triplet steps are not swung.
+- The grid, the piano roll and the automation view draw beats and bars for the division; the playhead follows each track's own steps. `b` `B` or the wheel over the top bar set it, and copies keep it.
+- Up to 8 ratchets per step.
+- Project format 12 (`pattern_division B 1/16T`); older files load as 16ths.
+
+Known limits:
+- All rows of a pattern share its division.
+- Micro-timing keeps 24 ticks per step, so its finest offset depends on the step length.
+
+## Phase 9b: Time signatures ✅ (0.23.0)
+
+- A time signature per pattern, 1 to 16 beats of /2, /4, /8 or /16 notes, set with `k` `K` and `J` or the wheel over the top bar. It places the beat and bar lines in the grid, the piano roll and the automation view; the ruler leaves a space between its labels in long bars.
+- Format 12 writes `pattern_meter B 6/8` for patterns not in 4/4; older files load in 4/4.
+
+Known limits:
+- The time signature does not change playback or the pattern's length; it only draws the lines.
+
+## Phase 9c: Tempo-synced LFO ✅ (0.23.0)
+
+- The synth's `LFO sync` sets one LFO cycle per note value, the delay's values from 1/32 to 1/2 and then 1/1, 2/1 and 4/1; `free` keeps the rate in Hz. A synced LFO starts its cycle when playback starts, also when the first step's automation syncs it, so playback and export land on the beat alike.
+- Format 12 adds `param lfo_sync`; older files load with a free LFO.
+
+## Phase 9d: Tempo points ✅ (0.23.0)
+
+- A song entry can start at a tempo of its own. The tempo holds until the next point or, with ramping on, moves there in a straight line. Before the first point the song plays at the set tempo.
+- The transport takes a new origin at each entry's exact fractional frame and integrates a ramp exactly, so steps land on the integral of the tempo at any buffer size, and song and region exports last as long as the song plays. The delay and synced LFOs follow the tempo playing.
+- The song view has a tempo row: `{` `}` or the wheel set the entry's point, `0` removes it, `/` switches between hold and ramp. Its title shows the cursor entry's tempo, and the top bar the tempo playing while it differs from the set one.
+- Format 12 adds `tempo_point <entry> <bpm>` and `tempo_ramp true`. Points move with their entries, and undo brings a removed entry's point back.
+
+Known limits:
+- Tempo points sit at the start of song entries; a tempo change inside a pattern needs an entry of its own.
+- A pattern playing on its own, outside the song, plays at the set tempo.
+
 ## Planned: more kinds of music
 
-TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. The phases below take it further, toward triplet and live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
-
-### Phase 9: Finer time (medium)
-
-For triplet and shuffle feels (6/8 and 12/8 grooves, jazz-influenced hip-hop), 32nd-note hat rolls, and songs whose tempo moves.
-
-Done, not yet released: all of it. All rows of a pattern share its division; parts in different divisions play together through song entries and per-track parts.
-- A step division per pattern: 1/8, 1/8T, 1/16 (today's grid), 1/16T or 1/32. A pattern still holds up to 64 steps, so a 1/32 pattern is two bars long. Micro-timing keeps its 24 ticks per step.
-- A time signature per pattern, which places the bar and beat lines in the grid and the piano roll.
-- Tempo automation: a song-level lane that holds or ramps. The transport integrates a ramp exactly, so playback and export agree at any buffer size.
-- A tempo-synced rate for the synth's LFO, in the delay's divisions.
-- Up to 8 ratchets.
-- Project format 12. Older files load as 1/16 in 4/4.
-- Tests: step frames for every division against the exact fraction of a beat, step positions under a tempo ramp against its integral, buffer-size independence, round trips and the fuzzer.
+TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes. The phases below take it further, toward live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
 
 ### Phase 10: MIDI performance (medium)
 

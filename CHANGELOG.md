@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-15
+
 ### Added
 - A step length per pattern: 1/8, 1/8 triplets, 1/16 (as before), 1/16 triplets or 1/32, set with `b` and `B` or the wheel over the top bar. The grid, the piano roll and the automation view draw beats and bars for it. A track playing its own pattern in a song entry plays it in that pattern's steps, cut where the entry ends. Swing moves the second step of each pair; triplet steps are not swung.
 - A time signature per pattern, 1 to 16 beats of /2, /4, /8 or /16 notes, set with `k` `K` (beats) and `J` (the beat's note value) or the wheel over the top bar. It places the beat and bar lines in the grid, the piano roll and the automation view, and leaves playback alone. Copy and paste carry a pattern's step length and time signature.
@@ -317,7 +319,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/IACBI/tinvo/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/IACBI/tinvo/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/IACBI/tinvo/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/IACBI/tinvo/compare/v0.19.0...v0.20.0
