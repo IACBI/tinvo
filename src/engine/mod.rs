@@ -1209,6 +1209,9 @@ impl Engine {
         self.transport.start(self.now);
         let e = self.entry;
         self.conductor = Some(self.tick_at(None, &e, 0));
+        for t in &mut self.tracks[..self.track_count] {
+            t.instrument.start();
+        }
         for t in 0..self.track_count {
             self.tracks[t].clock = Some(self.tick_at(Some(t), &e, 0));
             self.tracks[t].early_for = None;
@@ -1443,6 +1446,9 @@ impl Engine {
                 let pending = self.pending_position();
                 self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
                 self.mix.set_tempo(self.tempo);
+                for t in &mut self.tracks {
+                    t.instrument.set_tempo(self.tempo);
+                }
             }
             Edit::SetPatternLength { pattern, len } => {
                 if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
@@ -1509,6 +1515,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
+                    self.tracks[n].instrument.set_tempo(self.tempo);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
@@ -1526,6 +1533,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
+                    self.tracks[n].instrument.set_tempo(self.tempo);
                     self.track_count += 1;
                     self.update_gains();
                     if self.transport.is_playing() {
@@ -3199,6 +3207,35 @@ mod tests {
     /// A synth whose cutoff (panel index 7) ramps from 1 kHz at step 2 to
     /// 4 kHz at step 6, and whose volume drops to -12 dB from step 1, in an
     /// 8-step pattern.
+    #[test]
+    fn a_synced_lfo_set_by_the_first_step_s_automation_starts_on_the_beat() {
+        let id = |name: &str| InstrumentKind::Synth.params().iter().position(|s| s.id == name).unwrap();
+        // A square LFO on a sine's level, free on the knob and synced to
+        // quarters from step 0 by a lane: the second half of each beat is
+        // silent however long the engine ran before Play.
+        let set = |index: usize, value| Edit::SetParam { track: 0, index: index as u8, value };
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Synth),
+            set(id("osc1_wave"), 3.0),
+            set(id("osc_mix"), 0.0),
+            set(id("cutoff"), 20_000.0),
+            set(id("lfo_wave"), 3.0),
+            set(id("lfo_amp"), 1.0),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(69, 127, 16)) },
+            Edit::SetLane { track: 0, lane: 0, target: Some(2 + id("lfo_sync") as u8), ramp: false },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(9.0) },
+        ];
+        let mut e = engine(&edits);
+        run(&mut e, 7777);
+        e.handle(Command::Play);
+        let out = run(&mut e, 48_000);
+        let rms = |a: usize, b: usize| (out[2 * a..2 * b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt();
+        for b in [0, 24_000] {
+            let (on, off) = (rms(b + 1000, b + 11_000), rms(b + 13_000, b + 23_000));
+            assert!(off < on * 0.05, "beat at {b}: {on} {off}");
+        }
+    }
+
     fn automated_synth() -> Vec<Edit> {
         let point = |lane, step, value| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(value) };
         vec![

@@ -80,11 +80,12 @@ pub fn track_param_count(kind: InstrumentKind) -> usize {
 
 /// The project file format that introduced track parameter `index`: the
 /// strip arrived in format 7, the delay and reverb sends in 8, the
-/// compressor key and the chorus and key sends in 9.
+/// compressor key and the chorus and key sends in 9, the synth's LFO sync
+/// in 12.
 pub fn track_param_since(kind: InstrumentKind, index: usize) -> u32 {
     let n = kind.params().len();
     if index < n {
-        1
+        if kind == InstrumentKind::Synth && index == crate::instrument::synth_lfo_sync() { 12 } else { 1 }
     } else if index < n + sp::COUNT {
         if index - n == sp::COMP_KEY { 9 } else { 7 }
     } else {
@@ -401,6 +402,10 @@ mod tests {
         assert_eq!(since[n + sp::COMP_KEY], 9);
         assert_eq!(since[n + sp::DRIVE], 7);
         assert_eq!(since[n + sp::COUNT..], [8, 8, 9, 9]);
+        let s = InstrumentKind::Synth;
+        let lfo_sync = s.params().iter().position(|p| p.id == "lfo_sync").unwrap();
+        assert_eq!(track_param_since(s, lfo_sync), 12);
+        assert_eq!(track_param_since(s, lfo_sync - 1), 1);
     }
 
     #[test]
