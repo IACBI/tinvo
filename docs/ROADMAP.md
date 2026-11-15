@@ -362,6 +362,17 @@ Known limits:
 - Tempo points sit at the start of song entries; a tempo change inside a pattern needs an entry of its own.
 - A pattern playing on its own, outside the song, plays at the set tempo.
 
+## Phase 10a: Recording notes ✅ (0.24.0)
+
+- `C` records the notes played on the live track while the pattern or song plays. The engine finds each key's nearest step on the frame it sounds, among the steps of the pattern the track plays there (where swing puts them) and the next entry's first step, and reports it with its offset in ticks through a take queue, along with each step the track plays. The UI turns the take into step edits: one undo step, overdub or replace, micro-timing kept or quantized, a chord of up to four notes per step, the length in steps as held.
+- The engine counts how many record commands it has handled, so the UI writes the take only once every note pushed before the stop is in its queue.
+- A count-in of one or two bars clicks the pattern's beats in the engine, sample-accurately at any buffer size, and starts playback on the frame the last beat ends. A key up to half a step before that lands on the first step.
+- The settings file has `record_mode`, `record_timing` and `count_in` under `[options]`, and the settings page lists them.
+
+Known limits:
+- Notes record onto steps: a note shorter than a step lasts a step, and two notes on one step play together.
+- Recording from a stop plays the pattern being edited. To record over the song, start it and press `C` in the grid while it plays, without a count-in.
+
 ## Planned: more kinds of music
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes. The phases below take it further, toward live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
@@ -369,11 +380,10 @@ TINVO is at home with pattern-based electronic music: techno, house, electro, sy
 ### Phase 10: MIDI performance (medium)
 
 For playing parts in instead of entering them, expressive synth playing, and working alongside other programs and hardware.
-- Recording while the pattern plays: incoming notes written to their nearest step, keeping the rest as micro-timing or quantized fully (a setting), with velocity and length as played. A pass overdubs or replaces, is one undo step, and can start after a count-in.
 - Sustain pedal (CC 64), pitch bend with a range per track, and the mod wheel (CC 1) sent to a chosen parameter. MIDI channels can each play their own track; all channels playing the selected track stays the default.
 - Standard MIDI File import (formats 0 and 1, one TINVO track per MIDI track or channel, notes on the pattern's grid, the tempo from the first tempo event) and export of a pattern or the song.
 - MIDI output, with backends next to the input ones (WinMM, the ALSA sequencer, CoreMIDI): a track's notes to an external instrument or another program, and MIDI clock (start, stop, continue, song position, 24 clocks per quarter note). Following an external clock needs the audio clock to track another device's drift and would be a phase of its own.
-- Tests: recorded steps against the frames notes arrived on, a recorded pass identical to the same notes entered by hand, pedal and bend on the synth's voices, MIDI file round trips with the reader fuzzed like the project and WAV readers, clock bytes on their exact frames.
+- Tests: pedal and bend on the synth's voices, MIDI file round trips with the reader fuzzed like the project and WAV readers, clock bytes on their exact frames.
 
 ### Phase 11: Mixer (medium)
 

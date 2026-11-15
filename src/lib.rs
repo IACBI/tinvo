@@ -33,6 +33,7 @@ pub mod lock;
 pub mod loopback;
 pub mod midi;
 pub mod mix;
+pub mod note_take;
 pub mod project;
 pub mod record;
 pub mod render;

@@ -1,4 +1,4 @@
-//! The settings file: key bindings and colours.
+//! The settings file: key bindings, colours and options.
 //!
 //! ```text
 //! # Lines starting with # are comments; a # later in a line is not.
@@ -13,12 +13,14 @@
 //!
 //! [options]
 //! mouse = off
+//! record_mode = replace
 //! ```
 //!
 //! An action listed here keeps only the keys listed (`pattern_shorter`
 //! above has none); the others keep their defaults. `base` picks the
 //! built-in theme the colours start from. `mouse = off` leaves the mouse
-//! to the terminal. `tinvo settings` prints every action and role with
+//! to the terminal; the other options ([`OPTIONS`]) set how notes are
+//! recorded. `tinvo settings` prints every action and role with
 //! what it has, and the editor's settings page changes them in place
 //! ([`update_text`]), keeping the file's comments and order.
 
@@ -38,11 +40,81 @@ pub struct Settings {
     /// Whether the editor takes mouse input. Off, the terminal keeps the
     /// mouse for selecting text.
     pub mouse: bool,
+    pub recording: Recording,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { keys: Keymap::default(), base: theme::BUILT_IN[0], theme: Theme::default(), mouse: true }
+        Settings {
+            keys: Keymap::default(),
+            base: theme::BUILT_IN[0],
+            theme: Theme::default(),
+            mouse: true,
+            recording: Recording::default(),
+        }
+    }
+}
+
+/// How notes played while the pattern plays are recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recording {
+    /// Each pass replaces the steps the playhead passes instead of adding
+    /// to them.
+    pub replace: bool,
+    /// Notes land on their step instead of keeping their timing.
+    pub quantize: bool,
+    /// Bars counted in with a click when recording starts from a stop.
+    pub count_in: u8,
+}
+
+/// The settings under `[options]`: a name, its values (the first is the
+/// default) and what it does.
+pub const OPTIONS: [(&str, &[&str], &str); 4] = [
+    (
+        "mouse",
+        &["on", "off"],
+        "on: clicks, drags and the wheel work in the editor (Shift+drag still selects text in most terminals); off: the terminal keeps the mouse",
+    ),
+    (
+        "record_mode",
+        &["overdub", "replace"],
+        "recording notes: overdub adds them to the steps; replace clears each step the playhead passes, keeping what that pass played",
+    ),
+    (
+        "record_timing",
+        &["keep", "quantize"],
+        "keep: recorded notes keep their timing as micro-timing; quantize: they land on the step",
+    ),
+    ("count_in", &["off", "1", "2"], "bars counted in with a click when recording starts from a stop"),
+];
+
+impl Settings {
+    /// The value option `i` of [`OPTIONS`] has, as an index into its values.
+    pub fn option(&self, i: usize) -> usize {
+        match i {
+            0 => usize::from(!self.mouse),
+            1 => usize::from(self.recording.replace),
+            2 => usize::from(self.recording.quantize),
+            _ => usize::from(self.recording.count_in),
+        }
+    }
+
+    pub fn set_option(&mut self, i: usize, value: usize) {
+        match i {
+            0 => self.mouse = value == 0,
+            1 => self.recording.replace = value == 1,
+            2 => self.recording.quantize = value == 1,
+            _ => self.recording.count_in = value.min(OPTIONS[3].1.len() - 1) as u8,
+        }
+    }
+}
+
+/// "a or b", "a, b or c" (with `word` "or").
+fn listing(values: &[&str], word: &str) -> String {
+    match values {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} {word} {last}", rest.join(", ")),
     }
 }
 
@@ -86,7 +158,8 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     let mut keys = Keymap::default();
     let mut bound: Vec<Action> = Vec::new();
     let mut base: Option<&'static str> = None;
-    let mut mouse: Option<bool> = None;
+    let mut settings = Settings::default();
+    let mut options_set = [false; OPTIONS.len()];
     let mut styles: Vec<(Role, crate::tui::Style)> = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let at = |e: String| format!("line {}: {e}", n + 1);
@@ -112,17 +185,19 @@ pub fn parse(text: &str) -> Result<Settings, String> {
         match section {
             Section::None => return Err(at("a setting must come after [keys], [theme] or [options]".into())),
             Section::Options => {
-                if name != "mouse" {
-                    return Err(at(format!("unknown option '{name}' (there is mouse)")));
+                let names: Vec<&str> = OPTIONS.iter().map(|o| o.0).collect();
+                let Some(i) = OPTIONS.iter().position(|o| o.0 == name) else {
+                    return Err(at(format!("unknown option '{name}' (there are {})", listing(&names, "and"))));
+                };
+                if std::mem::replace(&mut options_set[i], true) {
+                    return Err(at(format!("{name} is set twice")));
                 }
-                if mouse.is_some() {
-                    return Err(at("mouse is set twice".into()));
-                }
-                mouse = Some(match value {
-                    "on" => true,
-                    "off" => false,
-                    _ => return Err(at(format!("mouse is on or off, not '{value}'"))),
-                });
+                let values = OPTIONS[i].1;
+                let v = values
+                    .iter()
+                    .position(|&v| v == value)
+                    .ok_or_else(|| at(format!("{name} is {}, not '{value}'", listing(values, "or"))))?;
+                settings.set_option(i, v);
             }
             Section::Keys => {
                 let a = Action::from_id(name).ok_or_else(|| at(format!("unknown action '{name}'")))?;
@@ -157,7 +232,7 @@ pub fn parse(text: &str) -> Result<Settings, String> {
     for (r, s) in styles {
         theme.set(r, s);
     }
-    Ok(Settings { keys, base, theme, mouse: mouse.unwrap_or(true) })
+    Ok(Settings { keys, base, theme, ..settings })
 }
 
 impl Settings {
@@ -191,11 +266,10 @@ impl Settings {
         for r in Role::ALL {
             out += &format!("# {}\n{} = {}\n", r.help(), r.id(), theme::style_name(self.theme.get(*r)));
         }
-        out += &format!(
-            "\n[options]\n# on: clicks, drags and the wheel work in the editor (Shift+drag still selects\n\
-             # text in most terminals); off: the terminal keeps the mouse.\nmouse = {}\n",
-            if self.mouse { "on" } else { "off" }
-        );
+        out += "\n[options]\n";
+        for (i, (name, values, help)) in OPTIONS.iter().enumerate() {
+            out += &format!("# {help} ({}).\n{name} = {}\n", listing(values, "or"), values[self.option(i)]);
+        }
         out
     }
 }
@@ -242,8 +316,10 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Settings {
             out.theme.set(r, ours.theme.get(r));
         }
     }
-    if ours.mouse != base.mouse {
-        out.mouse = ours.mouse;
+    for i in 0..OPTIONS.len() {
+        if ours.option(i) != base.option(i) {
+            out.set_option(i, ours.option(i));
+        }
     }
     out
 }
@@ -267,7 +343,8 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
     // Which settings have a line, and where each section's lines end.
     let mut has_key = vec![false; Action::ALL.len()];
     let mut has_role = vec![false; Role::ALL.len()];
-    let (mut has_base, mut has_mouse) = (false, false);
+    let mut has_base = false;
+    let mut has_option = [false; OPTIONS.len()];
     let mut ends: [Option<usize>; 3] = [None; 3];
     let mut section = Section::None;
     for (i, line) in lines.iter_mut().enumerate() {
@@ -297,10 +374,10 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
                     has_role[r as usize] = true;
                     theme::style_name(new.theme.get(r))
                 }),
-                Section::Options => {
-                    has_mouse = true;
-                    Some(if new.mouse { "on" } else { "off" }.to_string())
-                }
+                Section::Options => OPTIONS.iter().position(|o| o.0 == name).map(|i| {
+                    has_option[i] = true;
+                    OPTIONS[i].1[new.option(i)].to_string()
+                }),
                 Section::None => None,
             };
             if let Some(v) = value {
@@ -331,8 +408,10 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
             add[1].push(format!("{} = {}", r.id(), theme::style_name(new.theme.get(r))));
         }
     }
-    if !has_mouse && !new.mouse {
-        add[2].push("mouse = off".into());
+    for (i, (name, values, _)) in OPTIONS.iter().enumerate() {
+        if !has_option[i] && new.option(i) != 0 {
+            add[2].push(format!("{name} = {}", values[new.option(i)]));
+        }
     }
     // From the last section in the file back, so earlier positions hold.
     let mut order: Vec<usize> = (0..3).collect();
@@ -482,7 +561,12 @@ mod tests {
         for (text, want) in [
             ("undo = u", "line 1: a setting must come after [keys], [theme] or [options]"),
             ("[options]\nmouse = yes", "line 2: mouse is on or off, not 'yes'"),
-            ("[options]\nmice = on", "line 2: unknown option 'mice'"),
+            (
+                "[options]\nmice = on",
+                "line 2: unknown option 'mice' (there are mouse, record_mode, record_timing and count_in)",
+            ),
+            ("[options]\ncount_in = 3", "line 2: count_in is off, 1 or 2, not '3'"),
+            ("[options]\nrecord_mode = keep", "line 2: record_mode is overdub or replace, not 'keep'"),
             ("[options]\nmouse = on\nmouse = off", "line 3: mouse is set twice"),
             ("[colors]", "line 1: unknown section [colors]"),
             ("[keys]\n\nundoo = u", "line 3: unknown action 'undoo'"),

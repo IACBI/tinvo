@@ -92,7 +92,7 @@ tinvo settings            # check the settings file and print every key and colo
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
-The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
+The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `C` records what you play while the pattern plays: each note lands on its nearest step, and the whole take is one undo step. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
 
 The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
@@ -124,6 +124,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
 | `M` | choose the MIDI input |
 | `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
+| `C` | record notes from the MIDI keyboard while the pattern plays (from a stop it starts playback, after a count-in if one is set); `C` again stops |
 | `w` `W` `e` | save, save as, export WAV |
 | `F2` `P` | settings: keys, colours and the mouse |
 | `q` | quit |
@@ -146,9 +147,10 @@ cursor = black on bright-cyan bold
 
 [options]
 mouse = off
+record_mode = replace
 ```
 
-An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys. `mouse = off` leaves the mouse to the terminal.
+An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys. `mouse = off` leaves the mouse to the terminal. `record_mode` (`overdub` or `replace`), `record_timing` (`keep` or `quantize`) and `count_in` (`off`, `1` or `2` bars) set how `C` records notes; overdub adds to the steps, replace keeps only what the last pass over each step played.
 
 The settings page (`F2` or `P`) does the same without leaving the editor. It has three tabs, Keys, Colours and Options (`←` `→` or `Tab`). `Enter` adds a key to an action (press the key next) or changes a colour or option, `Del` removes an action's last key, `r` puts back the default and `Esc` closes the page. A change works at once. When the page closes, the changes are written into the settings file, keeping its comments, every line that did not change and whatever another TINVO session saved there meanwhile; a file that no longer reads is left alone. The page will not take the last key from the settings page itself or from quit.
 
@@ -245,7 +247,7 @@ tinvo settings            # check the settings file and print every key and colo
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
-Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
+Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `C` ise pattern çalarken çaldıklarını kaydeder: her nota en yakın adıma düşer, kaydın tamamı tek bir undo adımıdır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
 
 Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 
@@ -277,6 +279,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |
 | `M` | MIDI girişini seç |
 | `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
+| `C` | pattern çalarken MIDI klavyeden nota kaydet (durmuşken çalmayı başlatır, ayarlıysa önce count-in verir); tekrar `C` durdurur |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
 | `F2` `P` | ayarlar: tuşlar, renkler ve fare |
 | `q` | çık |
@@ -299,9 +302,10 @@ cursor = black on bright-cyan bold
 
 [options]
 mouse = off
+record_mode = replace
 ```
 
-`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir. `mouse = off` fareyi terminale bırakır.
+`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir. `mouse = off` fareyi terminale bırakır. `record_mode` (`overdub` ya da `replace`), `record_timing` (`keep` ya da `quantize`) ve `count_in` (`off`, `1` ya da `2` ölçü), `C` ile nota kaydının nasıl yapılacağını belirler: overdub adımlara ekler, replace her adımda yalnızca son geçişte çalınanı tutar.
 
 Ayar sayfası (`F2` ya da `P`) aynı işi editörden çıkmadan yapar. Üç sekmesi var: Keys, Colours ve Options (`←` `→` ya da `Tab`). `Enter` bir eyleme tuş ekler (ardından tuşa bas) ya da bir rengi veya seçeneği değiştirir, `Del` eylemin son tuşunu siler, `r` varsayılanı geri getirir, `Esc` sayfayı kapatır. Değişiklik anında çalışır. Sayfa kapanınca değişiklikler ayar dosyasına yazılır; dosyadaki yorumlar, değişmeyen satırlar ve bu arada başka bir TINVO oturumunun kaydettikleri olduğu gibi kalır. Artık okunamayan bir dosyaya dokunulmaz. Sayfa, ayar sayfasının ve çıkışın son tuşunu silmeye izin vermez.
 
