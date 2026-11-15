@@ -336,6 +336,11 @@ impl Transport {
         pulse as f64 / f64::from(PULSES_PER_16TH) + swing
     }
 
+    /// The frame of a position in 16th notes, unrounded.
+    pub fn exact_frame(&self, position: f64) -> f64 {
+        self.origin_frame as f64 + self.origin_frac + self.offset(position - self.origin)
+    }
+
     /// The frame of a position in 16th notes.
     pub fn frame_at(&self, position: f64) -> u64 {
         let offset = (self.origin_frac + self.offset(position - self.origin)).round();
