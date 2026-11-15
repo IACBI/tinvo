@@ -261,6 +261,11 @@ impl PolySynth {
         self.tempo = bpm;
     }
 
+    #[cfg(test)]
+    pub fn tempo(&self) -> f32 {
+        self.tempo
+    }
+
     /// Playback starts: a synced LFO starts its cycle on the first beat.
     /// Whether it is synced is decided at the first sample, after the first
     /// step's automation may have set it.

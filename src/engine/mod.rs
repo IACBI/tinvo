@@ -1671,7 +1671,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
-                    self.tracks[n].instrument.set_tempo(self.tempo);
+                    self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
@@ -1689,7 +1689,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
-                    self.tracks[n].instrument.set_tempo(self.tempo);
+                    self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.track_count += 1;
                     self.update_gains();
                     if self.transport.is_playing() {
@@ -2966,6 +2966,17 @@ mod tests {
         let want = span_frames(120.0, -22.5, 4.0, SR) + 4.0 * 24_000.0;
         let off = e.tracks[0].earliest_off().unwrap();
         assert!((off as f64 - want).abs() <= 1.0, "{off} vs {want}");
+    }
+
+    #[test]
+    fn a_synth_added_under_a_tempo_point_takes_the_tempo_playing() {
+        let mut e = engine(&tempo_song(&[(1, 60.0)], false));
+        e.handle(Command::PlaySong { entry: 1 });
+        run(&mut e, 100);
+        e.apply(Edit::AddTrack(InstrumentKind::Synth));
+        e.apply(Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth });
+        assert_eq!(e.tracks[0].instrument.tempo(), Some(60.0));
+        assert_eq!(e.tracks[2].instrument.tempo(), Some(60.0));
     }
 
     #[test]

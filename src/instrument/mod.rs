@@ -340,6 +340,14 @@ impl Instrument {
         }
     }
 
+    #[cfg(test)]
+    pub fn tempo(&self) -> Option<f32> {
+        match self {
+            Instrument::Synth(s) => Some(s.tempo()),
+            _ => None,
+        }
+    }
+
     /// Playback starts.
     pub fn start(&mut self) {
         if let Instrument::Synth(s) = self {
