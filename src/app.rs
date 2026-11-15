@@ -12,7 +12,7 @@ use crate::dsp::loudness::ExportMeter;
 use crate::engine::transport::Transport;
 use crate::engine::{
     Command, Division, Edit, Engine, LIVE_QUEUE, LiveNote, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
-    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, part_position,
+    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, part_position,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
@@ -164,6 +164,7 @@ type ClipTrack = ([Option<Step>; MAX_STEPS], [[Option<f32>; MAX_STEPS]; MAX_LANE
 struct Clip {
     len: u8,
     division: Division,
+    meter: Meter,
     tracks: Vec<ClipTrack>,
 }
 
@@ -205,6 +206,8 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetSwing(_) => (1, 0, 0, 0),
         Edit::SetMasterGain(_) => (2, 0, 0, 0),
         Edit::SetPatternLength { pattern, .. } => (3, pattern, 0, 0),
+        Edit::SetPatternDivision { pattern, .. } => (3, pattern, 1, 0),
+        Edit::SetPatternMeter { pattern, .. } => (3, pattern, 2, 0),
         Edit::SetStep { track, pattern, step, .. } => (4, track, pattern, step),
         Edit::SetParam { track, index, .. } => (5, track, index, 0),
         Edit::SetGain { track, .. } => (6, track, 0, 0),
@@ -240,6 +243,7 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetMasterGain(_) => "master level",
         Edit::SetPatternLength { .. } => "pattern length",
         Edit::SetPatternDivision { .. } => "step length",
+        Edit::SetPatternMeter { .. } => "time signature",
         Edit::InsertSongEntry { .. } => "add song entry",
         Edit::RemoveSongEntry(_) => "remove song entry",
         Edit::SetSongEntry { .. } => "song entry",
@@ -543,6 +547,7 @@ enum Target {
     Pattern,
     Length,
     Division,
+    Meter,
     /// A step column's beat label.
     Ruler,
     Track(usize),
@@ -1290,7 +1295,11 @@ impl App {
                 self.pattern = usize::from(*pattern);
                 self.step = usize::from(*step);
             }
-            Some(Edit::SetPatternLength { pattern, .. } | Edit::SetPatternDivision { pattern, .. }) => {
+            Some(
+                Edit::SetPatternLength { pattern, .. }
+                | Edit::SetPatternDivision { pattern, .. }
+                | Edit::SetPatternMeter { pattern, .. },
+            ) => {
                 self.pattern = usize::from(*pattern);
             }
             Some(Edit::SetPoint { track, lane, pattern, step, .. }) => {
@@ -1383,9 +1392,20 @@ impl App {
         self.song_row.min(self.track_count()).checked_sub(1)
     }
 
-    /// Steps in a beat of the edited pattern.
-    fn beat_steps(&self) -> usize {
-        self.project.divisions[self.pattern].steps_per_beat() as usize
+    /// The bar and beat that step `i` of the edited pattern starts, if it
+    /// starts one.
+    fn beat_at(&self, i: usize) -> Option<(u32, u32)> {
+        let pulse = i as u32 * self.project.divisions[self.pattern].pulses();
+        self.project.meters[self.pattern].beat_at(pulse)
+    }
+
+    /// The bar and beat starting at each of steps `first..last`, with the
+    /// column each is drawn at.
+    fn beats(&self, first: usize, last: usize) -> Vec<(u16, u32, u32)> {
+        (first..last)
+            .enumerate()
+            .filter_map(|(col, i)| self.beat_at(i).map(|(bar, beat)| (LEFT + col as u16 * CELL, bar, beat)))
+            .collect()
     }
 
     fn pattern_len(&self) -> usize {
@@ -1404,7 +1424,8 @@ impl App {
         let p = self.pattern;
         let tracks =
             self.project.tracks.iter().map(|t| (t.steps[p], std::array::from_fn(|k| t.lanes[k].points[p]))).collect();
-        self.clipboard = Some(Clip { len: self.project.pattern_lens[p], division: self.project.divisions[p], tracks });
+        let (len, division, meter) = (self.project.pattern_lens[p], self.project.divisions[p], self.project.meters[p]);
+        self.clipboard = Some(Clip { len, division, meter, tracks });
         self.set_status(format!("Copied pattern {}", pattern_name(p as u8)));
     }
 
@@ -1413,12 +1434,13 @@ impl App {
     /// matched by position; points go only to lanes that have a parameter.
     fn replace_pattern(&mut self, with: Option<Clip>, what: &'static str) {
         let (p, pattern) = (self.pattern, self.pattern as u8);
-        let (len, division) = (self.project.pattern_lens[p], self.project.divisions[p]);
-        let clip = with.unwrap_or(Clip { len, division, tracks: Vec::new() });
+        let (len, division, meter) = (self.project.pattern_lens[p], self.project.divisions[p], self.project.meters[p]);
+        let clip = with.unwrap_or(Clip { len, division, meter, tracks: Vec::new() });
         let empty = ([None; MAX_STEPS], [[None; MAX_STEPS]; MAX_LANES]);
         let mut edits = vec![
             Edit::SetPatternLength { pattern, len: clip.len },
             Edit::SetPatternDivision { pattern, division: clip.division },
+            Edit::SetPatternMeter { pattern, meter: clip.meter },
         ];
         for (t, track) in self.project.tracks.iter().enumerate() {
             let (steps, lanes) = clip.tracks.get(t).unwrap_or(&empty);
@@ -1791,6 +1813,7 @@ impl App {
             Target::Pattern => self.global_action(pick(Action::PrevPattern, Action::NextPattern)),
             Target::Length => self.global_action(pick(Action::PatternShorter, Action::PatternLonger)),
             Target::Division => self.global_action(pick(Action::StepsCoarser, Action::StepsFiner)),
+            Target::Meter => self.global_action(pick(Action::BeatsDown, Action::BeatsUp)),
             Target::Ruler if self.track < self.track_count() => {
                 let len = self.pattern_len();
                 self.step = if up { (self.step + len - 1) % len } else { (self.step + 1) % len };
@@ -2472,6 +2495,21 @@ impl App {
                 let i = if a == Action::StepsFiner { (i + 1).min(all.len() - 1) } else { i.saturating_sub(1) };
                 self.edit_with(Edit::SetPatternDivision { pattern: self.pattern as u8, division: all[i] }, true);
             }
+            Action::BeatsDown | Action::BeatsUp => {
+                let m = self.project.meters[self.pattern];
+                let beats =
+                    if a == Action::BeatsUp { m.beats().saturating_add(1) } else { m.beats().saturating_sub(1) };
+                if let Some(meter) = Meter::new(beats, m.unit()) {
+                    self.edit_with(Edit::SetPatternMeter { pattern: self.pattern as u8, meter }, true);
+                }
+            }
+            Action::BeatUnit => {
+                let m = self.project.meters[self.pattern];
+                let units = Meter::UNITS;
+                let i = units.iter().position(|&u| u == m.unit()).unwrap_or(1);
+                let meter = Meter::new(m.beats(), units[(i + 1) % units.len()]).unwrap_or_default();
+                self.edit_with(Edit::SetPatternMeter { pattern: self.pattern as u8, meter }, true);
+            }
             Action::NextPattern => self.select_pattern(self.pattern + 1),
             Action::PrevPattern => self.select_pattern(self.pattern + MAX_PATTERNS - 1),
             Action::SongView => self.song_view = !self.song_view,
@@ -3102,7 +3140,8 @@ impl App {
             (swing, Target::Swing),
             (format!("pattern {}", pattern_name(self.pattern as u8)), Target::Pattern),
             (format!(" · {} steps", self.pattern_len()), Target::Length),
-            (format!(" of {}  ", self.project.divisions[self.pattern].name()), Target::Division),
+            (format!(" of {}", self.project.divisions[self.pattern].name()), Target::Division),
+            (format!(" in {}  ", self.project.meters[self.pattern].name()), Target::Meter),
             (format!("{playing}{file}{dirty} "), Target::Inert),
         ] {
             let n = s.put(x, 0, &text, bar);
@@ -3146,13 +3185,11 @@ impl App {
         s.put(LEFT - 1, 1, "│", self.style(Role::Dim));
         let (first, last) = self.visible_steps(w);
         self.hit(LEFT, 1, (last - first) as u16 * CELL, Target::Ruler);
+        for (x, label) in ruler_labels(&self.beats(first, last)) {
+            s.put(x, 1, &label, self.style(Role::Beat));
+        }
         for (col, i) in (first..last).enumerate() {
             let x = LEFT + col as u16 * CELL;
-            let beat = self.beat_steps();
-            if i % beat == 0 {
-                let label = format!("{}.{}", i / (4 * beat) + 1, (i % (4 * beat)) / beat + 1);
-                s.put(x, 1, &label, self.style(Role::Beat));
-            }
             if self.play_step(self.track) == Some(i) {
                 s.put(x + 2, 1, "▼", self.style(Role::Playhead));
             }
@@ -3179,7 +3216,6 @@ impl App {
 
     fn draw_roll(&self, s: &mut Screen, w: u16, rows: u16) {
         let dim = self.style(Role::Dim);
-        let beat = self.beat_steps();
         let t = &self.project.tracks[self.track];
         let title = view_title("Piano roll", &t.name, &self.k(Action::PianoRoll));
         s.put(1, 1, &title, self.style(Role::Title));
@@ -3227,7 +3263,7 @@ impl App {
                     }
                     _ if held[i] >> pitch & 1 == 1 => ("───".to_string(), self.style(Role::Held)),
                     _ if black => (" · ".to_string(), self.style(Role::BlackKey)),
-                    _ if i % beat == 0 => (" · ".to_string(), self.style(Role::Beat)),
+                    _ if self.beat_at(i).is_some() => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
                 if self.play_step(self.track) == Some(i) {
@@ -3250,7 +3286,6 @@ impl App {
         const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let t = &self.project.tracks[self.track];
         let dim = self.style(Role::Dim);
-        let beat = self.beat_steps();
         let title = view_title("Automation", &t.name, &self.k(Action::Automate));
         s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
@@ -3274,7 +3309,7 @@ impl App {
                 let (text, mut st) = match (l.points[self.pattern][i], value) {
                     (Some(_), Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Point)),
                     (None, Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Value)),
-                    _ if i % beat == 0 => (" · ".to_string(), self.style(Role::Beat)),
+                    _ if self.beat_at(i).is_some() => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
                 if self.play_step(self.track) == Some(i) {
@@ -3484,7 +3519,6 @@ impl App {
 
     fn draw_grid(&self, s: &mut Screen, w: u16, rows: u16) {
         let dim = self.style(Role::Dim);
-        let beat = self.beat_steps();
         // Column positions match the track rows drawn below.
         s.put(1, 1, " # Track        Type", dim);
         s.put(26, 1, "M S", dim);
@@ -3534,7 +3568,7 @@ impl App {
                         };
                         (text, self.style(role))
                     }
-                    None if i % beat == 0 => (" · ".to_string(), self.style(Role::Beat)),
+                    None if self.beat_at(i).is_some() => (" · ".to_string(), self.style(Role::Beat)),
                     None => (" · ".to_string(), dim),
                 };
                 if t.mute && t.steps[self.pattern][i].is_some() {
@@ -4588,6 +4622,30 @@ fn ask_recovery(
     }
 }
 
+/// The ruler's labels for `beats` (column, bar, beat), with a space between
+/// any two. Every bar is labelled, as its bar number alone where `bar.1`
+/// would run into the next bar; beats are labelled where they fit.
+fn ruler_labels(beats: &[(u16, u32, u32)]) -> Vec<(u16, String)> {
+    let bars: Vec<(u16, u32)> = beats.iter().filter(|b| b.2 == 1).map(|&(x, bar, _)| (x, bar)).collect();
+    let mut out: Vec<(u16, String)> = bars
+        .iter()
+        .enumerate()
+        .map(|(k, &(x, bar))| {
+            let next = bars.get(k + 1).map_or(u16::MAX, |b| b.0);
+            let full = format!("{bar}.1");
+            (x, if x + (full.len() as u16) < next { full } else { bar.to_string() })
+        })
+        .collect();
+    for &(x, bar, beat) in beats.iter().filter(|b| b.2 != 1) {
+        let label = format!("{bar}.{beat}");
+        let end = x + label.len() as u16;
+        if out.iter().all(|(o, l)| end < *o || x > o + l.len() as u16) {
+            out.push((x, label));
+        }
+    }
+    out
+}
+
 /// The title of the piano roll or automation view: the view, the track's
 /// name cut to fit and the key back to the grid, all left of the step
 /// columns.
@@ -4667,7 +4725,64 @@ mod tests {
         mouse(&mut a, MouseKind::ScrollUp, wheel);
         assert_eq!(div(&a), Division::EighthTriplet);
         keys(&mut a, &[Key::Char('u')]);
-        assert_eq!(div(&a), Division::Eighth);
+        assert_eq!(div(&a), Division::Sixteenth, "quick nudges are one undo step");
+    }
+
+    #[test]
+    fn time_signature_keys_wheel_and_bar_lines() {
+        let mut a = app();
+        let meter = |a: &App| a.project.meters[a.pattern].name();
+        keys(&mut a, &[Key::Char('K'), Key::Char('K'), Key::Char('J')]);
+        assert_eq!(meter(&a), "6/8");
+        let s = frame(&a);
+        assert!(s.row_text(0).contains("16 steps of 1/16 in 6/8"), "{}", s.row_text(0));
+        // 16ths in 6/8: a beat every two steps, a bar every twelve.
+        let ruler = s.row_text(1);
+        let at = |i: u16| ruler.chars().skip(usize::from(LEFT + i * CELL)).take(3).collect::<String>();
+        assert_eq!([at(0), at(2), at(10), at(12)], ["1.1", "1.2", "1.6", "2.1"]);
+        assert_eq!(at(1).trim(), "");
+        keys(&mut a, &[Key::Char('J'), Key::Char('J'), Key::Char('J')]);
+        assert_eq!(meter(&a), "6/4", "the unit wraps round");
+        keys(&mut a, &[Key::Char('k'); 9]);
+        assert_eq!(meter(&a), "1/4", "at least one beat");
+        let wheel = spot(&a, Target::Meter);
+        mouse(&mut a, MouseKind::ScrollUp, wheel);
+        assert_eq!(meter(&a), "2/4");
+        // Quick nudges are one undo step; the length of the pattern stays.
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(meter(&a), "4/4");
+        assert_eq!(a.project.pattern_lens[a.pattern], 16);
+    }
+
+    #[test]
+    fn ruler_labels_never_run_into_each_other() {
+        // 16/16 in 16ths: a beat on every step, with two-digit beats from
+        // the tenth; 1/16 in 16ths: a bar on every step.
+        let beats: Vec<(u16, u32, u32)> =
+            (0..20).map(|i| (i * CELL, 1 + u32::from(i) / 16, 1 + u32::from(i) % 16)).collect();
+        let labels = ruler_labels(&beats);
+        let mut row = String::new();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        for (x, l) in &sorted {
+            assert!(row.is_empty() || row.len() < usize::from(*x), "{sorted:?}");
+            row.push_str(&" ".repeat(usize::from(*x) - row.len()));
+            row.push_str(l);
+        }
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["1.1", "1.3", "1.5", "1.7", "1.9", "1.11", "1.13", "1.15", "2.1", "2.3"]
+        );
+        let bars: Vec<(u16, u32, u32)> = (0..12).map(|i| (i * CELL, 1 + u32::from(i), 1)).collect();
+        let labels = ruler_labels(&bars);
+        assert_eq!(labels.len(), 12, "every bar is labelled");
+        assert_eq!(labels[10], (30, "11".to_string()));
+        assert_eq!(labels[11], (33, "12.1".to_string()), "the last bar has room");
+        // Room to spare keeps the full labels.
+        assert_eq!(
+            ruler_labels(&[(0, 1, 1), (6, 1, 2), (12, 2, 1)]),
+            [(0, "1.1".to_string()), (12, "2.1".to_string()), (6, "1.2".to_string())]
+        );
     }
 
     #[test]
@@ -4678,7 +4793,12 @@ mod tests {
         assert_eq!(a.project.divisions[1], Division::SixteenthTriplet);
         keys(&mut a, &[Key::Char('u')]);
         assert_eq!(a.project.divisions[1], Division::Sixteenth);
-        // Clearing keeps it.
+        // The time signature goes with it.
+        keys(&mut a, &[Key::Char('N'), Key::Char('K'), Key::Char('y'), Key::Char('n'), Key::Char('Y')]);
+        assert_eq!(a.project.meters[1].name(), "5/4");
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.meters[1], Meter::default());
+        // Clearing keeps them.
         keys(&mut a, &[Key::Char('B'), Key::Char('X')]);
         assert_eq!(a.project.divisions[1], Division::EighthTriplet);
     }

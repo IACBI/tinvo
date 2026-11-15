@@ -76,6 +76,67 @@ impl Division {
     }
 }
 
+/// A pattern's time signature. It places the beat and bar lines on screen
+/// and leaves playback alone; a pattern is as long as its steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Meter {
+    beats: u8,
+    unit: u8,
+}
+
+impl Default for Meter {
+    fn default() -> Self {
+        Meter { beats: 4, unit: 4 }
+    }
+}
+
+impl Meter {
+    pub const MAX_BEATS: u8 = 16;
+    /// The note values a beat can be, from the longest.
+    pub const UNITS: [u8; 4] = [2, 4, 8, 16];
+
+    /// `beats` (1 to [`Self::MAX_BEATS`]) of `unit` notes (one of
+    /// [`Self::UNITS`]) to the bar.
+    pub fn new(beats: u8, unit: u8) -> Option<Self> {
+        ((1..=Self::MAX_BEATS).contains(&beats) && Self::UNITS.contains(&unit)).then_some(Meter { beats, unit })
+    }
+
+    pub fn beats(self) -> u8 {
+        self.beats
+    }
+
+    pub fn unit(self) -> u8 {
+        self.unit
+    }
+
+    /// A beat's length in clock pulses.
+    pub fn beat_pulses(self) -> u32 {
+        PULSES_PER_BEAT * 4 / u32::from(self.unit)
+    }
+
+    /// A bar's length in clock pulses.
+    pub fn bar_pulses(self) -> u32 {
+        self.beat_pulses() * u32::from(self.beats)
+    }
+
+    /// The bar and beat (both from 1) that start at `pulse` of a pattern, if
+    /// one does.
+    pub fn beat_at(self, pulse: u32) -> Option<(u32, u32)> {
+        (pulse % self.beat_pulses() == 0)
+            .then(|| (pulse / self.bar_pulses() + 1, pulse % self.bar_pulses() / self.beat_pulses() + 1))
+    }
+
+    /// The name used on screen and in project files, such as `6/8`.
+    pub fn name(self) -> String {
+        format!("{}/{}", self.beats, self.unit)
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let (b, u) = name.split_once('/')?;
+        Self::new(b.parse().ok()?, u.parse().ok()?)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Transport {
     playing: bool,
@@ -190,6 +251,28 @@ mod tests {
         }
         assert_eq!(Division::default(), D16);
         assert_eq!(Division::from_name("1/4"), None);
+    }
+
+    #[test]
+    fn meters_place_beats_and_bars() {
+        let four = Meter::default();
+        assert_eq!(four.name(), "4/4");
+        assert_eq!((four.beat_pulses(), four.bar_pulses()), (24, 96));
+        let six = Meter::from_name("6/8").unwrap();
+        assert_eq!((six.beats(), six.unit(), six.beat_pulses(), six.bar_pulses()), (6, 8, 12, 72));
+        // 16ths in 6/8: a beat every two steps, a bar every twelve.
+        let marks: Vec<_> = (0..14).filter_map(|i| six.beat_at(i * 6).map(|b| (i, b))).collect();
+        assert_eq!(
+            marks,
+            [(0, (1, 1)), (2, (1, 2)), (4, (1, 3)), (6, (1, 4)), (8, (1, 5)), (10, (1, 6)), (12, (2, 1))]
+        );
+        // Triplet eighths in 4/4: three to the beat.
+        assert_eq!(four.beat_at(3 * 8), Some((1, 2)));
+        assert_eq!(four.beat_at(8), None);
+        for bad in ["0/4", "17/4", "4/3", "4/32", "4", "a/4", "4/4/4", ""] {
+            assert_eq!(Meter::from_name(bad), None, "{bad}");
+        }
+        assert_eq!(Meter::from_name("16/16").map(Meter::name).as_deref(), Some("16/16"));
     }
 
     #[test]

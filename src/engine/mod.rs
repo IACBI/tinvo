@@ -28,7 +28,7 @@ use crate::strip::{self, Strip, track_param};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
-pub use transport::{Division, PULSES_PER_BEAT};
+pub use transport::{Division, Meter, PULSES_PER_BEAT};
 
 pub const MAX_TRACKS: usize = 16;
 pub const MAX_STEPS: usize = 64;
@@ -289,6 +289,11 @@ pub enum Edit {
     SetPatternDivision {
         pattern: u8,
         division: Division,
+    },
+    /// `pattern`'s time signature. It changes only what the UI draws.
+    SetPatternMeter {
+        pattern: u8,
+        meter: Meter,
     },
     SetMasterGain(f32),
     /// Swing in percent (`MIN_SWING..=MAX_SWING`).
@@ -1450,6 +1455,7 @@ impl Engine {
                     self.realign();
                 }
             }
+            Edit::SetPatternMeter { .. } => {}
             Edit::InsertSongEntry { index, pattern } => {
                 let i = usize::from(index);
                 if self.song_len < MAX_SONG && i <= self.song_len && usize::from(pattern) < MAX_PATTERNS {

@@ -31,8 +31,8 @@
 
 use crate::dsp::noise::Rng;
 use crate::engine::{
-    Command, Division, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Part, Shared, Step,
-    target_spec,
+    Command, Division, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Meter, Part, Shared,
+    Step, target_spec,
 };
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
@@ -544,6 +544,7 @@ fn project_seeds() -> Vec<Vec<u8>> {
     rich.pattern_lens[15] = 64;
     rich.divisions[1] = Division::EighthTriplet;
     rich.divisions[15] = Division::ThirtySecond;
+    rich.meters[1] = Meter::new(6, 8).expect("a valid meter");
     rich.swing = 62.5;
     rich.mix[mp::LIMITER] = MIX_PARAMS[mp::LIMITER].max;
     rich.mix[mp::REVERB_DECAY] = MIX_PARAMS[mp::REVERB_DECAY].max;
@@ -1092,7 +1093,13 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let edit = match s.below(24) {
         0 => Edit::SetTempo(s.f32()),
         1 if s.byte() & 1 == 0 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
-        1 => Edit::SetPatternDivision { pattern, division: Division::ALL[s.below(Division::ALL.len())] },
+        1 if s.byte() & 1 == 0 => {
+            Edit::SetPatternDivision { pattern, division: Division::ALL[s.below(Division::ALL.len())] }
+        }
+        1 => {
+            let meter = Meter::new(s.byte() % 18, 1 << s.below(6)).unwrap_or_default();
+            Edit::SetPatternMeter { pattern, meter }
+        }
         2 => Edit::SetMasterGain(s.f32()),
         3 => Edit::SetSwing(s.f32()),
         4 => Edit::AddTrack(s.kind()),
