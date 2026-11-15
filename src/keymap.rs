@@ -130,6 +130,7 @@ actions! {
     MidiInputs "midi_inputs" Global [c('M')] "MIDI input";
     StepEntry "step_entry" Global [c('R')] "step entry: MIDI notes write the step at the cursor (held together: a chord)";
     Record "record" Global [c('I')] "record into the sampler track; again stops and loads the take";
+    RecordNotes "record_notes" Global [c('C')] "record notes played on the MIDI keyboard into the track while it plays (settings: overdub or replace, timing, count-in); again stops";
     DeleteTrack "delete_track" Track [c('D')] "delete the track";
     RenameTrack "rename_track" Track [c('r')] "rename the track";
     Mute "mute" Track [c('m')] "mute the track";

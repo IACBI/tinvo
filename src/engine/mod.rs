@@ -418,6 +418,125 @@ pub enum Command {
     },
     /// The track live notes play on from now on.
     SetLiveTrack(u8),
+    /// Hands the live notes and the steps the live track passes to the
+    /// take queue ([`Take`]) from now on, or stops.
+    RecordNotes(bool),
+    /// Clicks `bars` bars of `bar_beats` beats, each `beat_pulses` long,
+    /// then starts like `Play` (`entry: None`) or `PlaySong` on the frame
+    /// the last beat ends. Ignored while playing or counting in.
+    CountIn {
+        bars: u8,
+        bar_beats: u8,
+        beat_pulses: u16,
+        entry: Option<u16>,
+    },
+}
+
+/// Capacity of the queue that hands recorded notes to the UI thread.
+pub const TAKE_QUEUE: usize = 1024;
+
+/// What the engine reports while it records ([`Command::RecordNotes`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Take {
+    /// A key pressed on the live track, at its nearest step of the pattern
+    /// the track plays there, `offset` ticks from it as playback places
+    /// hits. `early`: that step had not played yet, so the note belongs to
+    /// the pass that is coming. `position` is in 16th notes from where
+    /// playback started (negative during a count-in).
+    On { track: u8, note: u8, velocity: u8, pattern: u8, step: u8, offset: i8, early: bool, position: f64 },
+    /// A recorded key ended: released, or still down when recording,
+    /// playback or the track it played on stopped. `length` is in steps of
+    /// its step's pattern, the step whose start is nearest the end (swung
+    /// steps where swing puts them, as playback ends a note).
+    Off { note: u8, length: u8 },
+    /// The live track played `step` of `pattern`.
+    Passed { track: u8, pattern: u8, step: u8 },
+    /// A track was inserted or removed: the reports before this name the
+    /// tracks as they were, the ones after as they are.
+    Layout,
+}
+
+/// The step a key is recorded on.
+#[derive(Clone, Copy)]
+struct Recorded {
+    pattern: u8,
+    step: u8,
+    offset: i8,
+    early: bool,
+    /// Where the step starts, and its pattern's division.
+    pulse: u64,
+    division: Division,
+}
+
+/// A key recorded and still down: where its step starts, to measure its
+/// length.
+#[derive(Clone, Copy)]
+struct RecHeld {
+    note: u8,
+    pulse: u64,
+    division: Division,
+}
+
+/// A count-in under way: clicks on `beats` beats from `origin`, then Play.
+#[derive(Clone, Copy, Debug)]
+struct CountIn {
+    entry: Option<u16>,
+    origin: u64,
+    /// Frames in a beat.
+    beat: f64,
+    beats: u32,
+    bar_beats: u32,
+    /// The beat whose click comes next.
+    next: u32,
+    /// The tempo playback starts at.
+    bpm: f64,
+}
+
+impl CountIn {
+    fn click_frame(&self, k: u32) -> u64 {
+        self.origin + (f64::from(k) * self.beat).round() as u64
+    }
+
+    /// The frame playback starts on.
+    fn start(&self) -> u64 {
+        self.click_frame(self.beats)
+    }
+}
+
+/// The count-in's click: a short decaying sine, higher on a bar's first
+/// beat.
+#[derive(Clone, Copy, Debug, Default)]
+struct Click {
+    phase: f32,
+    inc: f32,
+    gain: f32,
+    decay: f32,
+}
+
+impl Click {
+    fn trigger(&mut self, accent: bool, sample_rate: f32) {
+        let hz = if accent { 1760.0 } else { 1320.0 };
+        // From the crest, so the click starts on its frame.
+        self.phase = std::f32::consts::FRAC_PI_2;
+        self.inc = hz / sample_rate * std::f32::consts::TAU;
+        self.gain = 0.3;
+        self.decay = (-1.0 / (0.012 * sample_rate)).exp();
+    }
+
+    fn render(&mut self, l: &mut [f32], r: &mut [f32]) {
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            // Per sample, so the tail ends on the same frame at any block size.
+            if self.gain < 1e-4 {
+                self.gain = 0.0;
+                return;
+            }
+            let v = self.phase.sin() * self.gain;
+            *a += v;
+            *b += v;
+            self.phase = (self.phase + self.inc) % std::f32::consts::TAU;
+            self.gain *= self.decay;
+        }
+    }
 }
 
 /// Work one audio callback spends on commands, in units of a simple edit.
@@ -526,6 +645,15 @@ pub struct Shared {
     pub loudness: [AtomicF32; 3],
     /// Fraction of the real-time budget spent in the last callbacks.
     pub load: AtomicF32,
+    /// While counting in: the beat counted (from 1) in the high half, the
+    /// beats to count in the low half; 0 otherwise.
+    pub count_in: AtomicU32,
+    /// Take events lost to a full take queue.
+    pub takes_lost: AtomicU32,
+    /// [`Command::RecordNotes`] commands handled. Every take event the
+    /// engine pushed before handling one is in the queue once this counts
+    /// it, so the UI knows when a take is complete.
+    pub record_commands: AtomicU32,
 }
 
 impl Default for Shared {
@@ -546,6 +674,9 @@ impl Shared {
             limiter_reduction: AtomicF32::new(0.0),
             loudness: std::array::from_fn(|_| AtomicF32::new(f32::NAN)),
             load: AtomicF32::new(0.0),
+            count_in: AtomicU32::new(0),
+            takes_lost: AtomicU32::new(0),
+            record_commands: AtomicU32::new(0),
         }
     }
 }
@@ -936,6 +1067,16 @@ pub struct Engine {
     /// Live notes sounding, oldest first.
     held: [Held; MAX_LIVE],
     held_count: usize,
+    /// Where recorded notes go ([`Command::RecordNotes`]).
+    takes: Option<Producer<Take>>,
+    recording: bool,
+    /// Recorded keys still down, oldest first.
+    rec_held: [RecHeld; MAX_LIVE],
+    rec_count: usize,
+    /// The frame `render_block` has reached; no hit is queued before it.
+    cursor: u64,
+    count_in: Option<CountIn>,
+    click: Click,
 }
 
 /// A removed track and the frames left of its fade.
@@ -998,6 +1139,13 @@ impl Engine {
             live_track: 0,
             held: [Held { track: 0, note: 0, voice: VoiceId::NONE }; MAX_LIVE],
             held_count: 0,
+            takes: None,
+            recording: false,
+            rec_held: [RecHeld { note: 0, pulse: 0, division: Division::Sixteenth }; MAX_LIVE],
+            rec_count: 0,
+            cursor: 0,
+            count_in: None,
+            click: Click::default(),
         })
     }
 
@@ -1038,6 +1186,11 @@ impl Engine {
     /// and pass to its successor.
     pub fn attach_live(&mut self, mailbox: Arc<Mailbox<LiveNote>>) {
         self.live = Some(mailbox);
+    }
+
+    /// Sends what [`Command::RecordNotes`] records to `queue`.
+    pub fn attach_takes(&mut self, queue: Producer<Take>) {
+        self.takes = Some(queue);
     }
 
     /// Routes every sample the engine releases from now on to `queue`.
@@ -1105,15 +1258,33 @@ impl Engine {
                 // Track indices are about to shift; held notes would lose
                 // their tracks.
                 if matches!(e, Edit::AddTrack(_) | Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) {
+                    self.end_recorded();
                     self.release_live();
                 }
+                let layout = matches!(e, Edit::InsertTrack { .. } | Edit::RemoveTrack(_));
                 self.apply(e);
+                if layout && self.recording {
+                    self.push_take(Take::Layout);
+                }
             }
             Command::SetLiveTrack(t) => self.live_track = usize::from(t),
-            Command::Play => self.start(None),
-            Command::PlaySong { entry } => self.start(Some(entry)),
+            Command::Play => self.start(None, self.now),
+            Command::PlaySong { entry } => self.start(Some(entry), self.now),
+            Command::RecordNotes(on) => {
+                if !on {
+                    self.end_recorded();
+                }
+                self.recording = on;
+                self.shared.record_commands.fetch_add(1, Ordering::Release);
+            }
+            Command::CountIn { bars, bar_beats, beat_pulses, entry } => {
+                self.begin_count_in(bars, bar_beats, beat_pulses, entry)
+            }
             Command::Cue(p) => self.cue = p.min(MAX_PATTERNS as u8 - 1),
             Command::Stop => {
+                self.end_recorded();
+                self.count_in = None;
+                self.click.gain = 0.0;
                 self.transport.stop();
                 self.current = None;
                 self.conductor = None;
@@ -1153,14 +1324,219 @@ impl Engine {
         for _ in 0..LIVE_BUDGET {
             let Some(n) = live.pop() else { break };
             if n == LiveNote::ALL_OFF {
+                self.end_recorded();
                 self.release_live();
             } else if n.velocity == 0 {
+                self.record_off(n.note);
                 self.live_off(n.note);
             } else {
+                self.record_on(n.note, n.velocity);
                 self.live_on(n.note, n.velocity);
             }
         }
         self.live = Some(live);
+    }
+
+    fn push_take(&mut self, take: Take) {
+        if let Some(q) = self.takes.as_mut() {
+            if q.push(take).is_err() {
+                self.shared.takes_lost.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Where a live note played now sounds, in 16th notes from where
+    /// playback started (or starts, during a count-in).
+    fn take_position(&self) -> Option<f64> {
+        if self.transport.is_playing() {
+            Some(self.transport.position_at(self.now))
+        } else {
+            let c = self.count_in?;
+            let sixteenth = f64::from(self.sample_rate) * 15.0 / c.bpm;
+            Some(-(c.start().saturating_sub(self.now) as f64) / sixteenth)
+        }
+    }
+
+    /// Records a key pressed now on the live track at its nearest step.
+    fn record_on(&mut self, note: u8, velocity: u8) {
+        let t = self.live_track;
+        if !self.recording || t >= self.track_count {
+            return;
+        }
+        let Some(position) = self.take_position() else { return };
+        let found = if self.transport.is_playing() { self.nearest_step(t, position) } else { self.first_step(t) };
+        let Some(s) = found else { return };
+        // A key pressed again before its release ends its first press.
+        self.record_off(note);
+        if self.rec_count == MAX_LIVE {
+            self.end_held(0);
+        }
+        self.rec_held[self.rec_count] = RecHeld { note, pulse: s.pulse, division: s.division };
+        self.rec_count += 1;
+        let (track, pattern, step, offset, early) = (t as u8, s.pattern, s.step, s.offset, s.early);
+        self.push_take(Take::On { track, note, velocity, pattern, step, offset, early, position });
+    }
+
+    fn record_off(&mut self, note: u8) {
+        if let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.note == note) {
+            self.end_held(k);
+        }
+    }
+
+    /// Ends every recorded key still down.
+    fn end_recorded(&mut self) {
+        while self.rec_count > 0 {
+            self.end_held(0);
+        }
+    }
+
+    fn end_held(&mut self, k: usize) {
+        let h = self.rec_held[k];
+        self.rec_held.copy_within(k + 1..self.rec_count, k);
+        self.rec_count -= 1;
+        let length = match self.take_position() {
+            Some(end) => self.held_length(h, end),
+            None => 1,
+        };
+        self.push_take(Take::Off { note: h.note, length });
+    }
+
+    /// The length in steps of a key held from step `h` until `end` (in 16th
+    /// notes): the steps to the step start nearest `end`, as playback ends
+    /// a note at the (swung) start of the step its length reaches.
+    fn held_length(&self, h: RecHeld, end: f64) -> u8 {
+        let tr = &self.transport;
+        let d = u64::from(h.division.pulses());
+        let start = |l: u64| tr.step_position(h.pulse + l * d, h.division);
+        let guess = ((end - start(0)) / h.division.sixteenths()).round().clamp(1.0, MAX_STEPS as f64) as u64;
+        let best = (guess.saturating_sub(1).max(1)..=(guess + 1).min(MAX_STEPS as u64))
+            .min_by(|&a, &b| (start(a) - end).abs().total_cmp(&(start(b) - end).abs()));
+        best.unwrap_or(1) as u8
+    }
+
+    /// Frames per micro-timing tick of a step at `pulse`, as playback places
+    /// its hits: a late hit of a step in the next entry takes that entry's
+    /// tempo, any other the tempo now at the step.
+    fn tick_frames(&self, pulse: u64, division: Division, late: bool) -> f64 {
+        let sixteenth = if late && pulse >= self.entry_end() && self.tempo_lane() {
+            f64::from(self.sample_rate) * 15.0 / self.entry_tempo(&self.peek_upcoming()).0
+        } else {
+            self.transport.step_frames(pulse as f64 / 6.0)
+        };
+        sixteenth * division.sixteenths() / f64::from(TICKS_PER_STEP)
+    }
+
+    /// Track `t`'s step nearest `position` while playing: a step of the
+    /// pattern it plays in the current entry, or the first of the next
+    /// entry's (while the track rests, only within half a step of it).
+    /// Swung steps are where swing puts them.
+    fn nearest_step(&self, t: usize, position: f64) -> Option<Recorded> {
+        let tr = &self.transport;
+        let e = self.entry_now();
+        let end = e.start + self.pattern_pulses(e.pattern);
+        let p = self.track_pattern(t, &e);
+        let mut best: Option<(f64, u8, u8, Division, f64, u64)> = None;
+        let mut consider = |pos: f64, pattern: u8, step: u8, division: Division, pulse: u64| {
+            let d = (pos - position).abs();
+            if best.is_none_or(|b| d < b.0) {
+                best = Some((d, pattern, step, division, pos, pulse));
+            }
+        };
+        if let Some(p) = p {
+            let d = self.divisions[usize::from(p)];
+            let dp = u64::from(d.pulses());
+            let len = u64::from(self.pattern_lens[usize::from(p)].max(1));
+            let rel = (position * 6.0 - e.start as f64).max(0.0);
+            let n = (rel / dp as f64).floor() as u64;
+            for k in n.saturating_sub(1)..=n + 1 {
+                let pulse = e.start + k * dp;
+                if pulse < end {
+                    consider(tr.step_position(pulse, d), p, (k % len) as u8, d, pulse);
+                }
+            }
+        }
+        let u = self.peek_upcoming();
+        if let Some(q) = self.track_pattern(t, &u) {
+            let d = self.divisions[usize::from(q)];
+            let pos = tr.step_position(u.start, d);
+            if p.is_some() || pos - position <= d.sixteenths() / 2.0 {
+                consider(pos, q, 0, d, u.start);
+            }
+        }
+        let (_, pattern, step, division, step_pos, pulse) = best?;
+        // The track's clock is its next step to fire: a step before it has
+        // played.
+        let early = self.tracks[t].clock.is_none_or(|c| pulse >= c.pulse);
+        let step_frame = if early { self.later_frame(step_pos) as f64 } else { tr.exact_frame(step_pos) };
+        let frames = self.now as f64 - step_frame;
+        let ticks = (frames / self.tick_frames(pulse, division, frames > 0.0)).round();
+        let offset = ticks.clamp(f64::from(-MAX_OFFSET), f64::from(MAX_OFFSET)) as i8;
+        Some(Recorded { pattern, step, offset, early, pulse, division })
+    }
+
+    /// Track `t`'s first step after a count-in, for a key pressed within
+    /// half a step of its end; `None` earlier, or where the track rests.
+    fn first_step(&self, t: usize) -> Option<Recorded> {
+        let c = self.count_in?;
+        let pattern = match c.entry {
+            Some(e) if self.song_len > 0 => {
+                let i = usize::from(e).min(self.song_len - 1);
+                match self.tracks[t].parts[i] {
+                    Part::Follow => self.song[i],
+                    Part::Pattern(p) => p,
+                    Part::Rest => return None,
+                }
+            }
+            _ => self.cue,
+        };
+        let division = self.divisions[usize::from(pattern)];
+        let sixteenth = f64::from(self.sample_rate) * 15.0 / c.bpm;
+        let before = c.start().saturating_sub(self.now) as f64 / sixteenth;
+        if before > division.sixteenths() / 2.0 {
+            return None;
+        }
+        let ticks = (-before / division.sixteenths() * f64::from(TICKS_PER_STEP)).round();
+        let offset = ticks.max(f64::from(-MAX_OFFSET)) as i8;
+        Some(Recorded { pattern, step: 0, offset, early: true, pulse: 0, division })
+    }
+
+    fn begin_count_in(&mut self, bars: u8, bar_beats: u8, beat_pulses: u16, entry: Option<u16>) {
+        if self.transport.is_playing() || self.count_in.is_some() || bars == 0 {
+            return;
+        }
+        let bpm = match entry {
+            Some(e) if self.song_len > 0 => {
+                entry_tempo(
+                    usize::from(e).min(self.song_len - 1),
+                    self.song_len,
+                    self.tempo_ramp,
+                    self.tempo,
+                    |j| self.tempo_points[j],
+                    |j| self.pattern_pulses(self.song[j]),
+                )
+                .0
+            }
+            _ => f64::from(self.tempo),
+        };
+        let bar_beats = u32::from(bar_beats.max(1));
+        let beat = f64::from(beat_pulses.max(1)) / 6.0 * f64::from(self.sample_rate) * 15.0 / bpm;
+        let beats = u32::from(bars) * bar_beats;
+        self.count_in = Some(CountIn { entry, origin: self.now, beat, beats, bar_beats, next: 0, bpm });
+    }
+
+    /// Clicks the count-in's beats due at `pos` and starts playback when it
+    /// ends there.
+    fn count_in_at(&mut self, pos: u64) {
+        let Some(mut c) = self.count_in else { return };
+        if c.next < c.beats && c.click_frame(c.next) == pos {
+            self.click.trigger(c.next % c.bar_beats == 0, self.sample_rate);
+            c.next += 1;
+            self.count_in = Some(c);
+        }
+        if c.next == c.beats && c.start() == pos {
+            self.count_in = None;
+            self.start(c.entry, pos);
+        }
     }
 
     fn live_on(&mut self, note: u8, velocity: u8) {
@@ -1207,10 +1583,11 @@ impl Engine {
         }
     }
 
-    /// Starts the pattern loop (`None`) or the song at an entry. Ignored
-    /// while already playing.
-    fn start(&mut self, entry: Option<u16>) {
-        if self.transport.is_playing() {
+    /// Starts the pattern loop (`None`) or the song at an entry, on frame
+    /// `at` (inside the block being rendered). Ignored while already
+    /// playing or counting in.
+    fn start(&mut self, entry: Option<u16>, at: u64) {
+        if self.transport.is_playing() || self.count_in.is_some() {
             return;
         }
         self.song_mode = entry.is_some() && self.song_len > 0;
@@ -1224,9 +1601,9 @@ impl Engine {
         self.rng = Rng::new(CHANCE_SEED);
         self.loudness.reset();
         if self.transport.tempo() != (f64::from(self.tempo), 0.0) {
-            self.transport.set_tempo(self.tempo, self.sample_rate, self.now, 0.0);
+            self.transport.set_tempo(self.tempo, self.sample_rate, at, 0.0);
         }
-        self.transport.start(self.now);
+        self.transport.start(at);
         let e = self.entry;
         if self.tempo_lane() {
             let (bpm, slope) = self.entry_tempo(&e);
@@ -1822,7 +2199,8 @@ impl Engine {
             self.render_block(chunk);
         }
         let s = &self.shared;
-        s.playing.store(self.transport.is_playing(), Ordering::Relaxed);
+        s.playing.store(self.transport.is_playing() || self.count_in.is_some(), Ordering::Relaxed);
+        s.count_in.store(self.count_in.map_or(0, |c| c.next.min(c.beats) << 16 | c.beats), Ordering::Relaxed);
         s.position.store(self.current.map_or(u32::MAX, PlayPosition::pack), Ordering::Relaxed);
         for (i, slot) in s.track_steps.iter().enumerate() {
             let shown = self.tracks[..self.track_count].get(i).and_then(|t| t.shown);
@@ -1889,6 +2267,9 @@ impl Engine {
             self.tracks[t].clock = Some(k);
             self.tracks[t].shown = k.pattern.map(|p| (p, k.idx));
             *fired = true;
+            if let Some(pattern) = k.pattern.filter(|_| self.recording && t == self.live_track) {
+                self.push_take(Take::Passed { track: t as u8, pattern, step: k.idx });
+            }
             // Before the step's hits fire, so a point shapes the hit on its
             // step.
             self.update_segments(t, k, end);
@@ -2031,14 +2412,9 @@ impl Engine {
         // A late hit of a step looked ahead to in the next entry sounds in
         // that entry's tempo. An early one sounds before it starts, in the
         // tempo now, which also keeps it within the lookahead's reach.
-        let sixteenth = if step.offset > 0 && k.pulse >= self.entry_end() && self.tempo_lane() {
-            f64::from(self.sample_rate) * 15.0 / self.entry_tempo(&self.peek_upcoming()).0
-        } else {
-            tr.step_frames(k.pulse as f64 / 6.0)
-        };
-        let tick = sixteenth * k.division.sixteenths() / f64::from(TICKS_PER_STEP);
+        let tick = self.tick_frames(k.pulse, k.division, step.offset > 0);
         let shift = (f64::from(step.offset) * tick).round() as i64;
-        let at = start.saturating_add_signed(shift).max(self.now);
+        let at = start.saturating_add_signed(shift).max(self.cursor);
         let r = u64::from(step.ratchet);
         let gate = if r > 1 {
             (span / r).max(1)
@@ -2061,8 +2437,13 @@ impl Engine {
         let end = start + n as u64;
         let mut pos = start;
         while pos < end {
+            self.cursor = pos;
+            self.count_in_at(pos);
             self.fire_due(pos);
             let mut next = end;
+            if let Some(c) = &self.count_in {
+                next = next.min(if c.next < c.beats { c.click_frame(c.next) } else { c.start() });
+            }
             if self.ramping {
                 self.automate(pos);
                 next = next.min((pos / AUTOMATION_TICK + 1) * AUTOMATION_TICK);
@@ -2079,6 +2460,7 @@ impl Engine {
             debug_assert!(next > pos);
             let (a, b) = ((pos - start) as usize, (next - start) as usize);
             self.render_segment(a, b);
+            self.click.render(&mut self.mix_l[a..b], &mut self.mix_r[a..b]);
             // The buses and master run segment by segment too, so an
             // automated bus or master setting changes on its own frame.
             self.mix.add_returns(&mut self.mix_l[a..b], &mut self.mix_r[a..b], a);
@@ -2492,6 +2874,279 @@ mod tests {
 
     fn press(live: &Mailbox<LiveNote>, note: u8, velocity: u8) {
         live.push(LiveNote { note, velocity }).unwrap();
+    }
+
+    /// A live engine whose takes come out of the returned queue.
+    fn take_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<LiveNote>>, spsc::Consumer<Take>) {
+        let (mut e, live) = live_engine(edits);
+        let (tx, rx) = spsc::channel(TAKE_QUEUE);
+        e.attach_takes(tx);
+        (e, live, rx)
+    }
+
+    fn takes(rx: &mut spsc::Consumer<Take>) -> Vec<Take> {
+        std::iter::from_fn(|| rx.pop()).collect()
+    }
+
+    fn on(note: u8, pattern: u8, step: u8, offset: i8, early: bool, position: f64) -> Take {
+        Take::On { track: 0, note, velocity: 100, pattern, step, offset, early, position }
+    }
+
+    fn passed(pattern: u8, step: u8) -> Take {
+        Take::Passed { track: 0, pattern, step }
+    }
+
+    #[test]
+    fn recorded_notes_land_on_their_nearest_step() {
+        // 16ths of 6000 frames; a callback's live notes sound on its first
+        // frame, so each key is pressed at the frame the engine has reached.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.push(Edit::AddTrack(InstrumentKind::Synth));
+        let (mut e, live, mut rx) = take_engine(&edits);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        run(&mut e, 6000);
+        press(&live, 60, 100);
+        run(&mut e, 7500);
+        press(&live, 62, 100);
+        press(&live, 60, 0);
+        run(&mut e, 8500);
+        press(&live, 64, 100);
+        run(&mut e, 1000);
+        press(&live, 62, 0);
+        run(&mut e, 10);
+        assert_eq!(
+            takes(&mut rx),
+            [
+                passed(0, 0),
+                // On its step's frame, before the step plays in the callback.
+                on(60, 0, 1, 0, true, 1.0),
+                passed(0, 1),
+                passed(0, 2),
+                // A quarter of a step late; the step has played.
+                on(62, 0, 2, 6, false, 2.25),
+                Take::Off { note: 60, length: 1 },
+                passed(0, 3),
+                // A third of a step before the pattern starts again: its first
+                // step, early, for the pass that comes.
+                on(64, 0, 0, -8, true, 22_000.0 / 6000.0),
+                // Held from step 2 to nearer step 4's start than step 3's.
+                Take::Off { note: 62, length: 2 },
+            ]
+        );
+        // Another track records as the live track; stopping ends the keys
+        // still down, and then nothing is reported.
+        e.handle(Command::SetLiveTrack(1));
+        press(&live, 65, 100);
+        run(&mut e, 10);
+        assert!(matches!(takes(&mut rx)[..], [Take::On { track: 1, .. }]));
+        run(&mut e, 2 * 6000);
+        let on_one = |step| Take::Passed { track: 1, pattern: 0, step };
+        assert_eq!(takes(&mut rx), [on_one(0), on_one(1)]);
+        e.handle(Command::RecordNotes(false));
+        assert_eq!(takes(&mut rx), [Take::Off { note: 64, length: 2 }, Take::Off { note: 65, length: 2 }]);
+        press(&live, 65, 0);
+        press(&live, 66, 100);
+        run(&mut e, 30_000);
+        assert!(takes(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn recorded_notes_find_swung_steps_and_the_next_entry() {
+        // At 75 % swing step 1 sounds at 9000: a key at 8000 is 4 ticks
+        // early for it, not 8 late for step 1's straight place.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.push(Edit::SetSwing(75.0));
+        let (mut e, live, mut rx) = take_engine(&edits);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        run(&mut e, 8000);
+        press(&live, 60, 100);
+        run(&mut e, 10);
+        assert_eq!(takes(&mut rx)[1], on(60, 0, 1, -4, true, 8000.0 / 6000.0));
+        // In the song a key just before an entry ends goes to the next
+        // entry's first step, of that entry's pattern.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.extend([
+            Edit::SetPatternLength { pattern: 1, len: 8 },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 1 },
+        ]);
+        let (mut e, live, mut rx) = take_engine(&edits);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 23_000);
+        press(&live, 60, 100);
+        run(&mut e, 10);
+        assert!(takes(&mut rx).contains(&on(60, 1, 0, -4, true, 23_000.0 / 6000.0)));
+    }
+
+    #[test]
+    fn a_count_in_clicks_each_beat_then_starts_on_the_beat() {
+        // One bar of 4/4 at 120 BPM: clicks at 0, 24 000, 48 000 and 72 000,
+        // the first higher; the pattern's first hit at 96 000.
+        let edits = {
+            let mut v = hat_hits(Division::Sixteenth, 16, &[0]);
+            v.push(Edit::AddTrack(InstrumentKind::Synth));
+            v
+        };
+        let count_in = || Command::CountIn { bars: 1, bar_beats: 4, beat_pulses: 24, entry: None };
+        let mut e = engine(&edits);
+        e.handle(count_in());
+        let out = run(&mut e, 24_000);
+        assert!(e.shared.playing.load(Ordering::Relaxed), "counting in counts as playing");
+        assert_eq!(e.shared.count_in.load(Ordering::Relaxed), 1 << 16 | 4);
+        assert!(e.shared.position().is_none());
+        let mut out = out;
+        out.extend(run(&mut e, 80_000));
+        assert_eq!(onsets(&out, 2000), [0, 24_000, 48_000, 72_000, 96_000]);
+        assert_eq!(e.shared.count_in.load(Ordering::Relaxed), 0);
+        assert_eq!(e.shared.position().map(|p| p.step), Some(1));
+        // The same at any buffer size.
+        for size in [1usize, 17, 4096] {
+            let mut e = engine(&edits);
+            e.handle(count_in());
+            let mut got = Vec::new();
+            while got.len() < out.len() {
+                got.extend(run(&mut e, size.min((out.len() - got.len()) / 2)));
+            }
+            assert!(got == out, "buffer size {size}");
+        }
+        // Stop ends a count-in; Play waits for one to end.
+        let mut e = engine(&edits);
+        e.handle(count_in());
+        run(&mut e, 1000);
+        e.handle(Command::Play);
+        e.handle(Command::Stop);
+        assert!(run(&mut e, 200_000)[20_000..].iter().all(|&x| x == 0.0));
+        assert!(!e.shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_key_just_before_a_count_in_ends_is_the_first_step_played_early() {
+        let (mut e, live, mut rx) = take_engine(&hat_hits(Division::Sixteenth, 16, &[]));
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::CountIn { bars: 1, bar_beats: 4, beat_pulses: 24, entry: None });
+        run(&mut e, 90_000);
+        press(&live, 59, 100);
+        run(&mut e, 10);
+        assert!(takes(&mut rx).is_empty(), "a step and more before the start");
+        run(&mut e, 4490);
+        press(&live, 60, 100);
+        run(&mut e, 10);
+        assert_eq!(takes(&mut rx), [on(60, 0, 0, -6, true, -0.25)]);
+    }
+
+    #[test]
+    fn a_recorded_offset_plays_back_where_the_key_was_played_under_a_ramp() {
+        // 30 BPM ramping to 300 over the first entry's two 16ths: a key 0.3
+        // of a 16th after step 0 sounds about 4.6 ticks of 1000 frames after
+        // it, though 7.2 ticks of straight time.
+        let song = |offset: i8| {
+            let mut v = hat_hits(Division::Sixteenth, 2, &[]);
+            v.extend([
+                Edit::InsertSongEntry { index: 0, pattern: 0 },
+                Edit::InsertSongEntry { index: 1, pattern: 0 },
+                Edit::SetTempoPoint { index: 0, bpm: Some(30.0) },
+                Edit::SetTempoPoint { index: 1, bpm: Some(300.0) },
+                Edit::SetTempoRamp(true),
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step { offset, ..Step::new(60, 127, 1) }) },
+            ]);
+            v
+        };
+        let at = span_frames(30.0, 135.0, 0.3, SR).round() as usize;
+        let (mut e, live, mut rx) = take_engine(&song(0));
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, at);
+        press(&live, 61, 100);
+        run(&mut e, 10);
+        let got = takes(&mut rx);
+        let offset = got.iter().find_map(|t| match *t {
+            Take::On { step: 0, offset, .. } => Some(offset),
+            _ => None,
+        });
+        assert_eq!(offset, Some((at as f64 / 1000.0).round() as i8), "{got:?}");
+        // Played back, the hit lands within half a tick of the key.
+        let mut e = engine(&song(offset.unwrap()));
+        e.handle(Command::PlaySong { entry: 0 });
+        let hit = first_sound(&run(&mut e, 20_000)).unwrap();
+        assert!(hit.abs_diff(at) <= 500, "{hit} vs {at}");
+    }
+
+    #[test]
+    fn a_key_after_its_step_played_is_late_through_a_tempo_change() {
+        let (mut e, live, mut rx) = take_engine(&hat_hits(Division::Sixteenth, 4, &[]));
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        run(&mut e, 1000);
+        e.handle(Command::Edit(Edit::SetTempo(121.0)));
+        press(&live, 60, 100);
+        run(&mut e, 10);
+        let got = takes(&mut rx);
+        assert!(
+            matches!(got[..], [Take::Passed { step: 0, .. }, Take::On { step: 0, early: false, offset: 4, .. }]),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_while_the_track_rests_waits_for_the_next_entry_s_first_step() {
+        let mut edits = hat_hits(Division::Sixteenth, 8, &[]);
+        edits.extend([
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::SetPart { track: 0, index: 0, part: Part::Rest },
+        ]);
+        let (mut e, live, mut rx) = take_engine(&edits);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 6000);
+        press(&live, 60, 100);
+        run(&mut e, 10);
+        assert!(takes(&mut rx).is_empty(), "seven steps before the next entry");
+        run(&mut e, 46_000 - 6010);
+        press(&live, 62, 100);
+        run(&mut e, 10);
+        assert_eq!(takes(&mut rx), [on(62, 0, 0, -8, true, 46_000.0 / 6000.0)]);
+    }
+
+    #[test]
+    fn a_count_in_starts_an_early_ratcheted_first_step_alike_at_any_buffer_size() {
+        // At 123 BPM the count-in ends inside an internal block.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        let first = Step { offset: -6, ratchet: 2, ..Step::new(60, 127, 1) };
+        edits.extend([Edit::SetTempo(123.0), Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(first) }]);
+        let render = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::CountIn { bars: 1, bar_beats: 4, beat_pulses: 24, entry: None });
+            let mut out = Vec::new();
+            while out.len() < 2 * 110_000 {
+                out.extend(run(&mut e, size.min(110_000 - out.len() / 2)));
+            }
+            out
+        };
+        let reference = render(1);
+        assert_eq!(onsets(&reference[2 * 90_000..], 1000).len(), 2, "both ratchets after the clicks");
+        for size in [17, 4096] {
+            assert!(render(size) == reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_key_held_to_the_next_swung_step_lasts_one_step() {
+        // At 75 % swing step 1 starts 1.5 16ths after step 0, where a
+        // one-step note ends.
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[]);
+        edits.push(Edit::SetSwing(75.0));
+        let (mut e, live, mut rx) = take_engine(&edits);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        press(&live, 60, 100);
+        run(&mut e, 9000);
+        press(&live, 60, 0);
+        run(&mut e, 10);
+        assert!(takes(&mut rx).contains(&Take::Off { note: 60, length: 1 }));
     }
 
     #[test]

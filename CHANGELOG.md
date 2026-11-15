@@ -6,6 +6,11 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- Recording notes while the pattern plays (`C`). Each key played on the MIDI keyboard lands on its nearest step of the selected track (a swung step where swing puts it, or the next song entry's first step), with its velocity and its length in steps (measured by the engine, so a key held to the next swung step lasts one step). Its distance from the step is kept as micro-timing, landing where the key was played under a tempo ramp too, or dropped with `record_timing = quantize`. Notes on one step make a chord of up to four. With `record_mode = overdub` (the default) they add to the steps; with `replace` each step the playhead passes keeps only what that pass played. The take is one undo step, written when `C` or Stop ends it, before quitting or when the audio device goes; keys still held then end there, and playback goes on after `C`. Tracks inserted or removed while recording keep each note on the track it was played on.
+- A count-in: with `count_in = 1` or `2`, recording from a stop first clicks that many bars of the pattern's time signature, the first beat of each bar higher, then starts on the beat. A key played within half a step before the count-in ends lands on the first step. The top bar shows the beat counted, then `● REC NOTES`.
+- The settings page's options tab has the recording options next to the mouse.
+
 ## [0.23.0] - 2026-11-15
 
 ### Added
