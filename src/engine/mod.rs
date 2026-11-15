@@ -2028,8 +2028,10 @@ impl Engine {
         let span = step_end.saturating_sub(start).max(1);
         // Ticks are a fraction of a straight step, so the earliest offset
         // never reaches back past the (possibly swing-shortened) step before.
-        // A step looked ahead to in the next entry takes that entry's tempo.
-        let sixteenth = if k.pulse >= self.entry_end() && self.tempo_lane() {
+        // A late hit of a step looked ahead to in the next entry sounds in
+        // that entry's tempo. An early one sounds before it starts, in the
+        // tempo now, which also keeps it within the lookahead's reach.
+        let sixteenth = if step.offset > 0 && k.pulse >= self.entry_end() && self.tempo_lane() {
             f64::from(self.sample_rate) * 15.0 / self.entry_tempo(&self.peek_upcoming()).0
         } else {
             tr.step_frames(k.pulse as f64 / 6.0)
@@ -2977,6 +2979,27 @@ mod tests {
         e.apply(Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth });
         assert_eq!(e.tracks[0].instrument.tempo(), Some(60.0));
         assert_eq!(e.tracks[2].instrument.tempo(), Some(60.0));
+    }
+
+    #[test]
+    fn an_early_hit_before_a_slower_entry_is_timed_in_the_tempo_before_it() {
+        // 16 steps at 120, then 20 BPM: the next entry's first hit, half a
+        // step early, sounds half a 120 BPM step before the boundary.
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[]);
+        edits.extend([
+            Edit::SetStep {
+                track: 0,
+                pattern: 0,
+                step: 0,
+                value: Some(Step { offset: -MAX_OFFSET, ..Step::new(60, 127, 1) }),
+            },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::SetTempoPoint { index: 1, bpm: Some(20.0) },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 100_000), 200), [0, 93_000]);
     }
 
     #[test]
