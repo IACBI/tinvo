@@ -125,7 +125,7 @@ Known limits:
 Known limits:
 - No MIDI device was available while developing this phase. The parser, the engine's live notes, step entry and the path from the MIDI handler to both mailboxes are tested; the WinMM, rawmidi and CoreMIDI code compiles and links in CI but has never received a real message.
 - Live notes start at the beginning of the audio callback after they arrive, so their timing jitters by up to one device period (10 ms on the development machine) on top of the output latency. Backends' timestamps are not used yet.
-- Only notes are used: no sustain pedal, pitch bend, controllers or MIDI channels (every channel plays the selected track). There is no live recording while the pattern plays.
+- Only notes are used: no sustain pedal, pitch bend, controllers or MIDI channels (every channel plays the selected track). There is no live recording while the pattern plays (Phase 10a adds it).
 - On Linux, rawmidi sees hardware and USB ports only, not software clients of the ALSA sequencer.
 - A MIDI input that is unplugged stays silent until another one is picked with `M`; it is not reopened by itself.
 - If more than 256 notes arrive within one audio callback, the extra ones are dropped (a dropped release would leave a note held until the key is pressed again).
@@ -364,7 +364,7 @@ Known limits:
 
 ## Phase 10a: Recording notes ✅ (0.24.0)
 
-- `C` records the notes played on the live track while the pattern or song plays. The engine finds each key's nearest step on the frame it sounds, among the steps of the pattern the track plays there (where swing puts them) and the next entry's first step, and reports it with its offset in ticks through a take queue, along with each step the track plays. The UI turns the take into step edits: one undo step, overdub or replace, micro-timing kept or quantized, a chord of up to four notes per step, the length in steps as held.
+- `C` records the notes played on the live track while the pattern or song plays. The engine finds each key's nearest step on the frame it sounds, among the steps of the pattern the track plays there (where swing puts them) and the next entry's first step, and reports it with its offset in ticks through a take queue, along with each step the track plays. The UI turns the take into step edits: one undo step, overdub or replace, micro-timing kept or quantized, a chord of up to four notes per step, the length in steps as held, which the engine measures against the steps it plays. Keys still held when recording stops end there, and tracks inserted or removed meanwhile keep each note on its own track.
 - The engine counts how many record commands it has handled, so the UI writes the take only once every note pushed before the stop is in its queue.
 - A count-in of one or two bars clicks the pattern's beats in the engine, sample-accurately at any buffer size, and starts playback on the frame the last beat ends. A key up to half a step before that lands on the first step.
 - The settings file has `record_mode`, `record_timing` and `count_in` under `[options]`, and the settings page lists them.

@@ -19,7 +19,7 @@ use crate::keymap::{Action, Context, Keymap};
 use crate::lock::{self, Lock};
 use crate::midi::{self, Message};
 use crate::mix;
-use crate::note_take::NoteTake;
+use crate::note_take::{NoteTake, follow_track};
 use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, VOLUME, pattern_name};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
@@ -441,6 +441,8 @@ struct NoteRecording {
     started: bool,
     /// The engine was asked to stop recording.
     closing: bool,
+    /// Recording starts again once this take is written.
+    restart: bool,
     /// [`Shared::takes_lost`] when the recording started.
     lost: u32,
 }
@@ -908,6 +910,7 @@ impl App {
     /// ending).
     pub fn end_recording(&mut self) {
         self.finish_take(false, None);
+        self.finish_note_recording();
     }
 
     /// The MIDI input change the user asked for, if any.
@@ -1210,7 +1213,7 @@ impl App {
                     take.track = follow_track(take.track, &applied);
                 }
                 if let Some(r) = &mut self.note_rec {
-                    r.take.follow(|t| follow_track(Some(t), &applied));
+                    r.take.edited(&applied);
                 }
                 if let Some(l) = &mut self.link {
                     l.send(Command::Edit(applied));
@@ -1609,8 +1612,14 @@ impl App {
     /// Starts recording the notes played on the track at the cursor (from a
     /// stop, with the count-in the settings ask for), or stops it.
     fn toggle_note_recording(&mut self) {
-        if self.note_rec.as_ref().is_some_and(|r| !r.closing) {
-            self.stop_note_recording();
+        if let Some(r) = &mut self.note_rec {
+            if r.closing {
+                // What the engine recorded before it stopped is still on its
+                // way; the new take must not take it.
+                r.restart = true;
+            } else {
+                self.stop_note_recording();
+            }
             return;
         }
         if self.link.is_none() {
@@ -1628,7 +1637,8 @@ impl App {
         let Some(link) = &mut self.link else { return };
         let lost = link.shared.takes_lost.load(Ordering::Relaxed);
         link.record_notes(true);
-        self.note_rec = Some(NoteRecording { take: NoteTake::new(), started: false, closing: false, lost });
+        self.note_rec =
+            Some(NoteRecording { take: NoteTake::new(), started: false, closing: false, restart: false, lost });
         if !self.playing {
             self.send(Command::Cue(self.pattern as u8));
             let meter = self.project.meters[self.pattern];
@@ -1684,7 +1694,11 @@ impl App {
             r.take.push(e);
         }
         if complete {
+            let restart = r.restart;
             self.finish_note_recording();
+            if restart {
+                self.toggle_note_recording();
+            }
         } else if self.playing {
             r.started = true;
         } else if r.started && !r.closing {
@@ -1706,6 +1720,7 @@ impl App {
             }
             lost = link.shared.takes_lost.load(Ordering::Relaxed).wrapping_sub(r.lost);
         }
+        r.take.settle();
         let edits = r.take.edits(&self.project, &self.brushes, self.recording);
         let steps = edits.len();
         self.edit_group(edits, "record notes");
@@ -2662,6 +2677,7 @@ impl App {
                 self.set_status(status);
             }
             Action::Quit => {
+                self.finish_note_recording();
                 if self.dirty {
                     self.mode = Mode::Confirm(Confirm::Quit);
                 } else {
@@ -4297,17 +4313,6 @@ impl App {
     }
 }
 
-/// Where track `track` is after `e` (`None` once it is removed).
-fn follow_track(track: Option<usize>, e: &Edit) -> Option<usize> {
-    let t = track?;
-    match *e {
-        Edit::InsertTrack { index, .. } if usize::from(index) <= t => Some(t + 1),
-        Edit::RemoveTrack(r) if usize::from(r) == t => None,
-        Edit::RemoveTrack(r) if usize::from(r) < t => Some(t - 1),
-        _ => Some(t),
-    }
-}
-
 /// A step for the status line: its notes and velocity.
 fn step_label(s: &Step, kind: InstrumentKind) -> String {
     if kind.is_drum() {
@@ -4444,6 +4449,9 @@ impl Output {
     fn open(&mut self, app: &mut App) -> Result<String, String> {
         // Release the device before reopening it.
         self.stream = None;
+        // The new engine starts from the project, so a take still being
+        // recorded goes into it first.
+        app.finish_note_recording();
         let mut config = self.config.clone();
         self.fallback = false;
         if let Some(id) = &self.config.device {
@@ -4770,8 +4778,8 @@ pub fn run(
         // The session is ending without the user deciding about unsaved
         // edits: keep them for the next start.
         Ok(Err(e)) => {
-            app.autosave_now();
             app.end_recording();
+            app.autosave_now();
             return Err(e);
         }
         Err(panic) => {
@@ -5300,6 +5308,74 @@ mod tests {
         assert_eq!(steps[0], Some(Step { offset: -8, ..Step::new(60, 100, 1) }));
         assert_eq!(steps[3], None, "the pass played nothing there");
         assert!(!a.playing);
+    }
+
+    #[test]
+    fn notes_still_queued_when_a_track_goes_follow_their_track() {
+        let mut p = four_steps();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        let (mut e, live, mut a) = live_app(p);
+        a.track = 1;
+        a.tick();
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 6000);
+        // Played on track 1, still queued when track 0 is deleted.
+        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        run_engine(&mut e, 100);
+        assert!(a.edit(Edit::RemoveTrack(0)));
+        a.tick();
+        run_engine(&mut e, 6000 - 100);
+        // Once the engine has the removal too, the live track is track 0.
+        live.push(LiveNote { note: 62, velocity: 100 }).unwrap();
+        run_engine(&mut e, 100);
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 64);
+        a.tick();
+        let steps = &a.project.tracks[0].steps[0];
+        assert_eq!((steps[1].map(|s| s.note), steps[2].map(|s| s.note)), (Some(60), Some(62)));
+    }
+
+    #[test]
+    fn quitting_writes_the_notes_recorded_and_asks_about_them() {
+        let (mut e, live, mut a) = live_app(four_steps());
+        assert!(!a.dirty);
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 6000);
+        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        run_engine(&mut e, 100);
+        a.tick();
+        keys(&mut a, &[Key::Char('q')]);
+        assert_eq!(a.project.tracks[0].steps[0][1].map(|s| s.note), Some(60));
+        assert_eq!(a.mode, Mode::Confirm(Confirm::Quit));
+    }
+
+    #[test]
+    fn recording_again_while_a_take_is_written_waits_for_it() {
+        let (mut e, live, mut a) = live_app(four_steps());
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 6000);
+        // Held from step 1 through the stop, two steps on.
+        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        run_engine(&mut e, 12_000);
+        a.tick();
+        keys(&mut a, &[Key::Char('C'), Key::Char('C')]);
+        assert!(a.note_rec.as_ref().is_some_and(|r| r.closing && r.restart));
+        run_engine(&mut e, 64);
+        a.tick();
+        assert_eq!(a.project.tracks[0].steps[0][1], Some(Step::new(60, 100, 2)));
+        assert!(a.note_rec.as_ref().is_some_and(|r| !r.closing), "recording again");
+        // The second take is its own undo step and holds only what follows.
+        run_engine(&mut e, 64);
+        live.push(LiveNote { note: 60, velocity: 0 }).unwrap();
+        live.push(LiveNote { note: 64, velocity: 100 }).unwrap();
+        run_engine(&mut e, 100);
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 64);
+        a.tick();
+        assert_eq!(a.project.tracks[0].steps[0][3].map(|s| s.note), Some(64));
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.tracks[0].steps[0][3], None);
+        assert_eq!(a.project.tracks[0].steps[0][1], Some(Step::new(60, 100, 2)));
     }
 
     #[test]

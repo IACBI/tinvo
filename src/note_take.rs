@@ -1,15 +1,15 @@
 //! Notes recorded while the pattern plays, turned into step edits.
 //!
 //! The engine reports every key pressed on the live track at its nearest
-//! step, and every step the live track plays ([`Take`]). A [`NoteTake`]
-//! collects those reports and, when recording stops, writes them as
-//! [`Edit::SetStep`]s: one step per (track, pattern, step), whatever was
-//! played on it becoming a chord.
+//! step, its length when it ends, and every step the live track plays
+//! ([`Take`]). A [`NoteTake`] collects those reports and, when recording
+//! stops, writes them as [`Edit::SetStep`]s: one step per (track, pattern,
+//! step), whatever was played on it becoming a chord.
 
 use crate::engine::{Edit, MAX_CHORD, MAX_PATTERNS, MAX_STEPS, Step, Take};
 use crate::project::Project;
 use crate::settings::Recording;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// A key pressed while recording.
 #[derive(Clone, Copy, Debug)]
@@ -23,7 +23,8 @@ struct Played {
     /// Which pass over its step the note belongs to (the first is 1).
     pass: u32,
     on: f64,
-    off: Option<f64>,
+    /// In steps, once the key has ended.
+    length: Option<u8>,
 }
 
 /// The notes of one recording, from [`Take`] events.
@@ -34,8 +35,10 @@ pub struct NoteTake {
     held: Vec<usize>,
     /// How many times each (track, pattern, step) has played.
     passes: HashMap<(usize, u8, u8), u32>,
-    /// The latest position reported, for keys still down at the end.
-    last: f64,
+    /// Track insertions and removals made since recording started whose
+    /// [`Take::Layout`] has not come yet: reports before it still name the
+    /// tracks as they were.
+    pending: VecDeque<Edit>,
 }
 
 impl NoteTake {
@@ -51,53 +54,60 @@ impl NoteTake {
                 // A key whose step has not played yet belongs to the pass
                 // that is coming.
                 let pass = seen + u32::from(early);
-                // A key pressed again before its release ends its first press.
-                self.release(note, position);
+                self.release(note, 1);
                 self.held.push(self.played.len());
-                self.played.push(Played {
-                    track,
-                    pattern,
-                    step,
-                    note,
-                    velocity,
-                    offset,
-                    pass,
-                    on: position,
-                    off: None,
-                });
-                self.last = self.last.max(position);
+                let length = None;
+                self.played.push(Played { track, pattern, step, note, velocity, offset, pass, on: position, length });
             }
-            Take::Off { note, position } => {
-                self.release(note, position);
-                self.last = self.last.max(position);
-            }
+            Take::Off { note, length } => self.release(note, length),
             Take::Passed { track, pattern, step } => {
                 *self.passes.entry((usize::from(track), pattern, step)).or_insert(0) += 1;
             }
+            Take::Layout => {
+                if let Some(e) = self.pending.pop_front() {
+                    self.follow(&e);
+                }
+            }
         }
     }
 
-    fn release(&mut self, note: u8, position: f64) {
+    fn release(&mut self, note: u8, length: u8) {
         if let Some(i) = self.held.iter().position(|&i| self.played[i].note == note) {
             let p = self.held.swap_remove(i);
-            self.played[p].off = Some(position);
+            self.played[p].length = Some(length);
         }
     }
 
-    /// Follows the tracks through an edit that inserted or removed one:
-    /// `follow` gives a track's new index, or `None` once it is gone.
-    pub fn follow(&mut self, follow: impl Fn(usize) -> Option<usize>) {
+    /// Notes an edit applied to the project while recording: one that
+    /// inserts or removes a track moves the take's tracks once the engine
+    /// reports it has applied it too.
+    pub fn edited(&mut self, e: &Edit) {
+        if matches!(e, Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) {
+            self.pending.push_back(*e);
+        }
+    }
+
+    /// Moves the take's tracks through the edits the engine applied after
+    /// it stopped recording; call once every report has come.
+    pub fn settle(&mut self) {
+        while let Some(e) = self.pending.pop_front() {
+            self.follow(&e);
+        }
+    }
+
+    fn follow(&mut self, e: &Edit) {
         let mut kept = Vec::with_capacity(self.played.len());
         let mut index = vec![None; self.played.len()];
         for (i, p) in self.played.iter().enumerate() {
-            if let Some(track) = follow(p.track) {
+            if let Some(track) = follow_track(Some(p.track), e) {
                 index[i] = Some(kept.len());
                 kept.push(Played { track, ..*p });
             }
         }
         self.played = kept;
         self.held = self.held.iter().filter_map(|&i| index[i]).collect();
-        self.passes = self.passes.drain().filter_map(|((t, p, s), n)| Some(((follow(t)?, p, s), n))).collect();
+        self.passes =
+            self.passes.drain().filter_map(|((t, p, s), n)| Some(((follow_track(Some(t), e)?, p, s), n))).collect();
     }
 
     /// Whether the take holds nothing to write.
@@ -114,7 +124,7 @@ impl NoteTake {
     /// clearing it if that pass played none. The step's timing, velocity
     /// and length come from the notes of its last pass played: its first
     /// note's offset (0 with `quantize`), its loudest note's velocity and
-    /// its longest note's length in steps.
+    /// its longest note's length.
     pub fn edits(&self, project: &Project, brushes: &[Step], rec: Recording) -> Vec<Edit> {
         let mut steps: BTreeMap<(usize, u8, u8), Vec<&Played>> = BTreeMap::new();
         for p in &self.played {
@@ -133,82 +143,87 @@ impl NoteTake {
             }
             let seen = self.passes.get(&(track, pattern, step)).copied().unwrap_or(0);
             let lead = notes.iter().map(|p| p.pass).max().unwrap_or(0);
+            let drum = t.kind.is_drum();
             let value = if rec.replace {
                 let last = lead.max(seen);
                 let kept: Vec<&Played> = notes.into_iter().filter(|p| p.pass == last).collect();
-                self.step(None, &kept, &kept, brush, t.kind.is_drum(), project.divisions[usize::from(pattern)], rec)
+                step_with(None, &kept, &kept, brush, drum, rec)
             } else {
                 let latest: Vec<&Played> = notes.iter().copied().filter(|p| p.pass == lead).collect();
-                let old = t.steps[usize::from(pattern)][usize::from(step)];
-                self.step(old, &notes, &latest, brush, t.kind.is_drum(), project.divisions[usize::from(pattern)], rec)
+                step_with(t.steps[usize::from(pattern)][usize::from(step)], &notes, &latest, brush, drum, rec)
             };
-            let (track, pattern, step) = (track as u8, pattern, step);
-            edits.push(Edit::SetStep { track, pattern, step, value });
+            edits.push(Edit::SetStep { track: track as u8, pattern, step, value });
         }
         edits
     }
+}
 
-    /// The step `old` (or a new one from `brush`) becomes with `notes`
-    /// added, timed by `lead`.
-    #[allow(clippy::too_many_arguments)]
-    fn step(
-        &self,
-        old: Option<Step>,
-        notes: &[&Played],
-        lead: &[&Played],
-        brush: Step,
-        drum: bool,
-        division: crate::engine::Division,
-        rec: Recording,
-    ) -> Option<Step> {
-        let first = lead.iter().min_by(|a, b| a.on.total_cmp(&b.on))?;
-        let mut s = old.unwrap_or(brush);
-        s.offset = if rec.quantize { 0 } else { first.offset };
-        s.velocity = lead.iter().map(|p| p.velocity).max().unwrap_or(s.velocity);
-        let longest = lead.iter().map(|p| p.off.unwrap_or(self.last) - p.on).fold(0.0, f64::max);
-        s.length = (longest / division.sixteenths()).round().clamp(1.0, MAX_STEPS as f64) as u8;
-        if drum {
-            s.chord = [0; MAX_CHORD - 1];
-        } else {
-            // The step's notes oldest first, so the newest are kept.
-            let mut all: Vec<u8> = match old {
-                Some(o) => std::iter::once(o.note)
-                    .chain(o.chord.iter().filter(|&&i| i > 0).map(|&i| o.note.saturating_add(i)))
-                    .collect(),
-                None => Vec::new(),
-            };
-            let mut by_time: Vec<&&Played> = notes.iter().collect();
-            by_time.sort_by(|a, b| a.on.total_cmp(&b.on));
-            for p in by_time {
-                all.retain(|&n| n != p.note);
-                all.push(p.note);
-            }
-            let all = &all[all.len().saturating_sub(MAX_CHORD)..];
-            let root = *all.iter().min()?;
-            s.note = root;
-            s.chord = [0; MAX_CHORD - 1];
-            let mut ivs: Vec<u8> = all.iter().map(|&n| n - root).filter(|&i| i > 0).collect();
-            ivs.sort_unstable();
-            for (slot, i) in s.chord.iter_mut().zip(ivs) {
-                *slot = i;
-            }
+/// The step `old` (or a new one from `brush`) becomes with `notes` added,
+/// timed by `lead`.
+fn step_with(
+    old: Option<Step>,
+    notes: &[&Played],
+    lead: &[&Played],
+    brush: Step,
+    drum: bool,
+    rec: Recording,
+) -> Option<Step> {
+    let first = lead.iter().min_by(|a, b| a.on.total_cmp(&b.on))?;
+    let mut s = old.unwrap_or(brush);
+    s.offset = if rec.quantize { 0 } else { first.offset };
+    s.velocity = lead.iter().map(|p| p.velocity).max().unwrap_or(s.velocity);
+    s.length = lead.iter().map(|p| p.length.unwrap_or(1)).max().unwrap_or(1);
+    if drum {
+        s.chord = [0; MAX_CHORD - 1];
+    } else {
+        // The step's notes oldest first, so the newest are kept.
+        let mut all: Vec<u8> = match old {
+            Some(o) => std::iter::once(o.note)
+                .chain(o.chord.iter().filter(|&&i| i > 0).map(|&i| o.note.saturating_add(i)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut by_time: Vec<&&Played> = notes.iter().collect();
+        by_time.sort_by(|a, b| a.on.total_cmp(&b.on));
+        for p in by_time {
+            all.retain(|&n| n != p.note);
+            all.push(p.note);
         }
-        Some(s.sanitized())
+        let all = &all[all.len().saturating_sub(MAX_CHORD)..];
+        let root = *all.iter().min()?;
+        s.note = root;
+        s.chord = [0; MAX_CHORD - 1];
+        let mut ivs: Vec<u8> = all.iter().map(|&n| n - root).filter(|&i| i > 0).collect();
+        ivs.sort_unstable();
+        for (slot, i) in s.chord.iter_mut().zip(ivs) {
+            *slot = i;
+        }
+    }
+    Some(s.sanitized())
+}
+
+/// Where track `track` is after `e` (`None` once it is removed).
+pub fn follow_track(track: Option<usize>, e: &Edit) -> Option<usize> {
+    let t = track?;
+    match *e {
+        Edit::InsertTrack { index, .. } if usize::from(index) <= t => Some(t + 1),
+        Edit::RemoveTrack(r) if usize::from(r) == t => None,
+        Edit::RemoveTrack(r) if usize::from(r) < t => Some(t - 1),
+        _ => Some(t),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Division;
     use crate::instrument::InstrumentKind;
 
     fn on(note: u8, step: u8, offset: i8, early: bool, position: f64) -> Take {
         Take::On { track: 0, note, velocity: 90, pattern: 0, step, offset, early, position }
     }
 
-    fn off(note: u8, position: f64) -> Take {
-        Take::Off { note, position }
+    fn off(note: u8, length: u8) -> Take {
+        Take::Off { note, length }
     }
 
     fn passed(step: u8) -> Take {
@@ -263,10 +278,10 @@ mod tests {
                 early: false,
                 position: 2.04,
             },
-            off(67, 3.0),
-            off(64, 3.1),
-            off(60, 4.0),
-            off(62, 4.2),
+            off(67, 1),
+            off(64, 1),
+            off(60, 2),
+            off(62, 3),
         ]);
         assert_eq!(
             t.edits(&p, &brush, OVERDUB),
@@ -287,10 +302,10 @@ mod tests {
         let t = take(&[
             passed(0),
             on(60, 0, 2, false, 0.1),
-            off(60, 0.9),
+            off(60, 1),
             passed(1),
             on(64, 0, -3, true, 1.9),
-            off(64, 2.9),
+            off(64, 1),
             passed(0),
             passed(1),
         ]);
@@ -313,22 +328,52 @@ mod tests {
     }
 
     #[test]
-    fn a_take_follows_its_tracks() {
+    fn a_take_follows_its_tracks_when_the_engine_does() {
         let mut p = project(InstrumentKind::Synth);
         p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
         let brushes = [Step::new(60, 100, 1); 2];
-        let mut t = take(&[
-            Take::On { track: 1, note: 62, velocity: 90, pattern: 0, step: 0, offset: 0, early: true, position: 0.0 },
-            Take::Passed { track: 0, pattern: 0, step: 0 },
-        ]);
-        // Track 0 removed: track 1's notes move up, track 0's passes go.
-        t.follow(|tr| tr.checked_sub(1));
-        p.apply(Edit::RemoveTrack(0)).unwrap();
-        t.push(off(62, 2.0));
-        assert_eq!(t.edits(&p, &brushes, REPLACE), [set(0, Some(Step::new(62, 90, 2)))]);
+        let on_track = |track, note, step| Take::On {
+            track,
+            note,
+            velocity: 90,
+            pattern: 0,
+            step,
+            offset: 0,
+            early: true,
+            position: f64::from(step),
+        };
+        let mut t = take(&[on_track(1, 62, 0), Take::Passed { track: 0, pattern: 0, step: 0 }]);
+        // Track 0 is removed. A report the engine made before it applied the
+        // removal still names track 1; the ones after its marker, track 0.
+        let remove = Edit::RemoveTrack(0);
+        p.apply(remove).unwrap();
+        t.edited(&remove);
+        t.push(on_track(1, 64, 1));
+        t.push(Take::Layout);
+        t.push(on_track(0, 65, 2));
+        for (note, length) in [(62, 2), (64, 1), (65, 1)] {
+            t.push(off(note, length));
+        }
+        let want = [
+            set(0, Some(Step::new(62, 90, 2))),
+            set(1, Some(Step::new(64, 90, 1))),
+            set(2, Some(Step::new(65, 90, 1))),
+        ];
+        assert_eq!(t.edits(&p, &brushes, REPLACE), want);
         assert!(!t.is_empty());
-        // A step division sets the length's steps.
-        p.apply(Edit::SetPatternDivision { pattern: 0, division: Division::Eighth }).unwrap();
-        assert_eq!(t.edits(&p, &brushes, REPLACE), [set(0, Some(Step::new(62, 90, 1)))]);
+        // A track inserted after recording stopped has no marker: settling
+        // moves the take once every report is in.
+        let insert = Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick };
+        p.apply(insert).unwrap();
+        t.edited(&insert);
+        t.settle();
+        let moved: Vec<Edit> = want
+            .iter()
+            .map(|e| match *e {
+                Edit::SetStep { pattern, step, value, .. } => Edit::SetStep { track: 1, pattern, step, value },
+                e => e,
+            })
+            .collect();
+        assert_eq!(t.edits(&p, &brushes, REPLACE), moved);
     }
 }
