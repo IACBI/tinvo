@@ -373,6 +373,20 @@ Known limits:
 - Notes record onto steps: a note shorter than a step lasts a step, and two notes on one step play together.
 - Recording from a stop plays the pattern being edited. To record over the song, start it and press `C` in the grid while it plays, without a count-in.
 
+## Review: performance, security and dead code ✅ (0.24.0)
+
+A second review of the whole project, made with an independent model reading the code. Each finding was checked against the code, and the fixes that change behaviour have tests:
+- Security: the CoreAudio input callback borrows only its callback mutably; the end of terminal input is an error instead of a busy loop; names and paths from devices and the command line are printed escaped on one line; a failed WAV writer leaves no temporary file; a recording never replaces a file created at its name meanwhile; ALSA MIDI overruns and read errors release every held note; project and settings files are read up to a size, lines are split only as far as their longest valid form, and an action takes up to 8 keys.
+- Performance: drum envelopes flush denormals; tracks playing one file share its samples; grouped undo steps are built in linear time.
+- Dead code: accessors nothing used were removed, and the DSP module's documentation now names the two parts that allocate and run off the audio thread.
+
+Known limits (found bounded, and left for later):
+- A long note's release and the song view's length look up each song entry's tempo by searching the tempo points, so the work is bounded but grows with the square of the song's size; a table per entry, rebuilt on edits, would make it constant.
+- A change to one synth or mix parameter recomputes all of that instrument's or the mix's coefficients (both envelopes of every voice, every reverb gain), up to every 32 frames under automation.
+- Each synth voice computes its filter's `exp2` and `tan` every sample, also when nothing modulates the cutoff.
+- The piano roll formats a new string for every cell it draws.
+- An export's loudness meter keeps every 100 ms block, so its memory grows with the export's length, if slowly.
+
 ## Planned: more kinds of music
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes. The phases below take it further, toward live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
