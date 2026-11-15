@@ -27,7 +27,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 
 ### Features
 
-- 16 tracks, up to 64 steps per pattern, tempo 20–300 BPM, swing 50–75 %. Each pattern has its own step length (1/8, 1/8 triplets, 1/16, 1/16 triplets or 1/32) and time signature (such as 3/4, 6/8 or 7/8), which places its beat and bar lines.
+- 16 tracks, up to 64 steps per pattern, tempo 20–300 BPM, swing 50–75 %. Each pattern has its own step length (1/8, 1/8 triplets, 1/16, 1/16 triplets or 1/32) and time signature (such as 3/4, 6/8 or 7/8), which places its beat and bar lines. Song entries can set a tempo that holds or ramps to the next.
 - Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–8 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
 - 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. In any entry a track can play a pattern of its own or rest. Patterns switch at the end of the bar while playing.
@@ -114,7 +114,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `k` `K` / `J` | fewer / more beats to the pattern's bar / the beat's note value (/4, /8, /16, /2) |
 | `n` `N` | next / previous pattern |
 | `y` `Y` `X` | copy / paste / clear the pattern |
-| `S` | song view: entries across, tracks down (`←` `→` entry, `↑` `↓` the song's row or a track's, `,` `.` the entry's pattern, or on a track row its own pattern, the entry's or a rest; `Enter` repeat, `Del` remove the entry or make the track follow it, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section) |
+| `S` | song view: entries across, tracks down (`←` `→` entry, `↑` `↓` the song's row or a track's, `,` `.` the entry's pattern, or on a track row its own pattern, the entry's or a rest; `Enter` repeat, `Del` remove the entry or make the track follow it, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section, `{` `}` the entry's tempo point, `0` remove it, `/` hold or ramp between points) |
 | `f` | parameter panel: instrument, channel strip and sends, buses and master |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
@@ -128,7 +128,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `F2` `P` | settings: keys, colours and the mouse |
 | `q` | quit |
 
-The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point, and on their song line it opens the pattern the track plays in that entry. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern, length, step length and beats to the bar in the top bar, a parameter, a point, a song entry. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
+The mouse works too. A click toggles a step, selects a track, or mutes and solos it (`M` `S`); in the piano roll it adds or removes a note, in the automation view a point, and on their song line it opens the pattern the track plays in that entry. Dragging across a track's steps fills or clears them, and dragging from a piano-roll note sets its length. The wheel changes the value under the pointer: tempo, swing, pattern, length, step length and beats to the bar in the top bar, a parameter, a point, a song entry or its tempo point. The right button only moves the cursor, or resets a parameter. To select text in the terminal, hold Shift (in most terminals) or set `mouse = off`.
 
 ### Configuration
 
@@ -180,7 +180,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 
 ### Özellikler
 
-- 16 kanal, pattern başına 64'e kadar adım, 20–300 BPM tempo, %50–75 swing. Her pattern'in kendi adım uzunluğu (1/8, 1/8 triole, 1/16, 1/16 triole ya da 1/32) ve ölçüsü (3/4, 6/8, 7/8 gibi) var; vuruş ve ölçü çizgileri buna göre çizilir.
+- 16 kanal, pattern başına 64'e kadar adım, 20–300 BPM tempo, %50–75 swing. Her pattern'in kendi adım uzunluğu (1/8, 1/8 triole, 1/16, 1/16 triole ya da 1/32) ve ölçüsü (3/4, 6/8, 7/8 gibi) var; vuruş ve ölçü çizgileri buna göre çizilir. Şarkı girişleri kendi tempolarını koyabilir; tempo bir sonrakine kadar sabit kalır ya da ona doğru kayar.
 - Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–8 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
 - 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Her girişte bir kanal kendi pattern'ini çalabilir ya da susabilir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
@@ -267,7 +267,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `k` `K` / `J` | pattern'in ölçüsünde vuruş sayısını azaltır / artırır / vuruşun nota değerini değiştirir (/4, /8, /16, /2) |
 | `n` `N` | sonraki / önceki pattern |
 | `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
-| `S` | şarkı görünümü: girişler yan yana, kanallar alt alta (`←` `→` giriş, `↑` `↓` şarkı satırı ya da bir kanalın satırı, `,` `.` girişin pattern'i, kanal satırında ise kanalın kendi pattern'i, girişinki ya da sus; `Enter` tekrarla, `Del` girişi sil ya da kanalı girişe uydur, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al) |
+| `S` | şarkı görünümü: girişler yan yana, kanallar alt alta (`←` `→` giriş, `↑` `↓` şarkı satırı ya da bir kanalın satırı, `,` `.` girişin pattern'i, kanal satırında ise kanalın kendi pattern'i, girişinki ya da sus; `Enter` tekrarla, `Del` girişi sil ya da kanalı girişe uydur, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al, `{` `}` girişin tempo noktası, `0` noktayı sil, `/` noktalar arasında sabit tut ya da kaydır) |
 | `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, buslar ve master |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
@@ -281,7 +281,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `F2` `P` | ayarlar: tuşlar, renkler ve fare |
 | `q` | çık |
 
-Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler; bu iki görünümün şarkı satırında ise kanalın o girişte çaldığı pattern'i açar. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern, uzunluk, adım uzunluğu ve ölçüdeki vuruş sayısı, bir parametre, bir nokta, bir şarkı girişi. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
+Fare de çalışır. Tıklamak bir adımı açıp kapatır, bir kanalı seçer ya da onu susturur, solo yapar (`M` `S`); piyano rulosunda nota, otomasyon görünümünde nokta ekler ya da siler; bu iki görünümün şarkı satırında ise kanalın o girişte çaldığı pattern'i açar. Bir kanalın adımları üzerinde sürüklemek onları doldurur ya da temizler; piyano rulosunda bir notadan sürüklemek uzunluğunu ayarlar. Tekerlek, işaretçinin altındaki değeri değiştirir: üst çubukta tempo, swing, pattern, uzunluk, adım uzunluğu ve ölçüdeki vuruş sayısı, bir parametre, bir nokta, bir şarkı girişi ya da tempo noktası. Sağ tuş yalnızca imleci oraya götürür ya da parametreyi varsayılanına döndürür. Terminalde metin seçmek için Shift'e basılı tut (çoğu terminalde) ya da `mouse = off` yap.
 
 ### Yapılandırma
 

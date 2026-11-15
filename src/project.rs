@@ -3,17 +3,19 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 11
+//! tinvo 12
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
 //! pattern_division B 1/16T   # only patterns whose steps are not 16th notes
-//! pattern_meter B 6/8         # only patterns that are not in 4/4
+//! pattern_meter B 6/8        # only patterns that are not in 4/4
 //! master_gain_db 0
 //! song A A A B               # only when the song is not empty
 //! loop 2 3                   # song entries, 0-based; only when set
 //! marker 0 intro             # a named song position: entry, name
 //! marker 4 chorus
+//! tempo_point 4 128          # the tempo a song entry starts at
+//! tempo_ramp true            # ramp between tempo points; only when set
 //! mix reverb_decay 2.4       # buses and master; only values off their default
 //!
 //! track kick
@@ -48,7 +50,8 @@
 
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, loop_region, target_spec,
+    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, entry_tempo, loop_region, span_frames,
+    target_spec,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
@@ -160,6 +163,11 @@ pub struct Project {
     /// distinct names. Edits move them with their entries; the engine never
     /// sees them.
     pub markers: Vec<Marker>,
+    /// The tempo each song entry starts at, where set; the tempo before the
+    /// first point is `tempo`.
+    pub tempo_points: Box<[Option<f32>; MAX_SONG]>,
+    /// Whether the tempo ramps from each point to the next.
+    pub tempo_ramp: bool,
 }
 
 /// A named position in the song: the start of the entry it sits on.
@@ -262,6 +270,8 @@ impl Project {
             loop_region: None,
             mix: MIX_PARAMS.map(|p| p.default),
             markers: Vec::new(),
+            tempo_points: Box::new([None; MAX_SONG]),
+            tempo_ramp: false,
         }
     }
 
@@ -399,6 +409,8 @@ impl Project {
                     t.parts.copy_within(i..len - 1, i + 1);
                     t.parts[i] = Part::Follow;
                 }
+                self.tempo_points.copy_within(i..len - 1, i + 1);
+                self.tempo_points[i] = None;
                 for m in &mut self.markers {
                     if m.entry >= index {
                         m.entry += 1;
@@ -414,6 +426,8 @@ impl Project {
                     t.parts.copy_within(i + 1..=len, i);
                     t.parts[len] = Part::Follow;
                 }
+                self.tempo_points.copy_within(i + 1..=len, i);
+                self.tempo_points[len] = None;
                 // The marker goes with its entry. The editor's history keeps
                 // markers beside the edits, so undo brings it back.
                 self.markers.retain(|m| m.entry != index);
@@ -428,6 +442,20 @@ impl Project {
                 check_pattern(pattern)?;
                 self.entry(index)?;
                 self.song[usize::from(index)] = pattern;
+                edit
+            }
+            Edit::SetTempoPoint { index, bpm } => {
+                self.entry(index)?;
+                let slot = &mut self.tempo_points[usize::from(index)];
+                *slot = match bpm {
+                    Some(b) if b.is_finite() => Some(b.clamp(MIN_TEMPO, MAX_TEMPO)),
+                    Some(_) => *slot,
+                    None => None,
+                };
+                Edit::SetTempoPoint { index, bpm: *slot }
+            }
+            Edit::SetTempoRamp(ramp) => {
+                self.tempo_ramp = ramp;
                 edit
             }
             Edit::SetPart { track, index, part } => {
@@ -583,7 +611,6 @@ impl Project {
         self.song.get(usize::from(index)).copied().ok_or(EditError::NoSuchEntry(index))
     }
 
-    /// Steps in one pass through the song (0 if it is empty).
     /// Clock pulses in one pass of `pattern` (see [`crate::engine::PULSES_PER_BEAT`]).
     pub fn pattern_pulses(&self, pattern: u8) -> u64 {
         let p = usize::from(pattern).min(MAX_PATTERNS - 1);
@@ -598,6 +625,44 @@ impl Project {
     /// Clock pulses in the whole song.
     pub fn song_pulses(&self) -> u64 {
         self.song.iter().map(|&p| self.pattern_pulses(p)).sum()
+    }
+
+    /// Whether any song entry has a tempo point.
+    pub fn has_tempo_points(&self) -> bool {
+        self.tempo_points[..self.song.len()].iter().any(Option::is_some)
+    }
+
+    /// The tempo song entry `i` starts at and its change per 16th note
+    /// while it plays (see [`entry_tempo`]).
+    pub fn entry_tempo(&self, i: usize) -> (f64, f64) {
+        let pulses = |j: usize| self.pattern_pulses(self.song[j]);
+        entry_tempo(i, self.song.len(), self.tempo_ramp, self.tempo, |j| self.tempo_points[j], pulses)
+    }
+
+    /// The tempo `pulse` pulses into song entry `i`.
+    pub fn tempo_in_entry(&self, i: usize, pulse: u64) -> f64 {
+        let (bpm, slope) = self.entry_tempo(i);
+        bpm + slope * pulse as f64 / 6.0
+    }
+
+    /// Frames song entries `a..=b` take at `sample_rate`, following their
+    /// tempo points.
+    pub fn entries_frames(&self, a: usize, b: usize, sample_rate: f32) -> f64 {
+        if !self.has_tempo_points() {
+            let sps = crate::engine::transport::Transport::samples_per_step(self.tempo, sample_rate);
+            return sps * (self.entries_pulses(a, b) as f64 / 6.0);
+        }
+        (a..=b.min(self.song.len().saturating_sub(1)))
+            .map(|i| {
+                let (bpm, slope) = self.entry_tempo(i);
+                span_frames(bpm, slope, self.pattern_pulses(self.song[i]) as f64 / 6.0, sample_rate)
+            })
+            .sum()
+    }
+
+    /// The song's length in seconds.
+    pub fn song_seconds(&self) -> f64 {
+        if self.song.is_empty() { 0.0 } else { self.entries_frames(0, self.song.len() - 1, 1.0) }
     }
 
     /// The loop region, if it lies inside the song.
@@ -716,6 +781,12 @@ impl Project {
         for (i, &pattern) in self.song.iter().enumerate() {
             e.push(Edit::InsertSongEntry { index: i as u16, pattern });
         }
+        e.push(Edit::SetTempoRamp(self.tempo_ramp));
+        for (i, &bpm) in self.tempo_points[..self.song.len()].iter().enumerate() {
+            if bpm.is_some() {
+                e.push(Edit::SetTempoPoint { index: i as u16, bpm });
+            }
+        }
         e.push(Edit::SetLoop(self.loop_region));
         for (index, &value) in self.mix.iter().enumerate() {
             e.push(Edit::SetMixParam { index: index as u8, value });
@@ -763,8 +834,16 @@ impl Project {
                         v.push(Edit::SetPart { track: t as u8, index, part });
                     }
                 }
+                if let Some(bpm) = self.tempo_points[usize::from(index)] {
+                    v.push(Edit::SetTempoPoint { index, bpm: Some(bpm) });
+                }
                 v
             }
+            Edit::SetTempoPoint { index, .. } => {
+                self.entry(index)?;
+                vec![Edit::SetTempoPoint { index, bpm: self.tempo_points[usize::from(index)] }]
+            }
+            Edit::SetTempoRamp(_) => vec![Edit::SetTempoRamp(self.tempo_ramp)],
             Edit::SetSongEntry { index, pattern } => {
                 check_pattern(pattern)?;
                 vec![Edit::SetSongEntry { index, pattern: self.entry(index)? }]
@@ -877,6 +956,14 @@ impl Project {
         for m in &self.markers {
             let _ = writeln!(s, "marker {} {}", m.entry, m.name);
         }
+        for (i, bpm) in self.tempo_points[..self.song.len()].iter().enumerate() {
+            if let Some(bpm) = bpm {
+                let _ = writeln!(s, "tempo_point {i} {bpm}");
+            }
+        }
+        if self.tempo_ramp {
+            let _ = writeln!(s, "tempo_ramp true");
+        }
         for (spec, &v) in MIX_PARAMS.iter().zip(&self.mix) {
             if v != spec.default {
                 let _ = writeln!(s, "mix {} {v}", spec.id);
@@ -956,6 +1043,7 @@ impl Project {
         // the song is known.
         let mut marker_lines = Vec::new();
         let mut part_lines = Vec::new();
+        let mut tempo_lines = Vec::new();
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -1176,6 +1264,22 @@ impl Project {
                     }
                     p.loop_region = Some(r);
                 }
+                "tempo_point" if ver >= 12 => {
+                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    let [entry, bpm] = f[..] else { return Err(err("expected 'tempo_point <entry> <bpm>'".into())) };
+                    let entry: u16 = parse_num(entry).map_err(err)?;
+                    let bpm: f32 = parse_num(bpm).map_err(err)?;
+                    if !(MIN_TEMPO..=MAX_TEMPO).contains(&bpm) {
+                        return Err(err(format!("tempo must be {MIN_TEMPO}..={MAX_TEMPO}")));
+                    }
+                    let slot =
+                        p.tempo_points.get_mut(usize::from(entry)).ok_or_else(|| err("no such song entry".into()))?;
+                    if slot.replace(bpm).is_some() {
+                        return Err(err(format!("song entry {entry} has two tempo points")));
+                    }
+                    tempo_lines.push((entry, line_no));
+                }
+                "tempo_ramp" if ver >= 12 => p.tempo_ramp = parse_bool(rest).map_err(err)?,
                 "marker" if ver >= 10 => {
                     let (entry, name) = rest
                         .split_once(char::is_whitespace)
@@ -1225,6 +1329,11 @@ impl Project {
         for (m, &line) in p.markers.iter().zip(&marker_lines) {
             if usize::from(m.entry) >= p.song.len() {
                 return Err(ParseError { line, message: format!("marker '{}' is past the end of the song", m.name) });
+            }
+        }
+        for (entry, line) in tempo_lines {
+            if usize::from(entry) >= p.song.len() {
+                return Err(ParseError { line, message: format!("tempo point {entry} is past the end of the song") });
             }
         }
         for (track, line, count) in part_lines {
@@ -1944,6 +2053,60 @@ pattern_division A 1/8
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tempo_points_round_trip_follow_their_entries_and_invert() {
+        let mut p = Project::new();
+        for index in 0..4 {
+            p.apply(Edit::InsertSongEntry { index, pattern: 0 }).unwrap();
+        }
+        p.apply(Edit::SetTempoPoint { index: 1, bpm: Some(90.0) }).unwrap();
+        p.apply(Edit::SetTempoPoint { index: 3, bpm: Some(150.0) }).unwrap();
+        let text = p.to_text();
+        assert!(text.contains("\ntempo_point 1 90\ntempo_point 3 150\n"), "{text}");
+        assert!(!text.contains("tempo_ramp"), "only when set");
+        p.apply(Edit::SetTempoRamp(true)).unwrap();
+        let q = Project::from_text(&p.to_text()).unwrap();
+        assert_eq!(q.tempo_points[..4], [None, Some(90.0), None, Some(150.0)]);
+        assert!(q.tempo_ramp);
+        // Before the first point the set tempo holds; a ramp keeps one slope
+        // across the entries between two points.
+        assert_eq!(q.entry_tempo(0), (120.0, 0.0));
+        assert_eq!(q.entry_tempo(1), (90.0, 1.875));
+        assert_eq!(q.entry_tempo(2), (120.0, 1.875));
+        assert_eq!(q.entry_tempo(3), (150.0, 0.0));
+        assert_eq!(q.tempo_in_entry(2, 48), 135.0);
+        // Points move with their entries, and undo brings a removed one back.
+        let mut r = q.clone();
+        r.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        assert_eq!(r.tempo_points[..5], [None, None, Some(90.0), None, Some(150.0)]);
+        let undo = r.inverse(&Edit::RemoveSongEntry(2)).unwrap();
+        r.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(r.tempo_points[..5], [None, None, None, Some(150.0), None]);
+        for e in undo {
+            r.apply(e).unwrap();
+        }
+        assert_eq!(r.tempo_points[..5], [None, None, Some(90.0), None, Some(150.0)]);
+        // Out-of-range tempos are clamped, and NaN changes nothing.
+        r.apply(Edit::SetTempoPoint { index: 0, bpm: Some(1e9) }).unwrap();
+        assert_eq!(r.tempo_points[0], Some(MAX_TEMPO));
+        r.apply(Edit::SetTempoPoint { index: 0, bpm: Some(f32::NAN) }).unwrap();
+        assert_eq!(r.tempo_points[0], Some(MAX_TEMPO));
+        assert!(r.apply(Edit::SetTempoPoint { index: 5, bpm: Some(100.0) }).is_err());
+        // The song's length follows the tempo: 16 16ths at 120, then 90 to
+        // 150 over 32 and 16 at 150.
+        let secs = q.song_seconds();
+        let want = 2.0 + 15.0 / 1.875 * (1.0f64 + 1.875 * 32.0 / 90.0).ln() + 1.6;
+        assert!((secs - want).abs() < 1e-9, "{secs} vs {want}");
+        // Files.
+        let err = Project::from_text("tinvo 12\nsong A A\ntempo_point 2 100\n").unwrap_err().to_string();
+        assert!(err.contains("tempo point 2 is past the end of the song"), "{err}");
+        let err = Project::from_text("tinvo 12\nsong A A\ntempo_point 1 100\ntempo_point 1 90\n").unwrap_err();
+        assert!(err.to_string().contains("two tempo points"), "{err}");
+        assert!(Project::from_text("tinvo 12\nsong A\ntempo_point 0 5000\n").is_err());
+        assert!(Project::from_text("tinvo 11\nsong A\ntempo_point 0 100\n").is_err());
+        assert!(Project::from_text("tinvo 11\nsong A\ntempo_ramp true\n").is_err());
     }
 
     #[test]

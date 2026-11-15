@@ -28,7 +28,7 @@ use crate::strip::{self, Strip, track_param};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
-pub use transport::{Division, Meter, PULSES_PER_BEAT};
+pub use transport::{Division, Meter, PULSES_PER_BEAT, entry_tempo, span_frames};
 
 pub const MAX_TRACKS: usize = 16;
 pub const MAX_STEPS: usize = 64;
@@ -290,6 +290,14 @@ pub enum Edit {
         pattern: u8,
         division: Division,
     },
+    /// The tempo song entry `index` starts at, or `None` to follow the
+    /// tempo before it.
+    SetTempoPoint {
+        index: u16,
+        bpm: Option<f32>,
+    },
+    /// Whether the tempo ramps from each tempo point to the next or holds.
+    SetTempoRamp(bool),
     /// `pattern`'s time signature. It changes only what the UI draws.
     SetPatternMeter {
         pattern: u8,
@@ -874,6 +882,11 @@ pub struct Engine {
     song: [u8; MAX_SONG],
     song_len: usize,
     loop_region: Option<(u16, u16)>,
+    tempo_points: [Option<f32>; MAX_SONG],
+    tempo_ramp: bool,
+    /// The tempo the delay and synced LFOs follow: `tempo`, or the song's
+    /// where its tempo points set it.
+    tempo_now: f32,
     /// Pattern that `Play` starts with and that follows the current one.
     cue: u8,
     song_mode: bool,
@@ -949,6 +962,9 @@ impl Engine {
             song: [0; MAX_SONG],
             song_len: 0,
             loop_region: None,
+            tempo_points: [None; MAX_SONG],
+            tempo_ramp: false,
+            tempo_now: 120.0,
             cue: 0,
             song_mode: false,
             entry: EntryPos { entry: None, pattern: 0, start: 0 },
@@ -1113,6 +1129,7 @@ impl Engine {
                     }
                 }
                 self.ramping = false;
+                self.follow_tempo();
                 // Back to the knob values, so auditions sound as set.
                 self.automate(self.now);
             }
@@ -1206,8 +1223,16 @@ impl Engine {
         self.upcoming = None;
         self.rng = Rng::new(CHANCE_SEED);
         self.loudness.reset();
+        if self.transport.tempo() != (f64::from(self.tempo), 0.0) {
+            self.transport.set_tempo(self.tempo, self.sample_rate, self.now, 0.0);
+        }
         self.transport.start(self.now);
         let e = self.entry;
+        if self.tempo_lane() {
+            let (bpm, slope) = self.entry_tempo(&e);
+            self.transport.set_segment(0.0, bpm, slope);
+        }
+        self.follow_tempo();
         self.conductor = Some(self.tick_at(None, &e, 0));
         for t in &mut self.tracks[..self.track_count] {
             t.instrument.start();
@@ -1215,6 +1240,69 @@ impl Engine {
         for t in 0..self.track_count {
             self.tracks[t].clock = Some(self.tick_at(Some(t), &e, 0));
             self.tracks[t].early_for = None;
+        }
+    }
+
+    /// Whether the song's tempo points set the tempo now.
+    fn tempo_lane(&self) -> bool {
+        self.song_mode && self.tempo_points[..self.song_len].iter().any(Option::is_some)
+    }
+
+    /// The tempo at the start of entry `e` and its slope (see
+    /// [`entry_tempo`]).
+    fn entry_tempo(&self, e: &EntryPos) -> (f64, f64) {
+        match e.entry {
+            Some(i) if self.song_mode => entry_tempo(
+                usize::from(i),
+                self.song_len,
+                self.tempo_ramp,
+                self.tempo,
+                |j| self.tempo_points[j],
+                |j| self.pattern_pulses(self.song[j]),
+            ),
+            _ => (f64::from(self.tempo), 0.0),
+        }
+    }
+
+    /// Sets the transport's tempo for the current entry from `now`, after an
+    /// edit that may change it.
+    fn retempo(&mut self) {
+        let (bpm, slope) = self.transport.tempo();
+        if !self.transport.is_playing() || (!self.tempo_lane() && (bpm, slope) == (f64::from(self.tempo), 0.0)) {
+            return;
+        }
+        let e = self.entry_now();
+        let (start, slope) = self.entry_tempo(&e);
+        let pending = self.pending_position();
+        let at = self.transport.position_at(self.now).min(pending);
+        let bpm = start + slope * (at - e.start as f64 / 6.0).max(0.0);
+        self.transport.set_ramp(bpm, slope, self.now, pending);
+        self.follow_tempo();
+    }
+
+    /// Hands the tempo playing now to the delay and the synths' LFOs.
+    fn follow_tempo(&mut self) {
+        if self.transport.is_playing() {
+            self.follow_tempo_at(self.transport.position_at(self.now));
+        } else {
+            self.set_tempo_now(self.tempo);
+        }
+    }
+
+    /// Hands the tempo at `position` to the delay and the synths' LFOs: an
+    /// event inside a block sets the tempo at its own position, not at the
+    /// block's start, so it is the same at any buffer size.
+    fn follow_tempo_at(&mut self, position: f64) {
+        self.set_tempo_now(self.transport.bpm_at(position) as f32);
+    }
+
+    fn set_tempo_now(&mut self, bpm: f32) {
+        if bpm != self.tempo_now {
+            self.tempo_now = bpm;
+            self.mix.set_tempo(bpm);
+            for t in &mut self.tracks {
+                t.instrument.set_tempo(bpm);
+            }
         }
     }
 
@@ -1257,8 +1345,15 @@ impl Engine {
     fn peek_upcoming(&self) -> EntryPos {
         let now = self.entry_now();
         let start = now.start + self.pattern_pulses(now.pattern);
-        let (entry, pattern) = self.upcoming.unwrap_or_else(|| match now.entry {
-            Some(e) if self.song_mode => {
+        let (entry, pattern) = self.upcoming.unwrap_or_else(|| self.entry_after(now.entry));
+        EntryPos { entry, pattern, start }
+    }
+
+    /// The song entry and pattern that follow song entry `entry` (or the
+    /// pattern loop's cue).
+    fn entry_after(&self, entry: Option<u16>) -> (Option<u16>, u8) {
+        match entry {
+            Some(e) if self.song_mode && self.song_len > 0 => {
                 let e = usize::from(e);
                 let next = match self.loop_region {
                     Some((a, b)) if usize::from(b) == e && usize::from(b) < self.song_len => usize::from(a),
@@ -1268,8 +1363,35 @@ impl Engine {
                 (Some(next as u16), self.song[next])
             }
             _ => (None, self.cue),
-        });
-        EntryPos { entry, pattern, start }
+        }
+    }
+
+    /// The frame of a position in 16th notes, which may lie past the
+    /// current entry (a note's end, a step looked ahead to). Under tempo
+    /// points the entries after it set the tempo from its end on: the
+    /// current one's slope would run on past its point, even below zero.
+    fn later_frame(&self, position: f64) -> u64 {
+        let tr = &self.transport;
+        let now = self.entry_now();
+        let end = now.start + self.pattern_pulses(now.pattern);
+        if position <= end as f64 / 6.0 || !self.tempo_lane() {
+            return tr.frame_at(position);
+        }
+        let mut at = tr.exact_frame(end as f64 / 6.0);
+        let mut e = self.peek_upcoming();
+        // A note is at most 64 steps of 1/8, so a few hundred entries at most.
+        for _ in 0..2 * MAX_SONG {
+            let from = e.start as f64 / 6.0;
+            let e_end = e.start + self.pattern_pulses(e.pattern);
+            let (bpm, slope) = self.entry_tempo(&e);
+            at += span_frames(bpm, slope, position.min(e_end as f64 / 6.0) - from, self.sample_rate);
+            if position <= e_end as f64 / 6.0 || e_end == e.start {
+                break;
+            }
+            let (entry, pattern) = self.entry_after(e.entry);
+            e = EntryPos { entry, pattern, start: e_end };
+        }
+        at.round().max(0.0) as u64
     }
 
     /// The pattern track `t` plays in entry `e`; `None` while it rests.
@@ -1430,6 +1552,11 @@ impl Engine {
         self.entry = if next > end { EntryPos { start: next, ..self.entry_now() } } else { self.upcoming() };
         self.upcoming = None;
         let e = self.entry_now();
+        if self.tempo_lane() || self.transport.tempo().1 != 0.0 {
+            let (bpm, slope) = self.entry_tempo(&e);
+            self.transport.set_segment(e.start as f64 / 6.0, bpm, slope);
+            self.follow_tempo_at(e.start as f64 / 6.0);
+        }
         self.conductor = Some(self.tick_at(None, &e, e.start));
         for t in 0..self.track_count {
             self.tracks[t].clock = Some(self.tick_at(Some(t), &e, e.start));
@@ -1443,22 +1570,34 @@ impl Engine {
         match edit {
             Edit::SetTempo(bpm) => {
                 self.tempo = bpm.clamp(MIN_TEMPO, MAX_TEMPO);
-                let pending = self.pending_position();
-                self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
-                self.mix.set_tempo(self.tempo);
-                for t in &mut self.tracks {
-                    t.instrument.set_tempo(self.tempo);
+                if self.tempo_lane() || self.transport.tempo().1 != 0.0 {
+                    self.retempo();
+                    // Stopped, nothing is retimed, but auditions and live
+                    // notes play at the set tempo.
+                    if !self.transport.is_playing() {
+                        self.follow_tempo();
+                    }
+                } else {
+                    let pending = self.pending_position();
+                    self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
+                    self.tempo_now = self.tempo;
+                    self.mix.set_tempo(self.tempo);
+                    for t in &mut self.tracks {
+                        t.instrument.set_tempo(self.tempo);
+                    }
                 }
             }
             Edit::SetPatternLength { pattern, len } => {
                 if let Some(l) = self.pattern_lens.get_mut(usize::from(pattern)) {
                     *l = len.clamp(1, MAX_STEPS as u8);
+                    self.retempo();
                 }
             }
             Edit::SetPatternDivision { pattern, division } => {
                 if let Some(d) = self.divisions.get_mut(usize::from(pattern)) {
                     *d = division;
                     self.realign();
+                    self.retempo();
                 }
             }
             Edit::SetPatternMeter { .. } => {}
@@ -1471,8 +1610,11 @@ impl Engine {
                         t.parts.copy_within(i..self.song_len, i + 1);
                         t.parts[i] = Part::Follow;
                     }
+                    self.tempo_points.copy_within(i..self.song_len, i + 1);
+                    self.tempo_points[i] = None;
                     self.song_len += 1;
                     self.realign();
+                    self.retempo();
                 }
             }
             Edit::RemoveSongEntry(index) => {
@@ -1483,17 +1625,31 @@ impl Engine {
                         t.parts.copy_within(i + 1..self.song_len, i);
                         t.parts[self.song_len - 1] = Part::Follow;
                     }
+                    self.tempo_points.copy_within(i + 1..self.song_len, i);
+                    self.tempo_points[self.song_len - 1] = None;
                     self.song_len -= 1;
                     // Nothing left to chain: the cued pattern follows.
                     self.song_mode &= self.song_len > 0;
                     self.realign();
+                    self.retempo();
                 }
             }
             Edit::SetSongEntry { index, pattern } => {
                 if usize::from(index) < self.song_len && usize::from(pattern) < MAX_PATTERNS {
                     self.song[usize::from(index)] = pattern;
                     self.realign();
+                    self.retempo();
                 }
+            }
+            Edit::SetTempoPoint { index, bpm } => {
+                if let Some(p) = self.tempo_points[..self.song_len].get_mut(usize::from(index)) {
+                    *p = bpm.filter(|b| b.is_finite()).map(|b| b.clamp(MIN_TEMPO, MAX_TEMPO));
+                    self.retempo();
+                }
+            }
+            Edit::SetTempoRamp(ramp) => {
+                self.tempo_ramp = ramp;
+                self.retempo();
             }
             Edit::SetPart { track, index, part } => {
                 let valid = match part {
@@ -1515,7 +1671,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
-                    self.tracks[n].instrument.set_tempo(self.tempo);
+                    self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.tracks[i..=n].rotate_right(1);
                     self.track_count += 1;
                     self.update_gains();
@@ -1533,7 +1689,7 @@ impl Engine {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
                     self.tracks[n].reset(kind, self.sample_rate);
-                    self.tracks[n].instrument.set_tempo(self.tempo);
+                    self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.track_count += 1;
                     self.update_gains();
                     if self.transport.is_playing() {
@@ -1760,6 +1916,9 @@ impl Engine {
             let k = self.tick_at(None, &e, k.pulse);
             (shown, step) = (shown.max(Some(k.pulse)), Some(k.idx));
             self.conductor = Some(self.next_tick(None, k));
+            if self.transport.tempo().1 != 0.0 {
+                self.follow_tempo_at(self.transport.step_position(k.pulse, k.division));
+            }
         }
         // A track finer than the entry's grid moves the playhead's pulse
         // between the grid's steps; the entry's step changes only when the
@@ -1858,25 +2017,34 @@ impl Engine {
         };
         let tr = &self.transport;
         let div = u64::from(k.division.pulses());
-        let start = tr.step_frame(k.pulse, k.division);
+        let start = self.later_frame(tr.step_position(k.pulse, k.division));
         // A step cut short by the end of its entry keeps its ratchets inside
         // the entry.
         let step_end = if k.pulse + div > entry_end {
-            tr.pulse_frame(entry_end)
+            self.later_frame(entry_end as f64 / 6.0)
         } else {
-            tr.step_frame(k.pulse + div, k.division)
+            self.later_frame(tr.step_position(k.pulse + div, k.division))
         };
         let span = step_end.saturating_sub(start).max(1);
         // Ticks are a fraction of a straight step, so the earliest offset
         // never reaches back past the (possibly swing-shortened) step before.
-        let tick = tr.step_frames() * k.division.sixteenths() / f64::from(TICKS_PER_STEP);
+        // A late hit of a step looked ahead to in the next entry sounds in
+        // that entry's tempo. An early one sounds before it starts, in the
+        // tempo now, which also keeps it within the lookahead's reach.
+        let sixteenth = if step.offset > 0 && k.pulse >= self.entry_end() && self.tempo_lane() {
+            f64::from(self.sample_rate) * 15.0 / self.entry_tempo(&self.peek_upcoming()).0
+        } else {
+            tr.step_frames(k.pulse as f64 / 6.0)
+        };
+        let tick = sixteenth * k.division.sixteenths() / f64::from(TICKS_PER_STEP);
         let shift = (f64::from(step.offset) * tick).round() as i64;
         let at = start.saturating_add_signed(shift).max(self.now);
         let r = u64::from(step.ratchet);
         let gate = if r > 1 {
             (span / r).max(1)
         } else {
-            tr.step_frame(k.pulse + u64::from(step.length) * div, k.division).saturating_sub(start).max(1)
+            let end = tr.step_position(k.pulse + u64::from(step.length) * div, k.division);
+            self.later_frame(end).saturating_sub(start).max(1)
         };
         for i in 0..r {
             self.tracks[t].schedule_on(PendingOn { frame: at + span * i / r, step, gate });
@@ -2727,6 +2895,162 @@ mod tests {
         run(&mut e, 1000);
         e.apply(Edit::SetPart { track: 0, index: 0, part: Part::Pattern(1) });
         assert_eq!(onsets(&run(&mut e, 20_000), 1000), [8000 - 1000]);
+    }
+
+    /// Three entries of four 16ths with a hat on each step, and tempo points.
+    fn tempo_song(points: &[(u16, f32)], ramp: bool) -> Vec<Edit> {
+        let mut edits = hat_hits(Division::Sixteenth, 4, &[0, 1, 2, 3]);
+        for index in 0..3 {
+            edits.push(Edit::InsertSongEntry { index, pattern: 0 });
+        }
+        for &(index, bpm) in points {
+            edits.push(Edit::SetTempoPoint { index, bpm: Some(bpm) });
+        }
+        edits.push(Edit::SetTempoRamp(ramp));
+        edits
+    }
+
+    fn assert_near(got: &[usize], want: &[f64]) {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        for (&g, &w) in got.iter().zip(want) {
+            assert!((g as f64 - w).abs() <= 1.0, "{got:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn a_tempo_point_holds_until_the_next_and_the_song_wraps_to_the_set_tempo() {
+        let mut e = engine(&tempo_song(&[(1, 60.0)], false));
+        e.handle(Command::PlaySong { entry: 0 });
+        let out = run(&mut e, 128_000);
+        // 6000-frame steps at 120, then 12 000 at 60 from entry 1 on, then
+        // 120 again from the top.
+        let want = [
+            0, 6000, 12_000, 18_000, 24_000, 36_000, 48_000, 60_000, 72_000, 84_000, 96_000, 108_000, 120_000, 126_000,
+        ];
+        assert_eq!(onsets(&out, 200), want);
+    }
+
+    #[test]
+    fn a_tempo_ramp_lands_each_step_on_the_integral_of_its_tempo() {
+        use crate::engine::transport::span_frames;
+        let mut e = engine(&tempo_song(&[(0, 120.0), (2, 60.0)], true));
+        e.handle(Command::PlaySong { entry: 0 });
+        let out = run(&mut e, 140_000);
+        // 120 to 60 over the eight 16ths of entries 0 and 1, then 60 held.
+        let ramp: Vec<f64> = (0..=8).map(|n| span_frames(120.0, -7.5, f64::from(n), SR)).collect();
+        let start = ramp[8];
+        let mut want = ramp;
+        want.extend((1..4).map(|n| start + f64::from(n) * 12_000.0));
+        let end = start + 48_000.0;
+        want.extend((0..4).map(|n| end + span_frames(120.0, -7.5, f64::from(n), SR)));
+        assert_near(&onsets(&out, 200), &want);
+        assert!(e.shared.position().unwrap().entry == Some(0));
+    }
+
+    #[test]
+    fn a_note_past_a_ramp_s_end_lasts_by_the_tempo_after_it() {
+        // Four 16ths from 120 down to 30 BPM, then four held at 30: an
+        // eight-step note lasts the ramp's integral and four 30 BPM 16ths.
+        let edits = [
+            Edit::SetPatternLength { pattern: 0, len: 4 },
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(60, 100, 8)) },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::SetPart { track: 0, index: 1, part: Part::Rest },
+            Edit::SetTempoPoint { index: 0, bpm: Some(120.0) },
+            Edit::SetTempoPoint { index: 1, bpm: Some(30.0) },
+            Edit::SetTempoRamp(true),
+        ];
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 16);
+        let want = span_frames(120.0, -22.5, 4.0, SR) + 4.0 * 24_000.0;
+        let off = e.tracks[0].earliest_off().unwrap();
+        assert!((off as f64 - want).abs() <= 1.0, "{off} vs {want}");
+    }
+
+    #[test]
+    fn a_synth_added_under_a_tempo_point_takes_the_tempo_playing() {
+        let mut e = engine(&tempo_song(&[(1, 60.0)], false));
+        e.handle(Command::PlaySong { entry: 1 });
+        run(&mut e, 100);
+        e.apply(Edit::AddTrack(InstrumentKind::Synth));
+        e.apply(Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth });
+        assert_eq!(e.tracks[0].instrument.tempo(), Some(60.0));
+        assert_eq!(e.tracks[2].instrument.tempo(), Some(60.0));
+    }
+
+    #[test]
+    fn an_early_hit_before_a_slower_entry_is_timed_in_the_tempo_before_it() {
+        // 16 steps at 120, then 20 BPM: the next entry's first hit, half a
+        // step early, sounds half a 120 BPM step before the boundary.
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[]);
+        edits.extend([
+            Edit::SetStep {
+                track: 0,
+                pattern: 0,
+                step: 0,
+                value: Some(Step { offset: -MAX_OFFSET, ..Step::new(60, 127, 1) }),
+            },
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::SetTempoPoint { index: 1, bpm: Some(20.0) },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        assert_eq!(onsets(&run(&mut e, 100_000), 200), [0, 93_000]);
+    }
+
+    #[test]
+    fn tempo_edits_while_stopped_reach_the_delay_and_synths() {
+        let mut e = engine(&tempo_song(&[(1, 60.0)], false));
+        e.handle(Command::PlaySong { entry: 1 });
+        run(&mut e, 100);
+        assert_eq!(e.tempo_now, 60.0);
+        e.handle(Command::Stop);
+        run(&mut e, 100);
+        assert_eq!(e.tempo_now, 120.0);
+        e.apply(Edit::SetTempo(90.0));
+        assert_eq!(e.tempo_now, 90.0);
+    }
+
+    #[test]
+    fn a_tempo_ramp_is_independent_of_buffer_size() {
+        let mut edits = tempo_song(&[(0, 97.0), (2, 171.0)], true);
+        let id = |name: &str| InstrumentKind::Synth.params().iter().position(|s| s.id == name).unwrap() as u8;
+        edits.extend([
+            Edit::SetSwing(63.0),
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(Step { ratchet: 3, ..Step::new(60, 100, 1) }) },
+            // A synced LFO and the delay follow the tempo on each step.
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetParam { track: 1, index: id("lfo_sync"), value: 4.0 },
+            Edit::SetParam { track: 1, index: id("lfo_amp"), value: 1.0 },
+            Edit::SetParam { track: 1, index: id("lfo_wave"), value: 1.0 },
+            Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step::new(57, 100, 12)) },
+            Edit::SetParam {
+                track: 1,
+                index: (InstrumentKind::Synth.params().len() + strip::sp::COUNT + send::DELAY) as u8,
+                value: 0.0,
+            },
+        ]);
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            run(&mut e, 150_000)
+        };
+        for size in [1usize, 17, 64, 500, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::PlaySong { entry: 0 });
+            let mut got = Vec::new();
+            let mut left = 150_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            assert!(got == reference, "buffer size {size}");
+        }
     }
 
     #[test]
