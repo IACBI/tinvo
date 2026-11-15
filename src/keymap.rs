@@ -205,6 +205,9 @@ impl Default for Keymap {
     }
 }
 
+/// The most keys one action has.
+pub const MAX_KEYS: usize = 8;
+
 impl Keymap {
     fn index(a: Action) -> usize {
         a as usize
@@ -254,6 +257,10 @@ impl Keymap {
     /// Fails if a key is given twice where the actions it would start are
     /// active together.
     pub fn check(&self) -> Result<(), String> {
+        // First, as the checks below take time with the square of the keys.
+        if let Some(a) = Action::ALL.iter().find(|&&a| self.keys(a).len() > MAX_KEYS) {
+            return Err(format!("{} has more than {MAX_KEYS} keys", a.id()));
+        }
         let mut clashes = Vec::new();
         for (i, &a) in Action::ALL.iter().enumerate() {
             for &b in &Action::ALL[i + 1..] {

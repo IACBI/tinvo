@@ -1,7 +1,11 @@
 //! Signal-processing primitives.
 //!
-//! Everything in this module is allocation-free after construction and is
-//! safe to call from the real-time audio thread. Recursive state is flushed
+//! The processors (filters, envelopes, oscillators, dynamics, effects) are
+//! allocation-free after construction and safe to call from the real-time
+//! audio thread, `loudness::LiveLoudness` among them. Two analysis helpers
+//! are not: `loudness::LoudnessMeter` keeps every block it measures and
+//! `fft::power_spectrum` builds its buffers, so they run off the audio
+//! thread (export, the loopback check, tests). Recursive state is flushed
 //! explicitly instead of relying on the CPU's flush-to-zero mode, because
 //! changing the floating-point environment behind the compiler's back is not
 //! sound in Rust.

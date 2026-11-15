@@ -23,6 +23,9 @@ pub enum Message {
     NoteOn { channel: u8, note: u8, velocity: u8 },
     /// A key released (including note-on with velocity 0).
     NoteOff { channel: u8, note: u8 },
+    /// Messages were lost (the input overran), or the input stopped: keys
+    /// held may never send their releases.
+    Lost,
 }
 
 /// Decodes one complete channel message.

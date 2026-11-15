@@ -244,14 +244,16 @@ const FILE_DITHER_SEED: u64 = 0x7153_0d1f;
 /// export) the temporary file is removed and `path` is left untouched.
 pub struct FileWriter {
     inner: Option<Writer<BufWriter<File>>>,
-    tmp: PathBuf,
+    /// The temporary file, until it is renamed over `path`.
+    tmp: Option<PathBuf>,
     path: PathBuf,
 }
 
 impl FileWriter {
     pub fn create(path: &Path, channels: u16, sample_rate: u32, format: SampleFormat) -> Result<Self, String> {
         let (file, tmp) = crate::fsutil::create_temp_beside(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut w = Self { inner: None, tmp, path: path.to_path_buf() };
+        // From here on, dropping `w` removes the temporary file.
+        let mut w = Self { inner: None, tmp: Some(tmp), path: path.to_path_buf() };
         let writer =
             Writer::new(BufWriter::with_capacity(1 << 16, file), channels, sample_rate, format, FILE_DITHER_SEED);
         w.inner = Some(writer.map_err(|e| w.error(&e))?);
@@ -271,25 +273,62 @@ impl FileWriter {
         self.inner.as_ref().map_or(0, Writer::frames)
     }
 
-    pub fn finish(mut self) -> Result<EncodeStats, String> {
-        let w = self.inner.take().expect("finished twice");
-        let result = w.finish().map_err(|e| self.error(&e)).and_then(|(buf, stats)| {
-            let file = buf.into_inner().map_err(|e| self.error(&e.into_error()))?;
-            drop(file);
-            std::fs::rename(&self.tmp, &self.path).map_err(|e| self.error(&e))?;
-            Ok(stats)
-        });
-        if result.is_err() {
-            let _ = std::fs::remove_file(&self.tmp);
-        }
-        result
+    pub fn finish(self) -> Result<EncodeStats, String> {
+        self.finish_with(|tmp, path| std::fs::rename(tmp, path).map(|()| path.to_path_buf())).map(|(stats, _)| stats)
     }
+
+    /// Like [`FileWriter::finish`], but never replaces a file: if `path`
+    /// exists by then (another session wrote it meanwhile), the audio goes
+    /// to the first free `<stem>-2.wav`, `<stem>-3.wav`, ... beside it.
+    /// Returns where it went.
+    pub fn finish_new(self) -> Result<(EncodeStats, PathBuf), String> {
+        self.finish_with(|tmp, path| {
+            for n in 1..1000 {
+                let to = if n == 1 { path.to_path_buf() } else { numbered(path, n) };
+                match crate::fsutil::rename_new(tmp, &to) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    r => return r.map(|()| to),
+                }
+            }
+            Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name"))
+        })
+    }
+
+    fn finish_with(
+        mut self,
+        publish: impl FnOnce(&Path, &Path) -> std::io::Result<PathBuf>,
+    ) -> Result<(EncodeStats, PathBuf), String> {
+        let w = self.inner.take().expect("finished twice");
+        let (buf, stats) = w.finish().map_err(|e| self.error(&e))?;
+        let file = buf.into_inner().map_err(|e| self.error(&e.into_error()))?;
+        drop(file);
+        let tmp = self.tmp.take().expect("the temporary file is kept until now");
+        match publish(&tmp, &self.path) {
+            Ok(to) => Ok((stats, to)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(self.error(&e))
+            }
+        }
+    }
+}
+
+/// `<stem>-<n>.<extension>` beside `path`.
+fn numbered(path: &Path, n: u32) -> PathBuf {
+    let stem = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-{n}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{n}"),
+    };
+    path.with_file_name(name)
 }
 
 impl Drop for FileWriter {
     fn drop(&mut self) {
-        if self.inner.take().is_some() {
-            let _ = std::fs::remove_file(&self.tmp);
+        if let Some(tmp) = self.tmp.take() {
+            // Closed first: Windows cannot remove an open file.
+            drop(self.inner.take());
+            let _ = std::fs::remove_file(tmp);
         }
     }
 }
@@ -627,6 +666,17 @@ mod tests {
         assert_eq!(files(), 1);
         let d = decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(d.samples, vec![0.5; 100]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("tinvo-wav-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // More channels than a 24-bit frame can describe.
+        assert!(FileWriter::create(&dir.join("x.wav"), 30_000, 48_000, SampleFormat::Pcm24).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

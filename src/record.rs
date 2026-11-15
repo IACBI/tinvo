@@ -82,15 +82,16 @@ impl Sink {
         self.frames
     }
 
-    /// Writes what is left and completes the file.
-    pub fn finish(mut self) -> Result<u64, String> {
+    /// Writes what is left and completes the file, under a free name if
+    /// its own was taken meanwhile. Returns the frames written and where.
+    pub fn finish(mut self) -> Result<(u64, PathBuf), String> {
         self.drain()?;
         if self.frames == 0 {
             // Dropping the writer removes its temporary file.
             return Err("nothing was recorded".into());
         }
-        self.writer.finish()?;
-        Ok(self.frames)
+        let (_, path) = self.writer.finish_new()?;
+        Ok((self.frames, path))
     }
 }
 
@@ -181,9 +182,9 @@ impl Recorder {
         // Joining the capture thread first means every frame it pushed is
         // in the ring when the sink drains it.
         self.stream = None;
-        let frames = self.sink.finish()?;
+        let (frames, path) = self.sink.finish()?;
         Ok(Recording {
-            path: self.path,
+            path,
             frames,
             sample_rate: self.sample_rate,
             channels: self.channels,
@@ -234,11 +235,16 @@ mod tests {
             }
             assert_eq!(meter.dropped.load(Ordering::Relaxed), 0);
             assert!((meter.peak.take() - signal.iter().fold(0.0f32, |m, x| m.max(x.abs()))).abs() < 1e-9);
-            assert_eq!(sink.finish().unwrap(), 1000);
-            let back = crate::wav::decode(&std::fs::read(&path).unwrap()).unwrap();
+            let (frames, wrote) = sink.finish().unwrap();
+            assert_eq!(frames, 1000);
+            // The second take finds the first one's file there and goes
+            // beside it.
+            assert_eq!(wrote, if channels == 1 { path.clone() } else { dir.join("take-2.wav") });
+            let back = crate::wav::decode(&std::fs::read(&wrote).unwrap()).unwrap();
             assert_eq!((back.channels, back.sample_rate), (channels, 44_100));
             assert_eq!(back.samples, signal, "float WAV keeps every sample exactly");
         }
+        assert_eq!(crate::wav::decode(&std::fs::read(&path).unwrap()).unwrap().channels, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

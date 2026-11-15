@@ -982,6 +982,7 @@ impl App {
                     self.write_entry();
                 }
             }
+            Message::Lost => self.midi_reset(),
             Message::NoteOff { note, .. } => {
                 let Some(i) = self.entry_held.iter().position(|&n| n == note) else { return };
                 self.entry_held.swap_remove(i);
@@ -1148,16 +1149,17 @@ impl App {
     /// skipped.
     fn edit_group(&mut self, edits: Vec<Edit>, what: &'static str) {
         let meta_before = self.meta();
-        let (mut undo, mut redo) = (Vec::new(), Vec::new());
+        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
         for e in edits {
             let Ok(inverse) = self.project.inverse(&e) else { continue };
             let Some(applied) = self.apply_raw(e) else { continue };
             if inverse != [applied] {
-                // Undo runs the inverses in reverse order of the edits.
-                undo.splice(0..0, inverse);
+                inverses.push(inverse);
                 redo.push(applied);
             }
         }
+        // Undo runs the inverses in reverse order of the edits.
+        let undo = inverses.into_iter().rev().flatten().collect();
         if redo.is_empty() {
             return;
         }
@@ -2363,6 +2365,10 @@ impl App {
             self.set_status(format!("{} is already a key of {}", crate::keymap::key_label(key), a.id()));
             return;
         }
+        if list.len() >= crate::keymap::MAX_KEYS {
+            self.set_status(format!("Not changed: {} has {} keys, the most it can", a.id(), crate::keymap::MAX_KEYS));
+            return;
+        }
         // Some terminals send a key the settings file has no name for
         // (Ctrl+M is Enter there, for one); it could not be saved.
         if crate::keymap::parse_key(&crate::keymap::key_name(key)) != Ok(key) {
@@ -2501,7 +2507,7 @@ impl App {
         let Some(path) = self.settings_path.clone() else {
             return Ok("Settings apply until TINVO quits: there is no settings folder (no APPDATA or HOME)".into());
         };
-        let old = match std::fs::read_to_string(&path) {
+        let old = match crate::fsutil::read_text(&path, settings_mod::MAX_FILE_BYTES) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -4550,7 +4556,8 @@ struct MidiSession {
     input: Option<midi::Input>,
     live: Arc<Mailbox<LiveNote>>,
     ui: Arc<Mailbox<Message>>,
-    /// Set by the handler when a mailbox had no room for a message.
+    /// Set by the handler when a mailbox had no room for a message, or the
+    /// input lost some.
     lost: Arc<AtomicBool>,
     /// Every held note is to be let go (`LiveNote::ALL_OFF` not yet sent).
     release: bool,
@@ -4592,6 +4599,10 @@ impl MidiSession {
             let note = match m {
                 Message::NoteOn { note, velocity, .. } => LiveNote { note, velocity },
                 Message::NoteOff { note, .. } => LiveNote { note, velocity: 0 },
+                Message::Lost => {
+                    lost.store(true, Ordering::Relaxed);
+                    return;
+                }
             };
             // A full mailbox drops the note rather than block this thread,
             // and says so: a lost release would leave a note held.
@@ -6943,6 +6954,15 @@ mod tests {
         session.live.clear();
         session.poll(&mut a);
         assert_eq!((session.live.pop(), session.release), (Some(LiveNote::ALL_OFF), false));
+        // So does an input that lost messages itself.
+        handler(note_on(62, 99));
+        session.poll(&mut a);
+        assert_eq!(a.entry_held, [62]);
+        session.live.clear();
+        handler(Message::Lost);
+        session.poll(&mut a);
+        assert!(a.entry_held.is_empty());
+        assert_eq!((session.live.pop(), session.live.pop()), (Some(LiveNote::ALL_OFF), None));
         // With no input open, turning MIDI off has nothing to let go.
         session.open(&mut a, None);
         session.poll(&mut a);
@@ -7442,6 +7462,17 @@ mod tests {
         keys(&mut a, &[Key::Enter, Key::Esc]);
         assert_eq!(a.status_text(), Some("No key added"));
         assert_eq!(a.mode, Mode::Settings, "Esc while waiting only cancels the wait");
+        // Up to eight keys.
+        for n in 3..8 {
+            keys(&mut a, &[Key::Enter, Key::F(n)]);
+        }
+        assert_eq!(a.keys.keys(Action::Undo).len(), 8, "{:?}", a.status_text());
+        keys(&mut a, &[Key::Enter, Key::F(8)]);
+        assert_eq!(a.status_text(), Some("Not changed: undo has 8 keys, the most it can"));
+        assert_eq!(a.keys.keys(Action::Undo).len(), 8);
+        for _ in 3..8 {
+            keys(&mut a, &[Key::Delete]);
+        }
         // Del removes the last key, r puts the defaults back.
         keys(&mut a, &[Key::Delete, Key::Delete]);
         assert_eq!(a.keys.keys(Action::Undo), [Key::Char('u')]);

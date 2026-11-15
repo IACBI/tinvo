@@ -11,6 +11,23 @@ Author: 𝓐.𝓒.𝓑
 - A count-in: with `count_in = 1` or `2`, recording from a stop first clicks that many bars of the pattern's time signature, the first beat of each bar higher, then starts on the beat. A key played within half a step before the count-in ends lands on the first step. The top bar shows the beat counted, then `● REC NOTES`.
 - The settings page's options tab has the recording options next to the mouse.
 
+### Changed
+- Project files are read up to 64 MiB and the settings file up to 1 MiB; TINVO writes a few MiB at most. An action takes up to 8 keys, in the settings file and on the settings page.
+- A recording never replaces a file: if another program created one at its name meanwhile, the take goes to the first free `-2.wav`, `-3.wav`, ... beside it, and the status says where.
+
+### Fixed
+- When the ALSA sequencer overran and dropped MIDI events, or a sequencer or raw MIDI input failed, keys held then could sound on forever; every live note is now let go.
+- If the terminal closed TINVO's input, the editor spun at full speed instead of ending (Linux and macOS).
+- Device names, MIDI port names and paths printed by the command line could carry terminal escape sequences or line breaks; they are now printed escaped, on one line.
+- A WAV file that could not be written (too many channels for its format) left its temporary file behind.
+- The CoreAudio input callback took a mutable borrow of its whole state while the stopping thread read part of it.
+- Kick, snare and clap envelopes could fall into denormal numbers under a long hit, which are slow on some processors.
+- Tracks playing one sample file each loaded their own copy; they now share one, and a missing file is reported once.
+- Grouped edits (a paste, a recorded take) built their undo step in time growing with the square of their size.
+
+### Removed
+- Unused accessors in the engine, the sampler and the mixer.
+
 ## [0.23.0] - 2026-11-15
 
 ### Added

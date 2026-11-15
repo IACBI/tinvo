@@ -117,6 +117,7 @@ where
                     }
                     if got < 0 {
                         // The device is gone; there is nothing more to read.
+                        handler(Message::Lost);
                         return;
                     }
                     for &b in &buf[..got as usize] {

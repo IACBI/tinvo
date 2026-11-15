@@ -14,6 +14,7 @@ use tinvo::project::{Project, pattern_name};
 use tinvo::record::Recorder;
 use tinvo::render::{self, RenderOptions, Source};
 use tinvo::settings::{self, Settings};
+use tinvo::tui::printable_line as shown;
 use tinvo::wav::{self, SampleFormat};
 
 const USAGE: &str = "\
@@ -187,9 +188,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let elapsed = start.elapsed();
     let secs = frames as f64 / f64::from(opts.sample_rate);
     println!(
-        "Rendered {what}, {secs:.2} s ({}, {} Hz), to {out} in {:.3} s; {}; sample peak {:.2} dBFS; {} clipped samples",
+        "Rendered {what}, {secs:.2} s ({}, {} Hz), to {} in {:.3} s; {}; sample peak {:.2} dBFS; {} clipped samples",
         format.label(),
         opts.sample_rate,
+        shown(out),
         elapsed.as_secs_f64(),
         meter.finish().summary(),
         tinvo::dsp::gain_to_db(stats.peak),
@@ -216,7 +218,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                 file.write(&silence[..2 * n])?;
             }
             let st = file.finish()?;
-            println!("  stem {}: peak {:.2} dBFS", path.display(), tinvo::dsp::gain_to_db(st.peak));
+            println!("  stem {}: peak {:.2} dBFS", shown(&path.display().to_string()), tinvo::dsp::gain_to_db(st.peak));
         }
     }
     Ok(())
@@ -225,7 +227,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
 fn cmd_demo(args: &[String]) -> Result<(), String> {
     let [out] = args else { return Err("demo needs exactly one output path".into()) };
     Project::demo().save(out.as_ref()).map_err(|e| format!("{out}: {e}"))?;
-    println!("Wrote demo project to {out}");
+    println!("Wrote demo project to {}", shown(out));
     Ok(())
 }
 
@@ -361,7 +363,7 @@ fn cmd_inputs() -> Result<(), String> {
         println!("No input devices.");
     }
     for d in &devices {
-        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, d.name, d.id);
+        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, shown(&d.name), shown(&d.id));
     }
     if devices.iter().any(|d| d.is_default) {
         println!("(* is the system default)");
@@ -381,7 +383,7 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     }
     let path = PathBuf::from(out);
     let mut r = Recorder::start(input.as_deref(), &path)?;
-    println!("Recording {seconds} s from {} ...", r.device());
+    println!("Recording {seconds} s from {} ...", shown(r.device()));
     let start = Instant::now();
     let mut peak = 0.0f32;
     while start.elapsed().as_secs_f64() < seconds {
@@ -396,7 +398,7 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     let peak_db = if peak > 0.0 { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "silence".into() };
     println!(
         "Wrote {}: {:.2} s, {} Hz, {} channel(s), peak {peak_db}, {} frames dropped",
-        rec.path.display(),
+        shown(&rec.path.display().to_string()),
         rec.seconds(),
         rec.sample_rate,
         rec.channels,
@@ -411,7 +413,7 @@ fn cmd_midi() -> Result<(), String> {
         println!("No MIDI inputs.");
     }
     for p in &ports {
-        println!("  {}\n    {}", p.name, p.id);
+        println!("  {}\n    {}", shown(&p.name), shown(&p.id));
     }
     Ok(())
 }
@@ -422,7 +424,7 @@ fn cmd_devices() -> Result<(), String> {
         println!("No output devices.");
     }
     for d in &devices {
-        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, d.name, d.id);
+        println!("{} {}\n    {}", if d.is_default { "*" } else { " " }, shown(&d.name), shown(&d.id));
     }
     if devices.iter().any(|d| d.is_default) {
         println!("(* is the system default)");
@@ -465,7 +467,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     println!(
         "Opened {} on {}: {} Hz, {} channels, {} format, {}-frame buffer ({:.1} ms), {}-frame period ({:.2} ms){}",
         info.backend,
-        if info.device.is_empty() { "the default device" } else { &info.device },
+        if info.device.is_empty() { "the default device".into() } else { shown(&info.device) },
         info.sample_rate,
         info.device_channels,
         info.format,
@@ -571,12 +573,15 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
     println!(
         "Output: {} on {}, {rate} Hz, {:.2} ms period",
         out_info.backend,
-        if out_info.device.is_empty() { "the default device" } else { &out_info.device },
+        if out_info.device.is_empty() { "the default device".into() } else { shown(&out_info.device) },
         f64::from(out_info.period_frames) * 1000.0 / f64::from(rate)
     );
     println!(
         "Input:  {} on {}, {} Hz, {} channel(s)",
-        in_info.backend, in_info.device, in_info.sample_rate, in_info.device_channels
+        in_info.backend,
+        shown(&in_info.device),
+        in_info.sample_rate,
+        in_info.device_channels
     );
     if in_info.sample_rate != rate {
         return Err(format!(

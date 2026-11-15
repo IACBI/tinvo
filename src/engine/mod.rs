@@ -1035,7 +1035,6 @@ pub struct Engine {
     tracks: Box<[Track]>,
     track_count: usize,
     master: Smoother,
-    master_db: f32,
     mix_l: [f32; BLOCK],
     mix_r: [f32; BLOCK],
     /// Each track's signal for the current block: every instrument renders
@@ -1117,7 +1116,6 @@ impl Engine {
             tracks: tracks.into_boxed_slice(),
             track_count: 0,
             master: Smoother::new(1.0, SMOOTHING_TIME, sample_rate),
-            master_db: 0.0,
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
@@ -1169,10 +1167,6 @@ impl Engine {
         e.fading_count = 0;
         e.settle_smoothers();
         e
-    }
-
-    pub fn sample_rate(&self) -> f32 {
-        self.sample_rate
     }
 
     /// Frames by which the output lags the sequencer (the master limiter's
@@ -2058,7 +2052,6 @@ impl Engine {
                 }
             }
             Edit::SetMasterGain(db) => {
-                self.master_db = db;
                 self.master.set_target(fader_gain(db));
             }
             Edit::AddTrack(kind) => {

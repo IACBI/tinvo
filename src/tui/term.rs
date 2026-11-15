@@ -492,6 +492,23 @@ mod sys {
         last_size: (u16, u16),
     }
 
+    /// Reads what `fd` has into `pending`. The end of input is an error:
+    /// the terminal is gone, and waiting on it would spin forever.
+    fn read_into(fd: c_int, pending: &mut Vec<u8>) -> io::Result<()> {
+        let mut buf = [0u8; 256];
+        // SAFETY: reading into a local buffer of the given length.
+        let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted { Ok(()) } else { Err(e) };
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the terminal closed its input"));
+        }
+        pending.extend_from_slice(&buf[..n as usize]);
+        Ok(())
+    }
+
     impl RawMode {
         /// The mouse is asked for with escape sequences, so `_mouse` changes
         /// nothing here.
@@ -547,14 +564,7 @@ mod sys {
         }
 
         fn fill(&mut self) -> io::Result<()> {
-            let mut buf = [0u8; 256];
-            // SAFETY: reading into a local buffer of the given length.
-            let n = unsafe { read(STDIN, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            self.pending.extend_from_slice(&buf[..n as usize]);
-            Ok(())
+            read_into(STDIN, &mut self.pending)
         }
 
         pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
@@ -600,6 +610,29 @@ mod sys {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn input_is_read_and_its_end_is_an_error() {
+            let path = std::env::temp_dir().join(format!("tinvo-term-{}", std::process::id()));
+            std::fs::write(&path, b"ab").unwrap();
+            let f = std::fs::File::open(&path).unwrap();
+            let mut pending = vec![0x1b];
+            read_into(f.as_raw_fd(), &mut pending).unwrap();
+            assert_eq!(pending, b"\x1bab");
+            // At the end, with a lone ESC still waiting for the rest of its
+            // sequence.
+            let e = read_into(f.as_raw_fd(), &mut pending).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(pending, b"\x1bab");
+            drop(f);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

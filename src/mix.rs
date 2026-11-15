@@ -150,11 +150,6 @@ impl Mix {
         m
     }
 
-    /// The value set by edits (automation aside).
-    pub fn param(&self, index: usize) -> Option<f32> {
-        self.base.get(index).copied()
-    }
-
     pub fn set_param(&mut self, index: usize, value: f32) {
         if let Some(spec) = MIX_PARAMS.get(index) {
             self.base[index] = spec.clamp(value);

@@ -791,21 +791,25 @@ unsafe extern "C" fn captured<C: CaptureCallback>(
     _packets: u32,
     _descs: *const c_void,
 ) {
+    let state = user as *mut InputState<C>;
     // SAFETY: `user` is the `InputState<C>` boxed in `open_input`, alive
-    // until the queue is disposed; AudioQueue serializes callbacks.
-    let state = unsafe { &mut *(user as *mut InputState<C>) };
+    // until the queue is disposed; AudioQueue serializes callbacks. Only
+    // the callback is borrowed mutably: the owning thread sets `stopping`
+    // while a callback may be running, so the whole state must not be.
+    let (callback, stopping, health) =
+        unsafe { (&mut *ptr::addr_of_mut!((*state).callback), &(*state).stopping, &(*state).health) };
     // SAFETY: AudioQueue hands us a filled buffer it owns until re-enqueued.
     let buf = unsafe { &mut *buffer };
     let samples = (buf.audio_data_byte_size / 4) as usize & !1;
     // SAFETY: the buffer holds `audio_data_byte_size` bytes of stereo f32.
     let data = unsafe { std::slice::from_raw_parts(buf.audio_data as *const f32, samples) };
-    state.callback.capture(data);
-    if !state.stopping.load(Ordering::Acquire) {
+    callback.capture(data);
+    if !stopping.load(Ordering::Acquire) {
         // SAFETY: re-enqueueing the buffer we were handed.
         let status = unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null()) };
-        if status != 0 && !state.stopping.swap(true, Ordering::AcqRel) {
+        if status != 0 && !stopping.swap(true, Ordering::AcqRel) {
             // Error path only: the queue is dead, so taking a lock is acceptable.
-            state.health.fail(format!("input device lost (AudioQueueEnqueueBuffer OSStatus {status})"));
+            health.fail(format!("input device lost (AudioQueueEnqueueBuffer OSStatus {status})"));
         }
     }
 }

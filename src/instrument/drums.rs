@@ -8,7 +8,7 @@ use super::{InstrumentKind, ParamSpec, Unit};
 use crate::dsp::filter::{FilterMode, Svf};
 use crate::dsp::noise::Rng;
 use crate::dsp::osc::{Oscillator, Waveform};
-use crate::dsp::{decay_coef, semitones_to_ratio, velocity_to_gain};
+use crate::dsp::{decay_coef, flush_denormal, semitones_to_ratio, velocity_to_gain};
 use std::f64::consts::TAU;
 
 const HZ_STEP: f32 = 1.059_463_1;
@@ -288,9 +288,9 @@ impl Drum {
                 self.phase1 = (self.phase1 + f64::from(f) / srd).fract();
                 let body = (TAU * self.phase1).sin() as f32 * self.amp;
                 let click = self.f1.process(self.rng.bipolar(), FilterMode::HighPass) * self.amp2 * p[3];
-                self.pe *= self.pe_coef;
+                self.pe = flush_denormal(self.pe * self.pe_coef);
                 self.amp *= self.amp_coef;
-                self.amp2 *= self.amp2_coef;
+                self.amp2 = flush_denormal(self.amp2 * self.amp2_coef);
                 0.95 * body + 0.6 * click
             }
             InstrumentKind::Snare => {
@@ -302,9 +302,9 @@ impl Drum {
                 let noise = self.f2.process(self.f1.process(n, FilterMode::HighPass), FilterMode::LowPass);
                 let snappy = p[3];
                 let y = tone * self.amp * (1.0 - 0.5 * snappy) + noise * self.amp2 * snappy * 0.9;
-                self.pe *= self.pe_coef;
+                self.pe = flush_denormal(self.pe * self.pe_coef);
                 self.amp *= self.amp_coef;
-                self.amp2 *= self.amp2_coef;
+                self.amp2 = flush_denormal(self.amp2 * self.amp2_coef);
                 y
             }
             InstrumentKind::HatClosed | InstrumentKind::HatOpen => {
@@ -332,7 +332,7 @@ impl Drum {
                 let n = self.f1.process(self.rng.bipolar(), FilterMode::BandPass);
                 let y = n * (self.amp2 + 0.7 * self.amp);
                 self.amp *= self.amp_coef;
-                self.amp2 *= self.amp2_coef;
+                self.amp2 = flush_denormal(self.amp2 * self.amp2_coef);
                 1.4 * y
             }
             InstrumentKind::Synth | InstrumentKind::Sampler => 0.0,
@@ -371,6 +371,24 @@ mod tests {
             d.render(&mut buf);
             assert!(!d.active, "{kind:?} still active after 4 s");
             assert!(buf[buf.len() - 1000..].iter().all(|&x| x == 0.0));
+        }
+    }
+
+    #[test]
+    fn short_envelopes_under_a_long_hit_stop_at_zero() {
+        // The click and pitch envelopes fall far faster than a long kick or
+        // snare rings; they must reach zero without passing through the
+        // slow subnormal range.
+        for kind in [InstrumentKind::Kick, InstrumentKind::Snare, InstrumentKind::Clap] {
+            let mut d = Drum::new(kind, SR);
+            d.set_param(1, params(kind)[1].max);
+            d.trigger(60, 127);
+            let mut one = [0.0];
+            for i in 0..48_000 * 3 {
+                d.render(&mut one);
+                let ok = |x: f32| !x.is_subnormal();
+                assert!(ok(d.amp) && ok(d.amp2) && ok(d.pe), "{kind:?} at frame {i}: {} {} {}", d.amp, d.amp2, d.pe);
+            }
         }
     }
 
