@@ -1,8 +1,8 @@
-//! Linux MIDI input through ALSA rawmidi.
+//! Linux MIDI input and output through ALSA rawmidi.
 //!
 //! The fallback where the ALSA sequencer is missing. Ports are the rawmidi
-//! devices ALSA's hints list for input (hardware and USB MIDI); software
-//! clients of the sequencer are not visible here.
+//! devices ALSA's hints list (hardware and USB MIDI); software clients of
+//! the sequencer are not visible here.
 //! A TINVO thread polls the device and runs the byte stream through
 //! [`Parser`].
 
@@ -33,6 +33,7 @@ unsafe extern "C" {
     fn snd_rawmidi_open(input: *mut *mut c_void, output: *mut *mut c_void, name: *const c_char, mode: c_int) -> c_int;
     fn snd_rawmidi_close(rawmidi: *mut c_void) -> c_int;
     fn snd_rawmidi_read(rawmidi: *mut c_void, buffer: *mut c_void, size: usize) -> isize;
+    fn snd_rawmidi_write(rawmidi: *mut c_void, buffer: *const c_void, size: usize) -> isize;
     fn snd_rawmidi_poll_descriptors(rawmidi: *mut c_void, pfds: *mut PollFd, space: c_uint) -> c_int;
 }
 
@@ -40,15 +41,60 @@ unsafe extern "C" {
     fn poll(fds: *mut PollFd, n: c_ulong, timeout: c_int) -> c_int;
 }
 
-pub fn inputs() -> Result<Vec<Port>, String> {
+/// The devices ALSA's hints list, but for those only of the other direction.
+fn devices(not: &str) -> Result<Vec<Port>, String> {
     Ok(hints(c"rawmidi")?
         .into_iter()
-        .filter(|h| h.ioid.as_deref() != Some("Output"))
+        .filter(|h| h.ioid.as_deref() != Some(not))
         .map(|h| {
             let label = h.desc.unwrap_or_else(|| h.name.clone());
             Port { name: format!("{label} ({})", h.name), id: h.name }
         })
         .collect())
+}
+
+pub fn inputs() -> Result<Vec<Port>, String> {
+    devices("Output")
+}
+
+pub fn outputs() -> Result<Vec<Port>, String> {
+    devices("Input")
+}
+
+fn open_raw(port: &Port, input: bool) -> Result<Raw, String> {
+    let name = CString::new(port.id.as_str()).map_err(|_| format!("bad MIDI port name '{}'", port.id))?;
+    let mut raw = ptr::null_mut();
+    let (inp, out): (*mut *mut c_void, *mut *mut c_void) =
+        if input { (&mut raw, ptr::null_mut()) } else { (ptr::null_mut(), &mut raw) };
+    // SAFETY: one valid out-pointer, the other side null, and a
+    // NUL-terminated name.
+    let r = unsafe { snd_rawmidi_open(inp, out, name.as_ptr(), SND_RAWMIDI_NONBLOCK) };
+    if r < 0 {
+        let what = if input { "input" } else { "output" };
+        return Err(alsa_error(&format!("cannot open MIDI {what} '{}'", port.id), r));
+    }
+    Ok(Raw(raw))
+}
+
+/// An open rawmidi output.
+pub struct OutHandle(Raw);
+
+impl OutHandle {
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // SAFETY: an open output and a valid buffer of its length.
+        let r = unsafe { snd_rawmidi_write(self.0.0, bytes.as_ptr().cast(), bytes.len()) };
+        if r == bytes.len() as isize {
+            Ok(())
+        } else if r < 0 {
+            Err(alsa_error("cannot write to the MIDI output", r as c_int))
+        } else {
+            Err("the MIDI output took part of a message".into())
+        }
+    }
+}
+
+pub fn open_output(port: &Port) -> Result<OutHandle, String> {
+    open_raw(port, false).map(OutHandle)
 }
 
 struct Raw(*mut c_void);
@@ -81,14 +127,7 @@ pub fn open<H>(port: &Port, mut handler: H) -> Result<Handle, String>
 where
     H: FnMut(Message) + Send + 'static,
 {
-    let name = CString::new(port.id.as_str()).map_err(|_| format!("bad MIDI port name '{}'", port.id))?;
-    let mut raw = ptr::null_mut();
-    // SAFETY: valid out-pointer and NUL-terminated name; no output side.
-    let r = unsafe { snd_rawmidi_open(&mut raw, ptr::null_mut(), name.as_ptr(), SND_RAWMIDI_NONBLOCK) };
-    if r < 0 {
-        return Err(alsa_error(&format!("cannot open MIDI input '{}'", port.id), r));
-    }
-    let raw = Raw(raw);
+    let raw = open_raw(port, true)?;
     let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; MAX_FDS];
     // SAFETY: `fds` has room for MAX_FDS descriptors.
     let n = unsafe { snd_rawmidi_poll_descriptors(raw.0, fds.as_mut_ptr(), MAX_FDS as c_uint) };

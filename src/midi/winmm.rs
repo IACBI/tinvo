@@ -1,15 +1,17 @@
-//! Windows MIDI input through WinMM (`midiIn*`).
+//! Windows MIDI input and output through WinMM (`midiIn*`, `midiOut*`).
 //!
 //! WinMM numbers devices by position, which shifts when one is unplugged, so
 //! a port's id is its name (with ` #2`, ` #3` for repeated names, in device
 //! order). WinMM hands over complete short messages; system exclusive data
-//! would need buffers TINVO does not register, so it never arrives.
+//! would need buffers TINVO does not register, so it never arrives. Output
+//! sends short messages too, which is all TINVO sends.
 
 use super::{Message, Port, decode};
 use std::ffi::c_void;
 use std::ptr;
 
 type Hmidiin = *mut c_void;
+type Hmidiout = *mut c_void;
 
 const CALLBACK_FUNCTION: u32 = 0x0003_0000;
 const MIM_DATA: u32 = 0x3C3;
@@ -26,6 +28,20 @@ struct MidiInCapsW {
     support: u32,
 }
 
+/// `MIDIOUTCAPSW`, naturally aligned like [`MidiInCapsW`].
+#[repr(C)]
+struct MidiOutCapsW {
+    mid: u16,
+    pid: u16,
+    driver_version: u32,
+    pname: [u16; MAXPNAMELEN],
+    technology: u16,
+    voices: u16,
+    notes: u16,
+    channel_mask: u16,
+    support: u32,
+}
+
 type MidiInProc = unsafe extern "system" fn(Hmidiin, u32, usize, usize, usize);
 
 #[link(name = "winmm")]
@@ -38,6 +54,12 @@ unsafe extern "system" {
     fn midiInReset(handle: Hmidiin) -> u32;
     fn midiInClose(handle: Hmidiin) -> u32;
     fn midiInGetErrorTextW(error: u32, text: *mut u16, len: u32) -> u32;
+    fn midiOutGetNumDevs() -> u32;
+    fn midiOutGetDevCapsW(device: usize, caps: *mut MidiOutCapsW, size: u32) -> u32;
+    fn midiOutOpen(handle: *mut Hmidiout, device: u32, callback: usize, instance: usize, flags: u32) -> u32;
+    fn midiOutShortMsg(handle: Hmidiout, msg: u32) -> u32;
+    fn midiOutReset(handle: Hmidiout) -> u32;
+    fn midiOutClose(handle: Hmidiout) -> u32;
 }
 
 fn error_text(what: &str, err: u32) -> String {
@@ -56,17 +78,44 @@ fn error_text(what: &str, err: u32) -> String {
 fn ports() -> Vec<(u32, Port)> {
     // SAFETY: no arguments.
     let n = unsafe { midiInGetNumDevs() };
-    let mut out: Vec<(u32, Port)> = Vec::new();
-    for i in 0..n {
+    named(n, "MIDI input", |i| {
         let mut caps = MidiInCapsW { mid: 0, pid: 0, driver_version: 0, pname: [0; MAXPNAMELEN], support: 0 };
         // SAFETY: a valid out-pointer and its size.
         let r = unsafe { midiInGetDevCapsW(i as usize, &mut caps, size_of::<MidiInCapsW>() as u32) };
-        if r != 0 {
-            continue;
-        }
-        let end = caps.pname.iter().position(|&c| c == 0).unwrap_or(MAXPNAMELEN);
-        let name = String::from_utf16_lossy(&caps.pname[..end]);
-        let name = if name.is_empty() { format!("MIDI input {}", i + 1) } else { name };
+        (r == 0).then_some(caps.pname)
+    })
+}
+
+/// Every output device's index and port.
+fn output_ports() -> Vec<(u32, Port)> {
+    // SAFETY: no arguments.
+    let n = unsafe { midiOutGetNumDevs() };
+    named(n, "MIDI output", |i| {
+        let mut caps = MidiOutCapsW {
+            mid: 0,
+            pid: 0,
+            driver_version: 0,
+            pname: [0; MAXPNAMELEN],
+            technology: 0,
+            voices: 0,
+            notes: 0,
+            channel_mask: 0,
+            support: 0,
+        };
+        // SAFETY: a valid out-pointer and its size.
+        let r = unsafe { midiOutGetDevCapsW(i as usize, &mut caps, size_of::<MidiOutCapsW>() as u32) };
+        (r == 0).then_some(caps.pname)
+    })
+}
+
+/// The ports of `n` devices, from each one's name as `pname` reads it.
+fn named(n: u32, what: &str, pname: impl Fn(u32) -> Option<[u16; MAXPNAMELEN]>) -> Vec<(u32, Port)> {
+    let mut out: Vec<(u32, Port)> = Vec::new();
+    for i in 0..n {
+        let Some(pname) = pname(i) else { continue };
+        let end = pname.iter().position(|&c| c == 0).unwrap_or(MAXPNAMELEN);
+        let name = String::from_utf16_lossy(&pname[..end]);
+        let name = if name.is_empty() { format!("{what} {}", i + 1) } else { name };
         let repeats = out.iter().filter(|(_, p)| p.name == name).count();
         let id = if repeats == 0 { name.clone() } else { format!("{name} #{}", repeats + 1) };
         out.push((i, Port { id, name }));
@@ -148,4 +197,69 @@ where
         return Err(error_text(&format!("cannot start MIDI input '{}'", port.name), r));
     }
     Ok(h)
+}
+
+pub fn outputs() -> Result<Vec<Port>, String> {
+    Ok(output_ports().into_iter().map(|(_, p)| p).collect())
+}
+
+/// An open MIDI output device.
+pub struct OutHandle(Hmidiout);
+
+// SAFETY: WinMM output handles may be used from any thread, one at a time.
+unsafe impl Send for OutHandle {}
+
+impl OutHandle {
+    /// Sends one short message of one to three bytes.
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let msg = bytes.iter().take(3).enumerate().fold(0u32, |m, (i, &b)| m | u32::from(b) << (8 * i));
+        // SAFETY: an open handle.
+        match unsafe { midiOutShortMsg(self.0, msg) } {
+            0 => Ok(()),
+            r => Err(error_text("cannot send to the MIDI output", r)),
+        }
+    }
+}
+
+impl Drop for OutHandle {
+    fn drop(&mut self) {
+        // SAFETY: an open handle, closed once; reset releases every note.
+        unsafe {
+            midiOutReset(self.0);
+            midiOutClose(self.0);
+        }
+    }
+}
+
+pub fn open_output(port: &Port) -> Result<OutHandle, String> {
+    let index = output_ports()
+        .into_iter()
+        .find(|(_, p)| p.id == port.id)
+        .map(|(i, _)| i)
+        .ok_or_else(|| format!("MIDI output '{}' is not connected", port.id))?;
+    let mut handle: Hmidiout = ptr::null_mut();
+    // SAFETY: a valid out-pointer; no callback (CALLBACK_NULL).
+    let r = unsafe { midiOutOpen(&mut handle, index, 0, 0, 0) };
+    if r != 0 {
+        return Err(error_text(&format!("cannot open MIDI output '{}'", port.name), r));
+    }
+    Ok(OutHandle(handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opens the first output and sends it a clock, which an instrument
+    /// ignores; skipped where there is none.
+    #[test]
+    fn an_output_opens_and_takes_a_message() {
+        let Some(port) = outputs().unwrap().into_iter().next() else {
+            eprintln!("no MIDI output; skipping");
+            return;
+        };
+        let mut out = open_output(&port).unwrap();
+        out.send(&[0xF8]).unwrap();
+        assert!(open_output(&Port { id: "no such port".into(), name: String::new() }).is_err());
+    }
 }
