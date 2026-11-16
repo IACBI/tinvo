@@ -251,13 +251,18 @@ mod tests {
     use super::*;
 
     /// Opens the first output and sends it a clock, which an instrument
-    /// ignores; skipped where there is none.
+    /// ignores; skipped where there is none. Windows lists its own GS synth
+    /// also with no audio device to play it on, and then cannot open it.
     #[test]
     fn an_output_opens_and_takes_a_message() {
         let Some(port) = outputs().unwrap().into_iter().next() else {
             eprintln!("no MIDI output; skipping");
             return;
         };
+        if crate::audio::output_devices().is_ok_and(|d| d.is_empty()) {
+            eprintln!("no audio output for '{}' to play on; skipping", port.name);
+            return;
+        }
         let mut out = open_output(&port).unwrap();
         out.send(&[0xF8]).unwrap();
         assert!(open_output(&Port { id: "no such port".into(), name: String::new() }).is_err());
