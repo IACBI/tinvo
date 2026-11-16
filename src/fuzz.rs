@@ -37,7 +37,9 @@ use crate::engine::{
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
 use crate::project::{LaneData, Project, TrackData, sanitize_name};
+use crate::render::Source;
 use crate::sample::{self, Sample};
+use crate::smf;
 use crate::strip::{sp, track_param, track_param_count};
 use crate::wav::{self, SampleFormat};
 use std::collections::{BTreeSet, HashSet};
@@ -64,6 +66,7 @@ pub enum Target {
     Project,
     Wav,
     Edits,
+    Midi,
 }
 
 /// How a checked input ended, when no invariant broke.
@@ -76,13 +79,14 @@ struct Outcome {
 }
 
 impl Target {
-    pub const ALL: [Self; 3] = [Self::Project, Self::Wav, Self::Edits];
+    pub const ALL: [Self; 4] = [Self::Project, Self::Wav, Self::Edits, Self::Midi];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::Project => "project",
             Self::Wav => "wav",
             Self::Edits => "edits",
+            Self::Midi => "midi",
         }
     }
 
@@ -100,6 +104,7 @@ impl Target {
             Self::Project => project_seeds(),
             Self::Wav => wav_seeds(),
             Self::Edits => edit_seeds(),
+            Self::Midi => midi_seeds(),
         }
     }
 
@@ -108,6 +113,7 @@ impl Target {
             Self::Project => check_project(input, render),
             Self::Wav => check_wav(input, render),
             Self::Edits => check_edits(input, render),
+            Self::Midi => check_midi(input, render),
         }
     }
 
@@ -115,7 +121,7 @@ impl Target {
         match self {
             Self::Project => mutate_project(rng, input, corpus),
             Self::Wav => mutate_wav(rng, input, corpus),
-            Self::Edits => mutate_bytes(rng, input, corpus),
+            Self::Edits | Self::Midi => mutate_bytes(rng, input, corpus),
         }
     }
 }
@@ -700,6 +706,73 @@ fn without_meta(p: &Project) -> Project {
     p
 }
 
+fn midi_seeds() -> Vec<Vec<u8>> {
+    let demo = Project::demo();
+    let export = |source, loops| smf::write(&demo, source, loops).expect("the demo exports");
+    let mut seeds = vec![export(Source::Song, 1), export(Source::Pattern(0), 2)];
+    // Format 0 with running status, a velocity-0 release, system exclusive,
+    // a tempo, a time signature, a marker and drums.
+    #[rustfmt::skip]
+    let events: &[u8] = &[
+        0x00, 0xFF, 0x51, 0x03, 0x09, 0x27, 0xC0, 0x00, 0xFF, 0x58, 0x04, 6, 3, 12, 8,
+        0x00, 0xF0, 0x02, 0x7E, 0xF7, 0x00, 0xFF, 0x06, 0x01, b'A',
+        0x00, 0x90, 60, 100, 0x00, 64, 90, 0x60, 60, 0, 0x00, 64, 0,
+        0x00, 0x99, 36, 110, 0x30, 36, 0, 0x81, 0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20,
+        0x00, 0xB0, 64, 127, 0x00, 0xE0, 0, 64, 0x00, 0xC0, 5,
+        0x00, 0xFF, 0x2F, 0x00,
+    ];
+    let mut f = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk".to_vec();
+    f.extend_from_slice(&(events.len() as u32).to_be_bytes());
+    f.extend_from_slice(events);
+    seeds.push(f);
+    seeds
+}
+
+/// An accepted MIDI file must read into a valid project, and its export
+/// read again must be a fixed point: exporting that and reading it gives
+/// the same project.
+fn check_midi(input: &[u8], render: bool) -> Result<Outcome, String> {
+    let imp = match smf::read(input) {
+        Ok(i) => i,
+        Err(e) => {
+            return Ok(Outcome { accepted: false, features: vec![hash_of(("error", message_shape(&e)))] });
+        }
+    };
+    let p = &imp.project;
+    if p.tracks.is_empty() || p.tracks.len() > MAX_TRACKS || p.song.is_empty() || p.song.len() > MAX_SONG {
+        return Err(format!("{} tracks and {} song entries read", p.tracks.len(), p.song.len()));
+    }
+    match Project::from_text(&p.to_text()) {
+        Ok(back) if back == *p => {}
+        Ok(_) => return Err(format!("the project read does not save and load back equal:\n{}", p.to_text())),
+        Err(e) => return Err(format!("the project read does not load back: {e}\n{}", p.to_text())),
+    }
+    let again = |p: &Project| smf::read(&smf::write(p, Source::Song, 1)?);
+    let second = again(p).map_err(|e| format!("its own export does not read back: {e}\n{}", p.to_text()))?;
+    let third = again(&second.project).map_err(|e| format!("a second export does not read back: {e}"))?;
+    if third.project != second.project || second.dropped != 0 {
+        return Err(format!(
+            "exporting and reading again changes the project:\n{}\nbecomes\n{}",
+            second.project.to_text(),
+            third.project.to_text()
+        ));
+    }
+    if render {
+        render_check(p, &vec![None; p.tracks.len()])?;
+    }
+    let features = vec![
+        hash_of(("format", input.get(9).copied())),
+        hash_of(("tracks", p.tracks.len().min(4))),
+        hash_of(("drums", p.tracks.iter().any(|t| t.kind.is_drum()))),
+        hash_of(("entries", p.song.len().min(3))),
+        hash_of(("tempo points", p.has_tempo_points())),
+        hash_of(("markers", p.markers.len().min(2))),
+        hash_of(("meter", p.meters[0])),
+        hash_of(("dropped", imp.dropped.min(2), imp.cut)),
+    ];
+    Ok(Outcome { accepted: true, features })
+}
+
 /// Plays `p` from its start and checks every output sample is finite.
 fn render_check(p: &Project, samples: &[Option<Arc<Sample>>]) -> Result<(), String> {
     const BLOCK: usize = 1000;
@@ -1277,7 +1350,7 @@ mod tests {
         for target in Target::ALL {
             assert_eq!(Target::from_id(target.id()), Some(target));
         }
-        assert_eq!(Target::from_id("midi"), None);
+        assert_eq!(Target::from_id("mp3"), None);
     }
 
     #[test]

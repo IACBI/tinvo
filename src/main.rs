@@ -14,6 +14,7 @@ use tinvo::project::{Project, pattern_name};
 use tinvo::record::Recorder;
 use tinvo::render::{self, RenderOptions, Source};
 use tinvo::settings::{self, Settings};
+use tinvo::smf;
 use tinvo::tui::printable_line as shown;
 use tinvo::wav::{self, SampleFormat};
 
@@ -28,6 +29,11 @@ USAGE:
                                         pattern A); --from alone is that marker's section,
                                         --to stops where its marker starts; --stems also
                                         writes one file per track
+    tinvo render PROJECT OUT.mid [--loops N] [--song | --region | --pattern A-P | ...]
+                                        export a Standard MIDI File instead (one pass
+                                        unless --loops, at most 32)
+    tinvo import SONG.mid OUT.tvo       read a MIDI file (format 0 or 1) into a new project;
+                                        `tinvo SONG.mid` opens it in the editor unsaved
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
     tinvo midi                          list the MIDI inputs
@@ -44,7 +50,7 @@ USAGE:
                                         fails when one is over its time budget
     tinvo bench --instructions FILE     count instructions per scenario with Valgrind
                                         (x86-64 Linux) against the budgets in FILE
-    tinvo fuzz project|wav|edits [--seconds N | --runs N] [--seed N] [--render-every N]
+    tinvo fuzz project|wav|edits|midi [--seconds N | --runs N] [--seed N] [--render-every N]
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
     tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
@@ -89,6 +95,7 @@ fn main() -> ExitCode {
         Some("bench") => cmd_bench(&args[1..]),
         Some("fuzz") => cmd_fuzz(&args[1..]),
         Some("settings") => cmd_settings(&args[1..]),
+        Some("import") => cmd_import(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
     match result {
@@ -106,8 +113,15 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let mut opts = RenderOptions::default();
     let mut stems = false;
     let (mut from, mut to) = (None, None);
+    // Options that only a WAV file takes, and whether --loops was given.
+    let mut wav_only = None;
+    let mut loops_given = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if matches!(a.as_str(), "--format" | "--rate" | "--stems") {
+            wav_only = Some(a.clone());
+        }
+        loops_given |= a == "--loops";
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
         match a.as_str() {
             "--format" => {
@@ -146,7 +160,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         }
     }
     let [project, out] = positional.as_slice() else {
-        return Err(format!("render needs PROJECT and OUT.wav\n\n{USAGE}"));
+        return Err(format!("render needs PROJECT and OUT.wav (or OUT.mid)\n\n{USAGE}"));
     };
     let mut project = Project::load(project.as_ref())?;
     let mut range_name = None;
@@ -162,10 +176,6 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         project.loop_region = Some(range);
         opts.source = Source::Region;
     }
-    let (track_samples, errors) = project.load_samples();
-    if !errors.is_empty() {
-        return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
-    }
     match (opts.source, render::resolve(&project, opts.source)) {
         (Source::Song, Source::Pattern(_)) => return Err("the song is empty".into()),
         (Source::Region, Source::Pattern(_)) => return Err("the project has no loop region inside the song".into()),
@@ -177,6 +187,23 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         Source::Pattern(p) => format!("pattern {}", pattern_name(p)),
         Source::Auto => unreachable!("resolved"),
     };
+    if smf::is_midi_path(out.as_ref()) {
+        if let Some(flag) = wav_only {
+            return Err(format!("{flag} is for WAV files; {} is a MIDI file", shown(out)));
+        }
+        let loops = if loops_given { opts.loops } else { 1 };
+        if loops > smf::MAX_LOOPS {
+            return Err(format!("a MIDI file takes at most {} loops", smf::MAX_LOOPS));
+        }
+        smf::save(&project, opts.source, loops, out.as_ref()).map_err(|e| format!("{}: {e}", shown(out)))?;
+        let passes = if loops == 1 { String::new() } else { format!(" {loops} times") };
+        println!("Wrote {what}{passes} as a MIDI file to {}", shown(out));
+        return Ok(());
+    }
+    let (track_samples, errors) = project.load_samples();
+    if !errors.is_empty() {
+        return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
+    }
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
     let mut meter = ExportMeter::new(opts.sample_rate);
@@ -221,6 +248,35 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             println!("  stem {}: peak {:.2} dBFS", shown(&path.display().to_string()), tinvo::dsp::gain_to_db(st.peak));
         }
     }
+    Ok(())
+}
+
+/// Reads a MIDI file into a new project file, which must not exist yet.
+fn cmd_import(args: &[String]) -> Result<(), String> {
+    let [input, out] = args else { return Err(format!("import needs SONG.mid and OUT.tvo\n\n{USAGE}")) };
+    let out_path = std::path::Path::new(out);
+    if out_path.exists() {
+        return Err(format!("{} exists; import writes a new project", shown(out)));
+    }
+    let imported = smf::load(input.as_ref())?;
+    // Written beside it and given its name only if that is still free.
+    let failed = |e: std::io::Error| format!("{}: {e}", shown(out));
+    let (mut file, temp) = tinvo::fsutil::create_temp_beside(out_path).map_err(failed)?;
+    let written = std::io::Write::write_all(&mut file, imported.project.to_text().as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            tinvo::fsutil::rename_new(&temp, out_path)
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} exists; import writes a new project", shown(out))
+        } else {
+            failed(e)
+        });
+    }
+    println!("Imported {} to {}: {}", shown(input), shown(out), imported.summary());
     Ok(())
 }
 

@@ -3303,6 +3303,23 @@ impl App {
     }
 
     pub fn export_to(&mut self, path: &Path) {
+        if crate::smf::is_midi_path(path) {
+            let loops = self.export_loops;
+            if loops > crate::smf::MAX_LOOPS {
+                let max = crate::smf::MAX_LOOPS;
+                return self.set_status(format!("A MIDI file takes at most {max} repeats, not {loops}"));
+            }
+            let source = self.export_render_source();
+            match crate::smf::save(&self.project, source, loops, path) {
+                Ok(()) => {
+                    let what = self.export_source_label();
+                    let passes = if loops == 1 { String::new() } else { format!(" ×{loops}") };
+                    self.set_status(format!("Exported {what}{passes} as a MIDI file to {}", path.display()));
+                }
+                Err(e) => self.set_status(format!("Export failed: {e}")),
+            }
+            return;
+        }
         let opts = RenderOptions {
             sample_rate: self.sample_rate,
             loops: self.export_loops,
@@ -4095,7 +4112,7 @@ impl App {
                             self.export_source_label(),
                             self.export_loops
                         );
-                        let long = format!("{what} (←→ what, Tab format, ↑↓ repeats) file: ");
+                        let long = format!("{what} (←→ what, Tab format, ↑↓ repeats; .mid for MIDI) file: ");
                         // The keys' help goes first when the line is short.
                         if long.chars().count() + MIN_INPUT <= usize::from(w) { long } else { format!("{what} file: ") }
                     }
@@ -4694,8 +4711,16 @@ pub fn run(
     let (play, help) = (settings.keys.label(Action::Play), settings.keys.label(Action::Help));
     // The lock comes first, before an autosave is taken for a crashed
     // session's: a running session's autosave is not one to recover.
-    let (base, lock, lock_notice) = session_lock(path.as_deref(), autosave::state_dir().as_deref())?;
+    // A MIDI file is read into a new project, which is saved apart from it.
+    let midi = path.as_deref().is_some_and(crate::smf::is_midi_path);
+    let project_path = path.as_deref().filter(|_| !midi);
+    let (base, lock, lock_notice) = session_lock(project_path, autosave::state_dir().as_deref())?;
     let (project, path, mut message) = match path {
+        Some(p) if midi => {
+            let imported = crate::smf::load(&p)?;
+            let msg = format!("Imported {}: {}; save it to keep it as a project.", p.display(), imported.summary());
+            (imported.project, None, msg)
+        }
         Some(p) if p.exists() => {
             let proj = Project::load(&p)?;
             let msg = format!("Opened {}", p.display());
@@ -4760,7 +4785,7 @@ pub fn run(
         .with_samples(samples)
         .with_settings(settings)
         .with_settings_file(settings_path);
-    if recovered {
+    if recovered || midi {
         // Unsaved until the user saves; the autosave is rewritten from it.
         app.touch();
     }
@@ -6386,11 +6411,9 @@ mod tests {
         assert!(line.starts_with("Export [24-bit, song ×4] file: "), "{line}");
         assert!(line.ends_with("export█"), "the end of the name and the cursor: {line}");
         // A wide screen has room for the keys' help.
-        assert!(
-            frame(&a).row_text(29).contains("(←→ what, Tab format, ↑↓ repeats) file: a-rather"),
-            "{}",
-            frame(&a).row_text(29)
-        );
+        let wide = frame(&a).row_text(29);
+        assert!(wide.contains("(←→ what, Tab format, ↑↓ repeats; .mid for MIDI) file: "), "{wide}");
+        assert!(wide.trim_end().ends_with("export█"), "{wide}");
     }
 
     #[test]
@@ -6619,6 +6642,30 @@ mod tests {
             m.name = p.name.clone();
         }
         assert_eq!(mirror, a.project);
+    }
+
+    #[test]
+    fn export_to_a_mid_file_writes_midi_from_the_prompt() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-midi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.export_loops = 2;
+        let path = dir.join("beat.mid");
+        a.mode = Mode::Prompt(PromptKind::Export, path.display().to_string());
+        // Pattern A, twice.
+        keys(&mut a, &[Key::Right, Key::Enter]);
+        assert!(a.status_text().unwrap().contains("pattern A ×2 as a MIDI file"), "{:?}", a.status_text());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, crate::smf::write(&a.project, Source::Pattern(0), 2).unwrap());
+        let back = crate::smf::read(&bytes).unwrap().project;
+        assert_eq!(back.tempo, a.project.tempo);
+        // More repeats than a MIDI file takes are refused, not cut.
+        std::fs::remove_file(&path).unwrap();
+        a.export_loops = crate::smf::MAX_LOOPS + 1;
+        a.export_to(&path);
+        assert!(a.status_text().unwrap().contains("at most 32 repeats, not 33"), "{:?}", a.status_text());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

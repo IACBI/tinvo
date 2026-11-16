@@ -104,7 +104,7 @@ actions! {
     Quit "quit" Global [c('q'), Ctrl('c'), Ctrl('q')] "quit (asks if there are unsaved changes)";
     Save "save" Global [Ctrl('s'), c('w')] "save";
     SaveAs "save_as" Global [c('W')] "save under a new name";
-    Export "export" Global [c('e')] "export WAV (←→ song / pattern / loop region, Tab format, ↑↓ repeats)";
+    Export "export" Global [c('e')] "export WAV, or MIDI to a .mid file (←→ song / pattern / loop region, Tab format, ↑↓ repeats)";
     Undo "undo" Global [c('u'), Ctrl('z')] "undo";
     Redo "redo" Global [c('U'), Ctrl('y')] "redo";
     AddTrack "add_track" Global [c('a')] "add a track (then 1-7 picks its type)";
