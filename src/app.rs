@@ -11,12 +11,13 @@ use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
     Command, Division, Edit, Engine, LIVE_QUEUE, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
-    MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, TAKE_QUEUE,
-    Take as TakeEvent, part_position,
+    MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared,
+    Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
 use crate::lock::{self, Lock};
+use crate::midi::schedule::{self, OutSlot, OutputThread};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::note_take::{NoteTake, follow_track};
@@ -26,7 +27,7 @@ use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
 use crate::sample::{self as sample_mod, Sample};
-use crate::settings::{self as settings_mod, OPTIONS, Recording, Settings};
+use crate::settings::{self as settings_mod, MidiOut, OPTIONS, Recording, Settings};
 use crate::strip::{self, track_param};
 use crate::theme::{self as theme_mod, Role, Theme};
 use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal};
@@ -35,8 +36,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const COMMAND_QUEUE: usize = 4096;
@@ -408,11 +409,19 @@ fn actions_by_context() -> Vec<Action> {
     Context::ALL.iter().flat_map(|&c| Action::ALL.iter().copied().filter(move |a| a.context() == c)).collect()
 }
 
-/// The MIDI input list `M` shows. Entry 0 turns MIDI off.
+/// The MIDI input list `M` shows, or the output list. Entry 0 turns it
+/// off.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidiPicker {
     pub ports: Vec<midi::Port>,
     pub cursor: usize,
+    pub output: bool,
+}
+
+/// The MIDI channel (0-15) a MIDI-out track's notes go on: 10 for drums,
+/// as General MIDI has them, else its own or 1.
+fn out_channel(t: &project::TrackData) -> u8 {
+    if t.kind.is_drum() { crate::smf::DRUM_CHANNEL } else { t.channel.unwrap_or(0) }
 }
 
 /// Which MIDI input the editor opens at start.
@@ -523,6 +532,12 @@ pub struct App {
     pub midi_input: Option<(String, String)>,
     /// A MIDI input change (`None`: off) the picker asked for.
     midi_request: Option<Option<String>>,
+    /// The open MIDI output's id and name.
+    pub midi_output: Option<(String, String)>,
+    /// A MIDI output change (`None`: off) the picker asked for.
+    midi_out_request: Option<Option<String>>,
+    /// What else goes to the MIDI output (settings).
+    pub midi_out: MidiOut,
     /// The track the engine plays live notes on, as last sent.
     live_track_sent: Option<usize>,
     /// When the last MIDI note arrived, for the header's activity light.
@@ -713,6 +728,9 @@ impl App {
             audio_request: None,
             midi_input: None,
             midi_request: None,
+            midi_output: None,
+            midi_out_request: None,
+            midi_out: MidiOut::default(),
             live_track_sent: None,
             midi_seen: None,
             step_entry: false,
@@ -759,6 +777,7 @@ impl App {
         self.theme_base = settings.base;
         self.mouse = settings.mouse;
         self.recording = settings.recording;
+        self.midi_out = settings.midi_out;
         self
     }
 
@@ -776,6 +795,7 @@ impl App {
             theme: self.theme.clone(),
             mouse: self.mouse,
             recording: self.recording,
+            midi_out: self.midi_out,
         }
     }
 
@@ -818,6 +838,7 @@ impl App {
     pub fn reconnect(&mut self, link: EngineLink, sample_rate: u32, label: String) {
         self.finish_note_recording();
         self.link = Some(link);
+        self.send(Command::SetMidiClock(self.midi_out.clock));
         self.count_in = None;
         self.live_track_sent = None;
         self.sample_rate = sample_rate;
@@ -927,7 +948,19 @@ impl App {
     pub fn open_midi_picker(&mut self, ports: Vec<midi::Port>) {
         let cursor =
             self.midi_input.as_ref().and_then(|(id, _)| ports.iter().position(|p| &p.id == id)).map_or(0, |i| i + 1);
-        self.mode = Mode::MidiInputs(MidiPicker { ports, cursor });
+        self.mode = Mode::MidiInputs(MidiPicker { ports, cursor, output: false });
+    }
+
+    /// The MIDI output change the user asked for, if any.
+    pub fn take_midi_out_request(&mut self) -> Option<Option<String>> {
+        self.midi_out_request.take()
+    }
+
+    /// Shows the MIDI output picker for `ports`, on the output in use.
+    pub fn open_midi_out_picker(&mut self, ports: Vec<midi::Port>) {
+        let cursor =
+            self.midi_output.as_ref().and_then(|(id, _)| ports.iter().position(|p| &p.id == id)).map_or(0, |i| i + 1);
+        self.mode = Mode::MidiInputs(MidiPicker { ports, cursor, output: true });
     }
 
     /// Whether `key` closes a list: Esc, a quit key, or the key that opened
@@ -937,7 +970,7 @@ impl App {
     }
 
     fn key_midi(&mut self, p: MidiPicker, key: Key) {
-        if self.closes_list(key, Action::MidiInputs) {
+        if self.closes_list(key, if p.output { Action::MidiOutputs } else { Action::MidiInputs }) {
             self.mode = Mode::Normal;
             return;
         }
@@ -950,7 +983,12 @@ impl App {
             Some(Action::Up) => p.cursor = p.cursor.saturating_sub(1),
             Some(Action::Down) => p.cursor = (p.cursor + 1).min(p.ports.len()),
             Some(Action::Enter) => {
-                self.midi_request = Some(p.cursor.checked_sub(1).map(|i| p.ports[i].id.clone()));
+                let id = p.cursor.checked_sub(1).map(|i| p.ports[i].id.clone());
+                if p.output {
+                    self.midi_out_request = Some(id);
+                } else {
+                    self.midi_request = Some(id);
+                }
                 self.mode = Mode::Normal;
                 return;
             }
@@ -2508,6 +2546,13 @@ impl App {
             self.recording = s.recording;
             self.settings_changed = true;
         }
+        if s.midi_out != self.midi_out {
+            if s.midi_out.clock != self.midi_out.clock {
+                self.send(Command::SetMidiClock(s.midi_out.clock));
+            }
+            self.midi_out = s.midi_out;
+            self.settings_changed = true;
+        }
         let (name, values, _) = OPTIONS[i];
         self.set_status(format!("{name} = {}", values[s.option(i)]));
     }
@@ -2681,6 +2726,10 @@ impl App {
                 Ok(ports) => self.open_midi_picker(ports),
                 Err(e) => self.set_status(format!("Cannot list MIDI inputs: {e}")),
             },
+            Action::MidiOutputs => match midi::outputs() {
+                Ok(ports) => self.open_midi_out_picker(ports),
+                Err(e) => self.set_status(format!("Cannot list MIDI outputs: {e}")),
+            },
             Action::StepEntry => {
                 self.step_entry = !self.step_entry;
                 self.entry_held.clear();
@@ -2812,6 +2861,23 @@ impl App {
             Action::MidiChannel => {
                 let text = self.project.tracks[self.track].channel.map_or(String::new(), |c| (c + 1).to_string());
                 self.mode = Mode::Prompt(PromptKind::Channel, text);
+            }
+            Action::MidiOut => {
+                let on = !self.project.tracks[self.track].midi_out;
+                if self.edit(Edit::SetMidiOut { track: self.track as u8, on }) {
+                    let t = &self.project.tracks[self.track];
+                    let channel = out_channel(t) + 1;
+                    let status = match (on, &self.midi_output) {
+                        (false, _) => format!("{} sounds again", t.name),
+                        (true, Some((_, out))) => format!("{} plays on {out}, channel {channel}", t.name),
+                        (true, None) => format!(
+                            "{} goes to MIDI channel {channel}, but no MIDI output is open ({} chooses one)",
+                            t.name,
+                            self.k(Action::MidiOutputs)
+                        ),
+                    };
+                    self.set_status(status);
+                }
             }
             Action::Solo => {
                 let solo = !self.project.tracks[self.track].solo;
@@ -3890,6 +3956,7 @@ impl App {
             let name_style = self.style(if selected { Role::SelectedName } else { Role::Text });
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
             let kind = match t.channel {
+                _ if t.midi_out => format!("{:<5.5}→{:>2}", t.kind.label(), out_channel(t) + 1),
                 Some(c) => format!("{:<5.5} {:>2}", t.kind.label(), c + 1),
                 None => t.kind.label().to_string(),
             };
@@ -4159,14 +4226,25 @@ impl App {
     fn draw_midi(&self, s: &mut Screen, p: &MidiPicker) {
         let h = s.height();
         let dim = self.style(Role::Dim);
-        s.put(2, 1, "MIDI input", self.style(Role::Title));
-        let now = self.midi_input.as_ref().map_or("off", |(_, n)| n.as_str());
-        s.put(2, 2, &format!("Now: {now}"), dim);
-        let current = self.midi_input.as_ref().map(|(id, _)| id.as_str());
-        let mut entries = vec![("None (MIDI off)".to_string(), current.is_none())];
+        let (open, what) = if p.output { (&self.midi_output, "output") } else { (&self.midi_input, "input") };
+        s.put(2, 1, &format!("MIDI {what}"), self.style(Role::Title));
+        let now = open.as_ref().map_or("off", |(_, n)| n.as_str());
+        let about = if p.output {
+            let clock = if self.midi_out.clock { "on" } else { "off" };
+            let delay = self.midi_out.delay_ms();
+            format!(
+                "Now: {now}.  Tracks set to MIDI out ({}) play here; clock {clock}, delay {delay} ms (settings)",
+                self.k(Action::MidiOut)
+            )
+        } else {
+            format!("Now: {now}")
+        };
+        s.put(2, 2, &about, dim);
+        let current = open.as_ref().map(|(id, _)| id.as_str());
+        let mut entries = vec![(format!("None (MIDI {what} off)"), current.is_none())];
         entries.extend(p.ports.iter().map(|port| (port.name.clone(), current == Some(port.id.as_str()))));
         if p.ports.is_empty() {
-            entries.push(("(no MIDI inputs connected)".to_string(), false));
+            entries.push((format!("(no MIDI {what}s connected)"), false));
         }
         self.draw_list(s, &entries, p.cursor);
         let hint = format!(
@@ -4448,7 +4526,9 @@ pub fn start_audio(
     samples: &[Option<Arc<Sample>>],
     config: &StreamConfig,
     live: Option<&Arc<Mailbox<Message>>>,
+    midi_out: Option<&OutSlot>,
 ) -> Result<(Stream, EngineLink, u32), String> {
+    let midi_out = midi_out.cloned();
     // Notes played while no engine was listening are stale now.
     let live = live.cloned();
     if let Some(l) = &live {
@@ -4468,6 +4548,15 @@ pub fn start_audio(
         engine.attach_takes(take_tx);
         if let Some(l) = live {
             engine.attach_live(l);
+        }
+        if let Some(slot) = midi_out {
+            let (tx, rx) = spsc::channel(MIDI_OUT_QUEUE);
+            engine.attach_midi_out(tx);
+            // The output thread takes it from here, letting go of what the
+            // engine before sent.
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(rx);
+            }
         }
         for (track, sample) in samples.into_iter().enumerate() {
             engine.set_sample(track, sample);
@@ -4501,10 +4590,12 @@ struct Output {
     retry: Duration,
     /// Live notes from the MIDI input, handed to every engine in turn.
     live: Option<Arc<Mailbox<Message>>>,
+    /// Where every engine puts its MIDI output for the output thread.
+    midi_out: Option<OutSlot>,
 }
 
 impl Output {
-    fn new(config: StreamConfig, live: Option<Arc<Mailbox<Message>>>) -> Self {
+    fn new(config: StreamConfig, live: Option<Arc<Mailbox<Message>>>, midi_out: Option<OutSlot>) -> Self {
         Self {
             stream: None,
             config,
@@ -4513,6 +4604,7 @@ impl Output {
             next_check: Instant::now(),
             retry: RETRY_FIRST,
             live,
+            midi_out,
         }
     }
 
@@ -4533,16 +4625,18 @@ impl Output {
             }
         }
         app.audio_config = self.config.clone();
-        let (stream, link, sr) = match start_audio(&app.project, &app.track_samples(), &config, self.live.as_ref()) {
-            Ok(v) => v,
-            Err(e) => {
-                app.link = None;
-                app.audio_label = "audio offline".into();
-                app.playing = false;
-                app.play_pos = None;
-                return Err(e);
-            }
-        };
+        let samples = app.track_samples();
+        let (stream, link, sr) =
+            match start_audio(&app.project, &samples, &config, self.live.as_ref(), self.midi_out.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    app.link = None;
+                    app.audio_label = "audio offline".into();
+                    app.playing = false;
+                    app.play_pos = None;
+                    return Err(e);
+                }
+            };
         let info = stream.info();
         let ll = if info.low_latency { " LL" } else { "" };
         let label = format!("{} {} Hz{ll}", info.backend, sr);
@@ -4701,11 +4795,59 @@ impl MidiSession {
     }
 }
 
+/// The MIDI output for the session: the thread that sends what each
+/// engine queues in `slot` to the open output, on time.
+struct MidiOutSession {
+    thread: Option<OutputThread>,
+    id: Option<String>,
+    slot: OutSlot,
+    /// The delay the thread sends with.
+    delay: u16,
+}
+
+impl MidiOutSession {
+    fn new() -> Self {
+        Self { thread: None, id: None, slot: Arc::new(Mutex::new(None)), delay: 0 }
+    }
+
+    /// Opens the output with `id` (`None`: closes it). Returns a status.
+    fn open(&mut self, app: &mut App, id: Option<String>) -> String {
+        // Closing it lets go of every note it sent.
+        self.thread = None;
+        app.midi_output = None;
+        self.id = id.clone();
+        self.delay = app.midi_out.delay_ms();
+        let Some(id) = id else { return "MIDI output off".into() };
+        let delay = Duration::from_millis(u64::from(self.delay));
+        match midi::open_output(&id).and_then(|out| schedule::start(out, self.slot.clone(), delay)) {
+            Ok(thread) => {
+                let name = thread.name().to_string();
+                app.midi_output = Some((id, name.clone()));
+                self.thread = Some(thread);
+                format!("MIDI output: {name}")
+            }
+            Err(e) => format!("MIDI output unavailable: {e}"),
+        }
+    }
+
+    /// Runs once per UI frame.
+    fn poll(&mut self, app: &mut App) {
+        if let Some(id) = app.take_midi_out_request() {
+            let status = self.open(app, id);
+            app.set_status(status);
+        } else if self.thread.is_some() && app.midi_out.delay_ms() != self.delay {
+            let status = self.open(app, self.id.clone());
+            app.set_status(format!("{status}, {} ms later", self.delay));
+        }
+    }
+}
+
 /// Runs the interactive session until the user quits.
 pub fn run(
     path: Option<PathBuf>,
     config: StreamConfig,
     midi_start: MidiStart,
+    midi_out_start: Option<String>,
     input: Option<String>,
     settings: Settings,
     settings_path: Option<PathBuf>,
@@ -4798,7 +4940,8 @@ pub fn run(
     app.lock = lock;
     app.input_device = input;
     let mut midi = MidiSession::new();
-    let mut output = Output::new(config, Some(midi.live.clone()));
+    let mut midi_out = MidiOutSession::new();
+    let mut output = Output::new(config, Some(midi.live.clone()), Some(midi_out.slot.clone()));
     let midi_id = match midi_start {
         MidiStart::Off => None,
         MidiStart::Port(id) => Some(id),
@@ -4806,6 +4949,10 @@ pub fn run(
     };
     if midi_id.is_some() {
         let status = midi.open(&mut app, midi_id);
+        message = format!("{message}  {status}");
+    }
+    if midi_out_start.is_some() {
+        let status = midi_out.open(&mut app, midi_out_start);
         message = format!("{message}  {status}");
     }
     if let Err(e) = output.open(&mut app) {
@@ -4838,6 +4985,7 @@ pub fn run(
             }
             output.poll(&mut app);
             midi.poll(&mut app);
+            midi_out.poll(&mut app);
             app.tick();
             if app.quit {
                 return Ok(());
@@ -4879,6 +5027,8 @@ pub fn run(
     drop(term);
     drop(midi);
     drop(output);
+    // After the engine: what it sent last is let go.
+    drop(midi_out);
     Ok(())
 }
 
@@ -6890,7 +7040,7 @@ mod tests {
     #[test]
     fn output_opens_switches_and_falls_back_on_real_devices() {
         let mut a = app();
-        let mut out = Output::new(StreamConfig::default(), None);
+        let mut out = Output::new(StreamConfig::default(), None, None);
         if out.open(&mut a).is_err() {
             eprintln!("no audio device; skipping");
             return;
@@ -7012,6 +7162,87 @@ mod tests {
         keys(&mut a, &[Key::Up, Key::Up, Key::Up, Key::Enter]);
         assert_eq!(a.take_midi_request(), Some(None), "entry 0 turns MIDI off");
         assert_eq!(a.take_midi_request(), None);
+    }
+
+    #[test]
+    fn a_track_goes_to_the_midi_output_and_back_as_one_undo_step() {
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        let kick = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Kick).unwrap();
+        a.track = bass;
+        keys(&mut a, &[Key::Char('V')]);
+        assert!(a.project.tracks[bass].midi_out);
+        let status = a.status_text().unwrap();
+        assert!(status.contains("MIDI channel 1, but no MIDI output is open (Z chooses one)"), "{status}");
+        assert!(frame(&a).row_text(2 + bass as u16).contains("Synth→ 1"), "{}", frame(&a).row_text(2 + bass as u16));
+        // Drums go on channel 10; the track's own channel otherwise.
+        a.midi_output = Some(("x".into(), "Synth box".into()));
+        a.track = kick;
+        keys(&mut a, &[Key::Char('V')]);
+        assert!(a.status_text().unwrap().contains("plays on Synth box, channel 10"), "{:?}", a.status_text());
+        assert!(frame(&a).row_text(2 + kick as u16).contains("Kick →10"), "{}", frame(&a).row_text(2 + kick as u16));
+        a.track = bass;
+        a.edit(Edit::SetChannel { track: bass as u8, channel: Some(4) });
+        assert!(frame(&a).row_text(2 + bass as u16).contains("Synth→ 5"));
+        keys(&mut a, &[Key::Char('V')]);
+        assert!(!a.project.tracks[bass].midi_out);
+        assert!(a.status_text().unwrap().contains("sounds again"));
+        a.undo();
+        assert!(a.project.tracks[bass].midi_out);
+    }
+
+    #[test]
+    fn midi_output_picker_asks_for_the_chosen_output() {
+        let mut a = app();
+        let ports = vec![
+            midi::Port { id: "a".into(), name: "Synth box".into() },
+            midi::Port { id: "b".into(), name: "Drum box".into() },
+        ];
+        a.midi_output = Some(("b".into(), "Drum box".into()));
+        a.open_midi_out_picker(ports.clone());
+        let Mode::MidiInputs(p) = &a.mode else { panic!("picker not shown") };
+        assert_eq!((p.cursor, p.output), (2, true));
+        let f = frame(&a);
+        assert!(f.row_text(1).contains("MIDI output") && f.row_text(2).contains("Now: Drum box"), "{}", f.row_text(2));
+        assert!(f.row_text(2).contains("clock off, delay 0 ms"), "{}", f.row_text(2));
+        keys(&mut a, &[Key::Up, Key::Enter]);
+        assert_eq!((a.take_midi_out_request(), a.take_midi_request()), (Some(Some("a".into())), None));
+        a.open_midi_out_picker(ports);
+        keys(&mut a, &[Key::Up, Key::Up, Key::Up, Key::Enter]);
+        assert_eq!(a.take_midi_out_request(), Some(None), "entry 0 turns the output off");
+        // Its own key closes it.
+        a.open_midi_out_picker(Vec::new());
+        keys(&mut a, &[Key::Char('Z')]);
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn the_midi_clock_setting_reaches_every_engine() {
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a =
+            App::new(Project::demo(), None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "t".into());
+        let clock = OPTIONS.iter().position(|o| o.0 == "midi_clock").unwrap();
+        let delay = OPTIONS.iter().position(|o| o.0 == "midi_delay").unwrap();
+        a.set_option(clock, 1);
+        a.set_option(delay, 3);
+        assert_eq!((a.midi_out.clock, a.midi_out.delay_ms()), (true, 20));
+        assert!(a.settings_changed);
+        a.tick();
+        let mut sent = Vec::new();
+        while let Some(c) = rx.pop() {
+            sent.push(c);
+        }
+        assert!(sent.contains(&Command::SetMidiClock(true)), "{sent:?}");
+        // A new engine is told too.
+        let (tx, mut rx) = spsc::channel(256);
+        a.reconnect(EngineLink::new(tx, Arc::new(Shared::new())), 48_000, "t".into());
+        a.tick();
+        let mut sent = Vec::new();
+        while let Some(c) = rx.pop() {
+            sent.push(c);
+        }
+        assert!(sent.contains(&Command::SetMidiClock(true)), "{sent:?}");
+        assert_eq!(a.settings().midi_out, MidiOut { clock: true, delay: 3 });
     }
 
     #[test]
@@ -7189,10 +7420,11 @@ mod tests {
                     Mode::Devices(picker.clone()),
                     Mode::Devices(input_picker.clone()),
                     Mode::MidiInputs(MidiPicker {
+                        output: false,
                         ports: vec![midi::Port { id: "0".into(), name: "Keys".into() }],
                         cursor: 0,
                     }),
-                    Mode::MidiInputs(MidiPicker { ports: Vec::new(), cursor: 0 }),
+                    Mode::MidiInputs(MidiPicker { ports: Vec::new(), cursor: 0, output: true }),
                 ] {
                     a.mode = mode;
                     a.draw(&mut s);

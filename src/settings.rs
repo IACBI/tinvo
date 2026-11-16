@@ -43,6 +43,7 @@ pub struct Settings {
     /// mouse for selecting text.
     pub mouse: bool,
     pub recording: Recording,
+    pub midi_out: MidiOut,
 }
 
 impl Default for Settings {
@@ -53,6 +54,7 @@ impl Default for Settings {
             theme: Theme::default(),
             mouse: true,
             recording: Recording::default(),
+            midi_out: MidiOut::default(),
         }
     }
 }
@@ -69,9 +71,27 @@ pub struct Recording {
     pub count_in: u8,
 }
 
+/// What goes to the MIDI output besides the MIDI-out tracks' notes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MidiOut {
+    /// MIDI clock and start, stop and continue while playing.
+    pub clock: bool,
+    /// An index into [`MIDI_DELAYS`].
+    pub delay: u8,
+}
+
+/// How much later than its frames are heard the MIDI output is sent, in ms.
+pub const MIDI_DELAYS: [u16; 6] = [0, 5, 10, 20, 30, 50];
+
+impl MidiOut {
+    pub fn delay_ms(self) -> u16 {
+        MIDI_DELAYS[usize::from(self.delay).min(MIDI_DELAYS.len() - 1)]
+    }
+}
+
 /// The settings under `[options]`: a name, its values (the first is the
 /// default) and what it does.
-pub const OPTIONS: [(&str, &[&str], &str); 4] = [
+pub const OPTIONS: [(&str, &[&str], &str); 6] = [
     (
         "mouse",
         &["on", "off"],
@@ -88,6 +108,16 @@ pub const OPTIONS: [(&str, &[&str], &str); 4] = [
         "keep: recorded notes keep their timing as micro-timing; quantize: they land on the step",
     ),
     ("count_in", &["off", "1", "2"], "bars counted in with a click when recording starts from a stop"),
+    (
+        "midi_clock",
+        &["off", "on"],
+        "on: the MIDI output also gets clock, start, stop and continue (with the song position) while playing",
+    ),
+    (
+        "midi_delay",
+        &["0", "5", "10", "20", "30", "50"],
+        "milliseconds the MIDI output is sent later, to line up an external instrument with what TINVO plays",
+    ),
 ];
 
 impl Settings {
@@ -97,7 +127,9 @@ impl Settings {
             0 => usize::from(!self.mouse),
             1 => usize::from(self.recording.replace),
             2 => usize::from(self.recording.quantize),
-            _ => usize::from(self.recording.count_in),
+            3 => usize::from(self.recording.count_in),
+            4 => usize::from(self.midi_out.clock),
+            _ => usize::from(self.midi_out.delay),
         }
     }
 
@@ -106,7 +138,9 @@ impl Settings {
             0 => self.mouse = value == 0,
             1 => self.recording.replace = value == 1,
             2 => self.recording.quantize = value == 1,
-            _ => self.recording.count_in = value.min(OPTIONS[3].1.len() - 1) as u8,
+            3 => self.recording.count_in = value.min(OPTIONS[3].1.len() - 1) as u8,
+            4 => self.midi_out.clock = value == 1,
+            _ => self.midi_out.delay = value.min(MIDI_DELAYS.len() - 1) as u8,
         }
     }
 }
@@ -569,7 +603,7 @@ mod tests {
             ("[options]\nmouse = yes", "line 2: mouse is on or off, not 'yes'"),
             (
                 "[options]\nmice = on",
-                "line 2: unknown option 'mice' (there are mouse, record_mode, record_timing and count_in)",
+                "line 2: unknown option 'mice' (there are mouse, record_mode, record_timing, count_in, midi_clock and midi_delay)",
             ),
             ("[options]\ncount_in = 3", "line 2: count_in is off, 1 or 2, not '3'"),
             ("[options]\nrecord_mode = keep", "line 2: record_mode is overdub or replace, not 'keep'"),

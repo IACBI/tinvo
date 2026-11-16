@@ -128,6 +128,7 @@ actions! {
     Page "page" Global [c('f')] "parameter panel page: instrument, channel strip, buses and master";
     Devices "devices" Global [c('O')] "audio output and input devices (Tab: low-latency output; ←→: output / input)";
     MidiInputs "midi_inputs" Global [c('M')] "MIDI input";
+    MidiOutputs "midi_outputs" Global [c('Z')] "MIDI output: where MIDI-out tracks and the clock go (settings: clock, delay)";
     StepEntry "step_entry" Global [c('R')] "step entry: MIDI notes write the step at the cursor (held together: a chord)";
     Record "record" Global [c('I')] "record into the sampler track; again stops and loads the take";
     RecordNotes "record_notes" Global [c('C')] "record notes played on the MIDI keyboard into the track while it plays (settings: overdub or replace, timing, count-in); again stops";
@@ -136,6 +137,7 @@ actions! {
     Mute "mute" Track [c('m')] "mute the track";
     Solo "solo" Track [c('s')] "solo the track";
     MidiChannel "midi_channel" Track [c('H')] "the MIDI channel that plays the track whichever is selected (shown after its type)";
+    MidiOut "midi_out" Track [c('V')] "send the track's notes to the MIDI output instead of sounding them (→ before the channel they go on)";
     Preview "preview" Track [c('p')] "preview the track's note";
     LoadSample "load_sample" Track [c('o')] "load a WAV file into a sampler track";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";
