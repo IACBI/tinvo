@@ -47,9 +47,12 @@ pub const LATE: Duration = Duration::from_millis(50);
 /// How long a message that must not be lost is retried when the output
 /// refuses it; a release given up on is sent again when the output closes.
 const GIVE_UP: Duration = Duration::from_secs(1);
-/// How long without an anchor means the engine is gone or stalled: every
-/// note still sounding is let go then.
+/// How long without an anchor, beyond four of the longest callbacks seen,
+/// means the engine is gone or stalled: every note still sounding is let go
+/// then.
 pub const STALL: Duration = Duration::from_millis(250);
+/// How long closing an output waits for it to take the releases it owes.
+const CLOSING: Duration = Duration::from_millis(200);
 /// How fast the estimate of when frames are heard may move later, in
 /// seconds per second: far more than two clocks drift apart, far less than
 /// a late callback moves it.
@@ -62,7 +65,12 @@ struct Timing {
     /// Seconds after `t0` of the last anchor.
     last: f64,
     rate: f64,
+    /// The longest callback seen, in seconds.
+    period: f64,
 }
+
+/// Note counts per channel and key.
+type Keys = [[u8; 128]; 16];
 
 /// Orders the messages from the engine by frame and says when each is due.
 #[derive(Debug)]
@@ -77,7 +85,16 @@ pub struct Scheduler {
     delay: Duration,
     /// How many times each key on each channel was started and not yet
     /// released: two tracks can play one key, and each release counts.
-    sounding: [[u8; 128]; 16],
+    sounding: Keys,
+    /// The frame of each key's latest note message: one is never sent before
+    /// another of its key the engine queued earlier, even when the limiter's
+    /// latency fell between them.
+    last: Box<[[u64; 128]; 16]>,
+    /// Releases (and a Stop) the output refused while everything was let
+    /// go, tried again until [`GIVE_UP`] after `owed_since`.
+    owed: Keys,
+    owe_stop: bool,
+    owed_since: Option<Instant>,
     /// Start or Continue was sent and Stop has not been since. Clocks go
     /// only then, so an output opened while playing waits for the next Play.
     running: bool,
@@ -92,16 +109,25 @@ impl Scheduler {
             timing: None,
             delay,
             sounding: [[0; 128]; 16],
+            last: Box::new([[0; 128]; 16]),
+            owed: [[0; 128]; 16],
+            owe_stop: false,
+            owed_since: None,
             running: false,
         }
     }
 
     pub fn push(&mut self, ev: OutEvent) {
-        let (frame, bytes, len) = match ev {
+        let (mut frame, bytes, len) = match ev {
             OutEvent::Message { frame, bytes, len } => (frame, bytes, len.max(1)),
             OutEvent::Reset { frame, running } => (frame, [u8::from(running), 0, 0], 0),
             OutEvent::Anchor { frame, frames, rate, at } => return self.anchor(frame, frames, rate, at),
         };
+        if len == 3 && matches!(bytes[0] & 0xF0, 0x80 | 0x90) {
+            let last = &mut self.last[usize::from(bytes[0] & 0x0F)][usize::from(bytes[1] & 0x7F)];
+            frame = frame.max(*last);
+            *last = frame;
+        }
         let key = (frame, self.arrivals);
         self.arrivals += 1;
         let at = self.pending.partition_point(|p| (p.0, p.1) <= key);
@@ -112,12 +138,16 @@ impl Scheduler {
         let rate = f64::from(rate.max(1.0));
         let secs = at.saturating_duration_since(self.t0).as_secs_f64();
         // The callback's frames play after the buffer playing now.
-        let zero = secs + f64::from(frames) / rate - frame as f64 / rate;
+        let period = f64::from(frames) / rate;
+        let zero = secs + period - frame as f64 / rate;
         self.timing = Some(match self.timing {
-            Some(t) if t.rate == rate => {
-                Timing { zero: zero.min(t.zero + CREEP * (secs - t.last).max(0.0)), last: secs, rate }
-            }
-            _ => Timing { zero, last: secs, rate },
+            Some(t) if t.rate == rate => Timing {
+                zero: zero.min(t.zero + CREEP * (secs - t.last).max(0.0)),
+                last: secs,
+                rate,
+                period: t.period.max(period),
+            },
+            _ => Timing { zero, last: secs, rate, period },
         });
     }
 
@@ -146,7 +176,10 @@ impl Scheduler {
             }
             let late = now.saturating_duration_since(due);
             if len == 0 {
-                self.let_go(bytes[0] != 0, &mut send);
+                // A reset the output refused part of stays first in line.
+                if !self.let_go(bytes[0] != 0, &mut send) && late <= GIVE_UP {
+                    break;
+                }
                 taken += 1;
                 continue;
             }
@@ -195,36 +228,94 @@ impl Scheduler {
     }
 
     /// Sends a release for every note still sounding and, while the clock
-    /// runs and should not, Stop.
-    fn let_go(&mut self, running: bool, send: &mut impl FnMut(&[u8]) -> bool) {
-        for (channel, keys) in self.sounding.iter_mut().enumerate() {
-            for (key, n) in keys.iter_mut().enumerate() {
-                while *n > 0 && send(&[0x80 | channel as u8, key as u8, 0]) {
-                    *n -= 1;
-                }
+    /// runs and should not, Stop. Says whether the output took them all;
+    /// what it refused is still counted.
+    fn let_go(&mut self, running: bool, send: &mut impl FnMut(&[u8]) -> bool) -> bool {
+        let mut done = release(&mut self.sounding, send);
+        if self.running && !running {
+            if send(&[0xFC]) {
+                self.running = false;
+            } else {
+                done = false;
             }
         }
-        if self.running && !running && send(&[0xFC]) {
-            self.running = false;
-        }
+        done
     }
 
-    /// Whether no anchor has come for [`STALL`]: the engine is gone, or
-    /// stalled, and what it sent may never be released.
+    /// Whether no anchor has come for [`STALL`] beyond four callbacks: the
+    /// engine is gone, or stalled, and what it sent may never be released.
     pub fn stalled(&self, now: Instant) -> bool {
-        self.timing.is_some_and(|t| now.saturating_duration_since(self.t0).as_secs_f64() > t.last + STALL.as_secs_f64())
+        self.timing.is_some_and(|t| {
+            let since = now.saturating_duration_since(self.t0).as_secs_f64();
+            since > t.last + 4.0 * t.period + STALL.as_secs_f64()
+        })
     }
 
     /// Releases every note sent and not yet released, stops the receiver,
     /// and forgets the messages still to come: the engine they came from is
-    /// gone, or the output closes.
-    pub fn release_all(&mut self, mut send: impl FnMut(&[u8]) -> bool) {
-        self.let_go(false, &mut send);
+    /// gone, or the output closes. What the output refuses is owed, and
+    /// [`Scheduler::settle`] tries it again.
+    pub fn release_all(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
+        for (owed, sounding) in self.owed.iter_mut().flatten().zip(self.sounding.iter().flatten()) {
+            *owed = owed.saturating_add(*sounding);
+        }
         self.sounding = [[0; 128]; 16];
-        self.running = false;
+        self.owe_stop |= std::mem::take(&mut self.running);
+        self.owed_since.get_or_insert(now);
         self.pending.clear();
         self.timing = None;
+        self.settle(now, &mut send);
     }
+
+    /// Sends what [`Scheduler::release_all`] owes, giving up [`GIVE_UP`]
+    /// after it first owed something. Says whether nothing is owed now.
+    pub fn settle(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) -> bool {
+        let Some(since) = self.owed_since else { return true };
+        let mut done = release(&mut self.owed, &mut send);
+        if self.owe_stop {
+            if send(&[0xFC]) {
+                self.owe_stop = false;
+            } else {
+                done = false;
+            }
+        }
+        if done || now.saturating_duration_since(since) > GIVE_UP {
+            self.owed = [[0; 128]; 16];
+            self.owe_stop = false;
+            self.owed_since = None;
+            return true;
+        }
+        false
+    }
+
+    /// Takes the queue of a new engine, or the same engine's from another
+    /// output, at `now`: what it holds from more than [`LATE`] ago is stale.
+    pub fn take_backlog(&mut self, now: Instant, queue: &mut Consumer<OutEvent>) {
+        while let Some(ev) = queue.pop() {
+            self.push(ev);
+        }
+        let (t0, timing) = (self.t0, self.timing);
+        let before = now.checked_sub(LATE).unwrap_or(t0);
+        let fresh = |frame: u64| {
+            timing.is_none_or(|t| t0 + Duration::from_secs_f64((t.zero + frame as f64 / t.rate).max(0.0)) >= before)
+        };
+        self.pending.retain(|p| fresh(p.0));
+    }
+}
+
+/// Sends a release for each count in `keys`, counting down those the output
+/// takes. Says whether it took them all.
+fn release(keys: &mut Keys, send: &mut impl FnMut(&[u8]) -> bool) -> bool {
+    let mut done = true;
+    for (channel, notes) in keys.iter_mut().enumerate() {
+        for (key, n) in notes.iter_mut().enumerate() {
+            while *n > 0 && send(&[0x80 | channel as u8, key as u8, 0]) {
+                *n -= 1;
+            }
+            done &= *n == 0;
+        }
+    }
+    done
 }
 
 /// Where the engine's queue of MIDI messages waits for the output thread:
@@ -272,10 +363,10 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
             while !flag.load(Ordering::Acquire) {
                 if let Some(mut fresh) = slot.try_lock().ok().and_then(|mut s| s.take()) {
                     // A new engine: what the old one queued will not be
-                    // released, and what the new one queued before this
-                    // thread looked is stale.
-                    sched.release_all(&mut send);
-                    while fresh.pop().is_some() {}
+                    // released.
+                    let now = Instant::now();
+                    sched.release_all(now, &mut send);
+                    sched.take_backlog(now, &mut fresh);
                     queue = Some(fresh);
                 }
                 if let Some(q) = queue.as_mut() {
@@ -285,13 +376,18 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
                 }
                 let now = Instant::now();
                 if sched.stalled(now) {
-                    sched.release_all(&mut send);
+                    sched.release_all(now, &mut send);
                 }
+                sched.settle(now, &mut send);
                 sched.send_due(now, &mut send);
                 let wait = sched.next_due().map_or(POLL, |d| d.saturating_duration_since(now).min(POLL));
                 std::thread::sleep(wait.max(Duration::from_micros(100)));
             }
-            sched.release_all(&mut send);
+            let closing = Instant::now();
+            sched.release_all(closing, &mut send);
+            while !sched.settle(Instant::now(), &mut send) && closing.elapsed() < CLOSING {
+                std::thread::sleep(POLL);
+            }
             // The next output thread takes the queue from here.
             if let (Some(q), Ok(mut s)) = (queue, slot.lock()) {
                 if s.is_none() {
@@ -322,7 +418,7 @@ mod tests {
 
     fn released(s: &mut Scheduler) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        s.release_all(|m| {
+        s.release_all(s.t0, |m| {
             out.push(m.to_vec());
             true
         });
@@ -473,14 +569,88 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_or_a_release_of_everything_the_output_refuses_is_tried_again() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        for m in [&[0xFA][..], &[0x90, 60, 100], &[0x90, 61, 100]] {
+            s.push(OutEvent::message(0, m));
+        }
+        sent(&mut s, t0 + Duration::from_millis(11));
+        s.push(OutEvent::Reset { frame: 480, running: false });
+        s.push(OutEvent::message(480, &[0x90, 70, 100]));
+        // The output takes one release, then nothing: the reset waits.
+        let mut took = 0;
+        s.send_due(t0 + Duration::from_millis(21), |_| {
+            took += 1;
+            took == 1
+        });
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(22)), [vec![0x80, 61, 0], vec![0xFC], vec![0x90, 70, 100]]);
+        // Everything let go while the output refuses: owed, and settled.
+        s.push(anchor(t0, 480, 10));
+        s.push(OutEvent::message(480, &[0xFB]));
+        sent(&mut s, t0 + Duration::from_millis(30));
+        s.release_all(t0 + Duration::from_millis(30), |_| false);
+        assert!(!s.settle(t0 + Duration::from_millis(31), |_| false));
+        let mut out = Vec::new();
+        assert!(s.settle(t0 + Duration::from_millis(32), |m| {
+            out.push(m.to_vec());
+            true
+        }));
+        assert_eq!(out, [vec![0x80, 70, 0], vec![0xFC]]);
+        // Given up after a while.
+        s.push(anchor(t0, 960, 40));
+        s.push(OutEvent::message(960, &[0x90, 72, 100]));
+        sent(&mut s, t0 + Duration::from_millis(60));
+        s.release_all(t0 + Duration::from_millis(60), |_| false);
+        assert!(s.settle(t0 + Duration::from_millis(1100), |_| false));
+        assert!(s.settle(t0 + Duration::from_millis(1101), |_| panic!("nothing is owed")));
+    }
+
+    #[test]
+    fn a_note_message_never_goes_before_one_of_its_key_queued_earlier() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        // Started 77 frames late under the limiter, released after it went.
+        s.push(OutEvent::message(77, &[0x90, 60, 100]));
+        s.push(OutEvent::message(64, &[0x80, 60, 0]));
+        s.push(OutEvent::message(64, &[0x90, 62, 100]));
+        let got = sent(&mut s, t0 + Duration::from_millis(20));
+        assert_eq!(got, [vec![0x90, 62, 100], vec![0x90, 60, 100], vec![0x80, 60, 0]]);
+    }
+
+    #[test]
+    fn a_new_queue_keeps_only_what_is_fresh() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        let (mut tx, mut rx) = crate::rt::spsc::channel(16);
+        // Queued long ago, then Play just before the queue is taken.
+        tx.push(anchor(t0, 0, 0)).unwrap();
+        tx.push(OutEvent::message(0, &[0xFA])).unwrap();
+        tx.push(OutEvent::message(480, &[0xFC])).unwrap();
+        tx.push(anchor(t0, 480_000, 10_000)).unwrap();
+        tx.push(OutEvent::message(480_000, &[0xFA])).unwrap();
+        s.take_backlog(t0 + Duration::from_millis(10_001), &mut rx);
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(10_011)), [vec![0xFA]]);
+    }
+
+    #[test]
     fn an_engine_silent_for_a_while_has_stalled() {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
         assert!(!s.stalled(t0 + Duration::from_secs(5)), "no engine yet");
         s.push(anchor(t0, 0, 100));
-        assert!(!s.stalled(t0 + Duration::from_millis(340)));
-        assert!(s.stalled(t0 + Duration::from_millis(360)));
+        // Four 10 ms callbacks and 250 ms after the last.
+        assert!(!s.stalled(t0 + Duration::from_millis(385)));
+        assert!(s.stalled(t0 + Duration::from_millis(395)));
         s.push(anchor(t0, 480, 350));
-        assert!(!s.stalled(t0 + Duration::from_millis(360)));
+        assert!(!s.stalled(t0 + Duration::from_millis(395)));
+        // Callbacks of 16,384 frames come 341 ms apart and are not a stall.
+        let mut big = Scheduler::new(Duration::ZERO);
+        let t0 = big.t0;
+        big.push(OutEvent::Anchor { frame: 0, frames: 16_384, rate: 48_000.0, at: t0 });
+        assert!(!big.stalled(t0 + Duration::from_millis(1500)));
+        assert!(big.stalled(t0 + Duration::from_millis(1700)));
     }
 }

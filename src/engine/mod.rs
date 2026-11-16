@@ -1415,6 +1415,8 @@ impl Engine {
 
     /// Handles one command immediately.
     pub fn handle(&mut self, cmd: Command) {
+        // An earlier command may have switched the limiter.
+        self.midi.latency = self.mix.latency() as u64;
         match cmd {
             Command::Edit(e) => {
                 // Track indices are about to shift; held notes would lose
@@ -2541,6 +2543,9 @@ impl Engine {
     /// Renders interleaved stereo into `out`, first applying any queued
     /// commands. Real-time safe.
     pub fn process(&mut self, out: &mut [f32]) {
+        self.midi.latency = self.mix.latency() as u64;
+        let running = self.clock_pulse.is_some() && !self.clock_resume;
+        self.midi.anchor(self.now, (out.len() / 2) as u32, self.sample_rate, running);
         if let Some(mut rx) = self.commands.take() {
             // A callback handles commands up to a work budget; the rest wait,
             // in order, for the next one. The UI may keep pushing while this
@@ -2554,8 +2559,6 @@ impl Engine {
             self.commands = Some(rx);
         }
         self.midi.latency = self.mix.latency() as u64;
-        let running = self.clock_pulse.is_some() && !self.clock_resume;
-        self.midi.anchor(self.now, (out.len() / 2) as u32, self.sample_rate, running);
         self.play_live();
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
@@ -3519,6 +3522,33 @@ mod tests {
         assert!(!e.midi.lost);
         assert!(matches!(rx.pop(), Some(OutEvent::Reset { frame: 6000, running: true })));
         assert!(matches!(rx.pop(), Some(OutEvent::Anchor { frame: 6000, .. })));
+        // A note queued by a command in the callback that resets comes after
+        // the reset, so the reset does not end it.
+        let (tx, mut rx) = spsc::channel(4);
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(36) },
+            Edit::SetMidiOut { track: 0, on: true },
+        ]);
+        e.attach_midi_out(tx);
+        e.handle(Command::SetMidiClock(true));
+        e.handle(Command::Play);
+        run(&mut e, 6000);
+        e.handle(Command::Stop);
+        while rx.pop().is_some() {}
+        let (ctx, crx) = spsc::channel(4);
+        e.commands = Some(crx);
+        let mut ctx = ctx;
+        ctx.push(Command::Audition { track: 0, step: Step::new(36, 100, 1), frames: 480 }).unwrap();
+        run(&mut e, 64);
+        let kinds: Vec<&str> = std::iter::from_fn(|| rx.pop())
+            .map(|ev| match ev {
+                OutEvent::Reset { .. } => "reset",
+                OutEvent::Anchor { .. } => "anchor",
+                OutEvent::Message { .. } => "message",
+            })
+            .collect();
+        assert_eq!(kinds[..3], ["reset", "anchor", "message"], "{kinds:?}");
     }
 
     #[test]
