@@ -983,7 +983,7 @@ impl Track {
                 for note in step.notes().take(n) {
                     let (channel, note) = self.out_note(note);
                     self.send_on(now, channel, note, step.velocity, midi);
-                    self.schedule_midi_off(MidiOff { frame: now + gate.max(1), channel, note }, midi);
+                    self.schedule_midi_off(now, MidiOff { frame: now + gate.max(1), channel, note }, midi);
                 }
             }
             return;
@@ -1016,11 +1016,13 @@ impl Track {
         midi.send(frame, &[0x90 | channel, note, velocity.clamp(1, 127)]);
     }
 
-    fn schedule_midi_off(&mut self, off: MidiOff, midi: &mut MidiSink) {
+    fn schedule_midi_off(&mut self, now: u64, off: MidiOff, midi: &mut MidiSink) {
         if self.midi_off_count == MAX_PENDING_OFFS {
-            // As in `schedule_off`: release the earliest note now.
+            // As in `schedule_off`: release the earliest note now. Not on its
+            // own frame: the output sends in order, so a release due later
+            // would hold back everything queued after it.
             let (i, o) = self.midi_offs.iter().copied().enumerate().min_by_key(|(_, o)| o.frame).unwrap();
-            midi.send(off.frame.min(o.frame), &[0x80 | o.channel, o.note, 0]);
+            midi.send(now, &[0x80 | o.channel, o.note, 0]);
             self.midi_offs[i] = self.midi_offs[self.midi_off_count - 1];
             self.midi_off_count -= 1;
         }
@@ -3451,6 +3453,23 @@ mod tests {
         run(&mut e, 10_000);
         e.handle(Command::Stop);
         assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_release_pushed_out_by_a_full_track_goes_at_once() {
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth), Edit::SetMidiOut { track: 0, on: true }]);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        let long = 480_000;
+        for i in 0..=MAX_PENDING_OFFS {
+            let note = Step::new((i % 128) as u8, 100, 1);
+            e.handle(Command::Edit(Edit::SetChannel { track: 0, channel: Some((i / 128) as u8) }));
+            e.handle(Command::Audition { track: 0, step: note, frames: long });
+        }
+        run(&mut e, 64);
+        let got = sent(&mut rx);
+        let off = got.iter().find(|m| m.1[0] & 0xF0 == 0x80).expect("one note let go");
+        assert_eq!((off.0, &off.1[..]), (0, &[0x80, 0, 0][..]), "{off:?}");
     }
 
     #[test]

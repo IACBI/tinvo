@@ -90,6 +90,10 @@ pub struct Scheduler {
     /// How many times each key on each channel was started and not yet
     /// released: two tracks can play one key, and each release counts.
     sounding: Keys,
+    /// Starts dropped (late or refused) whose releases are still to come:
+    /// each skips the next release of its key, so another note on it goes
+    /// on sounding until its own.
+    skipped: Keys,
     /// Releases (and a Stop) the output refused while everything was let
     /// go, tried again until [`GIVE_UP`] after `owed_since`.
     owed: Keys,
@@ -108,6 +112,7 @@ impl Scheduler {
             timing: None,
             delay,
             sounding: [[0; 128]; 16],
+            skipped: [[0; 128]; 16],
             owed: [[0; 128]; 16],
             owe_stop: false,
             owed_since: None,
@@ -198,13 +203,19 @@ impl Scheduler {
             let (channel, key) = (usize::from(status & 0x0F), usize::from(msg.get(1).map_or(0, |&k| k & 0x7F)));
             let kept = match status & 0xF0 {
                 0x90 if msg.get(2).is_some_and(|&v| v > 0) => {
-                    if late <= LATE && send(msg) {
-                        let n = &mut self.sounding[channel][key];
-                        *n = n.saturating_add(1);
-                    }
+                    let n = if late <= LATE && send(msg) {
+                        &mut self.sounding[channel][key]
+                    } else {
+                        &mut self.skipped[channel][key]
+                    };
+                    *n = n.saturating_add(1);
                     true
                 }
                 // A release of a note never sent is not sent either.
+                0x80 | 0x90 if self.skipped[channel][key] > 0 => {
+                    self.skipped[channel][key] -= 1;
+                    true
+                }
                 0x80 | 0x90 if self.sounding[channel][key] == 0 => true,
                 0x80 | 0x90 => {
                     let ok = send(msg);
@@ -267,6 +278,7 @@ impl Scheduler {
             *owed = owed.saturating_add(*sounding);
         }
         self.sounding = [[0; 128]; 16];
+        self.skipped = [[0; 128]; 16];
         self.owe_stop |= std::mem::take(&mut self.running);
         self.owed_since.get_or_insert(now);
         self.pending.clear();
@@ -297,14 +309,15 @@ impl Scheduler {
 
     /// Takes the queue of a new engine, or the same engine's from another
     /// output, at `now`: what it holds that was due more than [`LATE`] ago
-    /// is stale. Messages queued before any anchor came in this callback,
-    /// after the last anchor another thread took, so they are kept.
+    /// is stale. So is what came with no anchor (after the last one another
+    /// thread took), which cannot be placed in time: at most one callback's
+    /// messages.
     pub fn take_backlog(&mut self, now: Instant, queue: &mut Consumer<OutEvent>) {
         while let Some(ev) = queue.pop() {
             self.push(ev);
         }
         let before = now.checked_sub(LATE).unwrap_or(now);
-        let stale: Vec<bool> = self.pending.iter().map(|p| self.heard(p.0).is_some_and(|at| at < before)).collect();
+        let stale: Vec<bool> = self.pending.iter().map(|p| self.heard(p.0).is_none_or(|at| at < before)).collect();
         let mut i = 0;
         self.pending.retain(|_| {
             i += 1;
@@ -588,6 +601,21 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_start_skips_its_release_and_not_another_notes() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        sent(&mut s, t0 + Duration::from_millis(11));
+        // A second C4, dropped as late, and its release.
+        s.push(OutEvent::message(480, &[0x90, 60, 90]));
+        s.push(OutEvent::message(480, &[0x80, 60, 0]));
+        assert!(sent(&mut s, t0 + Duration::from_millis(100)).is_empty());
+        s.push(OutEvent::message(4800, &[0x80, 60, 0]));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(111)), [vec![0x80, 60, 0]], "the first ends on its own");
+    }
+
+    #[test]
     fn a_reset_or_a_release_of_everything_the_output_refuses_is_tried_again() {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
@@ -698,9 +726,14 @@ mod tests {
 
     #[test]
     fn a_new_queue_keeps_only_what_is_fresh() {
+        // With no anchor, nothing can be placed in time.
+        let mut s = Scheduler::new(Duration::ZERO);
+        let (mut tx, mut rx) = crate::rt::spsc::channel(16);
+        tx.push(OutEvent::message(0, &[0xFA])).unwrap();
+        s.take_backlog(s.t0, &mut rx);
+        assert!(s.pending.is_empty());
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
-        let (mut tx, mut rx) = crate::rt::spsc::channel(16);
         // Queued long ago, then Play just before the queue is taken.
         tx.push(anchor(t0, 0, 0)).unwrap();
         tx.push(OutEvent::message(0, &[0xFA])).unwrap();
