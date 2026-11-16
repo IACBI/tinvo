@@ -28,9 +28,9 @@ pub fn create_temp_beside(path: &Path) -> io::Result<(File, PathBuf)> {
 }
 
 /// Renames `from` to `to` unless `to` exists (an `AlreadyExists` error
-/// then). Where the file system has hard links this is atomic, since a link
-/// to a name already taken fails; elsewhere it looks first, which leaves a
-/// moment for another program to take the name.
+/// then); a file another program creates at `to` meanwhile is never
+/// replaced. Where the file system has hard links this is atomic, since a
+/// link to a name already taken fails; elsewhere `from` is copied to `to`.
 pub fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     match std::fs::hard_link(from, to) {
         Ok(()) => {
@@ -39,9 +39,25 @@ pub fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        Err(_) if std::fs::symlink_metadata(to).is_ok() => Err(io::ErrorKind::AlreadyExists.into()),
-        Err(_) => std::fs::rename(from, to),
+        Err(_) => copy_new(from, to),
     }
+}
+
+/// Moves `from` to `to` by copying it into a file created with
+/// `create_new`, which takes the name only if it is free. Unlike a rename,
+/// a reader can see `to` half written, and a failed copy removes it.
+fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
+    let mut source = File::open(from)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(to)?;
+    let copied = io::copy(&mut source, &mut file).and_then(|_| file.sync_all());
+    drop(file);
+    drop(source);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(from);
+    Ok(())
 }
 
 /// Replaces `path` with `bytes` atomically.
@@ -56,17 +72,24 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Reads `path` as UTF-8 text of at most `max` bytes. A longer file is an
-/// error once `max + 1` bytes are read, so a huge file, or one that never
-/// ends (a FIFO, a device), cannot take all memory.
-pub fn read_text(path: &Path, max: u64) -> io::Result<String> {
+/// Reads at most `max` bytes from `path`. A longer file is an error once
+/// `max + 1` bytes are read, so a huge file, or one that never ends (a
+/// FIFO, a device), cannot take all memory.
+pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         let size = if max >= 1 << 20 { format!("{} MiB", max >> 20) } else { format!("{max} bytes") };
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("larger than {size}")));
     }
-    String::from_utf8(bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8 text"))
+    Ok(bytes)
+}
+
+/// Reads `path` as UTF-8 text of at most `max` bytes. A longer file is an
+/// error once `max + 1` bytes are read, so a huge file, or one that never
+/// ends (a FIFO, a device), cannot take all memory.
+pub fn read_text(path: &Path, max: u64) -> io::Result<String> {
+    String::from_utf8(read_bytes(path, max)?).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8 text"))
 }
 
 #[cfg(test)]
@@ -109,6 +132,25 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         assert!(write_atomic(&sub, b"x").is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_name_is_taken_only_while_it_is_free() {
+        let dir = std::env::temp_dir().join(format!("tinvo-rename-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) = (dir.join("from"), dir.join("to"));
+        for publish in [rename_new, copy_new] {
+            std::fs::write(&from, "new").unwrap();
+            std::fs::write(&to, "theirs").unwrap();
+            assert_eq!(publish(&from, &to).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_to_string(&to).unwrap(), "theirs");
+            std::fs::remove_file(&to).unwrap();
+            publish(&from, &to).unwrap();
+            assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+            assert!(!from.exists());
+            std::fs::remove_file(&to).unwrap();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

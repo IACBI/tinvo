@@ -46,6 +46,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - The editor's keys, colours and mouse can be changed on a settings page (`F2`) that applies them at once, or in the settings file it writes to. A light theme is built in.
 - Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
+- Standard MIDI Files: export the song, a pattern or the loop region as notes for another program, and open a MIDI file as a new project.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -74,6 +75,8 @@ tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
 tinvo render song.tvo chorus.wav --from chorus --loops 1   # the section from marker "chorus" to the next
+tinvo render song.tvo song.mid    # the song's notes as a Standard MIDI File
+tinvo import song.mid song.tvo    # a MIDI file as a new project (or open it: tinvo song.mid)
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
@@ -93,6 +96,8 @@ tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. The sustain pedal holds notes, the pitch bend wheel bends synths and samplers by their `Bend range` (2 semitones unless set), and the mod wheel moves the synth parameter its `Mod wheel` names (the cutoff unless set) up toward its maximum. `H` gives a track a MIDI channel of its own, which plays it whichever track is selected; the other channels play the selected track, and several tracks on one channel play together. `C` records what you play while the pattern plays: each note lands on its nearest step, and the whole take is one undo step. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
+
+A MIDI file (format 0 or 1) opens as a new, unsaved project: each MIDI track and channel becomes a synth track, and the General MIDI drums on channel 10 become kick, snare, clap and hat tracks. Notes land on the nearest 16th-note step with their timing kept as micro-timing, a step holds a chord of up to four notes, and the file is cut into patterns of whole bars that the song plays in order, a repeated stretch reusing its pattern. The tempo comes from the file, and later tempo changes become tempo points. Export (`e` with a file name ending in `.mid`, or `tinvo render` to a `.mid` file) writes each heard track's notes where TINVO plays them, with swing, micro-timing, ratchets and each song entry's tempo; drums go to channel 10, and tracks without a MIDI channel of their own take the free ones in turn.
 
 The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
@@ -126,7 +131,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `M` | choose the MIDI input |
 | `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
 | `C` | record notes from the MIDI keyboard while the pattern plays (from a stop it starts playback, after a count-in if one is set); `C` again stops |
-| `w` `W` `e` | save, save as, export WAV |
+| `w` `W` `e` | save, save as, export WAV (or MIDI, to a `.mid` file) |
 | `F2` `P` | settings: keys, colours and the mouse |
 | `q` | quit |
 
@@ -202,6 +207,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Editörün tuşları, renkleri ve faresi, değişikliği anında uygulayan bir ayar sayfasından (`F2`) ya da bu sayfanın yazdığı ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
 - Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
+- Standard MIDI File: şarkı, bir pattern ya da döngü bölgesi başka bir programa nota olarak aktarılabilir; bir MIDI dosyası da yeni bir proje olarak açılabilir.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
 
@@ -230,6 +236,8 @@ tinvo song.tvo            # open a project, or start a new one at that path
 tinvo render song.tvo song.wav --format 24 --loops 4
 tinvo render song.tvo beat.wav --pattern B --stems
 tinvo render song.tvo chorus.wav --from chorus --loops 1   # the section from marker "chorus" to the next
+tinvo render song.tvo song.mid    # the song's notes as a Standard MIDI File
+tinvo import song.mid song.tvo    # a MIDI file as a new project (or open it: tinvo song.mid)
 tinvo demo demo.tvo       # write the demo project to a file
 tinvo probe 3             # check the audio device for 3 seconds
 tinvo devices             # list the output devices
@@ -249,6 +257,8 @@ tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. Sustain pedalı notaları tutar, pitch bend tekerleği synth ve sampler'ı `Bend range` kadar büker (ayarlanmadıysa 2 yarım ses), mod tekerleği de synth'te `Mod wheel` ile seçilen parametreyi (ayarlanmadıysa cutoff) en yüksek değerine doğru götürür. `H` ile bir kanala kendi MIDI kanalı verilir; o MIDI kanalı, seçili kanal hangisi olursa olsun onu çalar. Diğer MIDI kanalları seçili kanalı çalar, aynı MIDI kanalındaki birden çok kanal birlikte çalar. `C` ise pattern çalarken çaldıklarını kaydeder: her nota en yakın adıma düşer, kaydın tamamı tek bir undo adımıdır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
+
+Bir MIDI dosyası (format 0 ya da 1) kaydedilmemiş yeni bir proje olarak açılır: her MIDI track'i ve kanalı bir synth kanalı olur, 10. kanaldaki General MIDI davulları da kick, snare, clap ve hat kanallarına dönüşür. Notalar en yakın 16'lık adıma düşer, zamanlamaları micro-timing olarak korunur; bir adımda en fazla dört notalık akor olur. Dosya tam ölçülerden oluşan pattern'lere bölünür, şarkı bunları sırayla çalar; tekrar eden bir bölüm aynı pattern'i kullanır. Tempo dosyadan gelir, sonraki tempo değişiklikleri tempo noktası olur. Dışa aktarma (`e` ile `.mid` uzantılı bir dosya adı ya da `.mid` dosyasına `tinvo render`), duyulan her kanalın notalarını TINVO'nun çaldığı yere yazar: swing, micro-timing, ratchet ve her şarkı girişinin temposuyla. Davullar 10. kanala gider; kendi MIDI kanalı olmayan kanallar boştaki MIDI kanallarını sırayla alır.
 
 Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 
@@ -282,7 +292,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `M` | MIDI girişini seç |
 | `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
 | `C` | pattern çalarken MIDI klavyeden nota kaydet (durmuşken çalmayı başlatır, ayarlıysa önce count-in verir); tekrar `C` durdurur |
-| `w` `W` `e` | kaydet, farklı kaydet, WAV dışa aktar |
+| `w` `W` `e` | kaydet, farklı kaydet, WAV (ya da `.mid` dosyasına MIDI) dışa aktar |
 | `F2` `P` | ayarlar: tuşlar, renkler ve fare |
 | `q` | çık |
 

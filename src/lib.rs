@@ -9,6 +9,7 @@
 //!   autosave   crash-safe autosave of unsaved edits, and their recovery
 //!   render     offline rendering, sharing the exact real-time code path
 //!   project    document model, edits, persistence
+//!   smf        Standard MIDI File export and import
 //!   engine     real-time audio graph: transport, tracks, mixer
 //!   instrument synthesizers, sampler and drum voices
 //!   sample     loaded audio samples and their interpolation
@@ -40,6 +41,7 @@ pub mod render;
 pub mod rt;
 pub mod sample;
 pub mod settings;
+pub mod smf;
 pub mod strip;
 pub mod theme;
 pub mod tui;
