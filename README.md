@@ -47,6 +47,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
 - WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 - Standard MIDI Files: export the song, a pattern or the loop region as notes for another program, and open a MIDI file as a new project.
+- MIDI output: any track can play an external synth or another program instead of sounding, in time with the audio, and MIDI clock keeps other gear on TINVO's tempo.
 
 The roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md) and the design is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -84,8 +85,9 @@ tinvo --device usb song.tvo        # play on the device whose name contains "usb
 tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
 tinvo loopback --input realtek     # play sweeps and hear them back: checks both devices, measures the round trip
-tinvo midi                # list the MIDI inputs
+tinvo midi                # list the MIDI inputs and outputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
+tinvo --midi-out "synth" song.tvo  # send MIDI-out tracks and the clock there
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
@@ -96,6 +98,8 @@ tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. The sustain pedal holds notes, the pitch bend wheel bends synths and samplers by their `Bend range` (2 semitones unless set), and the mod wheel moves the synth parameter its `Mod wheel` names (the cutoff unless set) up toward its maximum. `H` gives a track a MIDI channel of its own, which plays it whichever track is selected; the other channels play the selected track, and several tracks on one channel play together. `C` records what you play while the pattern plays: each note lands on its nearest step, and the whole take is one undo step. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
+
+`Z` chooses a MIDI output, and `V` sends the selected track there instead of sounding it: on its MIDI channel, or channel 1, and drums as General MIDI notes on channel 10. Notes leave when their audio would be heard, and muting the track ends them. With `midi_clock = on` the output also gets MIDI clock, Start, Stop and Continue with the song position, so a drum machine or another sequencer follows TINVO's tempo. `midi_delay` sends everything a little later (up to 50 ms) when the output sounds before TINVO's audio does.
 
 A MIDI file (format 0 or 1) opens as a new, unsaved project: each MIDI track and channel becomes a synth track, and the General MIDI drums on channel 10 become kick, snare, clap and hat tracks. Notes land on the nearest 16th-note step with their timing kept as micro-timing, a step holds a chord of up to four notes, and the file is cut into patterns of whole bars that the song plays in order, a repeated stretch reusing its pattern. The tempo comes from the file, and later tempo changes become tempo points from the bar line they fall on, or the next one. Export (`e` with a file name ending in `.mid`, or `tinvo render` to a `.mid` file) writes each heard track's notes where TINVO plays them, with swing, micro-timing, ratchets and each song entry's tempo; drums go to channel 10, and tracks without a MIDI channel of their own take the free ones in turn.
 
@@ -129,6 +133,8 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
 | `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
 | `M` | choose the MIDI input |
+| `Z` | choose the MIDI output |
+| `V` | send the track to the MIDI output instead of sounding it; `V` again plays it here |
 | `R` | step entry: MIDI keys write the step at the cursor (keys held together make a chord) |
 | `C` | record notes from the MIDI keyboard while the pattern plays (from a stop it starts playback, after a count-in if one is set); `C` again stops |
 | `w` `W` `e` | save, save as, export WAV (or MIDI, to a `.mid` file) |
@@ -156,7 +162,7 @@ mouse = off
 record_mode = replace
 ```
 
-An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys. `mouse = off` leaves the mouse to the terminal. `record_mode` (`overdub` or `replace`), `record_timing` (`keep` or `quantize`) and `count_in` (`off`, `1` or `2` bars) set how `C` records notes; overdub adds to the steps, replace keeps only what the last pass over each step played.
+An action listed under `[keys]` gets exactly the keys given; an empty value leaves it with none. `base` picks a built-in theme (`default` or `light`), and each role's style is `[colour] [on colour] [bold]`, where a colour is a name, a palette index `0`–`255` or `#rrggbb`. `tinvo settings` checks the file and prints every action and role with its current value, so its output is a full settings file to start from. A mistake stops TINVO before it starts and says what is wrong: the line, or for one key given to two actions that work in the same view, the key and both actions. Answers to questions (`y`, `n`, `Esc`) and editing in text prompts always use the same keys. `mouse = off` leaves the mouse to the terminal. `record_mode` (`overdub` or `replace`), `record_timing` (`keep` or `quantize`) and `count_in` (`off`, `1` or `2` bars) set how `C` records notes; overdub adds to the steps, replace keeps only what the last pass over each step played. `midi_clock` (`off` or `on`) sends MIDI clock and transport to the MIDI output, and `midi_delay` (`0`, `5`, `10`, `20`, `30` or `50` ms) sends everything to it that much later.
 
 The settings page (`F2` or `P`) does the same without leaving the editor. It has three tabs, Keys, Colours and Options (`←` `→` or `Tab`). `Enter` adds a key to an action (press the key next) or changes a colour or option, `Del` removes an action's last key, `r` puts back the default and `Esc` closes the page. A change works at once. When the page closes, the changes are written into the settings file, keeping its comments, every line that did not change and whatever another TINVO session saved there meanwhile; a file that no longer reads is left alone. The page will not take the last key from the settings page itself or from quit.
 
@@ -208,6 +214,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
 - 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 - Standard MIDI File: şarkı, bir pattern ya da döngü bölgesi başka bir programa nota olarak aktarılabilir; bir MIDI dosyası da yeni bir proje olarak açılabilir.
+- MIDI çıkışı: herhangi bir kanal kendi sesi yerine harici bir synth'i ya da başka bir programı, sesle aynı zamanda çalabilir; MIDI clock da diğer cihazları TINVO'nun temposunda tutar.
 
 Yol haritası [docs/ROADMAP.md](docs/ROADMAP.md), mimari [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) dosyasında (İngilizce).
 
@@ -245,8 +252,9 @@ tinvo --device usb song.tvo        # play on the device whose name contains "usb
 tinvo --device jack song.tvo       # Linux: play through JACK or PipeWire's JACK
 tinvo probe --device realtek --low-latency 3
 tinvo loopback --input realtek     # play sweeps and hear them back: checks both devices, measures the round trip
-tinvo midi                # list the MIDI inputs
+tinvo midi                # list the MIDI inputs and outputs
 tinvo --midi keystation song.tvo   # play from that MIDI keyboard
+tinvo --midi-out "synth" song.tvo  # send MIDI-out tracks and the clock there
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
 tinvo bench               # measure rendering speed
@@ -257,6 +265,8 @@ tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
 Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. Sustain pedalı notaları tutar, pitch bend tekerleği synth ve sampler'ı `Bend range` kadar büker (ayarlanmadıysa 2 yarım ses), mod tekerleği de synth'te `Mod wheel` ile seçilen parametreyi (ayarlanmadıysa cutoff) en yüksek değerine doğru götürür. `H` ile bir kanala kendi MIDI kanalı verilir; o MIDI kanalı, seçili kanal hangisi olursa olsun onu çalar. Diğer MIDI kanalları seçili kanalı çalar, aynı MIDI kanalındaki birden çok kanal birlikte çalar. `C` ise pattern çalarken çaldıklarını kaydeder: her nota en yakın adıma düşer, kaydın tamamı tek bir undo adımıdır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
+
+`Z` bir MIDI çıkışı seçer, `V` de seçili kanalı kendi sesi yerine oraya gönderir: kendi MIDI kanalından ya da 1. kanaldan; davullar 10. kanalda General MIDI notaları olarak gider. Notalar, sesleri duyulacağı anda çıkar; kanal mute edilince notaları da biter. `midi_clock = on` ile çıkışa MIDI clock, Start, Stop ve şarkı konumuyla Continue da gider, böylece bir davul makinesi ya da başka bir sequencer TINVO'nun temposunu takip eder. Çıkış TINVO'nun sesinden önce duyuluyorsa `midi_delay` her şeyi biraz geciktirir (en fazla 50 ms).
 
 Bir MIDI dosyası (format 0 ya da 1) kaydedilmemiş yeni bir proje olarak açılır: her MIDI track'i ve kanalı bir synth kanalı olur, 10. kanaldaki General MIDI davulları da kick, snare, clap ve hat kanallarına dönüşür. Notalar en yakın 16'lık adıma düşer, zamanlamaları micro-timing olarak korunur; bir adımda en fazla dört notalık akor olur. Dosya tam ölçülerden oluşan pattern'lere bölünür, şarkı bunları sırayla çalar; tekrar eden bir bölüm aynı pattern'i kullanır. Tempo dosyadan gelir; sonraki tempo değişiklikleri denk geldikleri ölçü çizgisinden, ölçü ortasındaysa bir sonrakinden başlayan tempo noktaları olur. Dışa aktarma (`e` ile `.mid` uzantılı bir dosya adı ya da `.mid` dosyasına `tinvo render`), duyulan her kanalın notalarını TINVO'nun çaldığı yere yazar: swing, micro-timing, ratchet ve her şarkı girişinin temposuyla. Davullar 10. kanala gider; kendi MIDI kanalı olmayan kanallar boştaki MIDI kanallarını sırayla alır.
 
@@ -290,6 +300,8 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |
 | `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |
 | `M` | MIDI girişini seç |
+| `Z` | MIDI çıkışını seç |
+| `V` | kanalı kendi sesi yerine MIDI çıkışına gönder; tekrar `V` yeniden burada çalar |
 | `R` | adım girişi: MIDI tuşları imleçteki adımı yazar (birlikte basılan tuşlar akor olur) |
 | `C` | pattern çalarken MIDI klavyeden nota kaydet (durmuşken çalmayı başlatır, ayarlıysa önce count-in verir); tekrar `C` durdurur |
 | `w` `W` `e` | kaydet, farklı kaydet, WAV (ya da `.mid` dosyasına MIDI) dışa aktar |
@@ -317,7 +329,7 @@ mouse = off
 record_mode = replace
 ```
 
-`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir. `mouse = off` fareyi terminale bırakır. `record_mode` (`overdub` ya da `replace`), `record_timing` (`keep` ya da `quantize`) ve `count_in` (`off`, `1` ya da `2` ölçü), `C` ile nota kaydının nasıl yapılacağını belirler: overdub adımlara ekler, replace her adımda yalnızca son geçişte çalınanı tutar.
+`[keys]` altında yazılan bir eylem yalnızca verilen tuşlara bağlanır; değeri boş bırakılırsa hiç tuşu kalmaz. `base` hazır temalardan birini seçer (`default` ya da `light`). Her rolün stili `[renk] [on renk] [bold]` biçimindedir; renk bir isim, `0`–`255` arası palet numarası ya da `#rrggbb` olabilir. `tinvo settings` dosyayı denetler ve bütün eylemleri ve rolleri şu anki değerleriyle yazdırır; çıktısı başlamak için hazır, eksiksiz bir ayar dosyasıdır. Dosyada bir hata varsa TINVO açılmadan durur ve sorunu söyler: hatalı satırı, ya da aynı görünümde çalışan iki eyleme aynı tuş verildiyse o tuşu ve iki eylemi. Sorulara verilen cevaplar (`y`, `n`, `Esc`) ve metin kutularındaki düzenleme tuşları sabittir. `mouse = off` fareyi terminale bırakır. `record_mode` (`overdub` ya da `replace`), `record_timing` (`keep` ya da `quantize`) ve `count_in` (`off`, `1` ya da `2` ölçü), `C` ile nota kaydının nasıl yapılacağını belirler: overdub adımlara ekler, replace her adımda yalnızca son geçişte çalınanı tutar. `midi_clock` (`off` ya da `on`) MIDI çıkışına clock ve transport gönderir, `midi_delay` (`0`, `5`, `10`, `20`, `30` ya da `50` ms) da çıkışa giden her şeyi o kadar geciktirir.
 
 Ayar sayfası (`F2` ya da `P`) aynı işi editörden çıkmadan yapar. Üç sekmesi var: Keys, Colours ve Options (`←` `→` ya da `Tab`). `Enter` bir eyleme tuş ekler (ardından tuşa bas) ya da bir rengi veya seçeneği değiştirir, `Del` eylemin son tuşunu siler, `r` varsayılanı geri getirir, `Esc` sayfayı kapatır. Değişiklik anında çalışır. Sayfa kapanınca değişiklikler ayar dosyasına yazılır; dosyadaki yorumlar, değişmeyen satırlar ve bu arada başka bir TINVO oturumunun kaydettikleri olduğu gibi kalır. Artık okunamayan bir dosyaya dokunulmaz. Sayfa, ayar sayfasının ve çıkışın son tuşunu silmeye izin vermez.
 

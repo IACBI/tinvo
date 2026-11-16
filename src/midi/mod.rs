@@ -1,10 +1,12 @@
-//! MIDI input: listing the input ports, opening one, and decoding its bytes
-//! into the channel messages TINVO plays.
+//! MIDI input and output: listing the ports, opening one, decoding an
+//! input's bytes into the channel messages TINVO plays, and sending the
+//! engine's messages to an output on time ([`schedule`]).
 //!
-//! Each backend calls a handler on its own thread for every message (WinMM's
-//! callback thread, a TINVO thread polling the ALSA sequencer or rawmidi,
-//! CoreMIDI's receive thread). The handler must not block; the app's pushes
-//! into lock-free mailboxes, one for the audio engine and one for the UI.
+//! Each backend calls an input's handler on its own thread for every message
+//! (WinMM's callback thread, a TINVO thread polling the ALSA sequencer or
+//! rawmidi, CoreMIDI's receive thread). The handler must not block; the
+//! app's pushes into lock-free mailboxes, one for the audio engine and one
+//! for the UI. An output is written from TINVO's MIDI output thread.
 
 #[cfg(target_os = "linux")]
 mod alsaseq;
@@ -12,8 +14,11 @@ mod alsaseq;
 mod coremidi;
 #[cfg(target_os = "linux")]
 mod rawmidi;
+pub mod schedule;
 #[cfg(windows)]
 mod winmm;
+
+pub use schedule::OutEvent;
 
 /// The sustain pedal's controller.
 pub const SUSTAIN: u8 = 64;
@@ -138,9 +143,18 @@ pub fn inputs() -> Result<Vec<Port>, String> {
     platform::inputs()
 }
 
-/// Picks the port `query` names: an exact id, else the one port whose name
-/// contains `query` (ignoring case).
+/// Picks the input port `query` names: an exact id, else the one port whose
+/// name contains `query` (ignoring case).
 pub fn find_port<'a>(ports: &'a [Port], query: &str) -> Result<&'a Port, String> {
+    find_in(ports, query, "input")
+}
+
+/// Picks the output port `query` names, as [`find_port`] does an input.
+pub fn find_output<'a>(ports: &'a [Port], query: &str) -> Result<&'a Port, String> {
+    find_in(ports, query, "output")
+}
+
+fn find_in<'a>(ports: &'a [Port], query: &str, what: &str) -> Result<&'a Port, String> {
     if let Some(p) = ports.iter().find(|p| p.id == query) {
         return Ok(p);
     }
@@ -148,9 +162,9 @@ pub fn find_port<'a>(ports: &'a [Port], query: &str) -> Result<&'a Port, String>
     let hits: Vec<&Port> = ports.iter().filter(|p| p.name.to_lowercase().contains(&q)).collect();
     match hits[..] {
         [p] => Ok(p),
-        [] => Err(format!("no MIDI input matches '{query}' (tinvo midi lists them)")),
+        [] => Err(format!("no MIDI {what} matches '{query}' (tinvo midi lists them)")),
         _ => Err(format!(
-            "'{query}' matches {} MIDI inputs: {}",
+            "'{query}' matches {} MIDI {what}s: {}",
             hits.len(),
             hits.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
         )),
@@ -181,6 +195,38 @@ where
     Ok(Input { name: port.name, _handle: handle })
 }
 
+/// Lists the MIDI output ports present now.
+pub fn outputs() -> Result<Vec<Port>, String> {
+    platform::outputs()
+}
+
+/// An open MIDI output; closing it (dropping) releases the notes the
+/// backend can release.
+pub struct Output {
+    name: String,
+    handle: platform::OutHandle,
+}
+
+impl Output {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Sends one complete message: a channel message, or a system common
+    /// or real-time one.
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.handle.send(bytes)
+    }
+}
+
+/// Opens the output port with `id`.
+pub fn open_output(id: &str) -> Result<Output, String> {
+    let port =
+        outputs()?.into_iter().find(|p| p.id == id).ok_or_else(|| format!("MIDI output '{id}' is not connected"))?;
+    let handle = platform::open_output(&port)?;
+    Ok(Output { name: port.name, handle })
+}
+
 #[cfg(windows)]
 use winmm as platform;
 
@@ -195,8 +241,34 @@ mod platform {
         Raw(#[allow(dead_code)] rawmidi::Handle),
     }
 
+    pub enum OutHandle {
+        Seq(alsaseq::OutHandle),
+        Raw(rawmidi::OutHandle),
+    }
+
+    impl OutHandle {
+        pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+            match self {
+                OutHandle::Seq(h) => h.send(bytes),
+                OutHandle::Raw(h) => h.send(bytes),
+            }
+        }
+    }
+
     pub fn inputs() -> Result<Vec<Port>, String> {
         alsaseq::inputs().or_else(|_| rawmidi::inputs())
+    }
+
+    pub fn outputs() -> Result<Vec<Port>, String> {
+        alsaseq::outputs().or_else(|_| rawmidi::outputs())
+    }
+
+    pub fn open_output(port: &Port) -> Result<OutHandle, String> {
+        if port.id.starts_with(alsaseq::PREFIX) {
+            alsaseq::open_output(port).map(OutHandle::Seq)
+        } else {
+            rawmidi::open_output(port).map(OutHandle::Raw)
+        }
     }
 
     pub fn open<H: FnMut(Message) + Send + 'static>(port: &Port, handler: H) -> Result<Handle, String> {
@@ -217,11 +289,27 @@ mod platform {
 
     pub struct Handle;
 
+    pub struct OutHandle;
+
+    impl OutHandle {
+        pub fn send(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Err("no MIDI backend for this platform".into())
+        }
+    }
+
     pub fn inputs() -> Result<Vec<Port>, String> {
         Err("no MIDI backend for this platform".into())
     }
 
     pub fn open<H: FnMut(Message) + Send + 'static>(_port: &Port, _handler: H) -> Result<Handle, String> {
+        Err("no MIDI backend for this platform".into())
+    }
+
+    pub fn outputs() -> Result<Vec<Port>, String> {
+        Err("no MIDI backend for this platform".into())
+    }
+
+    pub fn open_output(_port: &Port) -> Result<OutHandle, String> {
         Err("no MIDI backend for this platform".into())
     }
 }
@@ -305,12 +393,19 @@ mod tests {
         assert_eq!(find_port(&list, "launch").unwrap().id, "1");
         assert!(find_port(&list, "keystation").unwrap_err().contains("matches 2"));
         assert!(find_port(&list, "piano").unwrap_err().contains("no MIDI input"));
+        assert!(find_output(&list, "piano").unwrap_err().contains("no MIDI output"));
+        assert!(find_output(&list, "keystation").unwrap_err().contains("2 MIDI outputs"));
     }
 
     /// Exercises the platform listing; a bad FFI declaration would crash here.
     #[test]
     fn listing_inputs_is_consistent() {
-        match inputs() {
+        listing_is_consistent(inputs());
+        listing_is_consistent(outputs());
+    }
+
+    fn listing_is_consistent(list: Result<Vec<Port>, String>) {
+        match list {
             Ok(ports) => {
                 for p in &ports {
                     assert!(!p.id.is_empty() && !p.name.is_empty(), "{p:?}");

@@ -1,9 +1,11 @@
-//! macOS MIDI input through CoreMIDI.
+//! macOS MIDI input and output through CoreMIDI.
 //!
-//! Ports are CoreMIDI's sources, identified by their unique id (stable across
-//! reconnects). CoreMIDI calls the read procedure on its own high-priority
-//! thread with packet lists, which run through [`Parser`] since a packet may
-//! hold several messages (or part of a system exclusive one).
+//! Ports are CoreMIDI's sources and destinations, identified by their unique
+//! id (stable across reconnects). CoreMIDI calls the read procedure on its
+//! own high-priority thread with packet lists, which run through [`Parser`]
+//! since a packet may hold several messages (or part of a system exclusive
+//! one). Output sends each message in a packet list of its own, timestamped
+//! now.
 
 use super::{Message, Parser, Port};
 use crate::audio::coreaudio::{CFStringRef, new_cf_string, release, take_cf_string};
@@ -17,6 +19,8 @@ type ReadProc = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void);
 unsafe extern "C" {
     fn MIDIGetNumberOfSources() -> usize;
     fn MIDIGetSource(index: usize) -> MidiObject;
+    fn MIDIGetNumberOfDestinations() -> usize;
+    fn MIDIGetDestination(index: usize) -> MidiObject;
     fn MIDIObjectGetStringProperty(obj: MidiObject, property: CFStringRef, out: *mut CFStringRef) -> i32;
     fn MIDIObjectGetIntegerProperty(obj: MidiObject, property: CFStringRef, out: *mut i32) -> i32;
     fn MIDIClientCreate(name: CFStringRef, notify: *const c_void, refcon: *mut c_void, out: *mut MidiObject) -> i32;
@@ -29,6 +33,17 @@ unsafe extern "C" {
         out: *mut MidiObject,
     ) -> i32;
     fn MIDIPortConnectSource(port: MidiObject, source: MidiObject, refcon: *mut c_void) -> i32;
+    fn MIDIOutputPortCreate(client: MidiObject, name: CFStringRef, out: *mut MidiObject) -> i32;
+    fn MIDIPacketListInit(list: *mut c_void) -> *mut c_void;
+    fn MIDIPacketListAdd(
+        list: *mut c_void,
+        list_size: usize,
+        packet: *mut c_void,
+        time: u64,
+        n: usize,
+        data: *const u8,
+    ) -> *mut c_void;
+    fn MIDISend(port: MidiObject, dest: MidiObject, list: *const c_void) -> i32;
     fn MIDIPortDispose(port: MidiObject) -> i32;
     static kMIDIPropertyDisplayName: CFStringRef;
     static kMIDIPropertyUniqueID: CFStringRef;
@@ -36,11 +51,22 @@ unsafe extern "C" {
 
 /// Every source with its unique id and name.
 fn sources() -> Vec<(MidiObject, Port)> {
+    // SAFETY: plain queries with indices below the count.
+    endpoints(unsafe { MIDIGetNumberOfSources() }, |i| unsafe { MIDIGetSource(i) }, "source")
+}
+
+/// Every destination with its unique id and name.
+fn destinations() -> Vec<(MidiObject, Port)> {
+    // SAFETY: plain queries with indices below the count.
+    endpoints(unsafe { MIDIGetNumberOfDestinations() }, |i| unsafe { MIDIGetDestination(i) }, "destination")
+}
+
+fn endpoints(count: usize, get: impl Fn(usize) -> MidiObject, what: &str) -> Vec<(MidiObject, Port)> {
     // SAFETY: plain queries; properties are copied out and released.
     unsafe {
-        (0..MIDIGetNumberOfSources())
+        (0..count)
             .filter_map(|i| {
-                let src = MIDIGetSource(i);
+                let src = get(i);
                 if src == 0 {
                     return None;
                 }
@@ -55,7 +81,7 @@ fn sources() -> Vec<(MidiObject, Port)> {
                     None
                 };
                 let id = uid.to_string();
-                Some((src, Port { name: name.unwrap_or_else(|| format!("MIDI source {id}")), id }))
+                Some((src, Port { name: name.unwrap_or_else(|| format!("MIDI {what} {id}")), id }))
             })
             .collect()
     }
@@ -63,6 +89,74 @@ fn sources() -> Vec<(MidiObject, Port)> {
 
 pub fn inputs() -> Result<Vec<Port>, String> {
     Ok(sources().into_iter().map(|(_, p)| p).collect())
+}
+
+pub fn outputs() -> Result<Vec<Port>, String> {
+    Ok(destinations().into_iter().map(|(_, p)| p).collect())
+}
+
+/// An open output: a client and its output port, sending to `dest`.
+pub struct OutHandle {
+    client: MidiObject,
+    port: MidiObject,
+    dest: MidiObject,
+}
+
+// SAFETY: CoreMIDI references are plain ids, usable from any thread.
+unsafe impl Send for OutHandle {}
+
+impl Drop for OutHandle {
+    fn drop(&mut self) {
+        // SAFETY: references this handle created, disposed once.
+        unsafe {
+            if self.port != 0 {
+                MIDIPortDispose(self.port);
+            }
+            MIDIClientDispose(self.client);
+        }
+    }
+}
+
+impl OutHandle {
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // Room for a packet list of one short message, aligned for its
+        // 64-bit timestamp.
+        let mut buf = [0u64; 8];
+        let list = buf.as_mut_ptr().cast::<c_void>();
+        // SAFETY: a buffer of the size passed; a timestamp of 0 sends now.
+        let status = unsafe {
+            let packet = MIDIPacketListInit(list);
+            if MIDIPacketListAdd(list, size_of_val(&buf), packet, 0, bytes.len(), bytes.as_ptr()).is_null() {
+                return Err("a MIDI message too long to send".into());
+            }
+            MIDISend(self.port, self.dest, list)
+        };
+        if status == 0 { Ok(()) } else { Err(format!("cannot send to the MIDI output (OSStatus {status})")) }
+    }
+}
+
+pub fn open_output(port: &Port) -> Result<OutHandle, String> {
+    let dest = destinations()
+        .into_iter()
+        .find(|(_, p)| p.id == port.id)
+        .map(|(d, _)| d)
+        .ok_or_else(|| format!("MIDI output '{}' is not connected", port.id))?;
+    let mut client = 0;
+    // SAFETY: valid name and out-pointer; no notification callback.
+    let status =
+        with_cf_string("TINVO", |name| unsafe { MIDIClientCreate(name, ptr::null(), ptr::null_mut(), &mut client) });
+    if status != 0 {
+        return Err(format!("cannot create a CoreMIDI client (OSStatus {status})"));
+    }
+    let mut h = OutHandle { client, port: 0, dest };
+    let mut out = 0;
+    // SAFETY: valid client, name and out-pointer.
+    let status = with_cf_string("TINVO output", |name| unsafe { MIDIOutputPortCreate(client, name, &mut out) });
+    if status != 0 {
+        return Err(format!("cannot create a CoreMIDI output port (OSStatus {status})"));
+    }
+    h.port = out;
+    Ok(h)
 }
 
 struct State<H> {
@@ -172,4 +266,67 @@ where
         return Err(format!("cannot connect to MIDI input '{}' (OSStatus {status})", port.name));
     }
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[link(name = "CoreMIDI", kind = "framework")]
+    unsafe extern "C" {
+        fn MIDIDestinationCreate(
+            client: MidiObject,
+            name: CFStringRef,
+            read: ReadProc,
+            refcon: *mut c_void,
+            out: *mut MidiObject,
+        ) -> i32;
+        fn MIDIEndpointDispose(endpoint: MidiObject) -> i32;
+    }
+
+    type Handler = Box<dyn FnMut(Message) + Send>;
+
+    /// Sends through TINVO's output to a virtual destination of the test's
+    /// own, read back with the input's read procedure.
+    #[test]
+    fn messages_reach_a_virtual_destination() {
+        let mut client = 0;
+        // SAFETY: valid name and out-pointer.
+        let status = with_cf_string("tinvo-test", |name| unsafe {
+            MIDIClientCreate(name, ptr::null(), ptr::null_mut(), &mut client)
+        });
+        if status != 0 {
+            eprintln!("no CoreMIDI client (OSStatus {status}); skipping");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let handler: Handler = Box::new(move |m| {
+            let _ = tx.send(m);
+        });
+        let state = Box::into_raw(Box::new(State { handler, parser: Parser::new() }));
+        let mut dest = 0;
+        // SAFETY: valid client, name and out-pointer; the state outlives
+        // the destination, disposed below before it is freed.
+        let status = with_cf_string("tinvo-test-synth", |name| unsafe {
+            MIDIDestinationCreate(client, name, read::<Handler>, state.cast(), &mut dest)
+        });
+        assert_eq!(status, 0);
+        let port = outputs().unwrap().into_iter().find(|p| p.name.contains("tinvo-test-synth")).expect("listed");
+        let mut out = open_output(&port).unwrap();
+        out.send(&[0x93, 64, 90]).unwrap();
+        out.send(&[0x83, 64, 0]).unwrap();
+        let wait = Duration::from_secs(2);
+        assert_eq!(rx.recv_timeout(wait), Ok(Message::NoteOn { channel: 3, note: 64, velocity: 90 }));
+        assert_eq!(rx.recv_timeout(wait), Ok(Message::NoteOff { channel: 3, note: 64 }));
+        drop(out);
+        // SAFETY: disposing the destination stops its read procedure; the
+        // state is freed once after that.
+        unsafe {
+            MIDIEndpointDispose(dest);
+            MIDIClientDispose(client);
+            drop(Box::from_raw(state));
+        }
+    }
 }

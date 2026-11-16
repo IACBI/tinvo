@@ -399,6 +399,22 @@ Known limits:
 - An imported tempo change inside a bar takes effect from the next bar line.
 - A file timed in SMPTE frames, and format 2, are refused.
 
+## Phase 10d: MIDI output and clock ✅ (0.24.0)
+
+- Output backends next to the input ones: WinMM `midiOut*` short messages; on Linux a `TINVO:output` sequencer port connected to the chosen port with `snd_seq_connect_to`, sending direct events, or a rawmidi device written to without the sequencer; on macOS a CoreMIDI output port sending one packet list per message.
+- A track can play on the MIDI output instead of sounding (`V`, `midi_out true` in format 14). It sends on its own MIDI channel, or channel 1; drums send their General MIDI note on channel 10. The engine stamps each message with its exact frame plus the limiter's latency, so it lines up with the audio heard. A retriggered key is released first, and Stop, removing the track, muting it (or soloing another) and switching MIDI out off release every note it sent; switching it on lets the track's own voices go. Live notes from the MIDI keyboard go out too, held by the sustain pedal as they would sound (their release is sent when it lifts).
+- MIDI clock (`midi_clock` on the settings page): 24 clocks per quarter note on their exact frames at any buffer size, following tempo points and ramps. Play sends Start, or for a song entry after the first its Song Position and Continue; an entry that starts between two 16th notes continues on the next. Stop sends Stop.
+- Each audio callback sends the output thread an anchor (its first frame, its length, the rate and when it started), so the thread maps frames to wall-clock time a buffer after their callback. It keeps the earliest estimate and lets it move later only slowly, so one late callback does not shift what follows. `midi_delay` (0–50 ms) sends everything later, for an output heard sooner than the audio. Note-ons and clocks more than 50 ms late are dropped; releases, Start, Stop, Continue and Song Position never are. One the output refuses holds back what follows for up to a second; a release or Stop is then owed and tried again until the output takes it, and a Start, Continue or Song Position is dropped. The thread counts each key's starts and releases, so two tracks playing one key on one channel each release it, and it never sends a message before one the engine queued earlier, even when the limiter's latency fell between them. Clocks go only between Start or Continue and Stop, so an output chosen while playing gets them from the next Play. A new engine, an engine silent for 250 ms beyond four of its callbacks, or closing the output releases every note still sounding and stops a running receiver, trying again what the output refuses, before anything new for up to a second (on closing, for 200 ms). After the engine's queue was full and lost a message, the next callback releases every note sounding then, and stops the receiver unless the clock runs.
+- `Z` chooses the output, `tinvo midi` lists inputs and outputs, and `--midi-out NAME` opens one at start.
+
+Known limits:
+- Only notes, the clock and transport are sent: no controllers, pitch bend or program changes.
+- The clock runs only while playing. A loop back to its start is not signalled to the receiver, and turning the clock on while playing waits for the next Play.
+- Timing follows the audio callbacks' start times plus about 1 ms of polling, so its jitter is the callbacks'. A callback's frames are taken to be heard one callback after it starts; a device that buffers more (ALSA keeps several periods) plays later than that, which `midi_delay` makes up for. TINVO cannot follow an external clock.
+- Two tracks playing one key on one channel share it, as MIDI does: most receivers end it on the first release.
+- MIDI's song position reaches 16,383 16th notes (1,024 bars of 4/4); from a song entry past that, the receiver is not started.
+- An audio export leaves MIDI-out tracks silent; a MIDI file export keeps their notes.
+
 ## Review: performance, security and dead code ✅ (0.24.0)
 
 A second review of the whole project, made with an independent model reading the code. Each finding was checked against the code, and the fixes that change behaviour have tests:
@@ -415,15 +431,7 @@ Known limits (found bounded, and left for later):
 
 ## Planned: more kinds of music
 
-TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes. The phases below take it further, toward live-played parts, larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
-
-### Phase 10: MIDI performance (medium)
-
-For playing parts in instead of entering them, expressive synth playing, and working alongside other programs and hardware.
-- Sustain pedal (CC 64), pitch bend with a range per track, and the mod wheel (CC 1) sent to a chosen parameter. MIDI channels can each play their own track; all channels playing the selected track stays the default.
-- Standard MIDI File import (formats 0 and 1, one TINVO track per MIDI track or channel, notes on the pattern's grid, the tempo from the first tempo event) and export of a pattern or the song.
-- MIDI output, with backends next to the input ones (WinMM, the ALSA sequencer, CoreMIDI): a track's notes to an external instrument or another program, and MIDI clock (start, stop, continue, song position, 24 clocks per quarter note). Following an external clock needs the audio clock to track another device's drift and would be a phase of its own.
-- Tests: pedal and bend on the synth's voices, MIDI file round trips with the reader fuzzed like the project and WAV readers, clock bytes on their exact frames.
+TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
 
 ### Phase 11: Mixer (medium)
 

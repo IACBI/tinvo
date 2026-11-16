@@ -36,7 +36,7 @@ USAGE:
                                         `tinvo SONG.mid` opens it in the editor unsaved
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
-    tinvo midi                          list the MIDI inputs
+    tinvo midi                          list the MIDI inputs and outputs
     tinvo inputs                        list the audio input devices
     tinvo record OUT.wav [SECONDS] [--input NAME]
                                         record from an audio input (default 5 s) to a
@@ -65,6 +65,8 @@ AUDIO:
                                         backend supports it (WASAPI, CoreAudio)
     --midi NAME | none                  play from this MIDI input (its id, or a unique
                                         part of its name; default: the first one)
+    --midi-out NAME                     send MIDI-out tracks and the clock to this MIDI
+                                        output (Z in the editor; default: none)
     --input NAME                        record from this audio input (I in the editor;
                                         default: the system default)
     --settings FILE                     read keys and colours from FILE instead of the
@@ -328,6 +330,23 @@ fn midi_option(args: Vec<String>) -> Result<(MidiStart, Vec<String>), String> {
     Ok((start, rest))
 }
 
+/// Takes `--midi-out` out of `args`, returning the output id and the rest.
+fn midi_out_option(args: Vec<String>) -> Result<(Option<String>, Vec<String>), String> {
+    let mut out = None;
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a != "--midi-out" {
+            rest.push(a);
+            continue;
+        }
+        let query = it.next().ok_or("--midi-out needs an output name or id")?;
+        let ports = midi::outputs()?;
+        out = Some(midi::find_output(&ports, &query)?.id.clone());
+    }
+    Ok((out, rest))
+}
+
 /// Takes `--input` out of `args`, returning the input id and the rest.
 fn input_option(args: Vec<String>) -> Result<(Option<String>, Vec<String>), String> {
     let mut input = None;
@@ -385,11 +404,14 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
     let (settings, settings_path, _) = read_settings(file)?;
     let (config, rest) = audio_options(&rest)?;
     let (midi_start, rest) = midi_option(rest)?;
+    let (midi_out, rest) = midi_out_option(rest)?;
     let (input, rest) = input_option(rest)?;
     match &rest[..] {
-        [] => tinvo::app::run(None, config, midi_start, input, settings, settings_path),
+        [] => tinvo::app::run(None, config, midi_start, midi_out, input, settings, settings_path),
         [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
-        [path] => tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, input, settings, settings_path),
+        [path] => {
+            tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, midi_out, input, settings, settings_path)
+        }
         _ => Err(format!("too many arguments\n\n{USAGE}")),
     }
 }
@@ -464,12 +486,15 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_midi() -> Result<(), String> {
-    let ports = midi::inputs()?;
-    if ports.is_empty() {
-        println!("No MIDI inputs.");
-    }
-    for p in &ports {
-        println!("  {}\n    {}", shown(&p.name), shown(&p.id));
+    for (what, ports) in [("inputs", midi::inputs()?), ("outputs", midi::outputs()?)] {
+        if ports.is_empty() {
+            println!("No MIDI {what}.");
+        } else {
+            println!("MIDI {what}:");
+        }
+        for p in &ports {
+            println!("  {}\n    {}", shown(&p.name), shown(&p.id));
+        }
     }
     Ok(())
 }
