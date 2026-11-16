@@ -387,7 +387,7 @@ Known limits:
 ## Phase 10c: Standard MIDI Files ✅ (0.24.0)
 
 - Export (`src/smf.rs`) writes a format 1 file at 960 ticks per quarter note: a tempo track (each song entry's tempo, a ramp as one tempo per 16th note lasting exactly as long as that 16th, time signatures and markers), then one track per heard track. Notes are placed in musical time the way the engine plays them: swing, offsets in ticks, ratchets inside a step cut short by its entry, lengths that run past the pattern, and each track's part in each entry. A key struck again on its channel ends the note before it.
-- Import reads format 0 and 1 files (running status, system exclusive and unknown meta events skipped) into a new project. Each MIDI track and channel is a synth track, and on channel 10 each General MIDI drum TINVO has is a drum track. Notes go to the nearest step of a 16th-note grid on a tick grid of 24 per step, so an exported file reads back exactly; a step holds up to four notes. The project is read again from its own export until the two agree, so exporting an import gives it back. The file is cut into patterns of whole bars, a stretch that repeats reusing its pattern, and the song plays them in order; the last one ends with the bar of the last note.
+- Import reads format 0 and 1 files (running status, system exclusive and unknown meta events skipped) into a new project. Each MIDI track and channel is a synth track, and on channel 10 each General MIDI drum TINVO has is a drum track. Notes go to the nearest step of a 16th-note grid on a tick grid of 24 per step, so an exported file reads back exactly; a step holds up to four notes. The project is read again from its own export until the two agree, so exporting an import gives it back. The file is cut into patterns of whole bars, and at each bar line where the tempo changes, a stretch that repeats reusing its pattern, and the song plays them in order; the last one ends with the bar of the last note.
 - The CLI renders to a `.mid` file and imports one to a new project; the editor opens a MIDI file unsaved and exports to one from its export prompt.
 - `tinvo fuzz midi` checks every file the reader accepts: the project it reads loads back equal from its own text, and exporting it and reading that again is a fixed point.
 
@@ -396,6 +396,7 @@ Known limits:
 - Offsets, ratchets and lengths are placed in musical time. Where the tempo changes inside one (a ramp, or the next entry's tempo point), playback times it by the tempo at its step instead, so the file can differ from playback there, also on whether a hit just before the export's end is heard; a note still sounding when the song ends keeps its length in steps, where playback times it by the song's start.
 - Imported tracks are plain synths: program changes, controllers, pitch bend and General MIDI drums TINVO has no sound for are not read. Notes past 16 tracks, 16 patterns or 256 song entries are left out and counted.
 - Import puts every note on a 16th-note grid, so triplets and 32nd notes become offsets.
+- An imported tempo change inside a bar takes effect from the next bar line.
 - A file timed in SMPTE frames, and format 2, are refused.
 
 ## Review: performance, security and dead code ✅ (0.24.0)

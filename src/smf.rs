@@ -120,20 +120,22 @@ fn ticks(sixteenths: f64) -> u64 {
     (sixteenths.max(0.0) * TICKS_PER_16TH).round() as u64
 }
 
-/// The channel each exported track plays on: its own, drums on channel
-/// 10, and the others on the channels left, in turn.
+/// The channel each exported track plays on: drums on channel 10, where
+/// General MIDI has them, whichever channel plays them live; the others on
+/// their own channel, or on the channels left, in turn.
 fn channels(project: &Project, tracks: &[usize]) -> Vec<u8> {
-    let taken: u16 = project.tracks.iter().filter_map(|t| t.channel).fold(0, |m, c| m | 1 << c.min(15));
+    let melodic = project.tracks.iter().filter(|t| !t.kind.is_drum());
+    let taken: u16 = melodic.filter_map(|t| t.channel).fold(0, |m, c| m | 1 << c.min(15));
     let free: Vec<u8> = (0..16).filter(|&c| c != DRUM_CHANNEL && taken & 1 << c == 0).collect();
     let mut next = 0;
     tracks
         .iter()
         .map(|&t| {
             let track = &project.tracks[t];
-            if let Some(c) = track.channel {
-                c.min(15)
-            } else if track.kind.is_drum() {
+            if track.kind.is_drum() {
                 DRUM_CHANNEL
+            } else if let Some(c) = track.channel {
+                c.min(15)
             } else if free.is_empty() {
                 0
             } else {
@@ -830,12 +832,33 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
     };
     let mut cut = steps().any(|s| s >= limit);
     let last = last as usize;
-    let entries = last / len + 1;
-    // The last entry ends with the bar of the last note.
-    let last_len = (last % len + 1).div_ceil(bar.min(len)) * bar.min(len);
 
     let mut project = Project::new();
     project.tempo = parsed.tempos.first().map_or(120.0, |&(_, us)| bpm(us));
+    // The tempo on a step: of the last tempo event at or before it.
+    let tempo_at = |step: usize| {
+        let tick = step as f64 * division / 4.0;
+        let n = parsed.tempos.partition_point(|&(t, _)| t as f64 <= tick);
+        n.checked_sub(1).map_or(project.tempo, |i| bpm(parsed.tempos[i].1))
+    };
+    // Entries start every `len` steps, and at each bar line where the
+    // tempo changes, so the change is on an entry's start (one inside a
+    // bar from the next bar line). The last ends with the bar of the last
+    // note.
+    let bar_len = bar.min(len);
+    let mut song_end = (last / bar_len + 1) * bar_len;
+    let mut starts = vec![0];
+    for b in (bar_len..song_end).step_by(bar_len) {
+        if b % len == 0 || tempo_at(b) != tempo_at(b - bar_len) {
+            starts.push(b);
+        }
+    }
+    if starts.len() > MAX_SONG {
+        song_end = starts[MAX_SONG];
+        starts.truncate(MAX_SONG);
+        cut = true;
+    }
+    let entry_end = |e: usize| starts.get(e + 1).copied().unwrap_or(song_end);
     project.meters = [meter; MAX_PATTERNS];
     let multi_channel: HashMap<u16, usize> = groups.keys().fold(HashMap::new(), |mut m, g| {
         *m.entry(g.track).or_default() += 1;
@@ -873,10 +896,10 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
     }
     // Patterns: each entry's steps on every track; a repeat reuses one.
     let mut patterns: Vec<(u8, Vec<Vec<Option<Step>>>)> = Vec::new();
-    for e in 0..entries {
-        let elen = if e + 1 == entries { last_len.min(len) } else { len };
+    for (e, &start) in starts.iter().enumerate() {
+        let elen = entry_end(e) - start;
         let content: Vec<Vec<Option<Step>>> =
-            grids.iter().map(|g| (0..elen).map(|i| g.get(&(e * len + i)).map(|s| s.0)).collect()).collect();
+            grids.iter().map(|g| (start..start + elen).map(|i| g.get(&i).map(|s| s.0)).collect()).collect();
         let p = match patterns.iter().find(|(_, c)| *c == content) {
             Some(&(p, _)) => p,
             None if patterns.len() < MAX_PATTERNS => {
@@ -897,7 +920,7 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
     }
     // Notes past the song's end were left out, and a track left without
     // any goes.
-    let end = project.song.len() * len;
+    let end = starts.get(project.song.len()).copied().unwrap_or(song_end);
     let mut kept = Vec::new();
     for g in &grids {
         let inside: usize = g.range(..end).map(|(_, s)| s.1).sum();
@@ -911,22 +934,21 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
         return Err("no note of the file falls inside the longest song TINVO holds".into());
     }
     // Tempo points where the tempo at an entry's start changes.
-    let entry_tick = |e: usize| (e * len) as f64 * division / 4.0;
-    let (mut previous, mut next) = (project.tempo, 0);
-    for e in 0..project.song.len() {
-        let at = entry_tick(e);
-        while parsed.tempos.get(next).is_some_and(|&(t, _)| t as f64 <= at) {
-            next += 1;
-        }
-        let tempo = next.checked_sub(1).map_or(project.tempo, |i| bpm(parsed.tempos[i].1));
+    let mut previous = project.tempo;
+    for (e, &start) in starts.iter().enumerate().take(project.song.len()) {
+        let tempo = tempo_at(start);
         if tempo != previous {
             project.tempo_points[e] = Some(tempo);
             previous = tempo;
         }
     }
     for (tick, name) in &parsed.markers {
-        let e = (*tick as f64 / entry_tick(1)).floor() as usize;
-        if e < project.song.len() && project.marker_at(e as u16).is_none() {
+        let step = (*tick as f64 / (division / 4.0)).floor();
+        if step >= end as f64 {
+            continue;
+        }
+        let e = starts.partition_point(|&s| s as f64 <= step) - 1;
+        if project.marker_at(e as u16).is_none() {
             let _ = project.set_marker(e as u16, name);
         }
     }
@@ -1168,9 +1190,7 @@ mod tests {
         p.divisions[0] = crate::engine::Division::ThirtySecond;
         let step = Step { chord: [1, 2, 3], ratchet: 8, ..Step::new(60, 100, 1) };
         p.pattern_lens[0] = MAX_STEPS as u8;
-        for s in &mut p.tracks[0].steps[0] {
-            *s = Some(step);
-        }
+        p.tracks[0].steps[0].fill(Some(step));
         p.song = vec![0; MAX_SONG];
         // 2,048 notes an entry, 524,288 in the song.
         assert!(write(&p, Source::Song, 1).unwrap_err().contains("more than 1000000 MIDI events"));
@@ -1195,8 +1215,11 @@ mod tests {
         p.tracks.push(TrackData::new(InstrumentKind::Synth));
         p.tracks[2].channel = Some(0);
         p.tracks[3].mute = true;
-        for t in 0..4 {
-            p.tracks[t].steps[0][t] = Some(Step::new(60, 100, 1));
+        // A channel that plays the kick live does not move it off channel
+        // 10, nor take a channel from the others.
+        p.tracks[1].channel = Some(1);
+        for (t, track) in p.tracks.iter_mut().enumerate() {
+            track.steps[0][t] = Some(Step::new(60, 100, 1));
         }
         let got: Vec<(u8, u8)> =
             notes_of(&write(&p, Source::Pattern(0), 1).unwrap()).iter().map(|n| (n.0, n.1)).collect();
@@ -1366,6 +1389,50 @@ mod tests {
         let p = read(&file(1, 96, &[&ev])).unwrap().project;
         assert_eq!((p.tempo, p.tempo_points[0], p.tempo_points[1]), (120.0, None, Some(60.0)));
         assert_eq!(p.marker_at(1).map(|m| m.name.as_str()), Some("Drop!"));
+    }
+
+    #[test]
+    fn a_tempo_change_inside_a_block_starts_an_entry_at_its_bar() {
+        // 120 BPM, a note, and 60 BPM on the second bar with a note there.
+        let mut ev = vec![0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20];
+        ev.extend_from_slice(&[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0]);
+        ev.extend_from_slice(&[0x82, 0x20, 0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]);
+        ev.extend_from_slice(&[0x00, 0x90, 62, 100, 0x60, 0x80, 62, 0]);
+        let p = read(&file(1, 96, &[&ev])).unwrap().project;
+        assert_eq!((p.song.as_slice(), &p.pattern_lens[..2]), (&[0, 1][..], &[16, 16][..]));
+        assert_eq!((p.tempo, p.tempo_points[0], p.tempo_points[1]), (120.0, None, Some(60.0)));
+        // A change inside a bar takes effect from the next bar line.
+        let mut ev = vec![0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20];
+        ev.extend_from_slice(&[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0]);
+        ev.extend_from_slice(&[0x82, 0x50, 0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]);
+        ev.extend_from_slice(&[0x82, 0x50, 0x90, 62, 100, 0x60, 0x80, 62, 0]);
+        let p = read(&file(1, 96, &[&ev])).unwrap().project;
+        assert_eq!((p.song.as_slice(), &p.pattern_lens[..2]), (&[0, 1][..], &[32, 16][..]));
+        assert_eq!(p.tempo_points[1], Some(60.0));
+        // A marker past the song's last bar names no entry.
+        let mut ev = vec![0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0];
+        ev.extend_from_slice(&[0x8A, 0x60, 0xFF, 0x06, 0x03, b'E', b'n', b'd']);
+        let p = read(&file(1, 96, &[&ev])).unwrap().project;
+        assert_eq!((p.song.len(), p.marker_at(0)), (1, None));
+    }
+
+    #[test]
+    fn a_tempo_change_on_every_bar_past_the_longest_song_is_cut() {
+        // 300 one-note bars, the tempo 120 and 60 BPM in turn.
+        let mut ev = Vec::new();
+        for b in 0..300u32 {
+            ev.extend_from_slice(if b == 0 { &[0x00][..] } else { &[0x82, 0x20][..] });
+            let us: u32 = if b % 2 == 0 { 500_000 } else { 1_000_000 };
+            ev.extend_from_slice(&[0xFF, 0x51, 0x03]);
+            ev.extend_from_slice(&us.to_be_bytes()[1..]);
+            ev.extend_from_slice(&[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0]);
+        }
+        let import = read(&file(1, 96, &[&ev])).unwrap();
+        let p = &import.project;
+        assert_eq!((p.song.len(), p.pattern_lens[0]), (MAX_SONG, 16));
+        assert!(p.song.iter().all(|&e| e == 0));
+        assert_eq!((p.tempo_points[1], p.tempo_points[MAX_SONG - 1]), (Some(60.0), Some(60.0)));
+        assert_eq!((import.notes, import.dropped, import.cut), (MAX_SONG, 300 - MAX_SONG, true));
     }
 
     #[test]
