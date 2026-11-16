@@ -217,6 +217,57 @@ impl Output {
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.handle.send(bytes)
     }
+
+    /// Sends what is left of a message the output took only the start of
+    /// (rawmidi); says whether nothing is left.
+    pub fn flush(&mut self) -> bool {
+        self.handle.flush()
+    }
+}
+
+/// The end of a message a byte-stream output took only the start of: it
+/// goes before anything else, so the receiver never hears a message cut
+/// short, or another's bytes inside one.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default)]
+struct Unsent {
+    bytes: [u8; 3],
+    len: u8,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Unsent {
+    /// Sends `msg` (at most three bytes) through `write`, which returns how
+    /// many bytes the output took or a negative error code, after what an
+    /// earlier message still owes. Taking only its start counts as taken:
+    /// the rest is owed, and [`Unsent::flush`] sends it. Refused: `None`
+    /// while an earlier message's end is still owed or the output took
+    /// nothing, else the error.
+    fn send(&mut self, msg: &[u8], mut write: impl FnMut(&[u8]) -> isize) -> Result<(), Option<isize>> {
+        self.flush(&mut write)?;
+        let took = write(msg);
+        if took <= 0 {
+            return Err((took < 0).then_some(took));
+        }
+        let rest = &msg[(took as usize).min(msg.len())..];
+        self.bytes[..rest.len()].copy_from_slice(rest);
+        self.len = rest.len() as u8;
+        Ok(())
+    }
+
+    /// Sends what an earlier message still owes; done once nothing is.
+    fn flush(&mut self, mut write: impl FnMut(&[u8]) -> isize) -> Result<(), Option<isize>> {
+        while self.len > 0 {
+            let took = write(&self.bytes[..usize::from(self.len)]);
+            if took <= 0 {
+                return Err((took < 0).then_some(took));
+            }
+            let took = (took as usize).min(usize::from(self.len));
+            self.bytes.copy_within(took..usize::from(self.len), 0);
+            self.len -= took as u8;
+        }
+        Ok(())
+    }
 }
 
 /// Opens the output port with `id`.
@@ -251,6 +302,13 @@ mod platform {
             match self {
                 OutHandle::Seq(h) => h.send(bytes),
                 OutHandle::Raw(h) => h.send(bytes),
+            }
+        }
+
+        pub fn flush(&mut self) -> bool {
+            match self {
+                OutHandle::Seq(h) => h.flush(),
+                OutHandle::Raw(h) => h.flush(),
             }
         }
     }
@@ -295,6 +353,10 @@ mod platform {
         pub fn send(&mut self, _bytes: &[u8]) -> Result<(), String> {
             Err("no MIDI backend for this platform".into())
         }
+
+        pub fn flush(&mut self) -> bool {
+            true
+        }
     }
 
     pub fn inputs() -> Result<Vec<Port>, String> {
@@ -317,6 +379,38 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_the_output_took_part_of_ends_before_the_next_starts() {
+        let mut wire = Vec::new();
+        // What the output takes of each write: a note-on's first two bytes,
+        // then nothing, then its last, then a release whole.
+        let mut room = [2isize, 0, 1, 3, -11].into_iter();
+        let mut write = |b: &[u8]| {
+            let n = room.next().unwrap().min(b.len() as isize);
+            wire.extend_from_slice(&b[..n.max(0) as usize]);
+            n
+        };
+        let mut u = Unsent::default();
+        assert_eq!(u.send(&[0x90, 60, 100], &mut write), Ok(()), "taken, its end owed");
+        assert_eq!(u.send(&[0x80, 60, 0], &mut write), Err(None), "the end not taken yet");
+        assert_eq!(u.send(&[0x80, 60, 0], &mut write), Ok(()));
+        assert_eq!(u.send(&[0xFC], &mut write), Err(Some(-11)));
+        assert_eq!(wire, [0x90, 60, 100, 0x80, 60, 0]);
+        // The end of a last message goes with no other one after it.
+        let mut wire = Vec::new();
+        let mut room = [2isize, 0, 1].into_iter();
+        let mut write = |b: &[u8]| {
+            let n = room.next().unwrap().min(b.len() as isize);
+            wire.extend_from_slice(&b[..n as usize]);
+            n
+        };
+        let mut u = Unsent::default();
+        assert_eq!(u.send(&[0x80, 60, 0], &mut write), Ok(()));
+        assert_eq!(u.flush(&mut write), Err(None));
+        assert_eq!(u.flush(&mut write), Ok(()));
+        assert_eq!(wire, [0x80, 60, 0]);
+    }
 
     fn parse(bytes: &[u8]) -> Vec<Message> {
         let mut p = Parser::new();

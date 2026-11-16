@@ -6,6 +6,19 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-11-16
+
+### Fixed
+- A MIDI note-on dropped as late could leave another note on its key sounding past its end, until the dropped note's release; each note sent now carries a tag, and only its own release is skipped.
+- With a JACK buffer longer than 1,024 frames, MIDI output placed notes too early and dropped some as late; a callback is now timed as a whole.
+- A rawmidi output that took only part of a message had the message sent again from its start, which could leave a release never completed; its end now goes next, with or without another message after it.
+- A terminal reporting a huge size could make TINVO try to allocate gigabytes; the screen is at most 1000 × 500.
+- Exporting a long song in 1/32 steps many times over to a MIDI file could take seconds and hundreds of MiB for silence; an export that walks more than a million steps of a track is refused.
+- A project with a very long sample path made every frame copy it; sample paths are at most 4096 bytes.
+- A MIDI source that never paused could keep the input thread from closing and hold the editor in its MIDI loop, and a take recorded from it grew without limit; a take now keeps at most 100,000 keys and says how many it left out, and replacing keeps what a full take holds.
+- Two WinMM ports could get the same id when one's name ended in ` #2`, leaving one of them impossible to choose.
+- A sampler with no sample queued releases for notes it never played, and an idle synth worked out its LFO every sample.
+
 ## [0.24.0] - 2026-11-16
 
 ### Added
@@ -356,7 +369,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/IACBI/tinvo/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/IACBI/tinvo/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/IACBI/tinvo/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/IACBI/tinvo/compare/v0.21.0...v0.22.0

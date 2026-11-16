@@ -48,11 +48,6 @@ impl Division {
         }
     }
 
-    /// Steps in a quarter note.
-    pub const fn steps_per_beat(self) -> u32 {
-        PULSES_PER_BEAT / self.pulses()
-    }
-
     /// The name used on screen and in project files.
     pub const fn name(self) -> &'static str {
         match self {

@@ -29,6 +29,11 @@ use std::thread::JoinHandle;
 pub trait AudioCallback: Send + 'static {
     /// Fills `out` with interleaved stereo samples.
     fn process(&mut self, out: &mut [f32]);
+
+    /// A device callback of `frames` frames starts, which the calls to
+    /// `process` that follow fill a part at a time. A backend that fills
+    /// each callback in one call need not say so.
+    fn begin(&mut self, _frames: u32) {}
 }
 
 /// Facts about an opened output stream.

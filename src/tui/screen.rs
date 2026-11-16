@@ -97,6 +97,12 @@ struct Cell {
 
 const BLANK: Cell = Cell { ch: ' ', style: Style::DEFAULT };
 
+/// The most columns and rows a screen has: a terminal may report up to
+/// 65,535 of each, which would be gigabytes of cells. One larger is drawn
+/// in its top left corner.
+pub const MAX_WIDTH: u16 = 1000;
+pub const MAX_HEIGHT: u16 = 500;
+
 /// The right half of a wide character, which the cell before it shows.
 const WIDE_TAIL: char = '\0';
 
@@ -149,6 +155,7 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(width: u16, height: u16) -> Self {
+        let (width, height) = (width.min(MAX_WIDTH), height.min(MAX_HEIGHT));
         let n = usize::from(width) * usize::from(height);
         Self { width, height, back: vec![BLANK; n], front: vec![BLANK; n], full_redraw: true }
     }
@@ -163,6 +170,7 @@ impl Screen {
 
     /// Resizes and schedules a full redraw (no-op if the size is unchanged).
     pub fn resize(&mut self, width: u16, height: u16) {
+        let (width, height) = (width.min(MAX_WIDTH), height.min(MAX_HEIGHT));
         if (width, height) != (self.width, self.height) {
             *self = Self::new(width, height);
         }
@@ -285,16 +293,19 @@ impl Screen {
     }
 
     /// The character at (x, y) in the frame being drawn (for tests).
+    #[cfg(test)]
     pub fn char_at(&self, x: u16, y: u16) -> char {
         self.back[usize::from(y) * usize::from(self.width) + usize::from(x)].ch
     }
 
     /// The style at (x, y) in the frame being drawn (for tests).
+    #[cfg(test)]
     pub fn style_at(&self, x: u16, y: u16) -> Style {
         self.back[usize::from(y) * usize::from(self.width) + usize::from(x)].style
     }
 
     /// One row of the frame being drawn, as text (for tests).
+    #[cfg(test)]
     pub fn row_text(&self, y: u16) -> String {
         let w = usize::from(self.width);
         let start = usize::from(y) * w;
@@ -305,6 +316,19 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_huge_terminal_gets_a_screen_of_bounded_size() {
+        let mut s = Screen::new(u16::MAX, u16::MAX);
+        assert_eq!((s.width(), s.height()), (MAX_WIDTH, MAX_HEIGHT));
+        assert_eq!(s.back.len(), usize::from(MAX_WIDTH) * usize::from(MAX_HEIGHT));
+        s.full_redraw = false;
+        // Past the limit both ways it is the same screen, not a new one.
+        s.resize(u16::MAX, MAX_HEIGHT + 1);
+        assert!(!s.full_redraw);
+        s.resize(80, 24);
+        assert_eq!((s.width(), s.height(), s.back.len()), (80, 24, 80 * 24));
+    }
 
     #[test]
     fn put_clips_and_filters() {

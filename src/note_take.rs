@@ -28,6 +28,12 @@ struct Played {
     length: Option<u8>,
 }
 
+/// The most keys one take records: past it, keys pressed are left out
+/// (and counted), so a source that never stops cannot use up memory. The
+/// passes played then are not counted either: replacing would clear the
+/// steps with the notes a full take could not keep.
+pub const MAX_TAKE_NOTES: usize = 100_000;
+
 /// The notes of one recording, from [`Take`] events.
 #[derive(Debug, Default)]
 pub struct NoteTake {
@@ -40,6 +46,11 @@ pub struct NoteTake {
     /// [`Take::Layout`] has not come yet: reports before it still name the
     /// tracks as they were.
     pending: VecDeque<Edit>,
+    /// Keys pressed once the take held [`MAX_TAKE_NOTES`].
+    left_out: usize,
+    /// It held [`MAX_TAKE_NOTES`] at some point: it stays full when a track
+    /// removed takes notes away, so a later pass cannot replace them.
+    full: bool,
 }
 
 impl NoteTake {
@@ -49,6 +60,7 @@ impl NoteTake {
 
     pub fn push(&mut self, take: Take) {
         match take {
+            Take::On { .. } if self.full => self.left_out += 1,
             Take::On { track, channel, note, velocity, pattern, step, offset, early, position } => {
                 let track = usize::from(track);
                 let seen = self.passes.get(&(track, pattern, step)).copied().unwrap_or(0);
@@ -59,8 +71,10 @@ impl NoteTake {
                 self.held.push(self.played.len());
                 let (on, length) = (position, None);
                 self.played.push(Played { track, channel, pattern, step, note, velocity, offset, pass, on, length });
+                self.full = self.played.len() >= MAX_TAKE_NOTES;
             }
             Take::Off { channel, note, length } => self.release(channel, note, length),
+            Take::Passed { .. } if self.full => {}
             Take::Passed { track, pattern, step } => {
                 *self.passes.entry((usize::from(track), pattern, step)).or_insert(0) += 1;
             }
@@ -110,6 +124,11 @@ impl NoteTake {
         self.held = self.held.iter().filter_map(|&i| index[i]).collect();
         self.passes =
             self.passes.drain().filter_map(|((t, p, s), n)| Some(((follow_track(Some(t), e)?, p, s), n))).collect();
+    }
+
+    /// How many keys were pressed once the take was full.
+    pub fn left_out(&self) -> usize {
+        self.left_out
     }
 
     /// Whether the take holds nothing to write.
@@ -226,6 +245,47 @@ mod tests {
 
     fn off(note: u8, length: u8) -> Take {
         Take::Off { channel: 0, note, length }
+    }
+
+    #[test]
+    fn a_take_records_at_most_its_limit_of_keys() {
+        let mut t = NoteTake::new();
+        for i in 0..MAX_TAKE_NOTES + 5 {
+            let note = (i % 128) as u8;
+            t.push(on(note, 0, 0, false, i as f64));
+            t.push(off(note, 1));
+        }
+        assert_eq!((t.played.len(), t.left_out()), (MAX_TAKE_NOTES, 5));
+        assert!(t.held.is_empty(), "keys recorded are still released");
+        // A pass played once it is full does not replace what it kept, nor
+        // once a track removed has taken most of its notes away.
+        let mut t = take(&[passed(0), on(60, 0, 0, false, 0.0), off(60, 1)]);
+        for i in 1..MAX_TAKE_NOTES {
+            let position = i as f64;
+            t.push(Take::On {
+                track: 1,
+                channel: 1,
+                note: 64,
+                velocity: 90,
+                pattern: 0,
+                step: 1,
+                offset: 0,
+                early: false,
+                position,
+            });
+            t.push(Take::Off { channel: 1, note: 64, length: 1 });
+        }
+        let p = project(InstrumentKind::Synth);
+        let brush = [Step::new(60, 100, 1)];
+        let kept = [set(0, Some(Step { velocity: 90, ..Step::new(60, 100, 1) }))];
+        t.push(passed(0));
+        t.edited(&Edit::RemoveTrack(1));
+        t.push(Take::Layout);
+        assert_eq!(t.played.len(), 1);
+        t.push(passed(0));
+        t.push(on(62, 0, 0, false, 9.0e5));
+        assert_eq!(t.edits(&p, &brush, REPLACE), kept);
+        assert_eq!(t.left_out(), 1);
     }
 
     fn passed(step: u8) -> Take {

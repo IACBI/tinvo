@@ -116,8 +116,14 @@ fn named(n: u32, what: &str, pname: impl Fn(u32) -> Option<[u16; MAXPNAMELEN]>) 
         let end = pname.iter().position(|&c| c == 0).unwrap_or(MAXPNAMELEN);
         let name = String::from_utf16_lossy(&pname[..end]);
         let name = if name.is_empty() { format!("{what} {}", i + 1) } else { name };
-        let repeats = out.iter().filter(|(_, p)| p.name == name).count();
-        let id = if repeats == 0 { name.clone() } else { format!("{name} #{}", repeats + 1) };
+        // Numbered past any id taken, a device's own name ending in ` #2`
+        // included.
+        let mut id = name.clone();
+        let mut k = 1;
+        while out.iter().any(|(_, p)| p.id == id) {
+            k += 1;
+            id = format!("{name} #{k}");
+        }
         out.push((i, Port { id, name }));
     }
     out
@@ -210,6 +216,11 @@ pub struct OutHandle(Hmidiout);
 unsafe impl Send for OutHandle {}
 
 impl OutHandle {
+    /// A short message goes whole or not at all: nothing is left to send.
+    pub fn flush(&mut self) -> bool {
+        true
+    }
+
     /// Sends one short message of one to three bytes.
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         let msg = bytes.iter().take(3).enumerate().fold(0u32, |m, (i, &b)| m | u32::from(b) << (8 * i));
@@ -253,6 +264,20 @@ mod tests {
     /// Opens the first output and sends it a clock, which an instrument
     /// ignores; skipped where there is none. Windows lists its own GS synth
     /// also with no audio device to play it on, and then cannot open it.
+    #[test]
+    fn every_port_gets_an_id_of_its_own() {
+        let names = ["A", "A", "A #2", "", ""];
+        let ports = named(names.len() as u32, "MIDI output", |i| {
+            let mut pname = [0u16; MAXPNAMELEN];
+            for (c, u) in pname.iter_mut().zip(names[i as usize].encode_utf16()) {
+                *c = u;
+            }
+            Some(pname)
+        });
+        let ids: Vec<&str> = ports.iter().map(|(_, p)| p.id.as_str()).collect();
+        assert_eq!(ids, ["A", "A #2", "A #2 #2", "MIDI output 4", "MIDI output 5"]);
+    }
+
     #[test]
     fn an_output_opens_and_takes_a_message() {
         let Some(port) = outputs().unwrap().into_iter().next() else {

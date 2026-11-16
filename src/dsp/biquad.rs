@@ -90,6 +90,7 @@ impl Coefs {
     }
 
     /// Magnitude response in dB at `freq` Hz.
+    #[cfg(test)]
     pub fn response_db(&self, freq: f64, sample_rate: f64) -> f64 {
         let w = 2.0 * PI * freq / sample_rate;
         // H(z) at z = e^{jw}: evaluate numerator and denominator as complex.

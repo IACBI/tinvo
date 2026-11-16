@@ -118,6 +118,11 @@ impl Drop for OutHandle {
 }
 
 impl OutHandle {
+    /// A packet goes whole or not at all: nothing is left to send.
+    pub fn flush(&mut self) -> bool {
+        true
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         // Room for a packet list of one short message, aligned for its
         // 64-bit timestamp.

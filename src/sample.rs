@@ -209,6 +209,10 @@ pub fn relativize(path: &str, project_dir: Option<&Path>) -> String {
     }
 }
 
+/// The longest sample path a project keeps, in bytes: as long as a path
+/// most systems open.
+pub const MAX_PATH_BYTES: usize = 4096;
+
 /// Why `path` cannot be kept as a sample path, if it cannot: a project
 /// file must give it back unchanged. Files hold one setting per line, and
 /// each line is trimmed. A path inside the project's folder is written from
@@ -217,6 +221,8 @@ pub fn relativize(path: &str, project_dir: Option<&Path>) -> String {
 pub fn unstorable(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         Some("A sample path cannot be empty")
+    } else if path.len() > MAX_PATH_BYTES {
+        Some("A sample path can be at most 4096 bytes long")
     } else if path.contains(['\n', '\r']) {
         Some("A sample path cannot contain line breaks")
     } else if path.split(std::path::is_separator).any(|c| c.trim() != c) {
@@ -314,6 +320,8 @@ mod tests {
         for bad in ["", "   ", "kick.wav ", " kick.wav", "a\nb", "a\rb", "kits/ kick.wav", "kits /kick.wav"] {
             assert!(unstorable(bad).is_some(), "{bad:?}");
         }
+        assert_eq!(unstorable(&"a".repeat(MAX_PATH_BYTES)), None);
+        assert!(unstorable(&"a".repeat(MAX_PATH_BYTES + 1)).unwrap().contains(&MAX_PATH_BYTES.to_string()));
         let dir = absolute("project");
         for good in ["kick.wav", "my kick.wav", "kits/808 kick.wav", "é/🎹.wav"] {
             assert_eq!(unstorable(good), None, "{good:?}");

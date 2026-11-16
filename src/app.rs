@@ -20,7 +20,7 @@ use crate::lock::{self, Lock};
 use crate::midi::schedule::{self, OutSlot, OutputThread};
 use crate::midi::{self, Message};
 use crate::mix;
-use crate::note_take::{NoteTake, follow_track};
+use crate::note_take::{MAX_TAKE_NOTES, NoteTake, follow_track};
 use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, VOLUME, pattern_name};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
@@ -171,6 +171,10 @@ struct EngineCallback {
 }
 
 impl AudioCallback for EngineCallback {
+    fn begin(&mut self, frames: u32) {
+        self.engine.begin(frames);
+    }
+
     fn process(&mut self, out: &mut [f32]) {
         let start = Instant::now();
         self.engine.process(out);
@@ -1801,7 +1805,11 @@ impl App {
         let edits = r.take.edits(&self.project, &self.brushes, self.recording);
         let steps = edits.len();
         self.edit_group(edits, "record notes");
-        let lost = if lost > 0 { format!(" ({lost} notes lost: the editor fell behind)") } else { String::new() };
+        let mut lost = if lost > 0 { format!(" ({lost} notes lost: the editor fell behind)") } else { String::new() };
+        if r.take.left_out() > 0 {
+            let n = r.take.left_out();
+            lost += &format!(" ({n} notes past the take's {MAX_TAKE_NOTES} left out)");
+        }
         self.set_status(match steps {
             0 => format!("Recording stopped: no notes played{lost}"),
             1 => format!("Recorded 1 step{lost}"),
@@ -4057,8 +4065,9 @@ impl App {
                 };
                 match (&t.sample, t.kind) {
                     (Some(path), _) => {
-                        let file =
-                            Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+                        let file = Path::new(path)
+                            .file_name()
+                            .map_or(std::borrow::Cow::Borrowed(path.as_str()), |n| n.to_string_lossy());
                         let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
                         format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
                     }
@@ -4781,7 +4790,10 @@ impl MidiSession {
             let status = self.open(app, id);
             app.set_status(status);
         }
-        while let Some(m) = self.ui.pop() {
+        // A source that never pauses must not hold the UI here: a frame
+        // takes at most what the mailbox holds.
+        for _ in 0..LIVE_QUEUE {
+            let Some(m) = self.ui.pop() else { break };
             app.midi_message(m);
         }
         if self.lost.swap(false, Ordering::Relaxed) {

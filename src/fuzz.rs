@@ -1,6 +1,6 @@
 //! Dependency-free fuzzing of what TINVO reads and keeps.
 //!
-//! Three targets, each with invariants checked on every input:
+//! Four targets, each with invariants checked on every input:
 //!
 //! - `project`: `.tvo` text. A file is either rejected with an error that
 //!   points at one of its lines, or accepted; an accepted project saves to
@@ -18,6 +18,11 @@
 //!   to a new project. Every edit must be undone exactly by its inverse (or
 //!   both must fail, leaving the project unchanged), and the final project
 //!   must survive the same save round trip and rendering as above.
+//! - `midi`: Standard MIDI Files. A file is either rejected with an error
+//!   or read into a valid project (tracks and song entries within their
+//!   limits) that saves and loads back equal; its own export reads back,
+//!   and exporting that again gives the same project with nothing dropped;
+//!   and it renders without a non-finite sample.
 //!
 //! [`run`] mutates inputs from a corpus that starts as the seeds. It is not
 //! coverage-guided: that needs compiler instrumentation and a fuzzing

@@ -76,25 +76,41 @@ fn open_raw(port: &Port, input: bool) -> Result<Raw, String> {
     Ok(Raw(raw))
 }
 
-/// An open rawmidi output.
-pub struct OutHandle(Raw);
+/// An open rawmidi output. A non-blocking write may take part of a
+/// message; the rest goes before the next one.
+pub struct OutHandle {
+    raw: Raw,
+    unsent: super::Unsent,
+}
 
 impl OutHandle {
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // SAFETY: an open output and a valid buffer of its length.
-        let r = unsafe { snd_rawmidi_write(self.0.0, bytes.as_ptr().cast(), bytes.len()) };
-        if r == bytes.len() as isize {
-            Ok(())
-        } else if r < 0 {
-            Err(alsa_error("cannot write to the MIDI output", r as c_int))
-        } else {
-            Err("the MIDI output took part of a message".into())
+        if bytes.is_empty() || bytes.len() > 3 {
+            return Err("not a message the MIDI output sends".into());
         }
+        let raw = self.raw.0;
+        self.unsent.send(bytes, |b| write(raw, b)).map_err(|e| match e {
+            Some(r) => alsa_error("cannot write to the MIDI output", r as c_int),
+            None => "the MIDI output is full".into(),
+        })
+    }
+
+    /// Sends what is left of a message the output took only the start of;
+    /// says whether nothing is left.
+    pub fn flush(&mut self) -> bool {
+        let raw = self.raw.0;
+        self.unsent.flush(|b| write(raw, b)).is_ok()
     }
 }
 
+fn write(raw: *mut c_void, bytes: &[u8]) -> isize {
+    // SAFETY: an open output (the caller's handle) and a valid buffer of
+    // its length.
+    unsafe { snd_rawmidi_write(raw, bytes.as_ptr().cast(), bytes.len()) }
+}
+
 pub fn open_output(port: &Port) -> Result<OutHandle, String> {
-    open_raw(port, false).map(OutHandle)
+    open_raw(port, false).map(|raw| OutHandle { raw, unsent: super::Unsent::default() })
 }
 
 struct Raw(*mut c_void);
@@ -148,7 +164,9 @@ where
                 if unsafe { poll(ready.as_mut_ptr(), n as c_ulong, POLL_MS) } <= 0 {
                     continue;
                 }
-                loop {
+                // A source that never pauses must not keep the thread from
+                // stopping.
+                while !flag.load(Ordering::Acquire) {
                     // SAFETY: a valid buffer and its size.
                     let got = unsafe { snd_rawmidi_read(raw.0, buf.as_mut_ptr().cast(), buf.len()) };
                     if got == -EAGAIN || got == 0 {
