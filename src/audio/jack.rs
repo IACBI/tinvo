@@ -324,6 +324,7 @@ unsafe extern "C" fn render<C: AudioCallback>(frames: u32, arg: *mut c_void) -> 
             std::slice::from_raw_parts_mut((state.port_get_buffer)(state.ports[1], frames) as *mut f32, n),
         )
     };
+    state.callback.begin(frames);
     let mut done = 0;
     while done < n {
         let k = (n - done).min(CHUNK);

@@ -194,12 +194,19 @@ impl Lfo {
             }
             _ => self.held,
         };
+        self.advance(inc);
+        y
+    }
+
+    /// Moves on one sample without working out the value: phase and the
+    /// sample-and-hold draws go exactly as [`Lfo::tick`] moves them.
+    #[inline]
+    fn advance(&mut self, inc: f64) {
         self.phase += inc;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
             self.held = self.rng.bipolar();
         }
-        y
     }
 }
 
@@ -461,12 +468,18 @@ impl PolySynth {
         };
 
         // The LFO runs even when no voice sounds, so its phase is a function
-        // of time only.
+        // of time only; its value is worked out only for a voice to use.
         let mut lfo = [0.0f32; CHUNK];
         let shape = pr[p::LFO_WAVE] as usize;
         let inc = f64::from(self.lfo_hz() / sr);
-        for l in lfo[..out.len()].iter_mut() {
-            *l = self.lfo.tick(shape, inc);
+        if self.voices.iter().any(|v| v.amp.is_active()) {
+            for l in lfo[..out.len()].iter_mut() {
+                *l = self.lfo.tick(shape, inc);
+            }
+        } else {
+            for _ in 0..out.len() {
+                self.lfo.advance(inc);
+            }
         }
 
         for v in self.voices.iter_mut().filter(|v| v.amp.is_active()) {
@@ -516,6 +529,26 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn the_lfo_moves_on_alike_with_and_without_a_voice() {
+        let quiet = |shape: f32| {
+            let mut s = PolySynth::new(SR);
+            s.set_param(p::LFO_WAVE, shape);
+            s.set_param(p::LFO_RATE, 10.0);
+            s
+        };
+        for shape in 0..5 {
+            let (mut a, mut b) = (quiet(shape as f32), quiet(shape as f32));
+            b.note_on(60, 100);
+            let mut buf = vec![0.0; 48_000];
+            a.render(&mut buf);
+            b.render(&mut buf);
+            assert!(b.voices.iter().any(|v| v.amp.is_active()), "one sounds throughout");
+            assert_eq!((a.lfo.phase.to_bits(), a.lfo.held.to_bits()), (b.lfo.phase.to_bits(), b.lfo.held.to_bits()));
+            assert_ne!(a.lfo.held, 0.0, "sample and hold drew");
+        }
+    }
 
     #[test]
     fn a_synced_lfo_takes_its_rate_from_the_tempo() {

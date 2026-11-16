@@ -333,7 +333,9 @@ impl Drop for FileWriter {
     }
 }
 
-/// Encodes and writes a file atomically (temporary file, then rename).
+/// Encodes and writes a file atomically (temporary file, then rename). The
+/// app streams through [`FileWriter`]; this is for tests.
+#[cfg(test)]
 pub fn write_file(
     path: &Path,
     samples: &[f32],

@@ -1108,6 +1108,10 @@ impl Project {
                         if rest.is_empty() {
                             return Err(err("expected 'sample <path>'".into()));
                         }
+                        if rest.len() > crate::sample::MAX_PATH_BYTES {
+                            let max = crate::sample::MAX_PATH_BYTES;
+                            return Err(err(format!("a sample path is at most {max} bytes long")));
+                        }
                         t.sample = Some(rest.to_string());
                     }
                     "gain_db" => t.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
@@ -2394,6 +2398,10 @@ pattern_division A 1/8
             ("tinvo 1\ntrack kick\nname X", 3, "missing 'end'"),
             ("tinvo 1\nbogus 1", 2, "unknown key"),
         ];
+        let long = |n: usize| format!("tinvo 4\ntrack sampler\nsample {}\nend", "a".repeat(n));
+        let e = Project::from_text(&long(crate::sample::MAX_PATH_BYTES + 1)).unwrap_err();
+        assert_eq!((e.line, e.message.contains("at most 4096 bytes")), (3, true), "{e}");
+        assert!(Project::from_text(&long(crate::sample::MAX_PATH_BYTES)).is_ok());
         for (text, line, needle) in cases {
             let e = Project::from_text(text).unwrap_err();
             assert_eq!(e.line, line, "{text:?}: {e}");

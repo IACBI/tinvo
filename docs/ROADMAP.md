@@ -429,6 +429,17 @@ Known limits (found bounded, and left for later):
 - The piano roll formats a new string for every cell it draws.
 - An export's loudness meter keeps every 100 ms block, so its memory grows with the export's length, if slowly.
 
+## Review: performance, security and dead code, third pass ✅ (0.24.1)
+
+A review of all of 0.24.0, with extra attention to Phase 10, made with an independent model reading the code, which then reviewed the fixes. Each finding was checked against the code. The fixes that change behaviour have tests that fail without them; the LFO's test shows it moves on as before, and the input threads' stop checks and the UI's budget have none, since they need a source that never pauses:
+- Security: a terminal reporting a huge size (a pseudo-terminal may claim 65,535 columns and rows, gigabytes of cells) gets a screen of at most 1000 × 500; a MIDI file export refuses to walk more than a million steps of one track, silent ones included, before it allocates them; a sample path is at most 4096 bytes, in a project file and when loaded; a take records at most 100,000 keys and says how many it left out, and once full counts no more passes, so replacing keeps what it holds; the ALSA sequencer and rawmidi threads stop even while a source sends without a pause, and the UI takes at most a mailbox's worth of notes a frame; a rawmidi output that takes only the start of a message gets its end before anything else, and on the output thread's next look even with nothing else to send, instead of the message being sent again from its start; WinMM ports whose names repeat or end in ` #2` each get an id of their own.
+- MIDI timing: a note-on dropped as late skipped the next release of its key, which could be another note's, so that one sounded on; each note now carries a tag, and its own release is the one skipped. A JACK callback longer than 1,024 frames anchored each part as a callback of its own, which moved the estimate of when frames are heard earlier and dropped notes as late; it is anchored once as a whole.
+- Performance: a sampler with no sample no longer schedules releases for the notes it does not play; a synth with no voice sounding moves its LFO on without working out its value.
+- Dead code: `Division::steps_per_beat` was removed; helpers only tests use (`render_stems`, `wav::write_file`, `Coefs::response_db`, the screen's `char_at`, `style_at` and `row_text`) are built only for tests; the fuzzing module's documentation describes the MIDI target.
+
+Known limits (found bounded, and left for later):
+- A synth voice stolen for a new note keeps its old release queued until it is due; it then does nothing. The queue is bounded per track.
+
 ## Planned: more kinds of music
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.

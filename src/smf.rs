@@ -34,6 +34,10 @@ pub const MAX_LOOPS: u32 = 32;
 /// 8 MB, built in about 100 MB of memory.
 pub const MAX_EVENTS: usize = 1_000_000;
 
+/// The most grid steps an export walks on one track, sounding or not: a
+/// long song in 1/32 steps, repeated, is millions of them.
+pub const MAX_GRID_STEPS: u64 = 1_000_000;
+
 fn too_many() -> String {
     format!("the export holds more than {MAX_EVENTS} MIDI events; export fewer repeats or a shorter part")
 }
@@ -158,11 +162,13 @@ struct GridStep {
     span: usize,
 }
 
-/// Track `t`'s grid steps over `spans`, in order.
-fn grid_steps(project: &Project, t: usize, spans: &[Span]) -> Vec<GridStep> {
+/// Track `t`'s grid steps over `spans`, in order: an error if there are
+/// more than [`MAX_GRID_STEPS`].
+fn grid_steps(project: &Project, t: usize, spans: &[Span]) -> Result<Vec<GridStep>, String> {
     let track = &project.tracks[t];
-    let mut out = Vec::new();
-    for (n, s) in spans.iter().enumerate() {
+    // The pattern the track plays in a span, and the one whose grid it
+    // walks there.
+    let walk = |s: &Span| {
         let pattern = match s.entry {
             Some(i) => match project.part(t, i) {
                 Part::Follow => Some(s.pattern),
@@ -172,7 +178,17 @@ fn grid_steps(project: &Project, t: usize, spans: &[Span]) -> Vec<GridStep> {
             None => Some(s.pattern),
         };
         let pattern = pattern.map(|p| usize::from(p).min(MAX_PATTERNS - 1));
-        let grid = pattern.unwrap_or(usize::from(s.pattern).min(MAX_PATTERNS - 1));
+        (pattern, pattern.unwrap_or(usize::from(s.pattern).min(MAX_PATTERNS - 1)))
+    };
+    let count: u64 = spans.iter().map(|s| s.pulses.div_ceil(u64::from(project.divisions[walk(s).1].pulses()))).sum();
+    if count > MAX_GRID_STEPS {
+        return Err(format!(
+            "the export walks more than {MAX_GRID_STEPS} steps of a track; export fewer repeats or a shorter part"
+        ));
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for (n, s) in spans.iter().enumerate() {
+        let (pattern, grid) = walk(s);
         let division = project.divisions[grid];
         let dp = u64::from(division.pulses());
         let len = u64::from(project.pattern_lens[grid].max(1));
@@ -184,7 +200,7 @@ fn grid_steps(project: &Project, t: usize, spans: &[Span]) -> Vec<GridStep> {
             k += 1;
         }
     }
-    out
+    Ok(out)
 }
 
 /// When playback queues each grid step's early hits, in 16ths, as
@@ -227,7 +243,7 @@ fn track_hits(
     room: usize,
 ) -> Result<Vec<Hit>, String> {
     let drum = drum_note(project.tracks[t].kind);
-    let steps = grid_steps(project, t, spans);
+    let steps = grid_steps(project, t, spans)?;
     let pos = |g: &GridStep| tr.step_position(g.pulse, g.division);
     let edge = |g: &GridStep| g.end as f64 / PULSES_PER_16TH as f64;
     // The engine never fires a step that swing moves past its entry's end;
@@ -1198,6 +1214,20 @@ mod tests {
         assert!(write(&p, Source::Song, 1).unwrap_err().contains("more than 1000000 MIDI events"));
         p.song.truncate(MAX_SONG / 2);
         assert!(write(&p, Source::Song, 1).is_ok());
+    }
+
+    #[test]
+    fn an_export_walking_too_many_steps_is_refused() {
+        // Entries of 64 eighths, the track playing its own pattern in 1/32
+        // steps: 256 silent steps an entry, 65,536 a pass of the song.
+        let mut p = synth_project();
+        p.pattern_lens[0] = MAX_STEPS as u8;
+        p.divisions[0] = crate::engine::Division::Eighth;
+        p.divisions[1] = crate::engine::Division::ThirtySecond;
+        p.tracks[0].parts.fill(Part::Pattern(1));
+        p.song = vec![0; MAX_SONG];
+        assert!(write(&p, Source::Song, MAX_LOOPS).unwrap_err().contains("more than 1000000 steps"));
+        assert!(write(&p, Source::Song, 8).is_ok());
     }
 
     #[test]

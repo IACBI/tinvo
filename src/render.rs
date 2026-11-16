@@ -221,6 +221,8 @@ pub fn stem_project(project: &Project, i: usize) -> Project {
 /// Renders each audible track on its own (with the master level applied),
 /// as `(track index, audio)`. All stems are padded to the same length, so
 /// they line up when imported elsewhere; added together they make the mix.
+/// The export streams each stem instead ([`render_into`]).
+#[cfg(test)]
 pub fn render_stems(
     project: &Project,
     samples: &[Option<Arc<Sample>>],

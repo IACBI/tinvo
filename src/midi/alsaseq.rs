@@ -264,6 +264,11 @@ pub struct OutHandle {
 }
 
 impl OutHandle {
+    /// An event goes whole or not at all: nothing is left to send.
+    pub fn flush(&mut self) -> bool {
+        true
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut ev = event(bytes).ok_or("not a message the sequencer output sends")?;
         (ev.queue, ev.source[1], ev.dest) = (QUEUE_DIRECT, self.port as u8, [ADDRESS_SUBSCRIBERS, ADDRESS_UNKNOWN]);
@@ -379,7 +384,9 @@ where
                 if unsafe { poll(ready.as_mut_ptr(), n as c_ulong, POLL_MS) } <= 0 {
                     continue;
                 }
-                loop {
+                // A source that never pauses must not keep the thread from
+                // stopping.
+                while !flag.load(Ordering::Acquire) {
                     let mut ev: *mut Event = ptr::null_mut();
                     // SAFETY: an open, non-blocking sequencer; the event
                     // stays valid until the next call.

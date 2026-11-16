@@ -19,8 +19,11 @@ use std::time::{Duration, Instant};
 /// What the audio thread sends the MIDI output thread.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OutEvent {
-    /// `len` bytes of `bytes`, due on engine frame `frame`.
-    Message { frame: u64, bytes: [u8; 3], len: u8 },
+    /// `len` bytes of `bytes`, due on engine frame `frame`. A note-on and
+    /// its release carry the same `tag`, which no other note sounding has
+    /// (0 for none): the release of a note that was dropped is dropped
+    /// too, not another one's on the same key.
+    Message { frame: u64, bytes: [u8; 3], len: u8, tag: u32 },
     /// An audio callback for `frames` frames from `frame` started at `at`,
     /// at `rate` frames a second.
     Anchor { frame: u64, frames: u32, rate: f32, at: Instant },
@@ -33,10 +36,15 @@ pub enum OutEvent {
 impl OutEvent {
     /// A message of one to three bytes due on `frame`.
     pub fn message(frame: u64, msg: &[u8]) -> Self {
+        Self::tagged(frame, msg, 0)
+    }
+
+    /// A message of one to three bytes due on `frame`, of the note `tag`.
+    pub fn tagged(frame: u64, msg: &[u8], tag: u32) -> Self {
         let mut bytes = [0; 3];
         let len = msg.len().min(3);
         bytes[..len].copy_from_slice(&msg[..len]);
-        OutEvent::Message { frame, bytes, len: len as u8 }
+        OutEvent::Message { frame, bytes, len: len as u8, tag }
     }
 }
 
@@ -76,14 +84,14 @@ type Keys = [[u8; 128]; 16];
 /// Orders the messages from the engine by frame and says when each is due.
 #[derive(Debug)]
 pub struct Scheduler {
-    /// (frame, bytes, length), in the order the engine queued them, and
+    /// (frame, bytes, length, tag), in the order the engine queued them, and
     /// sent in that order: one due before a message queued earlier waits
     /// for it. When the limiter's latency falls, frames after it wait for
     /// those before (a millisecond and a half at most), so a release never
     /// goes before its note, Start before an earlier Stop, or a reset before
     /// what it lets go. Length 0 is a reset, with whether the clock runs in the first
     /// byte.
-    pending: Vec<(u64, [u8; 3], u8)>,
+    pending: Vec<(u64, [u8; 3], u8, u32)>,
     t0: Instant,
     timing: Option<Timing>,
     /// Added to every message's time.
@@ -91,10 +99,10 @@ pub struct Scheduler {
     /// How many times each key on each channel was started and not yet
     /// released: two tracks can play one key, and each release counts.
     sounding: Keys,
-    /// Starts dropped (late or refused) whose releases are still to come:
-    /// each skips the next release of its key, so another note on it goes
-    /// on sounding until its own.
-    skipped: Keys,
+    /// Starts dropped (late or refused) whose releases are still to come,
+    /// as (channel, key, tag): each skips its own release, so another note
+    /// on the key goes on sounding until its own.
+    skipped: Vec<(u8, u8, u32)>,
     /// Releases (and a Stop) the output refused for longer than
     /// [`GIVE_UP`], or while everything was let go: tried again until it
     /// takes them, holding back the engine's messages for [`GIVE_UP`] after
@@ -115,7 +123,7 @@ impl Scheduler {
             timing: None,
             delay,
             sounding: [[0; 128]; 16],
-            skipped: [[0; 128]; 16],
+            skipped: Vec::new(),
             owed: [[0; 128]; 16],
             owe_stop: false,
             owed_since: None,
@@ -124,12 +132,12 @@ impl Scheduler {
     }
 
     pub fn push(&mut self, ev: OutEvent) {
-        let (frame, bytes, len) = match ev {
-            OutEvent::Message { frame, bytes, len } => (frame, bytes, len.max(1)),
-            OutEvent::Reset { frame, running } => (frame, [u8::from(running), 0, 0], 0),
+        let (frame, bytes, len, tag) = match ev {
+            OutEvent::Message { frame, bytes, len, tag } => (frame, bytes, len.max(1), tag),
+            OutEvent::Reset { frame, running } => (frame, [u8::from(running), 0, 0], 0, 0),
             OutEvent::Anchor { frame, frames, rate, at } => return self.anchor(frame, frames, rate, at),
         };
-        self.pending.push((frame, bytes, len));
+        self.pending.push((frame, bytes, len, tag));
     }
 
     /// `at` in seconds after `t0`, negative before it.
@@ -188,7 +196,7 @@ impl Scheduler {
     /// to [`GIVE_UP`]; then a release or Stop is owed instead.
     pub fn send_due(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let mut taken = 0;
-        while let Some(&(frame, bytes, len)) = self.pending.get(taken) {
+        while let Some(&(frame, bytes, len, tag)) = self.pending.get(taken) {
             let Some(due) = self.due(frame) else { break };
             if due > now {
                 break;
@@ -197,7 +205,7 @@ impl Scheduler {
             if len == 0 {
                 // Releases of starts dropped before it are not coming: they
                 // may have been what was lost.
-                self.skipped = [[0; 128]; 16];
+                self.skipped.clear();
                 // A reset the output refused part of stays first in line.
                 if !self.let_go(bytes[0] != 0, &mut send) {
                     if late <= GIVE_UP {
@@ -214,19 +222,16 @@ impl Scheduler {
             let (channel, key) = (usize::from(status & 0x0F), usize::from(msg.get(1).map_or(0, |&k| k & 0x7F)));
             let kept = match status & 0xF0 {
                 0x90 if msg.get(2).is_some_and(|&v| v > 0) => {
-                    let n = if late <= LATE && send(msg) {
-                        &mut self.sounding[channel][key]
+                    if late <= LATE && send(msg) {
+                        let n = &mut self.sounding[channel][key];
+                        *n = n.saturating_add(1);
                     } else {
-                        &mut self.skipped[channel][key]
-                    };
-                    *n = n.saturating_add(1);
+                        self.skipped.push((channel as u8, key as u8, tag));
+                    }
                     true
                 }
                 // A release of a note never sent is not sent either.
-                0x80 | 0x90 if self.skipped[channel][key] > 0 => {
-                    self.skipped[channel][key] -= 1;
-                    true
-                }
+                0x80 | 0x90 if self.skip(channel as u8, key as u8, tag) => true,
                 0x80 | 0x90 if self.sounding[channel][key] == 0 => true,
                 0x80 | 0x90 => {
                     let ok = send(msg);
@@ -274,6 +279,13 @@ impl Scheduler {
         self.pending.drain(..taken);
     }
 
+    /// Whether the release of `tag` on `channel` and `key` goes with a start
+    /// that was dropped: then it is forgotten, and skipped.
+    fn skip(&mut self, channel: u8, key: u8, tag: u32) -> bool {
+        let found = self.skipped.iter().position(|&s| s == (channel, key, tag));
+        found.map(|i| self.skipped.swap_remove(i)).is_some()
+    }
+
     /// Sends a release for every note still sounding and, while the clock
     /// runs and should not, Stop. Says whether the output took them all;
     /// what it refused is still counted.
@@ -302,7 +314,7 @@ impl Scheduler {
     pub fn release_all(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let running = self.running;
         self.owe(now, running);
-        self.skipped = [[0; 128]; 16];
+        self.skipped.clear();
         self.pending.clear();
         self.timing = None;
         self.settle(now, &mut send);
@@ -434,8 +446,11 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
         .spawn(move || {
             let mut sched = Scheduler::new(delay);
             let mut queue: Option<Consumer<OutEvent>> = None;
-            let mut send = |m: &[u8]| output.send(m).is_ok();
             while !flag.load(Ordering::Acquire) {
+                // The end of a message the output took only the start of,
+                // even with nothing else to send.
+                output.flush();
+                let mut send = |m: &[u8]| output.send(m).is_ok();
                 if let Some(mut fresh) = slot.try_lock().ok().and_then(|mut s| s.take()) {
                     // A new engine: what the old one queued will not be
                     // released.
@@ -455,10 +470,10 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
                 std::thread::sleep(wait.max(Duration::from_micros(100)));
             }
             let closing = Instant::now();
-            sched.release_all(closing, &mut send);
-            while sched.owes() && closing.elapsed() < CLOSING {
+            sched.release_all(closing, |m| output.send(m).is_ok());
+            while (sched.owes() | !output.flush()) && closing.elapsed() < CLOSING {
                 std::thread::sleep(POLL);
-                sched.settle(Instant::now(), &mut send);
+                sched.settle(Instant::now(), |m| output.send(m).is_ok());
             }
             // The next output thread takes the queue from here.
             if let (Some(q), Ok(mut s)) = (queue, slot.lock()) {
@@ -495,6 +510,24 @@ mod tests {
             true
         });
         out
+    }
+
+    #[test]
+    fn a_dropped_start_skips_its_own_release_not_an_earlier_notes() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        // A, heard at 20 ms, starts on time.
+        s.push(OutEvent::tagged(480, &[0x90, 60, 100], 1));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(20)), [vec![0x90, 60, 100]]);
+        // B, on the same key and longer, is too late to start; A's release
+        // comes before B's.
+        s.push(OutEvent::tagged(960, &[0x90, 60, 100], 2));
+        s.push(OutEvent::tagged(961, &[0x80, 60, 0], 1));
+        s.push(OutEvent::tagged(4800, &[0x80, 60, 0], 2));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(100)), [vec![0x80, 60, 0]], "A ends on time");
+        assert!(sent(&mut s, t0 + Duration::from_millis(200)).is_empty(), "B never started");
+        assert!(s.skipped.is_empty());
     }
 
     #[test]
