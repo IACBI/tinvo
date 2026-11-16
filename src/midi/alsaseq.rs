@@ -32,6 +32,8 @@ const TYPE_APPLICATION: c_uint = 1 << 20;
 const CLIENT_SYSTEM: c_int = 0;
 const EVENT_NOTEON: u8 = 6;
 const EVENT_NOTEOFF: u8 = 7;
+const EVENT_CONTROLLER: u8 = 10;
+const EVENT_PITCHBEND: u8 = 13;
 const POLLIN: c_short = 1;
 const EAGAIN: c_int = 11;
 const ENOSPC: c_int = 28;
@@ -198,9 +200,18 @@ pub fn inputs() -> Result<Vec<Port>, String> {
 /// The note message an event carries, if any.
 fn message(ev: &Event) -> Option<Message> {
     let [channel, note, velocity, ..] = ev.data;
+    let channel = channel & 0x0F;
+    // `snd_seq_ev_ctrl_t`: the channel, three reserved bytes, then the
+    // controller and its value as 32-bit integers.
+    let word = |at: usize| i32::from_ne_bytes(ev.data[at..at + 4].try_into().expect("four bytes"));
     match ev.kind {
-        EVENT_NOTEON => decode(0x90 | (channel & 0x0F), note, velocity),
-        EVENT_NOTEOFF => decode(0x80 | (channel & 0x0F), note, velocity),
+        EVENT_NOTEON => decode(0x90 | channel, note, velocity),
+        EVENT_NOTEOFF => decode(0x80 | channel, note, velocity),
+        EVENT_CONTROLLER => {
+            let controller = u8::try_from(word(4)).ok().filter(|&c| c < 128)?;
+            Some(Message::Control { channel, controller, value: word(8).clamp(0, 127) as u8 })
+        }
+        EVENT_PITCHBEND => Some(Message::Bend { channel, value: word(8).clamp(-8192, 8191) as i16 }),
         _ => None,
     }
 }
@@ -326,8 +337,21 @@ mod tests {
         );
         assert_eq!(message(&note(EVENT_NOTEON, 0, 60, 0)), Some(Message::NoteOff { channel: 0, note: 60 }));
         assert_eq!(message(&note(EVENT_NOTEOFF, 15, 61, 64)), Some(Message::NoteOff { channel: 15, note: 61 }));
-        // Controller (10) and port-exit (64) events carry no note.
-        assert_eq!(message(&note(10, 0, 7, 100)), None);
+        let control = |kind, channel: u8, param: i32, value: i32| {
+            let mut data = [0; 12];
+            data[0] = channel;
+            data[4..8].copy_from_slice(&param.to_ne_bytes());
+            data[8..].copy_from_slice(&value.to_ne_bytes());
+            Event { kind, data, ..Event::default() }
+        };
+        assert_eq!(
+            message(&control(EVENT_CONTROLLER, 4, 64, 127)),
+            Some(Message::Control { channel: 4, controller: 64, value: 127 })
+        );
+        assert_eq!(message(&control(EVENT_CONTROLLER, 4, 300, 1)), None, "not a MIDI controller");
+        assert_eq!(message(&control(EVENT_PITCHBEND, 1, 0, -8192)), Some(Message::Bend { channel: 1, value: -8192 }));
+        assert_eq!(message(&control(EVENT_PITCHBEND, 1, 0, 9000)), Some(Message::Bend { channel: 1, value: 8191 }));
+        // Port-exit (64) events carry no note.
         assert_eq!(message(&note(64, 0, 0, 0)), None);
     }
 

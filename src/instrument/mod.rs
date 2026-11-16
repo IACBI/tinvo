@@ -14,9 +14,14 @@ pub use sampler::{SAMPLER_VOICES, Sampler};
 use std::sync::Arc;
 pub use synth::{PolySynth, SYNTH_VOICES};
 
-/// The index of the synth's LFO sync parameter.
-pub const fn synth_lfo_sync() -> usize {
-    synth::p::LFO_SYNC
+/// The project format that introduced parameter `index` of `kind`.
+pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
+    match kind {
+        InstrumentKind::Synth if index == synth::p::LFO_SYNC => 12,
+        InstrumentKind::Synth if index >= synth::p::BEND_RANGE => 13,
+        InstrumentKind::Sampler if index >= sampler::BEND_RANGE => 13,
+        _ => 1,
+    }
 }
 
 /// The kinds of instrument a track can host.
@@ -345,6 +350,23 @@ impl Instrument {
         match self {
             Instrument::Synth(s) => Some(s.tempo()),
             _ => None,
+        }
+    }
+
+    /// The pitch bend wheel, −1 to 1: synths and samplers bend their notes
+    /// by up to their bend range.
+    pub fn set_bend(&mut self, amount: f32) {
+        match self {
+            Instrument::Synth(s) => s.set_bend(amount),
+            Instrument::Sampler(s) => s.set_bend(amount),
+            Instrument::Drum(_) => {}
+        }
+    }
+
+    /// The mod wheel, 0 to 1: a synth moves the parameter it is set to.
+    pub fn set_wheel(&mut self, amount: f32) {
+        if let Instrument::Synth(s) = self {
+            s.set_wheel(amount);
         }
     }
 

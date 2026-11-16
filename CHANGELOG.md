@@ -10,12 +10,18 @@ Author: 𝓐.𝓒.𝓑
 - Recording notes while the pattern plays (`C`). Each key played on the MIDI keyboard lands on its nearest step of the selected track (a swung step where swing puts it, or the next song entry's first step), with its velocity and its length in steps (measured by the engine, so a key held to the next swung step lasts one step). Its distance from the step is kept as micro-timing, landing where the key was played under a tempo ramp too, or dropped with `record_timing = quantize`. Notes on one step make a chord of up to four. With `record_mode = overdub` (the default) they add to the steps; with `replace` each step the playhead passes keeps only what that pass played. The take is one undo step, written when `C` or Stop ends it, before quitting or when the audio device goes; keys still held then end there, and playback goes on after `C`. Tracks inserted or removed while recording keep each note on the track it was played on.
 - A count-in: with `count_in = 1` or `2`, recording from a stop first clicks that many bars of the pattern's time signature, the first beat of each bar higher, then starts on the beat. A key played within half a step before the count-in ends lands on the first step. The top bar shows the beat counted, then `● REC NOTES`.
 - The settings page's options tab has the recording options next to the mouse.
+- The sustain pedal (CC 64): keys released while it is down sound on until it lifts, and a recorded note lasts as long as it sounds. A key played again while the pedal holds it starts again.
+- Pitch bend: synths and samplers bend every note they play by up to their new `Bend range` (0–24 semitones, 2 by default).
+- The mod wheel (CC 1) moves the synth parameter its new `Mod wheel` names, from its value up to its maximum: the cutoff by default, or the resonance, envelope amount, oscillator mix, noise, pulse width, or one of the LFO amounts.
+- MIDI channels (`H`): a track can have a channel of its own, whose notes and wheels play it whichever track is selected; several tracks on one channel play together, and the other channels play the selected track as before. The track list shows the channel after the track's type. Step entry and recording take only the notes that play the selected track.
+- Project format 13: `midi_channel 3` in a track, and the synth's `bend_range` and `wheel` and the sampler's `bend_range`. Older files load with no channels, a 2-semitone bend and the wheel on the cutoff.
 
 ### Changed
 - Project files are read up to 64 MiB and the settings file up to 1 MiB; TINVO writes a few MiB at most. An action takes up to 8 keys, in the settings file and on the settings page.
 - A recording never replaces a file: if another program created one at its name meanwhile, the take goes to the first free `-2.wav`, `-3.wav`, ... beside it, and the status says where.
 
 ### Fixed
+- A bend or mod wheel message lost to a full mailbox is dropped quietly (the next one makes up for it), while a lost key or pedal message still lets every note go.
 - When the ALSA sequencer overran and dropped MIDI events, or a sequencer or raw MIDI input failed, keys held then could sound on forever; every live note is now let go.
 - If the terminal closed TINVO's input, the editor spun at full speed instead of ending (Linux and macOS).
 - Device names, MIDI port names and paths printed by the command line could carry terminal escape sequences or line breaks; they are now printed escaped, on one line.

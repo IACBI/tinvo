@@ -135,6 +135,7 @@ actions! {
     RenameTrack "rename_track" Track [c('r')] "rename the track";
     Mute "mute" Track [c('m')] "mute the track";
     Solo "solo" Track [c('s')] "solo the track";
+    MidiChannel "midi_channel" Track [c('H')] "the MIDI channel that plays the track whichever is selected (shown after its type)";
     Preview "preview" Track [c('p')] "preview the track's note";
     LoadSample "load_sample" Track [c('o')] "load a WAV file into a sampler track";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";

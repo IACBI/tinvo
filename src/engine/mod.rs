@@ -19,6 +19,7 @@ use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
+use crate::midi::{MOD_WHEEL, Message, SUSTAIN};
 use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
 use crate::rt::mailbox::Mailbox;
@@ -72,25 +73,16 @@ const MAX_LIVE: usize = 32;
 /// Live notes one callback takes, so a flood cannot stretch it.
 const LIVE_BUDGET: usize = LIVE_QUEUE;
 
-/// A key played live: `velocity` 1–127 presses `note`, 0 releases it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LiveNote {
-    pub note: u8,
-    pub velocity: u8,
-}
-
-impl LiveNote {
-    /// Releases every live note: the input they came from is gone, or a
-    /// release was lost.
-    pub const ALL_OFF: LiveNote = LiveNote { note: u8::MAX, velocity: 0 };
-}
-
 /// A live note sounding on a track.
 #[derive(Clone, Copy)]
 struct Held {
     track: u8,
+    channel: u8,
     note: u8,
     voice: VoiceId,
+    /// Released while the sustain pedal was down: it sounds on until the
+    /// pedal lifts.
+    sustained: bool,
 }
 pub const MIN_TEMPO: f32 = 20.0;
 pub const MAX_TEMPO: f32 = 300.0;
@@ -378,6 +370,12 @@ pub enum Edit {
         track: u8,
         solo: bool,
     },
+    /// The MIDI channel (0–15) whose notes and controllers play `track`
+    /// whichever track is selected; `None`: only while it is selected.
+    SetChannel {
+        track: u8,
+        channel: Option<u8>,
+    },
     /// Sets a parameter of the buses or the master (see
     /// [`mix::MIX_PARAMS`]).
     SetMixParam {
@@ -442,13 +440,14 @@ pub enum Take {
     /// the track plays there, `offset` ticks from it as playback places
     /// hits. `early`: that step had not played yet, so the note belongs to
     /// the pass that is coming. `position` is in 16th notes from where
-    /// playback started (negative during a count-in).
-    On { track: u8, note: u8, velocity: u8, pattern: u8, step: u8, offset: i8, early: bool, position: f64 },
-    /// A recorded key ended: released, or still down when recording,
-    /// playback or the track it played on stopped. `length` is in steps of
-    /// its step's pattern, the step whose start is nearest the end (swung
-    /// steps where swing puts them, as playback ends a note).
-    Off { note: u8, length: u8 },
+    /// playback started (negative during a count-in). A key is its MIDI
+    /// `channel` and `note`.
+    On { track: u8, channel: u8, note: u8, velocity: u8, pattern: u8, step: u8, offset: i8, early: bool, position: f64 },
+    /// A recorded key ended: released (or its pedal lifted), or still down
+    /// when recording, playback or the track it played on stopped. `length`
+    /// is in steps of its step's pattern, the step whose start is nearest
+    /// the end (swung steps where swing puts them, as playback ends a note).
+    Off { channel: u8, note: u8, length: u8 },
     /// The live track played `step` of `pattern`.
     Passed { track: u8, pattern: u8, step: u8 },
     /// A track was inserted or removed: the reports before this name the
@@ -472,9 +471,13 @@ struct Recorded {
 /// length.
 #[derive(Clone, Copy)]
 struct RecHeld {
+    channel: u8,
     note: u8,
     pulse: u64,
     division: Division,
+    /// Released while its channel's pedal is down: it ends when the pedal
+    /// lifts, whether or not a voice still sounds it.
+    sustained: bool,
 }
 
 /// A count-in under way: clicks on `beats` beats from `origin`, then Play.
@@ -783,6 +786,8 @@ struct Track {
     auto_pan: Option<f32>,
     mute: bool,
     solo: bool,
+    /// The MIDI channel that plays it ([`Edit::SetChannel`]).
+    channel: Option<u8>,
     gain_l: Smoother,
     gain_r: Smoother,
     /// Send levels, applied after fader and pan.
@@ -819,6 +824,7 @@ impl Track {
             auto_pan: None,
             mute: false,
             solo: false,
+            channel: None,
             gain_l: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             gain_r: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             sends: [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT],
@@ -852,6 +858,7 @@ impl Track {
         self.auto_pan = None;
         self.mute = false;
         self.solo = false;
+        self.channel = None;
         self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.gain_r = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.sends = [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT];
@@ -1060,12 +1067,17 @@ pub struct Engine {
     /// Loudness of the output since playback started.
     loudness: LiveLoudness,
     limiter_reduction: f32,
-    /// Notes played live (MIDI input), taken at the start of each callback.
-    live: Option<Arc<Mailbox<LiveNote>>>,
+    /// MIDI messages played live, taken at the start of each callback.
+    live: Option<Arc<Mailbox<Message>>>,
     live_track: usize,
     /// Live notes sounding, oldest first.
     held: [Held; MAX_LIVE],
     held_count: usize,
+    /// One bit per MIDI channel whose sustain pedal is down.
+    pedal: u16,
+    /// Each MIDI channel's pitch bend (-1 to 1) and mod wheel (0 to 1).
+    bends: [f32; 16],
+    wheels: [f32; 16],
     /// Where recorded notes go ([`Command::RecordNotes`]).
     takes: Option<Producer<Take>>,
     recording: bool,
@@ -1135,11 +1147,15 @@ impl Engine {
             limiter_reduction: 0.0,
             live: None,
             live_track: 0,
-            held: [Held { track: 0, note: 0, voice: VoiceId::NONE }; MAX_LIVE],
+            held: [Held { track: 0, channel: 0, note: 0, voice: VoiceId::NONE, sustained: false }; MAX_LIVE],
             held_count: 0,
+            pedal: 0,
+            bends: [0.0; 16],
+            wheels: [0.0; 16],
             takes: None,
             recording: false,
-            rec_held: [RecHeld { note: 0, pulse: 0, division: Division::Sixteenth }; MAX_LIVE],
+            rec_held: [RecHeld { channel: 0, note: 0, pulse: 0, division: Division::Sixteenth, sustained: false };
+                MAX_LIVE],
             rec_count: 0,
             cursor: 0,
             count_in: None,
@@ -1175,10 +1191,12 @@ impl Engine {
         self.mix.latency()
     }
 
-    /// Plays the notes pushed into `mailbox` live, on the track
-    /// [`Command::SetLiveTrack`] names. The mailbox may outlive the engine
-    /// and pass to its successor.
-    pub fn attach_live(&mut self, mailbox: Arc<Mailbox<LiveNote>>) {
+    /// Plays the MIDI messages pushed into `mailbox` live: each channel on
+    /// the tracks [`Edit::SetChannel`] gives it, or else on the track
+    /// [`Command::SetLiveTrack`] names. [`Message::Lost`] lets every note go
+    /// and puts the controllers back. The mailbox may outlive the engine and
+    /// pass to its successor.
+    pub fn attach_live(&mut self, mailbox: Arc<Mailbox<Message>>) {
         self.live = Some(mailbox);
     }
 
@@ -1261,7 +1279,10 @@ impl Engine {
                     self.push_take(Take::Layout);
                 }
             }
-            Command::SetLiveTrack(t) => self.live_track = usize::from(t),
+            Command::SetLiveTrack(t) => {
+                self.live_track = usize::from(t);
+                self.sync_controllers();
+            }
             Command::Play => self.start(None, self.now),
             Command::PlaySong { entry } => self.start(Some(entry), self.now),
             Command::RecordNotes(on) => {
@@ -1316,19 +1337,101 @@ impl Engine {
     fn play_live(&mut self) {
         let Some(live) = self.live.take() else { return };
         for _ in 0..LIVE_BUDGET {
-            let Some(n) = live.pop() else { break };
-            if n == LiveNote::ALL_OFF {
-                self.end_recorded();
-                self.release_live();
-            } else if n.velocity == 0 {
-                self.record_off(n.note);
-                self.live_off(n.note);
-            } else {
-                self.record_on(n.note, n.velocity);
-                self.live_on(n.note, n.velocity);
-            }
+            let Some(m) = live.pop() else { break };
+            self.play_message(m);
         }
         self.live = Some(live);
+    }
+
+    fn play_message(&mut self, m: Message) {
+        match m {
+            Message::NoteOn { channel, note, velocity } => {
+                // A key pressed again before its release ends its first
+                // press, whatever plays its channel now.
+                self.record_off(channel, note);
+                if self.records(channel) {
+                    self.record_on(channel, note, velocity);
+                }
+                self.live_on(channel, note, velocity);
+            }
+            Message::NoteOff { channel, note } => self.live_off(channel, note),
+            Message::Control { channel, controller: SUSTAIN, value } => self.set_pedal(channel, value >= 64),
+            Message::Control { channel, controller: MOD_WHEEL, value } => {
+                self.wheels[usize::from(channel & 0x0F)] = f32::from(value) / 127.0;
+                self.sync_controllers();
+            }
+            Message::Control { .. } => {}
+            Message::Bend { channel, value } => {
+                self.bends[usize::from(channel & 0x0F)] = f32::from(value) / 8192.0;
+                self.sync_controllers();
+            }
+            Message::Lost => {
+                self.end_recorded();
+                self.release_live();
+                self.pedal = 0;
+                self.bends = [0.0; 16];
+                self.wheels = [0.0; 16];
+                self.sync_controllers();
+            }
+        }
+    }
+
+    /// The tracks `channel` plays, one bit each: those set to it, or else
+    /// the live track.
+    fn targets(&self, channel: u8) -> u32 {
+        let own = self.tracks[..self.track_count]
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.channel == Some(channel))
+            .fold(0, |m, (i, _)| m | 1 << i);
+        if own != 0 || self.live_track >= self.track_count { own } else { 1 << self.live_track }
+    }
+
+    /// Whether `channel`'s notes go into a take: those playing the live
+    /// track.
+    fn records(&self, channel: u8) -> bool {
+        self.targets(channel) & 1u32.checked_shl(self.live_track as u32).unwrap_or(0) != 0
+    }
+
+    /// Sets every track's pitch bend and mod wheel from the channels that
+    /// play it: its own channel's, and on the live track also those of the
+    /// channels no track has (their bends add, the highest wheel counts).
+    /// Called whenever the values or the routing change, so a track no
+    /// channel reaches any more is back at rest.
+    fn sync_controllers(&mut self) {
+        let n = self.track_count;
+        let owned = self.tracks[..n].iter().filter_map(|t| t.channel).fold(0u16, |m, c| m | 1 << (c & 0x0F));
+        let (mut bend, mut wheel) = (0.0f32, 0.0f32);
+        for c in (0..16).filter(|&c| owned & 1 << c == 0) {
+            bend += self.bends[c];
+            wheel = wheel.max(self.wheels[c]);
+        }
+        let (bends, wheels, live) = (self.bends, self.wheels, self.live_track);
+        for (i, t) in self.tracks[..n].iter_mut().enumerate() {
+            let own = t.channel.map(|c| usize::from(c & 0x0F));
+            let (mut b, mut w) = own.map_or((0.0, 0.0), |c| (bends[c], wheels[c]));
+            if i == live {
+                b += bend;
+                w = w.max(wheel);
+            }
+            t.instrument.set_bend(b);
+            t.instrument.set_wheel(w);
+        }
+    }
+
+    fn set_pedal(&mut self, channel: u8, down: bool) {
+        let bit = 1 << (channel & 0x0F);
+        if down {
+            self.pedal |= bit;
+            return;
+        }
+        self.pedal &= !bit;
+        while let Some(k) = self.held[..self.held_count].iter().position(|h| h.channel == channel && h.sustained) {
+            self.release_held(k);
+        }
+        while let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.channel == channel && h.sustained) {
+            self.end_held(k);
+        }
     }
 
     fn push_take(&mut self, take: Take) {
@@ -1352,7 +1455,7 @@ impl Engine {
     }
 
     /// Records a key pressed now on the live track at its nearest step.
-    fn record_on(&mut self, note: u8, velocity: u8) {
+    fn record_on(&mut self, channel: u8, note: u8, velocity: u8) {
         let t = self.live_track;
         if !self.recording || t >= self.track_count {
             return;
@@ -1360,19 +1463,19 @@ impl Engine {
         let Some(position) = self.take_position() else { return };
         let found = if self.transport.is_playing() { self.nearest_step(t, position) } else { self.first_step(t) };
         let Some(s) = found else { return };
-        // A key pressed again before its release ends its first press.
-        self.record_off(note);
         if self.rec_count == MAX_LIVE {
             self.end_held(0);
         }
-        self.rec_held[self.rec_count] = RecHeld { note, pulse: s.pulse, division: s.division };
+        self.rec_held[self.rec_count] =
+            RecHeld { channel, note, pulse: s.pulse, division: s.division, sustained: false };
         self.rec_count += 1;
         let (track, pattern, step, offset, early) = (t as u8, s.pattern, s.step, s.offset, s.early);
-        self.push_take(Take::On { track, note, velocity, pattern, step, offset, early, position });
+        self.push_take(Take::On { track, channel, note, velocity, pattern, step, offset, early, position });
     }
 
-    fn record_off(&mut self, note: u8) {
-        if let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.note == note) {
+    /// Ends the recording of a key, wherever it was recorded.
+    fn record_off(&mut self, channel: u8, note: u8) {
+        if let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.channel == channel && h.note == note) {
             self.end_held(k);
         }
     }
@@ -1392,7 +1495,7 @@ impl Engine {
             Some(end) => self.held_length(h, end),
             None => 1,
         };
-        self.push_take(Take::Off { note: h.note, length });
+        self.push_take(Take::Off { channel: h.channel, note: h.note, length });
     }
 
     /// The length in steps of a key held from step `h` until `end` (in 16th
@@ -1533,13 +1636,22 @@ impl Engine {
         }
     }
 
-    fn live_on(&mut self, note: u8, velocity: u8) {
-        let i = self.live_track;
-        if i >= self.track_count {
-            return;
+    fn live_on(&mut self, channel: u8, note: u8, velocity: u8) {
+        // A key pressed again before its release retriggers, also one the
+        // pedal holds.
+        while let Some(k) = self.held[..self.held_count].iter().position(|h| h.channel == channel && h.note == note) {
+            self.release_held(k);
         }
-        // A key pressed again before its release retriggers.
-        self.live_off(note);
+        let mut mask = self.targets(channel);
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.sound(i, channel, note, velocity);
+        }
+    }
+
+    /// Starts a live note on track `i`.
+    fn sound(&mut self, i: usize, channel: u8, note: u8, velocity: u8) {
         if self.held_count == MAX_LIVE {
             self.release_held(0);
         }
@@ -1551,13 +1663,24 @@ impl Engine {
         let pitch = if kind.is_drum() { kind.default_note() } else { note.min(127) };
         let voice = self.tracks[i].instrument.note_on(pitch, velocity.min(127));
         if voice != VoiceId::NONE {
-            self.held[self.held_count] = Held { track: i as u8, note, voice };
+            self.held[self.held_count] = Held { track: i as u8, channel, note, voice, sustained: false };
             self.held_count += 1;
         }
     }
 
-    fn live_off(&mut self, note: u8) {
-        while let Some(k) = self.held[..self.held_count].iter().position(|h| h.note == note) {
+    fn live_off(&mut self, channel: u8, note: u8) {
+        let keys = |h: &Held| h.channel == channel && h.note == note && !h.sustained;
+        if self.pedal & 1 << (channel & 0x0F) != 0 {
+            for h in self.held[..self.held_count].iter_mut().filter(|h| keys(h)) {
+                h.sustained = true;
+            }
+            for h in self.rec_held[..self.rec_count].iter_mut().filter(|h| h.channel == channel && h.note == note) {
+                h.sustained = true;
+            }
+            return;
+        }
+        self.record_off(channel, note);
+        while let Some(k) = self.held[..self.held_count].iter().position(keys) {
             self.release_held(k);
         }
     }
@@ -1937,6 +2060,12 @@ impl Engine {
     /// Applies an edit. Invalid track/step indices are ignored and values are
     /// clamped exactly as `Project::apply` clamps them.
     pub fn apply(&mut self, edit: Edit) {
+        self.apply_edit(edit);
+        // Any edit can change which channels play which track.
+        self.sync_controllers();
+    }
+
+    fn apply_edit(&mut self, edit: Edit) {
         let n = self.track_count;
         match edit {
             Edit::SetTempo(bpm) => {
@@ -2147,6 +2276,11 @@ impl Engine {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
                     t.mute = mute;
                     self.update_gains();
+                }
+            }
+            Edit::SetChannel { track, channel } => {
+                if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
+                    t.channel = channel.map(|c| c.min(15));
                 }
             }
             Edit::SetSolo { track, solo } => {
@@ -2858,19 +2992,19 @@ mod tests {
         assert_eq!(e.fading_count, 0);
     }
 
-    fn live_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<LiveNote>>) {
+    fn live_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<Message>>) {
         let mut e = engine(edits);
         let live = Arc::new(Mailbox::new(LIVE_QUEUE));
         e.attach_live(live.clone());
         (e, live)
     }
 
-    fn press(live: &Mailbox<LiveNote>, note: u8, velocity: u8) {
-        live.push(LiveNote { note, velocity }).unwrap();
+    fn press(live: &Mailbox<Message>, note: u8, velocity: u8) {
+        live.push(Message::note(0, note, velocity)).unwrap();
     }
 
     /// A live engine whose takes come out of the returned queue.
-    fn take_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<LiveNote>>, spsc::Consumer<Take>) {
+    fn take_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<Message>>, spsc::Consumer<Take>) {
         let (mut e, live) = live_engine(edits);
         let (tx, rx) = spsc::channel(TAKE_QUEUE);
         e.attach_takes(tx);
@@ -2882,7 +3016,7 @@ mod tests {
     }
 
     fn on(note: u8, pattern: u8, step: u8, offset: i8, early: bool, position: f64) -> Take {
-        Take::On { track: 0, note, velocity: 100, pattern, step, offset, early, position }
+        Take::On { track: 0, channel: 0, note, velocity: 100, pattern, step, offset, early, position }
     }
 
     fn passed(pattern: u8, step: u8) -> Take {
@@ -2918,13 +3052,13 @@ mod tests {
                 passed(0, 2),
                 // A quarter of a step late; the step has played.
                 on(62, 0, 2, 6, false, 2.25),
-                Take::Off { note: 60, length: 1 },
+                Take::Off { channel: 0, note: 60, length: 1 },
                 passed(0, 3),
                 // A third of a step before the pattern starts again: its first
                 // step, early, for the pass that comes.
                 on(64, 0, 0, -8, true, 22_000.0 / 6000.0),
                 // Held from step 2 to nearer step 4's start than step 3's.
-                Take::Off { note: 62, length: 2 },
+                Take::Off { channel: 0, note: 62, length: 2 },
             ]
         );
         // Another track records as the live track; stopping ends the keys
@@ -2937,7 +3071,10 @@ mod tests {
         let on_one = |step| Take::Passed { track: 1, pattern: 0, step };
         assert_eq!(takes(&mut rx), [on_one(0), on_one(1)]);
         e.handle(Command::RecordNotes(false));
-        assert_eq!(takes(&mut rx), [Take::Off { note: 64, length: 2 }, Take::Off { note: 65, length: 2 }]);
+        assert_eq!(
+            takes(&mut rx),
+            [Take::Off { channel: 0, note: 64, length: 2 }, Take::Off { channel: 0, note: 65, length: 2 }]
+        );
         press(&live, 65, 0);
         press(&live, 66, 100);
         run(&mut e, 30_000);
@@ -3139,7 +3276,7 @@ mod tests {
         run(&mut e, 9000);
         press(&live, 60, 0);
         run(&mut e, 10);
-        assert!(takes(&mut rx).contains(&Take::Off { note: 60, length: 1 }));
+        assert!(takes(&mut rx).contains(&Take::Off { channel: 0, note: 60, length: 1 }));
     }
 
     #[test]
@@ -3149,10 +3286,294 @@ mod tests {
         press(&live, 64, 100);
         run(&mut e, 256);
         assert_eq!(e.held_count, 2);
-        live.push(LiveNote::ALL_OFF).unwrap();
+        live.push(Message::Lost).unwrap();
         run(&mut e, 256);
         assert_eq!(e.held_count, 0);
         assert!(energy(&run(&mut e, 48_000)[2 * 40_000..]) < 1e-9, "the notes die away");
+    }
+
+    fn send(live: &Mailbox<Message>, m: Message) {
+        live.push(m).unwrap();
+    }
+
+    fn pedal(channel: u8, down: bool) -> Message {
+        Message::Control { channel, controller: SUSTAIN, value: if down { 127 } else { 0 } }
+    }
+
+    #[test]
+    fn channels_play_their_own_tracks_and_the_rest_the_live_track() {
+        let synth = Edit::AddTrack(InstrumentKind::Synth);
+        let (mut e, live) = live_engine(&[
+            synth,
+            synth,
+            synth,
+            synth,
+            Edit::SetChannel { track: 1, channel: Some(3) },
+            Edit::SetChannel { track: 2, channel: Some(5) },
+            Edit::SetChannel { track: 3, channel: Some(5) },
+        ]);
+        let sounding = |e: &mut Engine| -> Vec<bool> { (0..4).map(|t| e.shared.track_peaks[t].take() > 0.0).collect() };
+        send(&live, Message::note(3, 60, 100));
+        run(&mut e, 2400);
+        assert_eq!(sounding(&mut e), [false, true, false, false], "channel 3 plays track 1 though track 0 is live");
+        send(&live, Message::note(0, 62, 100));
+        send(&live, Message::note(5, 64, 100));
+        run(&mut e, 2400);
+        assert_eq!(sounding(&mut e), [true, true, true, true], "channel 5 plays both its tracks");
+        // Each channel's release ends only its own notes.
+        send(&live, Message::note(5, 64, 0));
+        send(&live, Message::note(0, 60, 0));
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 2);
+        assert!(e.held[..2].iter().map(|h| (h.track, h.note)).eq([(1, 60), (0, 62)]));
+        // A track given no channel again follows the selection.
+        e.handle(Command::Edit(Edit::SetChannel { track: 1, channel: None }));
+        send(&live, Message::note(3, 67, 100));
+        run(&mut e, 64);
+        assert_eq!(e.held[2].track, 0);
+    }
+
+    #[test]
+    fn the_sustain_pedal_holds_released_keys_until_it_lifts() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        send(&live, pedal(0, true));
+        press(&live, 60, 100);
+        press(&live, 64, 100);
+        press(&live, 60, 0);
+        press(&live, 64, 0);
+        // The pedal of another channel changes nothing here.
+        send(&live, pedal(1, false));
+        run(&mut e, 4800);
+        assert_eq!(e.held_count, 2);
+        assert!(energy(&run(&mut e, 4800)) > 1e-3, "sounding on");
+        // A key played again while held by the pedal starts again, once.
+        press(&live, 60, 100);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 2);
+        assert!(!e.held[1].sustained);
+        send(&live, pedal(0, false));
+        run(&mut e, 64);
+        assert_eq!((e.held_count, e.held[0].note), (1, 60), "the key still down sounds on");
+        press(&live, 60, 0);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 0);
+        // Losing the input lifts the pedal too.
+        send(&live, pedal(0, true));
+        send(&live, Message::Lost);
+        press(&live, 62, 100);
+        press(&live, 62, 0);
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn a_full_bend_down_plays_its_range_lower() {
+        let bent = {
+            let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+            send(&live, Message::Bend { channel: 0, value: -8192 });
+            press(&live, 60, 100);
+            run(&mut e, 9600)
+        };
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        press(&live, 58, 100);
+        assert!(bent == run(&mut e, 9600), "two semitones down by default");
+        // Back at rest, and reset when the input is lost.
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        send(&live, Message::Bend { channel: 0, value: 4000 });
+        send(&live, Message::Lost);
+        press(&live, 60, 100);
+        let reset = run(&mut e, 9600);
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        press(&live, 60, 100);
+        assert!(reset == run(&mut e, 9600));
+    }
+
+    #[test]
+    fn the_wheels_leave_a_track_once_another_is_selected() {
+        let synth = Edit::AddTrack(InstrumentKind::Synth);
+        let render = |bend_after_switch: bool| {
+            let (mut e, live) = live_engine(&[synth, synth]);
+            send(&live, Message::Bend { channel: 0, value: 8191 });
+            send(&live, Message::Control { channel: 0, controller: MOD_WHEEL, value: 127 });
+            run(&mut e, 64);
+            e.handle(Command::SetLiveTrack(1));
+            if bend_after_switch {
+                send(&live, Message::Bend { channel: 0, value: 8191 });
+            }
+            e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 1), frames: 4800 });
+            run(&mut e, 9600)
+        };
+        let plain = {
+            let mut e = engine(&[synth, synth]);
+            run(&mut e, 64);
+            e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 1), frames: 4800 });
+            run(&mut e, 9600)
+        };
+        assert!(render(false) == plain && render(true) == plain);
+    }
+
+    /// The takes other than the steps that played.
+    fn keys_taken(rx: &mut spsc::Consumer<Take>) -> Vec<Take> {
+        takes(rx).into_iter().filter(|t| !matches!(t, Take::Passed { .. })).collect()
+    }
+
+    #[test]
+    fn a_recorded_key_ends_on_its_release_whatever_is_selected_by_then() {
+        let synth = Edit::AddTrack(InstrumentKind::Synth);
+        let (mut e, live, mut rx) = take_engine(&[synth, synth, Edit::SetChannel { track: 0, channel: Some(0) }]);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        press(&live, 60, 100);
+        run(&mut e, 3000);
+        e.handle(Command::SetLiveTrack(1));
+        press(&live, 60, 0);
+        run(&mut e, 3000);
+        let got = keys_taken(&mut rx);
+        assert!(matches!(got[..], [Take::On { note: 60, .. }, Take::Off { note: 60, length: 1, .. }]), "{got:?}");
+    }
+
+    #[test]
+    fn the_same_pitch_on_two_channels_records_two_keys() {
+        let (mut e, live, mut rx) = take_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        send(&live, Message::note(0, 60, 100));
+        run(&mut e, 6000);
+        send(&live, Message::note(1, 60, 100));
+        run(&mut e, 12000);
+        send(&live, Message::note(0, 60, 0));
+        run(&mut e, 12000);
+        send(&live, Message::note(1, 60, 0));
+        run(&mut e, 10);
+        let got = keys_taken(&mut rx);
+        assert!(
+            matches!(
+                got[..],
+                [
+                    Take::On { channel: 0, note: 60, step: 0, .. },
+                    Take::On { channel: 1, note: 60, step: 1, .. },
+                    Take::Off { channel: 0, note: 60, length: 3 },
+                    Take::Off { channel: 1, note: 60, length: 4 },
+                ]
+            ),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_drum_held_by_the_pedal_ends_its_recorded_note_when_the_pedal_lifts() {
+        let (mut e, live, mut rx) = take_engine(&[Edit::AddTrack(InstrumentKind::Kick)]);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        send(&live, pedal(0, true));
+        press(&live, 36, 100);
+        run(&mut e, 3000);
+        press(&live, 36, 0);
+        // Lifted 2.7 steps after the key went down.
+        run(&mut e, 2 * 6000 + 1200);
+        send(&live, pedal(0, false));
+        run(&mut e, 10);
+        let got = keys_taken(&mut rx);
+        assert!(matches!(got[..], [Take::On { note: 36, .. }, Take::Off { note: 36, length: 3, .. }]), "{got:?}");
+    }
+
+    /// A note auditioned on `track` after `setup`, on an engine whose live
+    /// mailbox `setup` can use.
+    fn audition_after(edits: &[Edit], track: u8, setup: impl FnOnce(&mut Engine, &Mailbox<Message>)) -> Vec<f32> {
+        let (mut e, live) = live_engine(edits);
+        setup(&mut e, &live);
+        run(&mut e, 64);
+        e.handle(Command::Audition { track, step: Step::new(60, 100, 1), frames: 4800 });
+        run(&mut e, 9600)
+    }
+
+    #[test]
+    fn a_selected_track_with_a_channel_takes_the_free_channels_bend_until_deselected() {
+        let synth = Edit::AddTrack(InstrumentKind::Synth);
+        let edits = [synth, synth, Edit::SetChannel { track: 0, channel: Some(0) }];
+        let plain = audition_after(&edits, 0, |_, _| {});
+        let bend = Message::Bend { channel: 1, value: 8191 };
+        let bent = audition_after(&edits, 0, |_, live| send(live, bend));
+        assert!(bent != plain, "channel 2 has no track, so it bends the selected one");
+        let deselected = audition_after(&edits, 0, |e, live| {
+            send(live, bend);
+            run(e, 64);
+            e.handle(Command::SetLiveTrack(1));
+        });
+        assert!(deselected == plain);
+        // Giving channel 2 to another track takes its bend there.
+        let given = audition_after(&edits, 0, |e, live| {
+            send(live, bend);
+            run(e, 64);
+            e.handle(Command::Edit(Edit::SetChannel { track: 1, channel: Some(1) }));
+        });
+        assert!(given == plain);
+        let applied = audition_after(&edits, 0, |e, live| {
+            send(live, bend);
+            run(e, 64);
+            e.apply(Edit::SetChannel { track: 1, channel: Some(1) });
+        });
+        assert!(applied == plain, "also when applied directly");
+        // A channel past 16 is the 16th, as in the project.
+        let mut e = engine(&[synth, Edit::SetChannel { track: 0, channel: Some(16) }]);
+        assert_eq!(e.tracks[0].channel, Some(15));
+        e.apply(Edit::SetChannel { track: 0, channel: Some(200) });
+        assert_eq!(e.tracks[0].channel, Some(15));
+    }
+
+    #[test]
+    fn a_track_moved_by_an_insert_leaves_the_bend_to_the_live_track() {
+        let synth = Edit::AddTrack(InstrumentKind::Synth);
+        let insert = Edit::InsertTrack { index: 0, kind: InstrumentKind::Synth };
+        let plain = audition_after(&[synth, synth], 2, |e, _| {
+            e.handle(Command::SetLiveTrack(1));
+            e.handle(Command::Edit(insert));
+        });
+        let moved = audition_after(&[synth, synth], 2, |e, live| {
+            e.handle(Command::SetLiveTrack(1));
+            send(live, Message::Bend { channel: 0, value: 8191 });
+            run(e, 64);
+            e.handle(Command::Edit(insert));
+        });
+        assert!(moved == plain);
+    }
+
+    #[test]
+    fn a_channel_set_again_unchanged_keeps_the_bend() {
+        let edits = [Edit::AddTrack(InstrumentKind::Synth)];
+        let bend = Message::Bend { channel: 0, value: 8191 };
+        let bent = audition_after(&edits, 0, |_, live| send(live, bend));
+        let again = audition_after(&edits, 0, |e, live| {
+            send(live, bend);
+            run(e, 64);
+            e.handle(Command::Edit(Edit::SetChannel { track: 0, channel: None }));
+        });
+        assert!(bent == again && bent != audition_after(&edits, 0, |_, _| {}));
+    }
+
+    #[test]
+    fn a_take_holds_the_notes_of_the_live_track_as_long_as_the_pedal() {
+        let (mut e, live, mut rx) = take_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetChannel { track: 1, channel: Some(2) },
+        ]);
+        e.handle(Command::RecordNotes(true));
+        e.handle(Command::Play);
+        send(&live, pedal(0, true));
+        press(&live, 60, 100);
+        send(&live, Message::note(2, 72, 100));
+        run(&mut e, 3000);
+        press(&live, 60, 0);
+        // Lifted 4.2 steps after the key went down.
+        run(&mut e, 3 * 6000 + 4200);
+        send(&live, pedal(0, false));
+        run(&mut e, 10);
+        let got: Vec<Take> = takes(&mut rx).into_iter().filter(|t| !matches!(t, Take::Passed { .. })).collect();
+        assert!(
+            matches!(got[..], [Take::On { note: 60, .. }, Take::Off { channel: 0, note: 60, length: 4 }]),
+            "{got:?}"
+        );
     }
 
     #[test]

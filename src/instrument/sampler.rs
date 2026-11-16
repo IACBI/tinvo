@@ -23,6 +23,9 @@ const MODES: &[&str] = &["gate", "one-shot"];
 const INTERP: &[&str] = &["sinc", "linear"];
 const TIME_STEP: f32 = 1.1;
 
+/// The index of the bend range parameter.
+pub const BEND_RANGE: usize = p::BEND_RANGE;
+
 mod p {
     pub const ROOT: usize = 0;
     pub const TUNE: usize = 1;
@@ -39,7 +42,9 @@ mod p {
     pub const R: usize = 12;
     pub const CUTOFF: usize = 13;
     pub const RESO: usize = 14;
-    pub const COUNT: usize = 15;
+    // Added in format 13.
+    pub const BEND_RANGE: usize = 15;
+    pub const COUNT: usize = 16;
 }
 
 pub static PARAMS: [ParamSpec; p::COUNT] = [
@@ -58,6 +63,7 @@ pub static PARAMS: [ParamSpec; p::COUNT] = [
     ParamSpec::log("release", "Release", 0.001, 10.0, 0.05, TIME_STEP, Unit::Seconds),
     ParamSpec::log("cutoff", "Cutoff", 20.0, 20_000.0, 20_000.0, 1.059_463_1, Unit::Hz),
     ParamSpec::linear("resonance", "Resonance", 0.0, 1.0, 0.0, 0.01, Unit::None),
+    ParamSpec::linear("bend_range", "Bend range", 0.0, 24.0, 2.0, 1.0, Unit::Semitones),
 ];
 
 #[derive(Clone, Copy)]
@@ -110,6 +116,8 @@ pub struct Sampler {
     one_shot: bool,
     sinc: bool,
     filter_on: bool,
+    /// The pitch bend wheel, −1 to 1.
+    bend: f32,
 }
 
 impl Sampler {
@@ -124,6 +132,7 @@ impl Sampler {
             one_shot: false,
             sinc: true,
             filter_on: false,
+            bend: 0.0,
         };
         for (v, spec) in s.params.iter_mut().zip(PARAMS.iter()) {
             *v = spec.default;
@@ -154,6 +163,11 @@ impl Sampler {
 
     pub fn param(&self, index: usize) -> Option<f32> {
         self.params.get(index).copied()
+    }
+
+    /// Bends every voice by `amount` (−1 to 1) of the bend range.
+    pub fn set_bend(&mut self, amount: f32) {
+        self.bend = amount.clamp(-1.0, 1.0);
     }
 
     fn update_derived(&mut self) {
@@ -252,6 +266,8 @@ impl Sampler {
         let r = self.region(sample.frames());
         let (sinc, filter_on, mode) = (self.sinc, self.filter_on, FilterMode::LowPass);
         let loop_len = r.end - r.loop_start;
+        let bend = self.bend * self.params[p::BEND_RANGE];
+        let ratio = if bend == 0.0 { 1.0 } else { f64::from(semitones_to_ratio(bend)) };
         for v in self.voices.iter_mut().filter(|v| v.playing) {
             for o in out.iter_mut() {
                 if v.pos >= r.end {
@@ -268,7 +284,7 @@ impl Sampler {
                 let fade = if r.looping { 1.0 } else { ((r.end - v.pos) / END_FADE).min(1.0) as f32 };
                 let y = if filter_on { v.filter.process(x, mode) } else { x };
                 *o += y * v.amp.tick() * v.gain * fade;
-                v.pos += v.inc;
+                v.pos += v.inc * ratio;
                 if !v.amp.is_active() {
                     v.playing = false;
                     break;
@@ -301,6 +317,23 @@ mod tests {
         let mut s = Sampler::new(SR);
         assert!(s.set_sample(Some(sample)).is_none());
         s
+    }
+
+    #[test]
+    fn a_bend_moves_playing_voices_by_the_bend_range() {
+        let mut s = sampler(sine_sample(441.0, 1.0, 44_100));
+        s.set_param(p::BEND_RANGE, 12.0);
+        s.note_on(60, 127);
+        let mut render = |bend: f32| {
+            s.set_bend(bend);
+            // Rendering adds into the buffer.
+            let mut buf = vec![0.0f32; 9600];
+            s.render(&mut buf);
+            freq(&buf[100..])
+        };
+        assert!((render(0.0) - 441.0).abs() < 1.0);
+        let (up, down) = (render(1.0), render(-1.0));
+        assert!((up - 882.0).abs() < 2.0 && (down - 220.5).abs() < 1.0, "{up} {down}");
     }
 
     #[test]
