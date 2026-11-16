@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 #[derive(Clone, Copy, Debug)]
 struct Played {
     track: usize,
+    channel: u8,
     pattern: u8,
     step: u8,
     note: u8,
@@ -48,18 +49,18 @@ impl NoteTake {
 
     pub fn push(&mut self, take: Take) {
         match take {
-            Take::On { track, note, velocity, pattern, step, offset, early, position } => {
+            Take::On { track, channel, note, velocity, pattern, step, offset, early, position } => {
                 let track = usize::from(track);
                 let seen = self.passes.get(&(track, pattern, step)).copied().unwrap_or(0);
                 // A key whose step has not played yet belongs to the pass
                 // that is coming.
                 let pass = seen + u32::from(early);
-                self.release(note, 1);
+                self.release(channel, note, 1);
                 self.held.push(self.played.len());
-                let length = None;
-                self.played.push(Played { track, pattern, step, note, velocity, offset, pass, on: position, length });
+                let (on, length) = (position, None);
+                self.played.push(Played { track, channel, pattern, step, note, velocity, offset, pass, on, length });
             }
-            Take::Off { note, length } => self.release(note, length),
+            Take::Off { channel, note, length } => self.release(channel, note, length),
             Take::Passed { track, pattern, step } => {
                 *self.passes.entry((usize::from(track), pattern, step)).or_insert(0) += 1;
             }
@@ -71,8 +72,9 @@ impl NoteTake {
         }
     }
 
-    fn release(&mut self, note: u8, length: u8) {
-        if let Some(i) = self.held.iter().position(|&i| self.played[i].note == note) {
+    fn release(&mut self, channel: u8, note: u8, length: u8) {
+        let key = |p: &Played| p.channel == channel && p.note == note;
+        if let Some(i) = self.held.iter().position(|&i| key(&self.played[i])) {
             let p = self.held.swap_remove(i);
             self.played[p].length = Some(length);
         }
@@ -219,11 +221,11 @@ mod tests {
     use crate::instrument::InstrumentKind;
 
     fn on(note: u8, step: u8, offset: i8, early: bool, position: f64) -> Take {
-        Take::On { track: 0, note, velocity: 90, pattern: 0, step, offset, early, position }
+        Take::On { track: 0, channel: 0, note, velocity: 90, pattern: 0, step, offset, early, position }
     }
 
     fn off(note: u8, length: u8) -> Take {
-        Take::Off { note, length }
+        Take::Off { channel: 0, note, length }
     }
 
     fn passed(step: u8) -> Take {
@@ -270,6 +272,7 @@ mod tests {
             passed(2),
             Take::On {
                 track: 0,
+                channel: 0,
                 note: 60,
                 velocity: 110,
                 pattern: 0,
@@ -289,6 +292,24 @@ mod tests {
         );
         let quantized = Recording { quantize: true, ..OVERDUB };
         assert_eq!(t.edits(&p, &brush, quantized)[0], set(1, Some(chord(62, 90, 3, 0, [0; 3]))));
+    }
+
+    #[test]
+    fn the_same_pitch_on_two_channels_is_two_keys() {
+        let p = project(InstrumentKind::Synth);
+        let brush = [Step::new(60, 100, 1)];
+        let on_channel = |channel, step| match on(60, step, 0, true, f64::from(step)) {
+            Take::On { track, note, velocity, pattern, step, offset, early, position, .. } => {
+                Take::On { track, channel, note, velocity, pattern, step, offset, early, position }
+            }
+            t => t,
+        };
+        let off_channel = |channel, length| Take::Off { channel, note: 60, length };
+        let t = take(&[on_channel(0, 1), on_channel(1, 2), off_channel(0, 3), off_channel(1, 1)]);
+        assert_eq!(
+            t.edits(&p, &brush, OVERDUB),
+            [set(1, Some(Step::new(60, 90, 3))), set(2, Some(Step::new(60, 90, 1)))]
+        );
     }
 
     #[test]
@@ -334,6 +355,7 @@ mod tests {
         let brushes = [Step::new(60, 100, 1); 2];
         let on_track = |track, note, step| Take::On {
             track,
+            channel: 0,
             note,
             velocity: 90,
             pattern: 0,

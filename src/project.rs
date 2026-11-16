@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 12
+//! tinvo 13
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -24,6 +24,7 @@
 //! pan 0
 //! mute false
 //! solo false
+//! midi_channel 3             # the MIDI channel (1-16) that plays it; only when set
 //! parts . . B -              # per song entry: . the entry's pattern, a pattern, - rest
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
@@ -43,8 +44,9 @@
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
 //! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers),
-//! 10 (every track plays the entry's pattern) and 11 (16th-note steps, up
-//! to 4 ratchets) are still read.
+//! 10 (every track plays the entry's pattern), 11 (16th-note steps, up
+//! to 4 ratchets) and 12 (no MIDI channels, bend ranges or mod wheel) are
+//! still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
@@ -59,7 +61,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -81,6 +83,8 @@ pub struct TrackData {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// The MIDI channel (0–15) that plays the track whichever is selected.
+    pub channel: Option<u8>,
     /// `steps[pattern][step]`.
     pub steps: Box<[[Option<Step>; MAX_STEPS]; MAX_PATTERNS]>,
     /// Sampler tracks: the sample file. Absolute in memory; written relative
@@ -136,6 +140,7 @@ impl TrackData {
             pan: 0.0,
             mute: false,
             solo: false,
+            channel: None,
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
@@ -564,6 +569,11 @@ impl Project {
                 self.track_mut(track)?.solo = solo;
                 edit
             }
+            Edit::SetChannel { track, channel } => {
+                let channel = channel.map(|c| c.min(15));
+                self.track_mut(track)?.channel = channel;
+                Edit::SetChannel { track, channel }
+            }
         };
         Ok(applied)
     }
@@ -916,6 +926,7 @@ impl Project {
             Edit::SetPan { track, .. } => vec![Edit::SetPan { track, pan: self.track(track)?.pan }],
             Edit::SetMute { track, .. } => vec![Edit::SetMute { track, mute: self.track(track)?.mute }],
             Edit::SetSolo { track, .. } => vec![Edit::SetSolo { track, solo: self.track(track)?.solo }],
+            Edit::SetChannel { track, .. } => vec![Edit::SetChannel { track, channel: self.track(track)?.channel }],
         };
         Ok(inv)
     }
@@ -982,6 +993,9 @@ impl Project {
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
             let _ = writeln!(s, "solo {}", t.solo);
+            if let Some(c) = t.channel {
+                let _ = writeln!(s, "midi_channel {}", c + 1);
+            }
             // Up to the last entry that does not follow; the rest follow.
             if let Some(last) = t.parts.iter().rposition(|&p| p != Part::Follow) {
                 let names: Vec<String> = t.parts[..=last].iter().map(|&p| part_name(p).to_string()).collect();
@@ -1088,6 +1102,13 @@ impl Project {
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
                     "mute" => t.mute = parse_bool(rest).map_err(err)?,
                     "solo" => t.solo = parse_bool(rest).map_err(err)?,
+                    "midi_channel" if ver >= 13 => {
+                        let c: u8 = parse_num(rest).map_err(err)?;
+                        if !(1..=16).contains(&c) {
+                            return Err(err("a MIDI channel is 1 to 16".into()));
+                        }
+                        t.channel = Some(c - 1);
+                    }
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
@@ -1477,6 +1498,7 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     e.push(Edit::SetPan { track, pan: t.pan });
     e.push(Edit::SetMute { track, mute: t.mute });
     e.push(Edit::SetSolo { track, solo: t.solo });
+    e.push(Edit::SetChannel { track, channel: t.channel });
     for (index, &part) in t.parts.iter().enumerate() {
         if part != Part::Follow {
             e.push(Edit::SetPart { track, index: index as u16, part });
@@ -1577,7 +1599,7 @@ mod tests {
         p.tracks[1].parts[3] = Part::Pattern(15);
         p.tracks[4].parts[4] = Part::Pattern(0);
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 12\n"));
+        assert!(text.starts_with("tinvo 13\n"));
         assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
         assert!(text.contains("\nparts . . . . A\n"), "{text}");
         assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
@@ -2003,6 +2025,43 @@ mod tests {
         // In memory and in plain text the path is kept exactly.
         assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn midi_channels_and_the_new_parameters_round_trip_from_format_13() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        assert_eq!(
+            p.apply(Edit::SetChannel { track: 0, channel: Some(99) }),
+            Ok(Edit::SetChannel { track: 0, channel: Some(15) })
+        );
+        let wheel = InstrumentKind::Synth.params().iter().position(|s| s.id == "wheel").unwrap();
+        p.apply(Edit::SetParam { track: 0, index: wheel as u8, value: 7.0 }).unwrap();
+        let text = p.to_text();
+        assert!(text.contains("\nmidi_channel 16\n") && text.contains("\nparam wheel 7\n"), "{text}");
+        assert!(text.contains("\nparam bend_range 2\n"));
+        assert_eq!(text.matches("midi_channel").count(), 1, "only when set");
+        let q = Project::from_text(&text).unwrap();
+        assert_eq!((q.tracks[0].channel, q.tracks[1].channel), (Some(15), None));
+        assert_eq!(q.tracks[0].params[wheel], 7.0);
+        // Undo puts it back, and a removed track comes back with it.
+        assert_eq!(
+            p.inverse(&Edit::SetChannel { track: 0, channel: None }).unwrap(),
+            [Edit::SetChannel { track: 0, channel: Some(15) }]
+        );
+        let back = p.inverse(&Edit::RemoveTrack(0)).unwrap();
+        assert!(back.contains(&Edit::SetChannel { track: 0, channel: Some(15) }));
+        for (text, needle) in [
+            ("tinvo 13\ntrack synth\nmidi_channel 0\nend", "1 to 16"),
+            ("tinvo 13\ntrack synth\nmidi_channel 17\nend", "1 to 16"),
+            ("tinvo 12\ntrack synth\nmidi_channel 1\nend", "unknown track key"),
+            ("tinvo 12\ntrack synth\nparam bend_range 3\nend", "unknown parameter"),
+            ("tinvo 12\ntrack sampler\nparam bend_range 3\nend", "unknown parameter"),
+        ] {
+            let e = Project::from_text(text).unwrap_err();
+            assert!(e.message.contains(needle), "{text:?}: {e}");
+        }
     }
 
     #[test]

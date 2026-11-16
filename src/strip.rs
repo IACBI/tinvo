@@ -85,7 +85,7 @@ pub fn track_param_count(kind: InstrumentKind) -> usize {
 pub fn track_param_since(kind: InstrumentKind, index: usize) -> u32 {
     let n = kind.params().len();
     if index < n {
-        if kind == InstrumentKind::Synth && index == crate::instrument::synth_lfo_sync() { 12 } else { 1 }
+        crate::instrument::param_since(kind, index)
     } else if index < n + sp::COUNT {
         if index - n == sp::COMP_KEY { 9 } else { 7 }
     } else {
@@ -406,6 +406,11 @@ mod tests {
         let lfo_sync = s.params().iter().position(|p| p.id == "lfo_sync").unwrap();
         assert_eq!(track_param_since(s, lfo_sync), 12);
         assert_eq!(track_param_since(s, lfo_sync - 1), 1);
+        let since =
+            |k: InstrumentKind, id: &str| track_param_since(k, k.params().iter().position(|p| p.id == id).unwrap());
+        assert_eq!((since(s, "bend_range"), since(s, "wheel")), (13, 13));
+        let m = InstrumentKind::Sampler;
+        assert_eq!((since(m, "bend_range"), since(m, "resonance")), (13, 1));
     }
 
     #[test]

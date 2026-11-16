@@ -125,7 +125,7 @@ Known limits:
 Known limits:
 - No MIDI device was available while developing this phase. The parser, the engine's live notes, step entry and the path from the MIDI handler to both mailboxes are tested; the WinMM, rawmidi and CoreMIDI code compiles and links in CI but has never received a real message.
 - Live notes start at the beginning of the audio callback after they arrive, so their timing jitters by up to one device period (10 ms on the development machine) on top of the output latency. Backends' timestamps are not used yet.
-- Only notes are used: no sustain pedal, pitch bend, controllers or MIDI channels (every channel plays the selected track). There is no live recording while the pattern plays (Phase 10a adds it).
+- Only notes are used: no sustain pedal, pitch bend, controllers or MIDI channels (every channel plays the selected track; Phase 10b adds them). There is no live recording while the pattern plays (Phase 10a adds it).
 - On Linux, rawmidi sees hardware and USB ports only, not software clients of the ALSA sequencer.
 - A MIDI input that is unplugged stays silent until another one is picked with `M`; it is not reopened by itself.
 - If more than 256 notes arrive within one audio callback, the extra ones are dropped (a dropped release would leave a note held until the key is pressed again).
@@ -373,6 +373,17 @@ Known limits:
 - Notes record onto steps: a note shorter than a step lasts a step, and two notes on one step play together.
 - Recording from a stop plays the pattern being edited. To record over the song, start it and press `C` in the grid while it plays, without a count-in.
 
+## Phase 10b: Pedal, bend, mod wheel and channels ✅ (0.24.0)
+
+- MIDI input decodes controllers and pitch bend as well as notes, on every backend: the byte parser (CoreMIDI, rawmidi), WinMM's short messages and the ALSA sequencer's controller and pitch bend events. The engine's live mailbox carries the MIDI messages themselves, and `Message::Lost` takes the place of the old all-off note.
+- The sustain pedal holds a key's voice after its release until the pedal lifts, per channel; the take ends a held note's length there.
+- Pitch bend moves the synth's and sampler's voices by up to a `Bend range` parameter per track; the synth's `Mod wheel` parameter picks what the wheel moves, from its value toward its maximum on the parameter's own scale (logarithmic for the cutoff).
+- A track can have a MIDI channel of its own (`H`, `midi_channel` in format 13). Notes and wheels on that channel play every track that has it; channels no track has play the selected track. The engine keeps each channel's bend and wheel and gives every track those of the channels that play it whenever they or the routing change, so a track no longer selected, moved by an insert or whose channel went to another track is back at rest. Recorded keys are told apart by channel and note and end on their own release or pedal, whatever is selected by then; losing the input lifts every pedal and puts every wheel back.
+
+Known limits:
+- Bend and wheel are not recorded into steps, and the wheel moves the synth only.
+- Bend and wheel positions take effect at the start of each audio callback, like live notes, and are not smoothed.
+
 ## Review: performance, security and dead code ✅ (0.24.0)
 
 A second review of the whole project, made with an independent model reading the code. Each finding was checked against the code, and the fixes that change behaviour have tests:
@@ -406,7 +417,7 @@ For larger arrangements and the mix structure they need: drum and vocal groups, 
 - Group buses: a track goes to a group or to the master. Groups have the channel strip, sends and automation.
 - Insert chains on tracks, groups and the master: an ordered list of the built-in effects (EQ, compressor, drive, delay, reverb, chorus) and new ones (a multimode filter, a phaser, a bit crusher, a gate). Each slot can be bypassed and automated.
 - The real-time rules hold: chains are built away from the audio thread and swapped in, and old ones leave through the release queue.
-- Project format 13.
+- A new project format.
 - Tests: routed sums against a mix made by hand, chain order, click-free bypass, latency compensation for slots that look ahead, stems per group, and the allocation test while chains change during playback.
 
 ### Phase 12: CLAP plugins (large)
@@ -419,7 +430,7 @@ For professional instruments and effects: sampled pianos and orchestral librarie
 - The spec's thread rules: main-thread calls from the UI thread, processing on the audio thread, and the host's callbacks honoured.
 - Export runs plugins through the same engine. A plugin whose output depends on timing or block size can make export differ from playback; TINVO says so instead of hiding it.
 - A plugin runs inside TINVO's process, so a plugin that crashes ends the session (the autosave keeps the project). Running plugins in a separate process is not planned.
-- Project format 14: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
+- A new project format: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
 - Tests: two small CLAP plugins built in the repository (a gain and a sine instrument) for scanning, loading, parameters, state, latency and the thread rules, and the allocation test with a plugin playing.
 
 ### Phase 13: Sampled instruments (medium)

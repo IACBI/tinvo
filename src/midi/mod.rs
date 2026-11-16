@@ -1,5 +1,5 @@
 //! MIDI input: listing the input ports, opening one, and decoding its bytes
-//! into note messages.
+//! into the channel messages TINVO plays.
 //!
 //! Each backend calls a handler on its own thread for every message (WinMM's
 //! callback thread, a TINVO thread polling the ALSA sequencer or rawmidi,
@@ -15,17 +15,34 @@ mod rawmidi;
 #[cfg(windows)]
 mod winmm;
 
-/// A decoded channel message TINVO uses. Everything else (controllers,
-/// pitch bend, system messages) is skipped.
+/// The sustain pedal's controller.
+pub const SUSTAIN: u8 = 64;
+/// The mod wheel's controller.
+pub const MOD_WHEEL: u8 = 1;
+
+/// A decoded channel message TINVO uses. Everything else (program changes,
+/// aftertouch, system messages) is skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Message {
     /// A key pressed; `velocity` is 1–127.
     NoteOn { channel: u8, note: u8, velocity: u8 },
     /// A key released (including note-on with velocity 0).
     NoteOff { channel: u8, note: u8 },
+    /// A controller moved to `value` (0–127): [`SUSTAIN`], [`MOD_WHEEL`]
+    /// and the others, which TINVO ignores.
+    Control { channel: u8, controller: u8, value: u8 },
+    /// The pitch bend wheel, −8192 (down) to 8191 (up); 0 at rest.
+    Bend { channel: u8, value: i16 },
     /// Messages were lost (the input overran), or the input stopped: keys
     /// held may never send their releases.
     Lost,
+}
+
+impl Message {
+    /// A note-on, or for `velocity` 0 a note-off, as a keyboard sends them.
+    pub fn note(channel: u8, note: u8, velocity: u8) -> Self {
+        decode(0x90 | (channel & 0x0F), note, velocity).expect("a note message")
+    }
 }
 
 /// Decodes one complete channel message.
@@ -35,6 +52,9 @@ pub fn decode(status: u8, data1: u8, data2: u8) -> Option<Message> {
     match status & 0xF0 {
         0x90 if velocity > 0 => Some(Message::NoteOn { channel, note, velocity }),
         0x80 | 0x90 => Some(Message::NoteOff { channel, note }),
+        0xB0 => Some(Message::Control { channel, controller: note, value: velocity }),
+        // Seven low bits first, then seven high ones.
+        0xE0 => Some(Message::Bend { channel, value: (i16::from(velocity) << 7 | i16::from(note)) - 8192 }),
         _ => None,
     }
 }
@@ -233,9 +253,9 @@ mod tests {
 
     #[test]
     fn other_messages_are_skipped_but_counted() {
-        // Controller (2 bytes), program change (1 byte), pitch bend (2), then a
-        // note that relies on none of them.
-        assert_eq!(parse(&[0xB0, 7, 100, 0xC0, 5, 0xE0, 0, 64, 0x90, 60, 1]), [on(60, 1)]);
+        // Program change (1 byte), channel pressure (1), poly pressure (2),
+        // then a note that relies on none of them.
+        assert_eq!(parse(&[0xC0, 5, 0xD0, 9, 0xA0, 60, 9, 0x90, 60, 1]), [on(60, 1)]);
         // Running status applies to program changes too: 5 and 6 are two
         // programs, not a note.
         assert_eq!(parse(&[0xC0, 5, 6, 0x90, 62, 3]), [on(62, 3)]);
@@ -265,7 +285,16 @@ mod tests {
     fn decode_masks_and_classifies() {
         assert_eq!(decode(0x91, 60, 0), Some(Message::NoteOff { channel: 1, note: 60 }));
         assert_eq!(decode(0x90, 0xBC, 0xFF), Some(on(60, 127)));
-        assert_eq!(decode(0xB0, 1, 2), None);
+        assert_eq!(decode(0xB3, 64, 127), Some(Message::Control { channel: 3, controller: SUSTAIN, value: 127 }));
+        assert_eq!(decode(0xC0, 1, 2), None);
+    }
+
+    #[test]
+    fn controllers_and_bends_with_running_status() {
+        let bend = |value| Message::Bend { channel: 2, value };
+        assert_eq!(parse(&[0xE2, 0, 64, 0x7F, 0x7F, 0, 0, 0x7F, 0x3F]), [bend(0), bend(8191), bend(-8192), bend(-1)]);
+        let wheel = |value| Message::Control { channel: 0, controller: MOD_WHEEL, value };
+        assert_eq!(parse(&[0xB0, 1, 0, 1, 127, 0x90, 60, 9]), [wheel(0), wheel(127), on(60, 9)]);
     }
 
     #[test]

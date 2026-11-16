@@ -33,6 +33,14 @@ const LFO_SYNC: &[&str] = &[
 /// Beats in one LFO cycle for each synced value of [`LFO_SYNC`].
 const LFO_SYNC_BEATS: [f32; 14] =
     [0.125, 1.0 / 6.0, 0.25, 0.375, 1.0 / 3.0, 0.5, 0.75, 2.0 / 3.0, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
+/// What the mod wheel moves. Files store the position, so new targets go
+/// at the end.
+const WHEEL_TARGETS: &[&str] =
+    &["off", "cutoff", "resonance", "env amt", "osc mix", "noise", "PW", "LFO>pitch", "LFO>cut", "LFO>level", "LFO>PW"];
+/// The parameter of each [`WHEEL_TARGETS`] after "off". Each is read once
+/// per chunk, so the wheel reaches it at once.
+const WHEEL_PARAMS: [usize; 10] =
+    [p::CUTOFF, p::RESO, p::ENV_AMT, p::MIX, p::NOISE, p::PW, p::LFO_PITCH, p::LFO_CUTOFF, p::LFO_AMP, p::PWM];
 const MIN_PW: f32 = 0.05;
 const MAX_PW: f32 = 0.95;
 
@@ -70,7 +78,10 @@ pub(crate) mod p {
     pub const DETUNE: usize = 28;
     // Added in format 12.
     pub const LFO_SYNC: usize = 29;
-    pub const COUNT: usize = 30;
+    // Added in format 13.
+    pub const BEND_RANGE: usize = 30;
+    pub const WHEEL: usize = 31;
+    pub const COUNT: usize = 32;
 }
 
 /// Semitone-sized steps for frequencies, ~10 % steps for times.
@@ -108,6 +119,8 @@ pub static PARAMS: [ParamSpec; p::COUNT] = [
     ParamSpec::stepped("unison", "Unison", UNISON, 0.0),
     ParamSpec::linear("detune", "Detune", 0.0, 50.0, 12.0, 1.0, Unit::Cents),
     ParamSpec::stepped("lfo_sync", "LFO sync", LFO_SYNC, 0.0),
+    ParamSpec::linear("bend_range", "Bend range", 0.0, 24.0, 2.0, 1.0, Unit::Semitones),
+    ParamSpec::stepped("wheel", "Mod wheel", WHEEL_TARGETS, 1.0),
 ];
 
 /// Glide covers 99 % of the interval in the glide time.
@@ -215,6 +228,9 @@ pub struct PolySynth {
     unison_gain: f32,
     /// Seeds of the voices' noise, and unison start phases.
     rng: Rng,
+    /// The pitch bend wheel, −1 to 1, and the mod wheel, 0 to 1.
+    bend: f32,
+    wheel: f32,
 }
 
 impl PolySynth {
@@ -238,6 +254,8 @@ impl PolySynth {
             unison_ratio: [1.0; MAX_UNISON],
             unison_gain: 1.0,
             rng: Rng::new(0x5E7_0015E),
+            bend: 0.0,
+            wheel: 0.0,
         };
         for (v, spec) in s.params.iter_mut().zip(PARAMS.iter()) {
             *v = spec.default;
@@ -259,6 +277,29 @@ impl PolySynth {
 
     pub fn set_tempo(&mut self, bpm: f32) {
         self.tempo = bpm;
+    }
+
+    /// Bends every voice by `amount` (−1 to 1) of the bend range.
+    pub fn set_bend(&mut self, amount: f32) {
+        self.bend = amount.clamp(-1.0, 1.0);
+    }
+
+    /// Moves the mod wheel's parameter from its value (`amount` 0) to its
+    /// maximum (1).
+    pub fn set_wheel(&mut self, amount: f32) {
+        self.wheel = amount.clamp(0.0, 1.0);
+    }
+
+    /// The parameters with the mod wheel's target moved.
+    fn wheeled(&self) -> [f32; p::COUNT] {
+        let mut pr = self.params;
+        let target = pr[p::WHEEL] as usize;
+        if self.wheel > 0.0 && target > 0 {
+            let i = WHEEL_PARAMS[target - 1];
+            let u = PARAMS[i].to_unit(pr[i]);
+            pr[i] = PARAMS[i].from_unit(u + (1.0 - u) * self.wheel);
+        }
+        pr
     }
 
     #[cfg(test)]
@@ -402,7 +443,8 @@ impl PolySynth {
 
     fn render_chunk(&mut self, out: &mut [f32]) {
         let sr = self.sample_rate;
-        let pr = self.params;
+        let pr = self.wheeled();
+        let bend = self.bend * pr[p::BEND_RANGE];
         let max_hz = 0.45 * sr;
         let (mix, base_cutoff, env_amt, reso) = (pr[p::MIX], pr[p::CUTOFF], pr[p::ENV_AMT], pr[p::RESO]);
         let (lfo_pitch, lfo_cut, lfo_amp, vel_cut) =
@@ -435,7 +477,7 @@ impl PolySynth {
             let static_pitch = v.pitch == target && lfo_pitch == 0.0;
             let (mut inc1, mut inc2) = ([0.0; MAX_UNISON], [0.0; MAX_UNISON]);
             if static_pitch {
-                incs(midi_to_hz(target), &mut inc1, &mut inc2);
+                incs(midi_to_hz(target + bend), &mut inc1, &mut inc2);
             }
             for (o, &l) in out.iter_mut().zip(&lfo) {
                 if !static_pitch {
@@ -445,7 +487,7 @@ impl PolySynth {
                             v.pitch = target;
                         }
                     }
-                    incs(midi_to_hz(v.pitch + l * lfo_pitch), &mut inc1, &mut inc2);
+                    incs(midi_to_hz(v.pitch + bend + l * lfo_pitch), &mut inc1, &mut inc2);
                 }
                 let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
                 let mut s = 0.0;
@@ -521,6 +563,48 @@ mod tests {
         s.render(&mut [0.0; 1]);
         assert_ne!(s.lfo.phase, 0.0);
         assert!((s.lfo.phase - phase - f64::from(s.lfo_hz() / SR)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_mod_wheel_moves_its_parameter_up_to_the_maximum() {
+        let render = |wheel: f32, set: &[(usize, f32)]| {
+            let mut s = PolySynth::new(SR);
+            for &(i, v) in set {
+                s.set_param(i, v);
+            }
+            s.set_wheel(wheel);
+            s.note_on(48, 100);
+            let mut out = vec![0.0; 9600];
+            s.render(&mut out);
+            out
+        };
+        // The wheel opens the filter by default.
+        assert_eq!(PARAMS[p::WHEEL].default, 1.0);
+        let open = render(0.0, &[(p::CUTOFF, 20_000.0)]);
+        assert!(render(1.0, &[]) == open);
+        assert!(render(0.0, &[]) != open && render(0.5, &[]) != open);
+        // Half way on a log scale: from 1200 Hz, √(1200 · 20 000) Hz.
+        let half = render(0.5, &[]);
+        let mid = render(0.0, &[(p::CUTOFF, (1200.0f32 * 20_000.0).sqrt())]);
+        assert!(half.iter().zip(&mid).all(|(a, b)| (a - b).abs() < 1e-4));
+        // Off, the wheel does nothing.
+        let off = (p::WHEEL, 0.0);
+        assert!(render(1.0, &[off]) == render(0.0, &[off]));
+    }
+
+    #[test]
+    fn a_full_bend_plays_the_bend_range_higher() {
+        let render = |note: u8, bend: f32| {
+            let mut s = sine_synth();
+            s.set_param(p::BEND_RANGE, 12.0);
+            s.set_bend(bend);
+            s.note_on(note, 100);
+            let mut out = vec![0.0; 9600];
+            s.render(&mut out);
+            out
+        };
+        assert!(render(57, 1.0) == render(69, 0.0));
+        assert!((freq(&render(69, -0.5)[480..]) - 440.0 / 2f32.sqrt()).abs() < 1.5);
     }
 
     /// A pure sine through an open filter: makes pitch directly measurable.

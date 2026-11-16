@@ -92,7 +92,7 @@ tinvo settings            # check the settings file and print every key and colo
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
-The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. `C` records what you play while the pattern plays: each note lands on its nearest step, and the whole take is one undo step. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
+The editor stays on the system default unless told otherwise, follows it when it changes, and reconnects by itself if the device disappears. It also opens the first MIDI input it finds: notes play the selected track, and with step entry on (`R`) they write steps at the cursor. The sustain pedal holds notes, the pitch bend wheel bends synths and samplers by their `Bend range` (2 semitones unless set), and the mod wheel moves the synth parameter its `Mod wheel` names (the cutoff unless set) up toward its maximum. `H` gives a track a MIDI channel of its own, which plays it whichever track is selected; the other channels play the selected track, and several tracks on one channel play together. `C` records what you play while the pattern plays: each note lands on its nearest step, and the whole take is one undo step. `I` records from the audio input into the selected sampler track and loads the take when you press it again.
 
 The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
@@ -119,6 +119,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
+| `H` | the MIDI channel (1–16) that plays the track whichever is selected; empty for none |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
 | `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
 | `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
@@ -247,7 +248,7 @@ tinvo settings            # check the settings file and print every key and colo
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
 
-Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. `C` ise pattern çalarken çaldıklarını kaydeder: her nota en yakın adıma düşer, kaydın tamamı tek bir undo adımıdır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
+Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kullanır, varsayılan değişince onu takip eder, cihaz kaybolursa kendi kendine yeniden bağlanır. Bulduğu ilk MIDI girişini de açar: çalınan notalar seçili kanalda duyulur, adım girişi açıkken (`R`) imlecin olduğu adıma yazılır. Sustain pedalı notaları tutar, pitch bend tekerleği synth ve sampler'ı `Bend range` kadar büker (ayarlanmadıysa 2 yarım ses), mod tekerleği de synth'te `Mod wheel` ile seçilen parametreyi (ayarlanmadıysa cutoff) en yüksek değerine doğru götürür. `H` ile bir kanala kendi MIDI kanalı verilir; o MIDI kanalı, seçili kanal hangisi olursa olsun onu çalar. Diğer MIDI kanalları seçili kanalı çalar, aynı MIDI kanalındaki birden çok kanal birlikte çalar. `C` ise pattern çalarken çaldıklarını kaydeder: her nota en yakın adıma düşer, kaydın tamamı tek bir undo adımıdır. `I` ses girişinden seçili sampler kanalına kayıt alır; tekrar basınca kayıt durur ve kanala yüklenir.
 
 Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 
@@ -274,6 +275,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
+| `H` | kanalı, seçili olmasa da çalan MIDI kanalı (1–16); boş bırakılırsa yok |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
 | `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |
 | `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |

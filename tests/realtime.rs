@@ -15,9 +15,9 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
-use tinvo::engine::{Command, Edit, Engine, LiveNote, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, Take};
+use tinvo::engine::{Command, Edit, Engine, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, Take};
 use tinvo::instrument::InstrumentKind;
-use tinvo::midi::Parser;
+use tinvo::midi::{MOD_WHEEL, Message, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
 use tinvo::project::Project;
 use tinvo::record::{Meter, capture_into};
@@ -92,7 +92,7 @@ struct Rig {
     engine: Box<Engine>,
     commands: Producer<Command>,
     retired: Consumer<Arc<Sample>>,
-    live: Arc<Mailbox<LiveNote>>,
+    live: Arc<Mailbox<Message>>,
     buf: Vec<f32>,
     rng: Rng,
 }
@@ -293,6 +293,18 @@ fn edits_while_playing() -> usize {
     calls
 }
 
+/// A key, a pedal, a wheel or a bend on one of four channels.
+fn random_message(rng: &mut Rng) -> Message {
+    let channel = (rng.next_u64() % 4) as u8;
+    let (a, b) = ((rng.next_u64() % 128) as u8, (rng.next_u64() % 128) as u8);
+    match rng.next_u64() % 8 {
+        0 => Message::Control { channel, controller: SUSTAIN, value: b },
+        1 => Message::Control { channel, controller: MOD_WHEEL, value: b },
+        2 => Message::Bend { channel, value: (rng.next_u64() % 16384) as i16 - 8192 },
+        _ => Message::note(channel, a, b),
+    }
+}
+
 fn live_notes() -> usize {
     let mut rig = Rig::new(&heavy_project());
     let mut rng = Rng::new(7);
@@ -301,10 +313,14 @@ fn live_notes() -> usize {
     for i in 0..3000u64 {
         if i % 50 == 0 {
             rig.send(Command::SetLiveTrack((i / 50 % 8) as u8));
+            let channel = Some((rng.next_u64() % 5) as u8).filter(|&c| c < 4);
+            rig.send(Command::Edit(Edit::SetChannel { track: (rng.next_u64() % 8) as u8, channel }));
+        }
+        if i % 400 == 399 {
+            let _ = rig.live.push(Message::Lost);
         }
         for _ in 0..rng.next_u64() % 12 {
-            let note = LiveNote { note: (rng.next_u64() % 128) as u8, velocity: (rng.next_u64() % 128) as u8 };
-            let _ = rig.live.push(note);
+            let _ = rig.live.push(random_message(&mut rng));
         }
         calls += rig.callback();
     }
@@ -332,8 +348,7 @@ fn recording_notes() -> usize {
             rig.send(Command::SetLiveTrack((i / 50 % 8) as u8));
         }
         for _ in 0..rng.next_u64() % 6 {
-            let note = LiveNote { note: (rng.next_u64() % 128) as u8, velocity: (rng.next_u64() % 128) as u8 };
-            let _ = rig.live.push(note);
+            let _ = rig.live.push(random_message(&mut rng));
         }
         calls += rig.callback();
         // The UI thread's side, now and then.

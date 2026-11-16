@@ -10,7 +10,7 @@ use crate::autosave::{self, Autosave};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
-    Command, Division, Edit, Engine, LIVE_QUEUE, LiveNote, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
+    Command, Division, Edit, Engine, LIVE_QUEUE, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
     MAX_STEPS, MAX_TRACKS, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared, Step, TAKE_QUEUE,
     Take as TakeEvent, part_position,
 };
@@ -289,6 +289,7 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetPan { .. } => "pan",
         Edit::SetMute { .. } => "mute",
         Edit::SetSolo { .. } => "solo",
+        Edit::SetChannel { .. } => "MIDI channel",
         Edit::SetMixParam { .. } => "bus or master setting",
     }
 }
@@ -340,6 +341,8 @@ pub enum PromptKind {
     Marker,
     /// A colour role's style, on the settings page.
     Style(Role),
+    /// The selected track's MIDI channel.
+    Channel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -534,8 +537,9 @@ pub struct App {
     pub recording: Recording,
     /// While counting in: the beat counted and the beats to count.
     count_in: Option<(u32, u32)>,
-    /// Keys held during step entry, and the notes of the step they write.
-    entry_held: Vec<u8>,
+    /// Keys (channel, note) held during step entry, and the notes of the
+    /// step they write.
+    entry_held: Vec<(u8, u8)>,
     entry_notes: Vec<(u8, u8)>,
     /// The undo step the chord being entered is building (its time and
     /// latest edit), so more keys extend it instead of adding steps.
@@ -954,15 +958,16 @@ impl App {
         self.mode = Mode::MidiInputs(p);
     }
 
-    /// Handles a message from the MIDI input (the engine has already played
-    /// it): with step entry on, notes write the step under the cursor.
-    /// Keys pressed together make a chord; releasing them all moves on.
     /// Forgets the keys held for step entry: their releases will not come.
     fn midi_reset(&mut self) {
         self.entry_held.clear();
         self.entry_notes.clear();
     }
 
+    /// Handles a message from the MIDI input (the engine has already played
+    /// it): with step entry on, keys that play the selected track write the
+    /// step under the cursor. Keys pressed together make a chord; releasing
+    /// them all moves on, whatever is selected by then.
     pub fn midi_message(&mut self, m: Message) {
         self.midi_seen = Some(Instant::now());
         let entering = self.step_entry
@@ -972,19 +977,20 @@ impl App {
             && !self.auto_view
             && self.track < self.track_count();
         match m {
-            Message::NoteOn { note, velocity, .. } => {
-                if !entering || self.entry_held.contains(&note) {
+            Message::NoteOn { channel, note, velocity } => {
+                if !entering || !self.plays_selected(channel) || self.entry_held.contains(&(channel, note)) {
                     return;
                 }
-                self.entry_held.push(note);
+                self.entry_held.push((channel, note));
                 if self.entry_notes.len() < MAX_CHORD && !self.entry_notes.iter().any(|&(n, _)| n == note) {
                     self.entry_notes.push((note, velocity));
                     self.write_entry();
                 }
             }
             Message::Lost => self.midi_reset(),
-            Message::NoteOff { note, .. } => {
-                let Some(i) = self.entry_held.iter().position(|&n| n == note) else { return };
+            Message::Control { .. } | Message::Bend { .. } => {}
+            Message::NoteOff { channel, note } => {
+                let Some(i) = self.entry_held.iter().position(|&k| k == (channel, note)) else { return };
                 self.entry_held.swap_remove(i);
                 if self.entry_held.is_empty() {
                     self.entry_notes.clear();
@@ -993,6 +999,34 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Whether MIDI `channel` plays the selected track: no track has it, so
+    /// it plays the selected one, or the selected track has it.
+    fn plays_selected(&self, channel: u8) -> bool {
+        let mut own = self.project.tracks.iter().enumerate().filter(|(_, t)| t.channel == Some(channel));
+        own.clone().next().is_none() || own.any(|(i, _)| i == self.track)
+    }
+
+    /// Sets the selected track's MIDI channel from what was typed.
+    fn set_channel(&mut self, text: &str) {
+        let channel = match text {
+            "" => None,
+            t => match t.parse::<u8>() {
+                Ok(c @ 1..=16) => Some(c - 1),
+                _ => {
+                    self.set_status(format!("Not changed: a MIDI channel is 1 to 16, not '{t}'"));
+                    return;
+                }
+            },
+        };
+        if self.edit(Edit::SetChannel { track: self.track as u8, channel }) {
+            let name = &self.project.tracks[self.track].name;
+            self.set_status(match channel {
+                Some(c) => format!("MIDI channel {} plays {name}", c + 1),
+                None => format!("{name} plays MIDI only while selected"),
+            });
         }
     }
 
@@ -1388,7 +1422,8 @@ impl App {
                 | Edit::SetGain { track, .. }
                 | Edit::SetPan { track, .. }
                 | Edit::SetMute { track, .. }
-                | Edit::SetSolo { track, .. },
+                | Edit::SetSolo { track, .. }
+                | Edit::SetChannel { track, .. },
             ) => self.track = usize::from(*track),
             _ => {}
         }
@@ -2213,7 +2248,7 @@ impl App {
                 self.mode = after;
                 let text = text.trim().to_string();
                 // An empty marker name removes the marker.
-                if text.is_empty() && kind != PromptKind::Marker {
+                if text.is_empty() && !matches!(kind, PromptKind::Marker | PromptKind::Channel) {
                     return;
                 }
                 match kind {
@@ -2223,6 +2258,7 @@ impl App {
                     PromptKind::LoadSample => self.load_sample(&text),
                     PromptKind::Marker => self.set_marker(&text),
                     PromptKind::Style(role) => self.set_style(role, &text),
+                    PromptKind::Channel => self.set_channel(&text),
                 }
                 return;
             }
@@ -2770,6 +2806,10 @@ impl App {
             Action::Mute => {
                 let mute = !self.project.tracks[self.track].mute;
                 self.edit(Edit::SetMute { track: self.track as u8, mute });
+            }
+            Action::MidiChannel => {
+                let text = self.project.tracks[self.track].channel.map_or(String::new(), |c| (c + 1).to_string());
+                self.mode = Mode::Prompt(PromptKind::Channel, text);
             }
             Action::Solo => {
                 let solo = !self.project.tracks[self.track].solo;
@@ -3830,7 +3870,11 @@ impl App {
             let selected = ti == self.track;
             let name_style = self.style(if selected { Role::SelectedName } else { Role::Text });
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
-            s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, t.name, t.kind.label()), name_style);
+            let kind = match t.channel {
+                Some(c) => format!("{:<5.5} {:>2}", t.kind.label(), c + 1),
+                None => t.kind.label().to_string(),
+            };
+            s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, t.name, kind), name_style);
             s.put(26, y, "M", if t.mute { self.style(Role::Mute) } else { dim });
             s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
             self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
@@ -4041,6 +4085,9 @@ impl App {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
                     }
                     PromptKind::Style(r) => style_prompt(*r),
+                    PromptKind::Channel => {
+                        "MIDI channel 1-16 that plays the track (empty: while selected): ".to_string()
+                    }
                     PromptKind::Export => {
                         let what = format!(
                             "Export [{}, {} ×{}]",
@@ -4381,7 +4428,7 @@ pub fn start_audio(
     project: &Project,
     samples: &[Option<Arc<Sample>>],
     config: &StreamConfig,
-    live: Option<&Arc<Mailbox<LiveNote>>>,
+    live: Option<&Arc<Mailbox<Message>>>,
 ) -> Result<(Stream, EngineLink, u32), String> {
     // Notes played while no engine was listening are stale now.
     let live = live.cloned();
@@ -4434,11 +4481,11 @@ struct Output {
     next_check: Instant,
     retry: Duration,
     /// Live notes from the MIDI input, handed to every engine in turn.
-    live: Option<Arc<Mailbox<LiveNote>>>,
+    live: Option<Arc<Mailbox<Message>>>,
 }
 
 impl Output {
-    fn new(config: StreamConfig, live: Option<Arc<Mailbox<LiveNote>>>) -> Self {
+    fn new(config: StreamConfig, live: Option<Arc<Mailbox<Message>>>) -> Self {
         Self {
             stream: None,
             config,
@@ -4554,12 +4601,12 @@ impl Output {
 /// step entry); both mailboxes outlive inputs and engines.
 struct MidiSession {
     input: Option<midi::Input>,
-    live: Arc<Mailbox<LiveNote>>,
+    live: Arc<Mailbox<Message>>,
     ui: Arc<Mailbox<Message>>,
     /// Set by the handler when a mailbox had no room for a message, or the
     /// input lost some.
     lost: Arc<AtomicBool>,
-    /// Every held note is to be let go (`LiveNote::ALL_OFF` not yet sent).
+    /// Every held note is to be let go (`Message::Lost` not yet sent).
     release: bool,
 }
 
@@ -4596,17 +4643,20 @@ impl MidiSession {
     fn handler(&self) -> impl FnMut(Message) + Send + 'static {
         let (live, ui, lost) = (self.live.clone(), self.ui.clone(), self.lost.clone());
         move |m: Message| {
-            let note = match m {
-                Message::NoteOn { note, velocity, .. } => LiveNote { note, velocity },
-                Message::NoteOff { note, .. } => LiveNote { note, velocity: 0 },
-                Message::Lost => {
-                    lost.store(true, Ordering::Relaxed);
-                    return;
+            // A full mailbox drops a message rather than block this thread.
+            // A lost key or pedal message is said, since a lost release
+            // would leave a note held; the next bend or wheel position
+            // makes up for a lost one. Only notes concern the UI.
+            let vital = match m {
+                Message::NoteOn { .. } | Message::NoteOff { .. } => ui.push(m).is_err() | live.push(m).is_err(),
+                Message::Control { controller: midi::SUSTAIN, .. } => live.push(m).is_err(),
+                Message::Control { .. } | Message::Bend { .. } => {
+                    let _ = live.push(m);
+                    false
                 }
+                Message::Lost => true,
             };
-            // A full mailbox drops the note rather than block this thread,
-            // and says so: a lost release would leave a note held.
-            if live.push(note).is_err() | ui.push(m).is_err() {
+            if vital {
                 lost.store(true, Ordering::Relaxed);
             }
         }
@@ -4627,7 +4677,7 @@ impl MidiSession {
         if self.release {
             app.midi_reset();
             // Tried again next frame if the mailbox is full or busy.
-            self.release = self.live.push(LiveNote::ALL_OFF).is_err();
+            self.release = self.live.push(Message::Lost).is_err();
         }
     }
 }
@@ -5213,7 +5263,7 @@ mod tests {
     }
 
     /// An app driving an engine on this thread, with live notes and takes.
-    fn live_app(project: Project) -> (Box<Engine>, Arc<Mailbox<LiveNote>>, App) {
+    fn live_app(project: Project) -> (Box<Engine>, Arc<Mailbox<Message>>, App) {
         let shared = Arc::new(Shared::new());
         let (tx, rx) = spsc::channel(COMMAND_QUEUE);
         let (take_tx, take_rx) = spsc::channel(TAKE_QUEUE);
@@ -5245,7 +5295,7 @@ mod tests {
         a.recording.quantize = true;
         keys(&mut a, &[Key::Char('C')]);
         assert!(a.status_text().unwrap().starts_with("Recording notes into"), "{:?}", a.status_text());
-        let note = |n, v| live.push(LiveNote { note: n, velocity: v }).unwrap();
+        let note = |n, v| live.push(Message::note(0, n, v)).unwrap();
         run_engine(&mut e, 6000);
         // A note on step 1 and, a little late, a chord on step 2.
         note(60, 100);
@@ -5305,9 +5355,9 @@ mod tests {
         assert!(frame(&a).row_text(0).contains("COUNT 1/4"), "{}", frame(&a).row_text(0));
         // A third of a step before the count-in ends: the first step, early.
         run_engine(&mut e, 94_000 - 100);
-        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 100)).unwrap();
         run_engine(&mut e, 1000);
-        live.push(LiveNote { note: 60, velocity: 0 }).unwrap();
+        live.push(Message::note(0, 60, 0)).unwrap();
         // One whole pass, then Stop.
         run_engine(&mut e, 25_000);
         a.tick();
@@ -5331,13 +5381,13 @@ mod tests {
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 6000);
         // Played on track 1, still queued when track 0 is deleted.
-        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 100)).unwrap();
         run_engine(&mut e, 100);
         assert!(a.edit(Edit::RemoveTrack(0)));
         a.tick();
         run_engine(&mut e, 6000 - 100);
         // Once the engine has the removal too, the live track is track 0.
-        live.push(LiveNote { note: 62, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 62, 100)).unwrap();
         run_engine(&mut e, 100);
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 64);
@@ -5352,7 +5402,7 @@ mod tests {
         assert!(!a.dirty);
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 6000);
-        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 100)).unwrap();
         run_engine(&mut e, 100);
         a.tick();
         keys(&mut a, &[Key::Char('q')]);
@@ -5366,7 +5416,7 @@ mod tests {
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 6000);
         // Held from step 1 through the stop, two steps on.
-        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 100)).unwrap();
         run_engine(&mut e, 12_000);
         a.tick();
         keys(&mut a, &[Key::Char('C'), Key::Char('C')]);
@@ -5377,8 +5427,8 @@ mod tests {
         assert!(a.note_rec.as_ref().is_some_and(|r| !r.closing), "recording again");
         // The second take is its own undo step and holds only what follows.
         run_engine(&mut e, 64);
-        live.push(LiveNote { note: 60, velocity: 0 }).unwrap();
-        live.push(LiveNote { note: 64, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 0)).unwrap();
+        live.push(Message::note(0, 64, 100)).unwrap();
         run_engine(&mut e, 100);
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 64);
@@ -5398,7 +5448,7 @@ mod tests {
         a.tick();
         keys(&mut a, &[Key::Char('C')]);
         run_engine(&mut e, 6000);
-        live.push(LiveNote { note: 60, velocity: 100 }).unwrap();
+        live.push(Message::note(0, 60, 100)).unwrap();
         run_engine(&mut e, 100);
         a.tick();
         // A track inserted above it moves it down.
@@ -6916,13 +6966,77 @@ mod tests {
     }
 
     #[test]
+    fn a_track_gets_a_midi_channel_its_notes_alone_enter() {
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        a.track = bass;
+        keys(&mut a, &[Key::Char('H'), Key::Char('1'), Key::Char('7'), Key::Enter]);
+        assert!(a.status_text().unwrap().contains("1 to 16, not '17'"), "{:?}", a.status_text());
+        assert_eq!(a.project.tracks[bass].channel, None);
+        keys(&mut a, &[Key::Char('H'), Key::Char('1'), Key::Char('2'), Key::Enter]);
+        assert_eq!(a.project.tracks[bass].channel, Some(11));
+        assert!(frame(&a).row_text(2 + bass as u16).contains("Synth 12"), "{}", frame(&a).row_text(2 + bass as u16));
+        // The prompt starts from the channel set; empty takes it away.
+        keys(&mut a, &[Key::Char('H')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Channel, "12".into()));
+        keys(&mut a, &[Key::Backspace, Key::Backspace, Key::Enter]);
+        assert_eq!(a.project.tracks[bass].channel, None);
+        a.undo();
+        assert_eq!(a.project.tracks[bass].channel, Some(11));
+        // Step entry on another track takes no notes of channel 12, and
+        // takes the others.
+        a.track = 0;
+        a.step = 0;
+        keys(&mut a, &[Key::Char('R')]);
+        let before = a.project.tracks[0].steps[0][0];
+        a.midi_message(Message::note(11, 50, 90));
+        a.midi_message(Message::note(11, 50, 0));
+        assert_eq!((a.step, a.project.tracks[0].steps[0][0]), (0, before));
+        a.midi_message(Message::note(0, 50, 90));
+        a.midi_message(Message::note(0, 50, 0));
+        assert_eq!(a.step, 1);
+        // A key of channel 12 pressed on its track ends there, even once
+        // another track is selected; the same pitch on another channel is
+        // a key of its own.
+        a.track = bass;
+        a.midi_message(Message::note(11, 50, 90));
+        a.track = 0;
+        a.midi_message(Message::note(0, 50, 90));
+        assert_eq!(a.entry_held, [(11, 50), (0, 50)]);
+        a.midi_message(Message::note(11, 50, 0));
+        a.midi_message(Message::note(0, 50, 0));
+        assert!(a.entry_held.is_empty() && a.entry_notes.is_empty());
+    }
+
+    #[test]
+    fn controllers_reach_only_the_engine_and_a_lost_bend_lets_nothing_go() {
+        let mut session = MidiSession::new();
+        let mut a = app();
+        let mut handler = session.handler();
+        let bend = Message::Bend { channel: 0, value: 100 };
+        let pedal = Message::Control { channel: 0, controller: midi::SUSTAIN, value: 0 };
+        handler(bend);
+        handler(pedal);
+        assert_eq!((session.live.pop(), session.live.pop(), session.ui.pop()), (Some(bend), Some(pedal), None));
+        for _ in 0..LIVE_QUEUE {
+            session.live.push(bend).unwrap();
+        }
+        handler(bend);
+        session.poll(&mut a);
+        assert!(!session.release, "the next bend makes up for it");
+        handler(pedal);
+        session.poll(&mut a);
+        assert!(session.release, "a lost pedal could hold notes");
+    }
+
+    #[test]
     fn midi_messages_reach_the_engine_and_the_ui() {
         let mut session = MidiSession::new();
         let mut handler = session.handler();
         handler(note_on(60, 99));
         handler(note_off(60));
-        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 99 }));
-        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 0 }));
+        assert_eq!(session.live.pop(), Some(Message::note(0, 60, 99)));
+        assert_eq!(session.live.pop(), Some(Message::note(0, 60, 0)));
         let mut a = app();
         let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
         (a.track, a.step, a.step_entry) = (bass, 2, true);
@@ -6941,11 +7055,11 @@ mod tests {
         let mut handler = session.handler();
         handler(note_on(60, 99));
         session.poll(&mut a);
-        assert_eq!(a.entry_held, [60]);
-        assert_eq!(session.live.pop(), Some(LiveNote { note: 60, velocity: 99 }));
+        assert_eq!(a.entry_held, [(0, 60)]);
+        assert_eq!(session.live.pop(), Some(Message::note(0, 60, 99)));
         // A full mailbox loses the release: everything is let go instead.
         for _ in 0..LIVE_QUEUE {
-            session.live.push(LiveNote { note: 1, velocity: 1 }).unwrap();
+            session.live.push(Message::note(0, 1, 1)).unwrap();
         }
         handler(note_off(60));
         session.poll(&mut a);
@@ -6953,16 +7067,16 @@ mod tests {
         assert!(session.release, "waits for room");
         session.live.clear();
         session.poll(&mut a);
-        assert_eq!((session.live.pop(), session.release), (Some(LiveNote::ALL_OFF), false));
+        assert_eq!((session.live.pop(), session.release), (Some(Message::Lost), false));
         // So does an input that lost messages itself.
         handler(note_on(62, 99));
         session.poll(&mut a);
-        assert_eq!(a.entry_held, [62]);
+        assert_eq!(a.entry_held, [(0, 62)]);
         session.live.clear();
         handler(Message::Lost);
         session.poll(&mut a);
         assert!(a.entry_held.is_empty());
-        assert_eq!((session.live.pop(), session.live.pop()), (Some(LiveNote::ALL_OFF), None));
+        assert_eq!((session.live.pop(), session.live.pop()), (Some(Message::Lost), None));
         // With no input open, turning MIDI off has nothing to let go.
         session.open(&mut a, None);
         session.poll(&mut a);
