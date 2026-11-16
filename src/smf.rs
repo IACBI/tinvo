@@ -834,7 +834,9 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
     let last = last as usize;
 
     let mut project = Project::new();
-    project.tempo = parsed.tempos.first().map_or(120.0, |&(_, us)| bpm(us));
+    // Until a file sets its tempo it plays at 120 BPM, MIDI's default.
+    let at_start = parsed.tempos.partition_point(|&(t, _)| t == 0);
+    project.tempo = at_start.checked_sub(1).map_or(120.0, |i| bpm(parsed.tempos[i].1));
     // The tempo on a step: of the last tempo event at or before it.
     let tempo_at = |step: usize| {
         let tick = step as f64 * division / 4.0;
@@ -1414,6 +1416,20 @@ mod tests {
         ev.extend_from_slice(&[0x8A, 0x60, 0xFF, 0x06, 0x03, b'E', b'n', b'd']);
         let p = read(&file(1, 96, &[&ev])).unwrap().project;
         assert_eq!((p.song.len(), p.marker_at(0)), (1, None));
+    }
+
+    #[test]
+    fn music_before_the_first_tempo_event_plays_at_120_bpm() {
+        // A note, then 60 BPM on the second bar with a note there.
+        let mut ev = vec![0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0];
+        ev.extend_from_slice(&[0x82, 0x20, 0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]);
+        ev.extend_from_slice(&[0x00, 0x90, 62, 100, 0x60, 0x80, 62, 0]);
+        let p = read(&file(1, 96, &[&ev])).unwrap().project;
+        assert_eq!((p.tempo, p.tempo_points[0], p.tempo_points[1]), (120.0, None, Some(60.0)));
+        // Of several at the start, the last one counts.
+        let mut ev = vec![0x00, 0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40, 0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20];
+        ev.extend_from_slice(&[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0]);
+        assert_eq!(read(&file(1, 96, &[&ev])).unwrap().project.tempo, 120.0);
     }
 
     #[test]
