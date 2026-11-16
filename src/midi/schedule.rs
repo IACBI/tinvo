@@ -75,10 +75,14 @@ type Keys = [[u8; 128]; 16];
 /// Orders the messages from the engine by frame and says when each is due.
 #[derive(Debug)]
 pub struct Scheduler {
-    /// (frame, arrival, bytes, length), sorted. Length 0 is a reset, with
-    /// whether the clock runs in the first byte.
-    pending: Vec<(u64, u64, [u8; 3], u8)>,
-    arrivals: u64,
+    /// (frame, bytes, length), in the order the engine queued them, and
+    /// sent in that order: one due before a message queued earlier waits
+    /// for it. When the limiter's latency falls, frames after it wait for
+    /// those before (a millisecond and a half at most), so a release never
+    /// goes before its note, Start before an earlier Stop, or a reset before
+    /// what it lets go. Length 0 is a reset, with whether the clock runs in the first
+    /// byte.
+    pending: Vec<(u64, [u8; 3], u8)>,
     t0: Instant,
     timing: Option<Timing>,
     /// Added to every message's time.
@@ -86,10 +90,6 @@ pub struct Scheduler {
     /// How many times each key on each channel was started and not yet
     /// released: two tracks can play one key, and each release counts.
     sounding: Keys,
-    /// The frame of each key's latest note message: one is never sent before
-    /// another of its key the engine queued earlier, even when the limiter's
-    /// latency fell between them.
-    last: Box<[[u64; 128]; 16]>,
     /// Releases (and a Stop) the output refused while everything was let
     /// go, tried again until [`GIVE_UP`] after `owed_since`.
     owed: Keys,
@@ -104,12 +104,10 @@ impl Scheduler {
     pub fn new(delay: Duration) -> Self {
         Self {
             pending: Vec::new(),
-            arrivals: 0,
             t0: Instant::now(),
             timing: None,
             delay,
             sounding: [[0; 128]; 16],
-            last: Box::new([[0; 128]; 16]),
             owed: [[0; 128]; 16],
             owe_stop: false,
             owed_since: None,
@@ -118,25 +116,38 @@ impl Scheduler {
     }
 
     pub fn push(&mut self, ev: OutEvent) {
-        let (mut frame, bytes, len) = match ev {
+        let (frame, bytes, len) = match ev {
             OutEvent::Message { frame, bytes, len } => (frame, bytes, len.max(1)),
             OutEvent::Reset { frame, running } => (frame, [u8::from(running), 0, 0], 0),
             OutEvent::Anchor { frame, frames, rate, at } => return self.anchor(frame, frames, rate, at),
         };
-        if len == 3 && matches!(bytes[0] & 0xF0, 0x80 | 0x90) {
-            let last = &mut self.last[usize::from(bytes[0] & 0x0F)][usize::from(bytes[1] & 0x7F)];
-            frame = frame.max(*last);
-            *last = frame;
+        self.pending.push((frame, bytes, len));
+    }
+
+    /// `at` in seconds after `t0`, negative before it.
+    fn secs(&self, at: Instant) -> f64 {
+        match at.checked_duration_since(self.t0) {
+            Some(d) => d.as_secs_f64(),
+            None => -(self.t0 - at).as_secs_f64(),
         }
-        let key = (frame, self.arrivals);
-        self.arrivals += 1;
-        let at = self.pending.partition_point(|p| (p.0, p.1) <= key);
-        self.pending.insert(at, (frame, key.1, bytes, len));
+    }
+
+    /// When `frame` is heard (after the delay), or `None` before the first
+    /// anchor.
+    fn heard(&self, frame: u64) -> Option<Instant> {
+        let t = self.timing?;
+        let secs = t.zero + frame as f64 / t.rate;
+        let at = if secs >= 0.0 {
+            self.t0 + Duration::from_secs_f64(secs)
+        } else {
+            self.t0.checked_sub(Duration::from_secs_f64(-secs)).unwrap_or(self.t0)
+        };
+        Some(at + self.delay)
     }
 
     fn anchor(&mut self, frame: u64, frames: u32, rate: f32, at: Instant) {
         let rate = f64::from(rate.max(1.0));
-        let secs = at.saturating_duration_since(self.t0).as_secs_f64();
+        let secs = self.secs(at);
         // The callback's frames play after the buffer playing now.
         let period = f64::from(frames) / rate;
         let zero = secs + period - frame as f64 / rate;
@@ -151,11 +162,10 @@ impl Scheduler {
         });
     }
 
-    /// When `frame` is heard, or `None` before the first anchor.
+    /// When a message for `frame` is due, or `None` before the first
+    /// anchor: never before the scheduler started.
     pub fn due(&self, frame: u64) -> Option<Instant> {
-        let t = self.timing?;
-        let secs = (t.zero + frame as f64 / t.rate).max(0.0);
-        Some(self.t0 + Duration::from_secs_f64(secs) + self.delay)
+        self.heard(frame).map(|at| at.max(self.t0))
     }
 
     /// When the next message is due.
@@ -169,7 +179,7 @@ impl Scheduler {
     /// refused is tried again on the next call, for up to [`GIVE_UP`].
     pub fn send_due(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let mut taken = 0;
-        while let Some(&(frame, _, bytes, len)) = self.pending.get(taken) {
+        while let Some(&(frame, bytes, len)) = self.pending.get(taken) {
             let Some(due) = self.due(frame) else { break };
             if due > now {
                 break;
@@ -245,10 +255,7 @@ impl Scheduler {
     /// Whether no anchor has come for [`STALL`] beyond four callbacks: the
     /// engine is gone, or stalled, and what it sent may never be released.
     pub fn stalled(&self, now: Instant) -> bool {
-        self.timing.is_some_and(|t| {
-            let since = now.saturating_duration_since(self.t0).as_secs_f64();
-            since > t.last + 4.0 * t.period + STALL.as_secs_f64()
-        })
+        self.timing.is_some_and(|t| self.secs(now) > t.last + 4.0 * t.period + STALL.as_secs_f64())
     }
 
     /// Releases every note sent and not yet released, stops the receiver,
@@ -289,17 +296,33 @@ impl Scheduler {
     }
 
     /// Takes the queue of a new engine, or the same engine's from another
-    /// output, at `now`: what it holds from more than [`LATE`] ago is stale.
+    /// output, at `now`: what it holds that was due more than [`LATE`] ago
+    /// is stale. Messages queued before any anchor came in this callback,
+    /// after the last anchor another thread took, so they are kept.
     pub fn take_backlog(&mut self, now: Instant, queue: &mut Consumer<OutEvent>) {
         while let Some(ev) = queue.pop() {
             self.push(ev);
         }
-        let (t0, timing) = (self.t0, self.timing);
-        let before = now.checked_sub(LATE).unwrap_or(t0);
-        let fresh = |frame: u64| {
-            timing.is_none_or(|t| t0 + Duration::from_secs_f64((t.zero + frame as f64 / t.rate).max(0.0)) >= before)
-        };
-        self.pending.retain(|p| fresh(p.0));
+        let before = now.checked_sub(LATE).unwrap_or(now);
+        let stale: Vec<bool> = self.pending.iter().map(|p| self.heard(p.0).is_some_and(|at| at < before)).collect();
+        let mut i = 0;
+        self.pending.retain(|_| {
+            i += 1;
+            !stale[i - 1]
+        });
+    }
+
+    /// One look at what is due at `now`: everything let go if the engine
+    /// has stalled, what that still owes, then the engine's messages, which
+    /// wait until nothing is owed so an old release or Stop cannot follow
+    /// the new engine's notes and Start.
+    pub fn run(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
+        if self.stalled(now) {
+            self.release_all(now, &mut send);
+        }
+        if self.settle(now, &mut send) {
+            self.send_due(now, &mut send);
+        }
     }
 }
 
@@ -375,11 +398,7 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
                     }
                 }
                 let now = Instant::now();
-                if sched.stalled(now) {
-                    sched.release_all(now, &mut send);
-                }
-                sched.settle(now, &mut send);
-                sched.send_due(now, &mut send);
+                sched.run(now, &mut send);
                 let wait = sched.next_due().map_or(POLL, |d| d.saturating_duration_since(now).min(POLL));
                 std::thread::sleep(wait.max(Duration::from_micros(100)));
             }
@@ -448,12 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn messages_go_in_frame_order_when_due() {
+    fn messages_go_in_order_when_due() {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
         s.push(OutEvent::message(0, &[0xFA]));
-        s.push(OutEvent::message(960, &[0x90, 60, 100]));
         s.push(OutEvent::message(480, &[0xF8]));
+        s.push(OutEvent::message(960, &[0x90, 60, 100]));
         s.push(OutEvent::message(960, &[0xF8]));
         s.push(anchor(t0, 0, 0));
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(10)), [vec![0xFA]]);
@@ -492,8 +511,8 @@ mod tests {
         for m in [[0x90, 60, 100], [0x9F, 127, 1], [0x90, 61, 100], [0x90, 61, 0]] {
             s.push(OutEvent::message(0, &m));
         }
-        s.push(OutEvent::message(48_000, &[0x80, 60, 0]));
         s.push(OutEvent::message(0, &[0xFB]));
+        s.push(OutEvent::message(48_000, &[0x80, 60, 0]));
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)).len(), 5);
         assert_eq!(released(&mut s), [vec![0x80, 60, 0], vec![0x8F, 127, 0], vec![0xFC]]);
         assert_eq!((s.next_due(), s.due(0)), (None, None), "the rest is forgotten");
@@ -608,16 +627,73 @@ mod tests {
     }
 
     #[test]
-    fn a_note_message_never_goes_before_one_of_its_key_queued_earlier() {
+    fn a_message_never_goes_before_one_queued_earlier() {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
         s.push(anchor(t0, 0, 0));
-        // Started 77 frames late under the limiter, released after it went.
+        // Queued 77 frames late under the limiter, then the limiter went: a
+        // release, a Stop and Start, a reset, each after what came before.
+        s.push(OutEvent::message(0, &[0xFA]));
         s.push(OutEvent::message(77, &[0x90, 60, 100]));
         s.push(OutEvent::message(64, &[0x80, 60, 0]));
-        s.push(OutEvent::message(64, &[0x90, 62, 100]));
+        s.push(OutEvent::message(77, &[0x90, 62, 100]));
+        s.push(OutEvent::message(77, &[0xFC]));
+        s.push(OutEvent::message(64, &[0xFA]));
+        s.push(OutEvent::message(64, &[0xF8]));
+        s.push(OutEvent::Reset { frame: 64, running: true });
+        s.push(OutEvent::message(64, &[0x90, 64, 100]));
         let got = sent(&mut s, t0 + Duration::from_millis(20));
-        assert_eq!(got, [vec![0x90, 62, 100], vec![0x90, 60, 100], vec![0x80, 60, 0]]);
+        let want = [
+            vec![0xFA],
+            vec![0x90, 60, 100],
+            vec![0x80, 60, 0],
+            vec![0x90, 62, 100],
+            vec![0xFC],
+            vec![0xFA],
+            vec![0xF8],
+            vec![0x80, 62, 0],
+            vec![0x90, 64, 100],
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn what_cleanup_owes_goes_before_the_next_engine_sends() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::message(0, &[0xFA]));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        sent(&mut s, t0 + Duration::from_millis(11));
+        s.release_all(t0 + Duration::from_millis(12), |_| false);
+        s.push(anchor(t0, 0, 20));
+        s.push(OutEvent::message(0, &[0xFA]));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        let mut out = Vec::new();
+        s.run(t0 + Duration::from_millis(31), |m| {
+            out.push(m.to_vec());
+            false
+        });
+        assert_eq!(out, [vec![0x80, 60, 0], vec![0xFC]], "only the old cleanup is tried");
+        out.clear();
+        s.run(t0 + Duration::from_millis(32), |m| {
+            out.push(m.to_vec());
+            true
+        });
+        assert_eq!(out, [vec![0x80, 60, 0], vec![0xFC], vec![0xFA], vec![0x90, 60, 100]]);
+    }
+
+    #[test]
+    fn a_new_engine_counting_from_frame_0_is_not_held_back() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 480_000, 0));
+        s.push(OutEvent::message(480_000, &[0x90, 60, 100]));
+        sent(&mut s, t0 + Duration::from_millis(11));
+        released(&mut s);
+        s.push(anchor(t0, 0, 20));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(31)), [vec![0x90, 60, 100]]);
     }
 
     #[test]
@@ -633,6 +709,27 @@ mod tests {
         tx.push(OutEvent::message(480_000, &[0xFA])).unwrap();
         s.take_backlog(t0 + Duration::from_millis(10_001), &mut rx);
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(10_011)), [vec![0xFA]]);
+        // Stale too from callbacks before this scheduler started.
+        let early = Instant::now();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut s = Scheduler::new(Duration::ZERO);
+        for ev in [
+            OutEvent::Anchor { frame: 0, frames: 480, rate: 48_000.0, at: early },
+            OutEvent::message(0, &[0xFA]),
+            OutEvent::message(0, &[0xFC]),
+        ] {
+            tx.push(ev).unwrap();
+        }
+        s.take_backlog(early + Duration::from_millis(70), &mut rx);
+        s.push(OutEvent::message(1_000_000, &[0xFA]));
+        assert_eq!(s.pending.len(), 1, "stale, though from before the scheduler");
+        // With a delay: heard 70 ms ago is due 20 ms ago, and kept.
+        let mut s = Scheduler::new(Duration::from_millis(50));
+        let t0 = s.t0;
+        tx.push(OutEvent::Anchor { frame: 0, frames: 480, rate: 48_000.0, at: t0 }).unwrap();
+        tx.push(OutEvent::message(0, &[0xFA])).unwrap();
+        s.take_backlog(t0 + Duration::from_millis(80), &mut rx);
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(80)), [vec![0xFA]]);
     }
 
     #[test]
