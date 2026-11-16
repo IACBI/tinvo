@@ -1214,11 +1214,12 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
             let spec = kind_of(track).and_then(|k| track_param(k, usize::from(index)));
             Edit::SetParam { track, index, value: s.value(spec) }
         }
-        17 => match s.below(5) {
+        17 => match s.below(6) {
             0 => Edit::SetGain { track, db: s.f32() },
             1 => Edit::SetPan { track, pan: s.f32() },
             2 => Edit::SetMute { track, mute: s.byte() & 1 == 1 },
             3 => Edit::SetChannel { track, channel: Some(s.byte()).filter(|&c| c < 20) },
+            4 => Edit::SetMidiOut { track, on: s.byte() & 1 == 1 },
             _ => Edit::SetSolo { track, solo: s.byte() & 1 == 1 },
         },
         18 => {

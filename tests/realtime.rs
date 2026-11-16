@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
 use tinvo::engine::{Command, Edit, Engine, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, Take};
 use tinvo::instrument::InstrumentKind;
-use tinvo::midi::{MOD_WHEEL, Message, Parser, SUSTAIN};
+use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
 use tinvo::project::Project;
 use tinvo::record::{Meter, capture_into};
@@ -362,6 +362,45 @@ fn recording_notes() -> usize {
     calls
 }
 
+/// MIDI out: tracks switched to it and back, live notes, the clock across
+/// song entries and stops, with the output queue overflowing at times.
+fn midi_out() -> usize {
+    let mut rig = Rig::new(&heavy_project());
+    let (tx, mut out) = spsc::channel::<OutEvent>(256);
+    rig.engine.attach_midi_out(tx);
+    let mut rng = Rng::new(13);
+    rig.send(Command::SetMidiClock(true));
+    let (mut calls, mut got) = (0, 0);
+    for i in 0..3000u64 {
+        match i % 500 {
+            0 => rig.send(Command::PlaySong { entry: (i / 500 % 3) as u16 }),
+            400 => rig.send(Command::Stop),
+            450 => rig.send(Command::Play),
+            499 => rig.send(Command::Stop),
+            _ => {}
+        }
+        if i % 40 == 0 {
+            let track = (rng.next_u64() % 8) as u8;
+            rig.send(Command::Edit(Edit::SetMidiOut { track, on: rng.next_u64() % 3 != 0 }));
+        }
+        if i == 1500 {
+            rig.send(Command::SetMidiClock(false));
+        }
+        for _ in 0..rng.next_u64() % 6 {
+            let _ = rig.live.push(random_message(&mut rng));
+        }
+        calls += rig.callback();
+        // The output thread's side, now and then.
+        if i % 5 == 0 {
+            while out.pop().is_some() {
+                got += 1;
+            }
+        }
+    }
+    assert!(got > 5000, "the engine sent only {got} events");
+    calls
+}
+
 /// The capture thread's side of recording, at both channel counts and with
 /// the ring overflowing.
 fn capture() -> usize {
@@ -403,12 +442,13 @@ fn midi() -> usize {
 type Check = fn() -> usize;
 
 fn main() {
-    let checks: [(&str, Check); 7] = [
+    let checks: [(&str, Check); 8] = [
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
         ("edits, samples and transport commands while playing", edits_while_playing),
         ("live notes", live_notes),
         ("recording notes and count-ins", recording_notes),
+        ("MIDI out and its clock", midi_out),
         ("the capture side of recording", capture),
         ("MIDI parsing and mailboxes", midi),
     ];

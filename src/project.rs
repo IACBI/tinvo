@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 13
+//! tinvo 14
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -25,6 +25,7 @@
 //! mute false
 //! solo false
 //! midi_channel 3             # the MIDI channel (1-16) that plays it; only when set
+//! midi_out true              # its notes go to the MIDI output; only when set
 //! parts . . B -              # per song entry: . the entry's pattern, a pattern, - rest
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
@@ -61,7 +62,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 13;
+pub const FORMAT_VERSION: u32 = 14;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -85,6 +86,8 @@ pub struct TrackData {
     pub solo: bool,
     /// The MIDI channel (0–15) that plays the track whichever is selected.
     pub channel: Option<u8>,
+    /// Its notes go to the MIDI output instead of sounding.
+    pub midi_out: bool,
     /// `steps[pattern][step]`.
     pub steps: Box<[[Option<Step>; MAX_STEPS]; MAX_PATTERNS]>,
     /// Sampler tracks: the sample file. Absolute in memory; written relative
@@ -141,6 +144,7 @@ impl TrackData {
             mute: false,
             solo: false,
             channel: None,
+            midi_out: false,
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
@@ -574,6 +578,10 @@ impl Project {
                 self.track_mut(track)?.channel = channel;
                 Edit::SetChannel { track, channel }
             }
+            Edit::SetMidiOut { track, on } => {
+                self.track_mut(track)?.midi_out = on;
+                edit
+            }
         };
         Ok(applied)
     }
@@ -927,6 +935,7 @@ impl Project {
             Edit::SetMute { track, .. } => vec![Edit::SetMute { track, mute: self.track(track)?.mute }],
             Edit::SetSolo { track, .. } => vec![Edit::SetSolo { track, solo: self.track(track)?.solo }],
             Edit::SetChannel { track, .. } => vec![Edit::SetChannel { track, channel: self.track(track)?.channel }],
+            Edit::SetMidiOut { track, .. } => vec![Edit::SetMidiOut { track, on: self.track(track)?.midi_out }],
         };
         Ok(inv)
     }
@@ -995,6 +1004,9 @@ impl Project {
             let _ = writeln!(s, "solo {}", t.solo);
             if let Some(c) = t.channel {
                 let _ = writeln!(s, "midi_channel {}", c + 1);
+            }
+            if t.midi_out {
+                let _ = writeln!(s, "midi_out true");
             }
             // Up to the last entry that does not follow; the rest follow.
             if let Some(last) = t.parts.iter().rposition(|&p| p != Part::Follow) {
@@ -1109,6 +1121,7 @@ impl Project {
                         }
                         t.channel = Some(c - 1);
                     }
+                    "midi_out" if ver >= 14 => t.midi_out = parse_bool(rest).map_err(err)?,
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
@@ -1499,6 +1512,7 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     e.push(Edit::SetMute { track, mute: t.mute });
     e.push(Edit::SetSolo { track, solo: t.solo });
     e.push(Edit::SetChannel { track, channel: t.channel });
+    e.push(Edit::SetMidiOut { track, on: t.midi_out });
     for (index, &part) in t.parts.iter().enumerate() {
         if part != Part::Follow {
             e.push(Edit::SetPart { track, index: index as u16, part });
@@ -1598,8 +1612,9 @@ mod tests {
         p.tracks[1].parts[1] = Part::Rest;
         p.tracks[1].parts[3] = Part::Pattern(15);
         p.tracks[4].parts[4] = Part::Pattern(0);
+        p.tracks[2].midi_out = true;
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 13\n"));
+        assert!(text.starts_with("tinvo 14\n"));
         assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
         assert!(text.contains("\nparts . . . . A\n"), "{text}");
         assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
@@ -2025,6 +2040,24 @@ mod tests {
         // In memory and in plain text the path is kept exactly.
         assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn midi_out_round_trips_from_format_14() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        p.apply(Edit::SetMidiOut { track: 1, on: true }).unwrap();
+        let text = p.to_text();
+        assert_eq!(text.matches("midi_out").count(), 1, "only when set");
+        assert!(text.contains("\nmidi_out true\n"), "{text}");
+        let q = Project::from_text(&text).unwrap();
+        assert_eq!((q.tracks[0].midi_out, q.tracks[1].midi_out), (false, true));
+        let off = Edit::SetMidiOut { track: 1, on: false };
+        assert_eq!(p.inverse(&off).unwrap(), [Edit::SetMidiOut { track: 1, on: true }]);
+        assert!(p.inverse(&Edit::RemoveTrack(1)).unwrap().contains(&Edit::SetMidiOut { track: 1, on: true }));
+        let e = Project::from_text("tinvo 13\ntrack synth\nmidi_out true\nend").unwrap_err();
+        assert!(e.message.contains("unknown track key"), "{e}");
     }
 
     #[test]

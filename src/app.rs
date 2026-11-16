@@ -290,6 +290,7 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetMute { .. } => "mute",
         Edit::SetSolo { .. } => "solo",
         Edit::SetChannel { .. } => "MIDI channel",
+        Edit::SetMidiOut { .. } => "MIDI out",
         Edit::SetMixParam { .. } => "bus or master setting",
     }
 }
@@ -1423,7 +1424,8 @@ impl App {
                 | Edit::SetPan { track, .. }
                 | Edit::SetMute { track, .. }
                 | Edit::SetSolo { track, .. }
-                | Edit::SetChannel { track, .. },
+                | Edit::SetChannel { track, .. }
+                | Edit::SetMidiOut { track, .. },
             ) => self.track = usize::from(*track),
             _ => {}
         }

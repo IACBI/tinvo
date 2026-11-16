@@ -19,7 +19,7 @@ use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
-use crate::midi::{MOD_WHEEL, Message, SUSTAIN};
+use crate::midi::{MOD_WHEEL, Message, OutEvent, SUSTAIN};
 use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
 use crate::rt::mailbox::Mailbox;
@@ -80,9 +80,39 @@ struct Held {
     channel: u8,
     note: u8,
     voice: VoiceId,
+    /// The channel and note it sent to the MIDI output, on a MIDI-out track.
+    out: Option<(u8, u8)>,
     /// Released while the sustain pedal was down: it sounds on until the
     /// pedal lifts.
     sustained: bool,
+}
+
+/// Capacity of the queue that hands MIDI output to its thread.
+pub const MIDI_OUT_QUEUE: usize = 8192;
+
+/// A note sent to the MIDI output, released on `frame`.
+#[derive(Clone, Copy)]
+struct MidiOff {
+    frame: u64,
+    channel: u8,
+    note: u8,
+}
+
+/// Where the engine sends MIDI ([`Engine::attach_midi_out`]), each message
+/// stamped with the frame it is heard on: `latency` after the sequencer's.
+struct MidiSink {
+    out: Option<Producer<OutEvent>>,
+    latency: u64,
+}
+
+impl MidiSink {
+    fn send(&mut self, frame: u64, bytes: &[u8]) {
+        if let Some(q) = self.out.as_mut() {
+            // A full queue loses the message; the output thread lets every
+            // note it sent go when it closes.
+            let _ = q.push(OutEvent::message(frame + self.latency, bytes));
+        }
+    }
 }
 pub const MIN_TEMPO: f32 = 20.0;
 pub const MAX_TEMPO: f32 = 300.0;
@@ -376,6 +406,13 @@ pub enum Edit {
         track: u8,
         channel: Option<u8>,
     },
+    /// Sends the track's notes to the MIDI output instead of sounding them:
+    /// on its MIDI channel (channel 1 without one), drums on channel 10 as
+    /// their General MIDI notes.
+    SetMidiOut {
+        track: u8,
+        on: bool,
+    },
     /// Sets a parameter of the buses or the master (see
     /// [`mix::MIX_PARAMS`]).
     SetMixParam {
@@ -428,6 +465,10 @@ pub enum Command {
         beat_pulses: u16,
         entry: Option<u16>,
     },
+    /// Sends MIDI clock, 24 a quarter note while playing, with start,
+    /// continue (after the song position, for a song started past its first
+    /// entry) and stop, from the next Play on.
+    SetMidiClock(bool),
 }
 
 /// Capacity of the queue that hands recorded notes to the UI thread.
@@ -788,6 +829,12 @@ struct Track {
     solo: bool,
     /// The MIDI channel that plays it ([`Edit::SetChannel`]).
     channel: Option<u8>,
+    /// Its notes go to the MIDI output ([`Edit::SetMidiOut`]).
+    midi_out: bool,
+    /// Neither muted nor left out by a solo.
+    audible: bool,
+    midi_offs: [MidiOff; MAX_PENDING_OFFS],
+    midi_off_count: usize,
     gain_l: Smoother,
     gain_r: Smoother,
     /// Send levels, applied after fader and pan.
@@ -825,6 +872,10 @@ impl Track {
             mute: false,
             solo: false,
             channel: None,
+            midi_out: false,
+            audible: true,
+            midi_offs: [MidiOff { frame: 0, channel: 0, note: 0 }; MAX_PENDING_OFFS],
+            midi_off_count: 0,
             gain_l: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             gain_r: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             sends: [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT],
@@ -859,6 +910,9 @@ impl Track {
         self.mute = false;
         self.solo = false;
         self.channel = None;
+        self.midi_out = false;
+        self.audible = true;
+        self.midi_off_count = 0;
         self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.gain_r = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.sends = [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT];
@@ -908,14 +962,66 @@ impl Track {
     }
 
     /// Starts every note of `step` now and schedules their release `gate`
-    /// frames later.
-    fn hit(&mut self, now: u64, step: &Step, gate: u64) {
+    /// frames later; on a MIDI-out track, sends them.
+    fn hit(&mut self, now: u64, step: &Step, gate: u64, midi: &mut MidiSink) {
+        if self.midi_out {
+            if self.audible {
+                // A drum is one note, whatever chord the step holds.
+                let n = if self.instrument.kind().is_drum() { 1 } else { MAX_CHORD };
+                for note in step.notes().take(n) {
+                    let (channel, note) = self.out_note(note);
+                    self.send_on(now, channel, note, step.velocity, midi);
+                    self.schedule_midi_off(MidiOff { frame: now + gate.max(1), channel, note }, midi);
+                }
+            }
+            return;
+        }
         for note in step.notes() {
             let id = self.instrument.note_on(note, step.velocity);
             if self.instrument.uses_note_off() {
                 self.schedule_off(now + gate.max(1), id);
             }
         }
+    }
+
+    /// The channel and note a MIDI-out track sends `note` as.
+    fn out_note(&self, note: u8) -> (u8, u8) {
+        match crate::smf::drum_note(self.instrument.kind()) {
+            Some(n) => (crate::smf::DRUM_CHANNEL, n),
+            None => (self.channel.unwrap_or(0), note.min(127)),
+        }
+    }
+
+    /// Sends a note-on, first ending the same note if it still sounds, so
+    /// the receiver hears it start again.
+    fn send_on(&mut self, frame: u64, channel: u8, note: u8, velocity: u8, midi: &mut MidiSink) {
+        let same = |o: &MidiOff| o.channel == channel && o.note == note;
+        if let Some(i) = self.midi_offs[..self.midi_off_count].iter().position(same) {
+            self.midi_offs[i] = self.midi_offs[self.midi_off_count - 1];
+            self.midi_off_count -= 1;
+            midi.send(frame, &[0x80 | channel, note, 0]);
+        }
+        midi.send(frame, &[0x90 | channel, note, velocity.clamp(1, 127)]);
+    }
+
+    fn schedule_midi_off(&mut self, off: MidiOff, midi: &mut MidiSink) {
+        if self.midi_off_count == MAX_PENDING_OFFS {
+            // As in `schedule_off`: release the earliest note now.
+            let (i, o) = self.midi_offs.iter().copied().enumerate().min_by_key(|(_, o)| o.frame).unwrap();
+            midi.send(off.frame.min(o.frame), &[0x80 | o.channel, o.note, 0]);
+            self.midi_offs[i] = self.midi_offs[self.midi_off_count - 1];
+            self.midi_off_count -= 1;
+        }
+        self.midi_offs[self.midi_off_count] = off;
+        self.midi_off_count += 1;
+    }
+
+    /// Releases every note it sent, on `frame`.
+    fn release_midi(&mut self, frame: u64, midi: &mut MidiSink) {
+        for o in &self.midi_offs[..self.midi_off_count] {
+            midi.send(frame, &[0x80 | o.channel, o.note, 0]);
+        }
+        self.midi_off_count = 0;
     }
 
     fn schedule_on(&mut self, on: PendingOn) {
@@ -928,14 +1034,14 @@ impl Track {
     }
 
     /// Plays deferred hits due at or before `frame`.
-    fn fire_ons(&mut self, frame: u64) {
+    fn fire_ons(&mut self, frame: u64, midi: &mut MidiSink) {
         let mut i = 0;
         while i < self.on_count {
             let on = self.ons[i];
             if on.frame <= frame {
                 self.ons[i] = self.ons[self.on_count - 1];
                 self.on_count -= 1;
-                self.hit(frame, &on.step, on.gate);
+                self.hit(frame, &on.step, on.gate, midi);
             } else {
                 i += 1;
             }
@@ -959,7 +1065,7 @@ impl Track {
         self.off_count += 1;
     }
 
-    fn fire_offs(&mut self, frame: u64) {
+    fn fire_offs(&mut self, frame: u64, midi: &mut MidiSink) {
         let mut i = 0;
         while i < self.off_count {
             if self.offs[i].frame <= frame {
@@ -970,14 +1076,27 @@ impl Track {
                 i += 1;
             }
         }
+        let mut i = 0;
+        while i < self.midi_off_count {
+            let o = self.midi_offs[i];
+            if o.frame <= frame {
+                midi.send(o.frame, &[0x80 | o.channel, o.note, 0]);
+                self.midi_offs[i] = self.midi_offs[self.midi_off_count - 1];
+                self.midi_off_count -= 1;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn earliest_off(&self) -> Option<u64> {
-        self.offs[..self.off_count].iter().map(|o| o.frame).min()
+        let midi = self.midi_offs[..self.midi_off_count].iter().map(|o| o.frame);
+        self.offs[..self.off_count].iter().map(|o| o.frame).chain(midi).min()
     }
 
-    fn release_all(&mut self) {
+    fn release_all(&mut self, frame: u64, midi: &mut MidiSink) {
         self.instrument.release_all();
+        self.release_midi(frame, midi);
         self.off_count = 0;
         self.on_count = 0;
     }
@@ -1088,6 +1207,11 @@ pub struct Engine {
     cursor: u64,
     count_in: Option<CountIn>,
     click: Click,
+    midi: MidiSink,
+    /// Whether Play sends MIDI clock ([`Command::SetMidiClock`]).
+    midi_clock: bool,
+    /// The pulse the next clock is sent for, while it runs.
+    clock_pulse: Option<u64>,
 }
 
 /// A removed track and the frames left of its fade.
@@ -1147,7 +1271,7 @@ impl Engine {
             limiter_reduction: 0.0,
             live: None,
             live_track: 0,
-            held: [Held { track: 0, channel: 0, note: 0, voice: VoiceId::NONE, sustained: false }; MAX_LIVE],
+            held: [Held { track: 0, channel: 0, note: 0, voice: VoiceId::NONE, out: None, sustained: false }; MAX_LIVE],
             held_count: 0,
             pedal: 0,
             bends: [0.0; 16],
@@ -1160,6 +1284,9 @@ impl Engine {
             cursor: 0,
             count_in: None,
             click: Click::default(),
+            midi: MidiSink { out: None, latency: 0 },
+            midi_clock: false,
+            clock_pulse: None,
         })
     }
 
@@ -1200,6 +1327,13 @@ impl Engine {
         self.live = Some(mailbox);
     }
 
+    /// Sends the MIDI-out tracks' notes, and the clock while it is on, to
+    /// `queue`, with an anchor at the start of every callback that tells
+    /// the output thread when its frames are heard.
+    pub fn attach_midi_out(&mut self, queue: Producer<OutEvent>) {
+        self.midi.out = Some(queue);
+    }
+
     /// Sends what [`Command::RecordNotes`] records to `queue`.
     pub fn attach_takes(&mut self, queue: Producer<Take>) {
         self.takes = Some(queue);
@@ -1223,6 +1357,7 @@ impl Engine {
     /// that slot's idle track in exchange. With every slot busy, the fade
     /// nearest its end is cut short.
     fn fade_out(&mut self, slot: usize) {
+        self.tracks[slot].release_midi(self.now, &mut self.midi);
         let Some(f) = self.fading.iter_mut().min_by_key(|f| f.left) else { return };
         if f.left == 0 {
             self.fading_count += 1;
@@ -1298,15 +1433,24 @@ impl Engine {
             Command::Cue(p) => self.cue = p.min(MAX_PATTERNS as u8 - 1),
             Command::Stop => {
                 self.end_recorded();
+                if self.clock_pulse.take().is_some() {
+                    self.midi.send(self.now, &[0xFC]);
+                }
                 self.count_in = None;
                 self.click.gain = 0.0;
                 self.transport.stop();
                 self.current = None;
                 self.conductor = None;
                 self.upcoming = None;
+                for h in &self.held[..self.held_count] {
+                    if let Some((channel, note)) = h.out {
+                        self.midi.send(self.now, &[0x80 | channel, note, 0]);
+                    }
+                }
                 self.held_count = 0;
+                let (now, midi) = (self.now, &mut self.midi);
                 for t in &mut self.tracks[..self.track_count] {
-                    t.release_all();
+                    t.release_all(now, midi);
                     t.clock = None;
                     t.shown = None;
                     t.ramping = false;
@@ -1320,6 +1464,12 @@ impl Engine {
                 self.automate(self.now);
             }
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
+            Command::SetMidiClock(on) => {
+                self.midi_clock = on;
+                if !on && self.clock_pulse.take().is_some() {
+                    self.midi.send(self.now, &[0xFC]);
+                }
+            }
             Command::Audition { track, step, frames } => {
                 let (now, n) = (self.now, self.track_count);
                 let i = usize::from(track);
@@ -1327,7 +1477,7 @@ impl Engine {
                     if self.tracks[i].instrument.kind() == InstrumentKind::HatClosed {
                         choke_open_hats(&mut self.tracks[..n]);
                     }
-                    self.tracks[i].hit(now, &step.sanitized(), u64::from(frames));
+                    self.tracks[i].hit(now, &step.sanitized(), u64::from(frames), &mut self.midi);
                 }
             }
         }
@@ -1659,11 +1809,23 @@ impl Engine {
         if kind == InstrumentKind::HatClosed {
             choke_open_hats(&mut self.tracks[..self.track_count]);
         }
+        let t = &mut self.tracks[i];
+        if t.midi_out {
+            if t.audible {
+                let (c, n) = t.out_note(note);
+                t.send_on(self.now, c, n, velocity, &mut self.midi);
+                let out = Some((c, n));
+                self.held[self.held_count] =
+                    Held { track: i as u8, channel, note, voice: VoiceId::NONE, out, sustained: false };
+                self.held_count += 1;
+            }
+            return;
+        }
         // Drums sound at their own pitch whatever the key.
         let pitch = if kind.is_drum() { kind.default_note() } else { note.min(127) };
-        let voice = self.tracks[i].instrument.note_on(pitch, velocity.min(127));
+        let voice = t.instrument.note_on(pitch, velocity.min(127));
         if voice != VoiceId::NONE {
-            self.held[self.held_count] = Held { track: i as u8, channel, note, voice, sustained: false };
+            self.held[self.held_count] = Held { track: i as u8, channel, note, voice, out: None, sustained: false };
             self.held_count += 1;
         }
     }
@@ -1687,7 +1849,9 @@ impl Engine {
 
     fn release_held(&mut self, k: usize) {
         let h = self.held[k];
-        if let Some(t) = self.tracks[..self.track_count].get_mut(usize::from(h.track)) {
+        if let Some((channel, note)) = h.out {
+            self.midi.send(self.now, &[0x80 | channel, note, 0]);
+        } else if let Some(t) = self.tracks[..self.track_count].get_mut(usize::from(h.track)) {
             t.instrument.note_off(h.voice);
         }
         self.held.copy_within(k + 1..self.held_count, k);
@@ -1734,6 +1898,19 @@ impl Engine {
         for t in 0..self.track_count {
             self.tracks[t].clock = Some(self.tick_at(Some(t), &e, 0));
             self.tracks[t].early_for = None;
+        }
+        if self.midi_clock {
+            match e.entry.filter(|&i| self.song_mode && i > 0) {
+                // The song position counts 16th notes (MIDI beats).
+                Some(i) => {
+                    let pulses: u64 = self.song[..usize::from(i)].iter().map(|&p| self.pattern_pulses(p)).sum();
+                    let beats = (pulses / u64::from(PULSES_PER_BEAT / 4)).min(0x3FFF) as u16;
+                    self.midi.send(at, &[0xF2, (beats & 0x7F) as u8, (beats >> 7) as u8]);
+                    self.midi.send(at, &[0xFB]);
+                }
+                None => self.midi.send(at, &[0xFA]),
+            }
+            self.clock_pulse = Some(0);
         }
     }
 
@@ -2283,6 +2460,21 @@ impl Engine {
                     t.channel = channel.map(|c| c.min(15));
                 }
             }
+            Edit::SetMidiOut { track, on } => {
+                let (now, midi) = (self.now, &mut self.midi);
+                if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
+                    if t.midi_out && !on {
+                        t.release_midi(now, midi);
+                    }
+                    t.midi_out = on;
+                }
+                // Live notes sounding on it end where they started.
+                for k in (0..self.held_count).rev() {
+                    if usize::from(self.held[k].track) == usize::from(track) {
+                        self.release_held(k);
+                    }
+                }
+            }
             Edit::SetSolo { track, solo } => {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
                     t.solo = solo;
@@ -2299,6 +2491,7 @@ impl Engine {
         let any_solo = tracks.iter().any(|t| t.solo);
         for t in tracks {
             let audible = !t.mute && (!any_solo || t.solo);
+            t.audible = audible;
             let g = if audible { fader_gain(t.auto_gain.unwrap_or(t.gain_db)) } else { 0.0 };
             let (l, r) = pan_gains(t.auto_pan.unwrap_or(t.pan));
             t.gain_l.set_target(g * l);
@@ -2320,6 +2513,16 @@ impl Engine {
                 self.handle(cmd);
             }
             self.commands = Some(rx);
+        }
+        self.midi.latency = self.mix.latency() as u64;
+        if let Some(q) = self.midi.out.as_mut() {
+            let anchor = OutEvent::Anchor {
+                frame: self.now,
+                frames: (out.len() / 2) as u32,
+                rate: self.sample_rate,
+                at: std::time::Instant::now(),
+            };
+            let _ = q.push(anchor);
         }
         self.play_live();
         for chunk in out.chunks_mut(BLOCK * 2) {
@@ -2352,9 +2555,9 @@ impl Engine {
     /// ending exactly when the next note starts is free for reuse.
     fn fire_due(&mut self, frame: u64) {
         loop {
-            let tracks = &mut self.tracks[..self.track_count];
+            let (tracks, midi) = (&mut self.tracks[..self.track_count], &mut self.midi);
             for t in tracks.iter_mut() {
-                t.fire_offs(frame);
+                t.fire_offs(frame, midi);
             }
             let closed_hat_due = tracks.iter().any(|t| {
                 t.instrument.kind() == InstrumentKind::HatClosed && t.earliest_on().is_some_and(|f| f <= frame)
@@ -2363,7 +2566,7 @@ impl Engine {
                 choke_open_hats(tracks);
             }
             for t in tracks.iter_mut() {
-                t.fire_ons(frame);
+                t.fire_ons(frame, midi);
             }
             match self.next_event() {
                 // A step only queues hits; the next pass fires the ones due
@@ -2585,6 +2788,20 @@ impl Engine {
             }
             // fire_due consumed everything at `pos`, so `next > pos`.
             debug_assert!(next > pos);
+            // Nothing moves the transport inside a segment, so the clocks
+            // due in it are on the same frames at any buffer size. One a
+            // tempo change moved before the segment goes at its start.
+            if let Some(mut pulse) = self.clock_pulse {
+                loop {
+                    let f = self.transport.pulse_frame(pulse);
+                    if f >= next {
+                        break;
+                    }
+                    self.midi.send(f.max(pos), &[0xF8]);
+                    pulse += 1;
+                }
+                self.clock_pulse = Some(pulse);
+            }
             let (a, b) = ((pos - start) as usize, (next - start) as usize);
             self.render_segment(a, b);
             self.click.render(&mut self.mix_l[a..b], &mut self.mix_r[a..b]);
@@ -2990,6 +3207,185 @@ mod tests {
         let fade = e.fade_frames as usize;
         run(&mut e, fade);
         assert_eq!(e.fading_count, 0);
+    }
+
+    /// An engine whose MIDI output comes out of the returned queue.
+    fn midi_engine(edits: &[Edit]) -> (Box<Engine>, spsc::Consumer<OutEvent>) {
+        let mut e = engine(edits);
+        let (tx, rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        (e, rx)
+    }
+
+    /// The messages queued so far, with their frames.
+    fn sent(rx: &mut spsc::Consumer<OutEvent>) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Some(ev) = rx.pop() {
+            if let OutEvent::Message { frame, bytes, len } = ev {
+                out.push((frame, bytes[..usize::from(len)].to_vec()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_midi_out_track_sends_its_notes_instead_of_sounding() {
+        let note = Step { chord: [4, 7, 0], ..Step::new(60, 100, 2) };
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(note) },
+            Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step { note: 50, ..note }) },
+            Edit::SetChannel { track: 0, channel: Some(2) },
+            Edit::SetChannel { track: 1, channel: Some(2) },
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::SetMidiOut { track: 1, on: true },
+        ]);
+        e.handle(Command::Play);
+        assert!(run(&mut e, 24_000).iter().all(|&x| x == 0.0), "nothing sounds");
+        // The chord on its channel for two steps; the kick once, on channel
+        // 10 as General MIDI's kick, for its step.
+        let mut got = sent(&mut rx);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (0, vec![0x99, 36, 100]),
+                (6000, vec![0x92, 60, 100]),
+                (6000, vec![0x92, 64, 100]),
+                (6000, vec![0x92, 67, 100]),
+                (12_000, vec![0x89, 36, 0]),
+                (18_000, vec![0x82, 60, 0]),
+                (18_000, vec![0x82, 64, 0]),
+                (18_000, vec![0x82, 67, 0]),
+            ]
+        );
+        // Muted, it sends nothing; nor once MIDI out is off, when it sounds.
+        e.handle(Command::Edit(Edit::SetMute { track: 1, mute: true }));
+        run(&mut e, 96_000);
+        let pass = sent(&mut rx);
+        assert!(pass.len() == 6 && pass.iter().all(|(_, m)| m[0] & 0x0F == 2), "the kick is muted: {pass:?}");
+        e.handle(Command::Edit(Edit::SetMidiOut { track: 0, on: false }));
+        assert!(run(&mut e, 96_000).iter().any(|&x| x != 0.0));
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn notes_sent_are_released_on_stop_retrigger_and_when_midi_out_goes() {
+        let long = Step::new(60, 90, 4);
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(long) },
+            Edit::SetStep { track: 0, pattern: 0, step: 1, value: Some(long) },
+            Edit::SetMidiOut { track: 0, on: true },
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 7000);
+        // Struck again before its release: released first, on the frame.
+        assert_eq!(sent(&mut rx), [(0, vec![0x90, 60, 90]), (6000, vec![0x80, 60, 0]), (6000, vec![0x90, 60, 90])]);
+        e.handle(Command::Stop);
+        assert_eq!(sent(&mut rx), [(7000, vec![0x80, 60, 0])], "on the callback Stop came in");
+        e.handle(Command::Play);
+        run(&mut e, 1000);
+        e.handle(Command::Edit(Edit::SetMidiOut { track: 0, on: false }));
+        assert_eq!(sent(&mut rx), [(7000, vec![0x90, 60, 90]), (8000, vec![0x80, 60, 0])]);
+        // Nor does a removed track leave a note sounding.
+        e.handle(Command::Edit(Edit::SetMidiOut { track: 0, on: true }));
+        run(&mut e, 6000);
+        e.handle(Command::Edit(Edit::RemoveTrack(0)));
+        assert_eq!(sent(&mut rx), [(13_000, vec![0x90, 60, 90]), (14_000, vec![0x80, 60, 0])]);
+    }
+
+    #[test]
+    fn live_notes_on_a_midi_out_track_are_sent_and_released() {
+        let (mut e, live) =
+            live_engine(&[Edit::AddTrack(InstrumentKind::Synth), Edit::SetMidiOut { track: 0, on: true }]);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        press(&live, 64, 80);
+        assert!(run(&mut e, 480).iter().all(|&x| x == 0.0));
+        press(&live, 64, 0);
+        live.push(Message::Control { channel: 0, controller: SUSTAIN, value: 127 }).unwrap();
+        press(&live, 65, 70);
+        press(&live, 65, 0);
+        run(&mut e, 480);
+        assert_eq!(sent(&mut rx), [(0, vec![0x90, 64, 80]), (480, vec![0x80, 64, 0]), (480, vec![0x90, 65, 70])]);
+        // The pedal holds it until it lifts; Stop releases what still sounds.
+        live.push(Message::Control { channel: 0, controller: SUSTAIN, value: 0 }).unwrap();
+        press(&live, 66, 60);
+        run(&mut e, 480);
+        e.handle(Command::Stop);
+        assert_eq!(sent(&mut rx), [(960, vec![0x80, 65, 0]), (960, vec![0x90, 66, 60]), (1440, vec![0x80, 66, 0])]);
+    }
+
+    #[test]
+    fn midi_clock_and_transport_are_the_same_at_any_buffer_size() {
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetSwing(66.0),
+            Edit::InsertSongEntry { index: 0, pattern: 0 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+            Edit::InsertSongEntry { index: 2, pattern: 0 },
+            Edit::SetTempoPoint { index: 1, bpm: Some(120.0) },
+            Edit::SetTempoPoint { index: 2, bpm: Some(60.0) },
+            Edit::SetTempoRamp(true),
+        ];
+        let play = |block: usize, entry: u16| {
+            let (mut e, mut rx) = midi_engine(&edits);
+            e.handle(Command::SetMidiClock(true));
+            e.handle(Command::PlaySong { entry });
+            // Drained as the output thread would: each callback queues an
+            // anchor.
+            let (mut left, mut got) = (200_000, Vec::new());
+            while left > 0 {
+                run(&mut e, block.min(left));
+                left -= block.min(left);
+                got.extend(sent(&mut rx));
+            }
+            e.handle(Command::Stop);
+            got.extend(sent(&mut rx));
+            got
+        };
+        let reference = play(4096, 0);
+        for block in [1, 64, 333] {
+            assert_eq!(play(block, 0), reference, "{block}");
+        }
+        assert_eq!(reference[..2], [(0, vec![0xFA]), (0, vec![0xF8])]);
+        // 24 a quarter note: at 120 BPM, one every 1000 frames.
+        assert_eq!(reference[2], (1000, vec![0xF8]));
+        let clocks: Vec<u64> = reference.iter().filter(|m| m.1 == [0xF8]).map(|m| m.0).collect();
+        assert!(clocks.windows(2).all(|w| w[1] > w[0]), "one per pulse, in order");
+        // The first entry, held at 120 BPM, is 16 16ths of six clocks; the
+        // second ramps to 60 BPM, so its clocks come further apart.
+        assert_eq!(clocks[16 * 6], 96_000);
+        assert!(clocks[clocks.len() - 1] - clocks[clocks.len() - 2] > 1500);
+        assert_eq!(reference.last().unwrap().1, [0xFC]);
+        // Started at the second entry: its song position, then continue.
+        assert_eq!(play(4096, 1)[..3], [(0, vec![0xF2, 16, 0]), (0, vec![0xFB]), (0, vec![0xF8])]);
+        // Without the clock on, nothing but notes.
+        let (mut e, mut rx) = midi_engine(&edits);
+        e.handle(Command::PlaySong { entry: 0 });
+        run(&mut e, 10_000);
+        e.handle(Command::Stop);
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn each_callback_anchors_the_midi_output_and_latency_moves_the_frames() {
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(36) },
+            Edit::SetMidiOut { track: 0, on: true },
+        ]);
+        let limiter = mix::MIX_PARAMS.iter().position(|s| s.id == "limiter").unwrap() as u8;
+        e.handle(Command::Edit(Edit::SetMixParam { index: limiter, value: 1.0 }));
+        let latency = e.latency() as u64;
+        assert!(latency > 0);
+        e.handle(Command::Play);
+        run(&mut e, 100);
+        let first = rx.pop();
+        assert!(matches!(first, Some(OutEvent::Anchor { frame: 0, frames: 100, rate: SR, .. })), "{first:?}");
+        assert_eq!(sent(&mut rx), [(latency, vec![0x99, 36, 127])], "heard after the limiter's look-ahead");
     }
 
     fn live_engine(edits: &[Edit]) -> (Box<Engine>, Arc<Mailbox<Message>>) {
