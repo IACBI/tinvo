@@ -349,21 +349,19 @@ impl Scheduler {
     }
 
     /// Takes the queue of a new engine, or the same engine's from another
-    /// output, at `now`: what it holds that was due more than [`LATE`] ago
-    /// is stale. So is what came with no anchor (after the last one another
-    /// thread took), which cannot be placed in time: at most one callback's
-    /// messages.
+    /// output, at `now`: what it holds up to the first message due from
+    /// [`LATE`] ago on is stale. Everything after that is kept, even a frame
+    /// earlier than its own (a release once the limiter went), so a note
+    /// kept keeps its release. What came with no anchor (after the last one
+    /// another thread took) cannot be placed in time and is dropped: at most
+    /// one callback's messages.
     pub fn take_backlog(&mut self, now: Instant, queue: &mut Consumer<OutEvent>) {
         while let Some(ev) = queue.pop() {
             self.push(ev);
         }
         let before = now.checked_sub(LATE).unwrap_or(now);
-        let stale: Vec<bool> = self.pending.iter().map(|p| self.heard(p.0).is_none_or(|at| at < before)).collect();
-        let mut i = 0;
-        self.pending.retain(|_| {
-            i += 1;
-            !stale[i - 1]
-        });
+        let fresh = self.pending.iter().position(|p| self.heard(p.0).is_some_and(|at| at >= before));
+        self.pending.drain(..fresh.unwrap_or(self.pending.len()));
     }
 
     /// One look at what is due at `now`: everything let go if the engine
@@ -851,6 +849,15 @@ mod tests {
         tx.push(OutEvent::message(0, &[0xFA])).unwrap();
         s.take_backlog(t0 + Duration::from_millis(80), &mut rx);
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(80)), [vec![0xFA]]);
+        // A fresh note keeps its release, though its frame is earlier: the
+        // limiter went off before Stop.
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        tx.push(OutEvent::Anchor { frame: 0, frames: 480, rate: 48_000.0, at: t0 }).unwrap();
+        tx.push(OutEvent::message(77, &[0x90, 60, 100])).unwrap();
+        tx.push(OutEvent::message(0, &[0x80, 60, 0])).unwrap();
+        s.take_backlog(t0 + Duration::from_millis(61), &mut rx);
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(61)), [vec![0x90, 60, 100], vec![0x80, 60, 0]]);
     }
 
     #[test]
