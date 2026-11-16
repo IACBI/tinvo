@@ -24,6 +24,10 @@ pub enum OutEvent {
     /// An audio callback for `frames` frames from `frame` started at `at`,
     /// at `rate` frames a second.
     Anchor { frame: u64, frames: u32, rate: f32, at: Instant },
+    /// Messages before this one, due on `frame`, may have been lost to a
+    /// full queue: every note still sounding is let go then, and the
+    /// receiver is stopped unless the clock is `running`.
+    Reset { frame: u64, running: bool },
 }
 
 impl OutEvent {
@@ -40,6 +44,12 @@ impl OutEvent {
 /// that would start late, a clock), except what must not be lost: the
 /// release of a note sent, and start, stop, continue and song position.
 pub const LATE: Duration = Duration::from_millis(50);
+/// How long a message that must not be lost is retried when the output
+/// refuses it; a release given up on is sent again when the output closes.
+const GIVE_UP: Duration = Duration::from_secs(1);
+/// How long without an anchor means the engine is gone or stalled: every
+/// note still sounding is let go then.
+pub const STALL: Duration = Duration::from_millis(250);
 /// How fast the estimate of when frames are heard may move later, in
 /// seconds per second: far more than two clocks drift apart, far less than
 /// a late callback moves it.
@@ -57,43 +67,58 @@ struct Timing {
 /// Orders the messages from the engine by frame and says when each is due.
 #[derive(Debug)]
 pub struct Scheduler {
-    /// (frame, arrival, bytes, length), sorted.
+    /// (frame, arrival, bytes, length), sorted. Length 0 is a reset, with
+    /// whether the clock runs in the first byte.
     pending: Vec<(u64, u64, [u8; 3], u8)>,
     arrivals: u64,
     t0: Instant,
     timing: Option<Timing>,
     /// Added to every message's time.
     delay: Duration,
-    /// Notes sent and not yet released, a bit per key on each channel.
-    sounding: [u128; 16],
+    /// How many times each key on each channel was started and not yet
+    /// released: two tracks can play one key, and each release counts.
+    sounding: [[u8; 128]; 16],
+    /// Start or Continue was sent and Stop has not been since. Clocks go
+    /// only then, so an output opened while playing waits for the next Play.
+    running: bool,
 }
 
 impl Scheduler {
     pub fn new(delay: Duration) -> Self {
-        Self { pending: Vec::new(), arrivals: 0, t0: Instant::now(), timing: None, delay, sounding: [0; 16] }
+        Self {
+            pending: Vec::new(),
+            arrivals: 0,
+            t0: Instant::now(),
+            timing: None,
+            delay,
+            sounding: [[0; 128]; 16],
+            running: false,
+        }
     }
 
     pub fn push(&mut self, ev: OutEvent) {
-        match ev {
-            OutEvent::Message { frame, bytes, len } => {
-                let key = (frame, self.arrivals);
-                self.arrivals += 1;
-                let at = self.pending.partition_point(|p| (p.0, p.1) <= key);
-                self.pending.insert(at, (frame, key.1, bytes, len));
+        let (frame, bytes, len) = match ev {
+            OutEvent::Message { frame, bytes, len } => (frame, bytes, len.max(1)),
+            OutEvent::Reset { frame, running } => (frame, [u8::from(running), 0, 0], 0),
+            OutEvent::Anchor { frame, frames, rate, at } => return self.anchor(frame, frames, rate, at),
+        };
+        let key = (frame, self.arrivals);
+        self.arrivals += 1;
+        let at = self.pending.partition_point(|p| (p.0, p.1) <= key);
+        self.pending.insert(at, (frame, key.1, bytes, len));
+    }
+
+    fn anchor(&mut self, frame: u64, frames: u32, rate: f32, at: Instant) {
+        let rate = f64::from(rate.max(1.0));
+        let secs = at.saturating_duration_since(self.t0).as_secs_f64();
+        // The callback's frames play after the buffer playing now.
+        let zero = secs + f64::from(frames) / rate - frame as f64 / rate;
+        self.timing = Some(match self.timing {
+            Some(t) if t.rate == rate => {
+                Timing { zero: zero.min(t.zero + CREEP * (secs - t.last).max(0.0)), last: secs, rate }
             }
-            OutEvent::Anchor { frame, frames, rate, at } => {
-                let rate = f64::from(rate.max(1.0));
-                let secs = at.saturating_duration_since(self.t0).as_secs_f64();
-                // The callback's frames play after the buffer playing now.
-                let zero = secs + f64::from(frames) / rate - frame as f64 / rate;
-                self.timing = Some(match self.timing {
-                    Some(t) if t.rate == rate => {
-                        Timing { zero: zero.min(t.zero + CREEP * (secs - t.last).max(0.0)), last: secs, rate }
-                    }
-                    _ => Timing { zero, last: secs, rate },
-                });
-            }
-        }
+            _ => Timing { zero, last: secs, rate },
+        });
     }
 
     /// When `frame` is heard, or `None` before the first anchor.
@@ -108,52 +133,95 @@ impl Scheduler {
         self.pending.first().and_then(|p| self.due(p.0))
     }
 
-    /// Hands `send` every message due by `now`, in order. Those due more
-    /// than [`LATE`] ago are dropped unless they must not be lost.
-    pub fn send_due(&mut self, now: Instant, mut send: impl FnMut(&[u8])) {
+    /// Hands `send` every message due by `now`, in order; `send` says
+    /// whether the output took it. Note-ons and clocks due more than
+    /// [`LATE`] ago, or refused, are dropped. The rest must not be lost: one
+    /// refused is tried again on the next call, for up to [`GIVE_UP`].
+    pub fn send_due(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let mut taken = 0;
-        for &(frame, _, bytes, len) in &self.pending {
+        while let Some(&(frame, _, bytes, len)) = self.pending.get(taken) {
             let Some(due) = self.due(frame) else { break };
             if due > now {
                 break;
             }
-            taken += 1;
-            let msg = &bytes[..usize::from(len)];
-            let late = now.saturating_duration_since(due) > LATE;
-            let status = msg.first().copied().unwrap_or(0);
-            let channel = usize::from(status & 0x0F);
-            let key = msg.get(1).map_or(0, |&k| 1u128 << (k & 0x7F));
-            match status & 0xF0 {
-                0x90 if msg.get(2).is_some_and(|&v| v > 0) => {
-                    if late {
-                        continue;
-                    }
-                    self.sounding[channel] |= key;
-                }
-                0x80 | 0x90 => {
-                    if self.sounding[channel] & key == 0 {
-                        continue;
-                    }
-                    self.sounding[channel] &= !key;
-                }
-                _ if late && status == 0xF8 => continue,
-                _ => {}
+            let late = now.saturating_duration_since(due);
+            if len == 0 {
+                self.let_go(bytes[0] != 0, &mut send);
+                taken += 1;
+                continue;
             }
-            send(msg);
+            let msg = &bytes[..usize::from(len)];
+            let status = msg[0];
+            let (channel, key) = (usize::from(status & 0x0F), usize::from(msg.get(1).map_or(0, |&k| k & 0x7F)));
+            let kept = match status & 0xF0 {
+                0x90 if msg.get(2).is_some_and(|&v| v > 0) => {
+                    if late <= LATE && send(msg) {
+                        let n = &mut self.sounding[channel][key];
+                        *n = n.saturating_add(1);
+                    }
+                    true
+                }
+                // A release of a note never sent is not sent either.
+                0x80 | 0x90 if self.sounding[channel][key] == 0 => true,
+                0x80 | 0x90 => {
+                    let ok = send(msg);
+                    if ok {
+                        self.sounding[channel][key] -= 1;
+                    }
+                    ok
+                }
+                _ if status == 0xF8 => {
+                    if self.running && late <= LATE {
+                        send(msg);
+                    }
+                    true
+                }
+                _ => {
+                    let ok = send(msg);
+                    match status {
+                        0xFA | 0xFB if ok => self.running = true,
+                        0xFC if ok => self.running = false,
+                        _ => {}
+                    }
+                    ok
+                }
+            };
+            if !kept && late <= GIVE_UP {
+                break;
+            }
+            taken += 1;
         }
         self.pending.drain(..taken);
     }
 
-    /// Releases every note sent and not yet released, and forgets the
-    /// messages still to come: the engine they came from is gone, or the
-    /// output closes.
-    pub fn release_all(&mut self, mut send: impl FnMut(&[u8])) {
+    /// Sends a release for every note still sounding and, while the clock
+    /// runs and should not, Stop.
+    fn let_go(&mut self, running: bool, send: &mut impl FnMut(&[u8]) -> bool) {
         for (channel, keys) in self.sounding.iter_mut().enumerate() {
-            for key in (0..128u8).filter(|&k| *keys & 1 << k != 0) {
-                send(&[0x80 | channel as u8, key, 0]);
+            for (key, n) in keys.iter_mut().enumerate() {
+                while *n > 0 && send(&[0x80 | channel as u8, key as u8, 0]) {
+                    *n -= 1;
+                }
             }
-            *keys = 0;
         }
+        if self.running && !running && send(&[0xFC]) {
+            self.running = false;
+        }
+    }
+
+    /// Whether no anchor has come for [`STALL`]: the engine is gone, or
+    /// stalled, and what it sent may never be released.
+    pub fn stalled(&self, now: Instant) -> bool {
+        self.timing.is_some_and(|t| now.saturating_duration_since(self.t0).as_secs_f64() > t.last + STALL.as_secs_f64())
+    }
+
+    /// Releases every note sent and not yet released, stops the receiver,
+    /// and forgets the messages still to come: the engine they came from is
+    /// gone, or the output closes.
+    pub fn release_all(&mut self, mut send: impl FnMut(&[u8]) -> bool) {
+        self.let_go(false, &mut send);
+        self.sounding = [[0; 128]; 16];
+        self.running = false;
         self.pending.clear();
         self.timing = None;
     }
@@ -200,11 +268,7 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
         .spawn(move || {
             let mut sched = Scheduler::new(delay);
             let mut queue: Option<Consumer<OutEvent>> = None;
-            let mut send = |m: &[u8]| {
-                // A failed send is not retried: the next messages may go
-                // through, and a lost release is made up for on close.
-                let _ = output.send(m);
-            };
+            let mut send = |m: &[u8]| output.send(m).is_ok();
             while !flag.load(Ordering::Acquire) {
                 if let Some(mut fresh) = slot.try_lock().ok().and_then(|mut s| s.take()) {
                     // A new engine: what the old one queued will not be
@@ -220,6 +284,9 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
                     }
                 }
                 let now = Instant::now();
+                if sched.stalled(now) {
+                    sched.release_all(&mut send);
+                }
                 sched.send_due(now, &mut send);
                 let wait = sched.next_due().map_or(POLL, |d| d.saturating_duration_since(now).min(POLL));
                 std::thread::sleep(wait.max(Duration::from_micros(100)));
@@ -246,7 +313,19 @@ mod tests {
 
     fn sent(s: &mut Scheduler, now: Instant) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        s.send_due(now, |m| out.push(m.to_vec()));
+        s.send_due(now, |m| {
+            out.push(m.to_vec());
+            true
+        });
+        out
+    }
+
+    fn released(s: &mut Scheduler) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        s.release_all(|m| {
+            out.push(m.to_vec());
+            true
+        });
         out
     }
 
@@ -276,12 +355,13 @@ mod tests {
     fn messages_go_in_frame_order_when_due() {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
+        s.push(OutEvent::message(0, &[0xFA]));
         s.push(OutEvent::message(960, &[0x90, 60, 100]));
         s.push(OutEvent::message(480, &[0xF8]));
         s.push(OutEvent::message(960, &[0xF8]));
         s.push(anchor(t0, 0, 0));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(10)), [vec![0xFA]]);
         // Frame 0 plays at 10 ms, 480 at 20 ms, 960 at 30 ms.
-        assert!(((s.next_due().unwrap() - t0).as_secs_f64() - 0.020).abs() < 1e-6);
         assert!(sent(&mut s, t0 + Duration::from_millis(19)).is_empty());
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(21)), [vec![0xF8]]);
         // On one frame, in the order the engine queued them.
@@ -294,8 +374,9 @@ mod tests {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
         s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::message(0, &[0xFA]));
         s.push(OutEvent::message(0, &[0x90, 60, 100]));
-        assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)), [vec![0x90, 60, 100]]);
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)), [vec![0xFA], vec![0x90, 60, 100]]);
         for m in [[0x91, 62, 100], [0x80, 60, 0], [0x81, 62, 0]] {
             s.push(OutEvent::message(480, &m));
         }
@@ -316,10 +397,90 @@ mod tests {
             s.push(OutEvent::message(0, &m));
         }
         s.push(OutEvent::message(48_000, &[0x80, 60, 0]));
-        assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)).len(), 4);
-        let mut out = Vec::new();
-        s.release_all(|m| out.push(m.to_vec()));
-        assert_eq!(out, [vec![0x80, 60, 0], vec![0x8F, 127, 0]]);
+        s.push(OutEvent::message(0, &[0xFB]));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)).len(), 5);
+        assert_eq!(released(&mut s), [vec![0x80, 60, 0], vec![0x8F, 127, 0], vec![0xFC]]);
         assert_eq!((s.next_due(), s.due(0)), (None, None), "the rest is forgotten");
+        assert!(released(&mut s).is_empty());
+    }
+
+    #[test]
+    fn a_key_two_tracks_play_is_released_as_often_as_it_was_started() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        for m in [[0x90, 60, 100], [0x90, 60, 90], [0x80, 60, 0], [0x80, 60, 0], [0x80, 60, 0]] {
+            s.push(OutEvent::message(0, &m));
+        }
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(11)).len(), 4, "the third release has no note");
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        sent(&mut s, t0 + Duration::from_millis(12));
+        assert_eq!(released(&mut s), [vec![0x80, 60, 0], vec![0x80, 60, 0]]);
+    }
+
+    #[test]
+    fn a_release_the_output_refuses_is_tried_again() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        s.push(OutEvent::message(480, &[0x80, 60, 0]));
+        s.push(OutEvent::message(480, &[0x90, 62, 100]));
+        sent(&mut s, t0 + Duration::from_millis(11));
+        // Full: the release waits, and what follows it with it.
+        let mut tries = 0;
+        s.send_due(t0 + Duration::from_millis(21), |_| {
+            tries += 1;
+            false
+        });
+        assert_eq!(tries, 1);
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(22)), [vec![0x80, 60, 0], vec![0x90, 62, 100]]);
+        // Refused for longer than it is tried: given up, and sent on close.
+        s.push(OutEvent::message(960, &[0x80, 62, 0]));
+        s.send_due(t0 + Duration::from_millis(1100), |_| false);
+        assert_eq!(s.next_due(), None);
+        assert_eq!(released(&mut s), [vec![0x80, 62, 0]]);
+    }
+
+    #[test]
+    fn a_reset_lets_every_note_go_and_stops_a_clock_that_should_not_run() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        for m in [&[0xFA][..], &[0x90, 60, 100], &[0xF8]] {
+            s.push(OutEvent::message(0, m));
+        }
+        s.push(OutEvent::Reset { frame: 480, running: true });
+        s.push(OutEvent::message(480, &[0xF8]));
+        s.push(OutEvent::message(960, &[0x80, 60, 0]));
+        s.push(OutEvent::Reset { frame: 960, running: false });
+        s.push(OutEvent::message(960, &[0xF8]));
+        let got = sent(&mut s, t0 + Duration::from_millis(31));
+        assert_eq!(got, [vec![0xFA], vec![0x90, 60, 100], vec![0xF8], vec![0x80, 60, 0], vec![0xF8], vec![0xFC]]);
+    }
+
+    #[test]
+    fn clocks_wait_for_start_or_continue() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        for m in [&[0xF8][..], &[0xF2, 4, 0], &[0xFB], &[0xF8], &[0xFC], &[0xF8]] {
+            s.push(OutEvent::message(0, m));
+        }
+        let got = sent(&mut s, t0 + Duration::from_millis(11));
+        assert_eq!(got, [vec![0xF2, 4, 0], vec![0xFB], vec![0xF8], vec![0xFC]]);
+    }
+
+    #[test]
+    fn an_engine_silent_for_a_while_has_stalled() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        assert!(!s.stalled(t0 + Duration::from_secs(5)), "no engine yet");
+        s.push(anchor(t0, 0, 100));
+        assert!(!s.stalled(t0 + Duration::from_millis(340)));
+        assert!(s.stalled(t0 + Duration::from_millis(360)));
+        s.push(anchor(t0, 480, 350));
+        assert!(!s.stalled(t0 + Duration::from_millis(360)));
     }
 }

@@ -103,15 +103,27 @@ struct MidiOff {
 struct MidiSink {
     out: Option<Producer<OutEvent>>,
     latency: u64,
+    /// A message was lost to a full queue and no reset has followed yet.
+    lost: bool,
 }
 
 impl MidiSink {
     fn send(&mut self, frame: u64, bytes: &[u8]) {
         if let Some(q) = self.out.as_mut() {
-            // A full queue loses the message; the output thread lets every
-            // note it sent go when it closes.
-            let _ = q.push(OutEvent::message(frame + self.latency, bytes));
+            if q.push(OutEvent::message(frame + self.latency, bytes)).is_err() {
+                self.lost = true;
+            }
         }
+    }
+
+    /// Starts a callback of `frames` frames from `now`: after a lost
+    /// message, a reset (with whether the clock runs), then the anchor.
+    fn anchor(&mut self, now: u64, frames: u32, rate: f32, running: bool) {
+        let Some(q) = self.out.as_mut() else { return };
+        if self.lost && q.push(OutEvent::Reset { frame: now + self.latency, running }).is_ok() {
+            self.lost = false;
+        }
+        let _ = q.push(OutEvent::Anchor { frame: now, frames, rate, at: std::time::Instant::now() });
     }
 }
 pub const MIN_TEMPO: f32 = 20.0;
@@ -1210,6 +1222,8 @@ pub struct Engine {
     midi: MidiSink,
     /// Whether Play sends MIDI clock ([`Command::SetMidiClock`]).
     midi_clock: bool,
+    /// The clock waits for its first pulse on a 16th note to send Continue.
+    clock_resume: bool,
     /// The pulse the next clock is sent for, while it runs.
     clock_pulse: Option<u64>,
 }
@@ -1284,8 +1298,9 @@ impl Engine {
             cursor: 0,
             count_in: None,
             click: Click::default(),
-            midi: MidiSink { out: None, latency: 0 },
+            midi: MidiSink { out: None, latency: 0, lost: false },
             midi_clock: false,
+            clock_resume: false,
             clock_pulse: None,
         })
     }
@@ -1433,7 +1448,7 @@ impl Engine {
             Command::Cue(p) => self.cue = p.min(MAX_PATTERNS as u8 - 1),
             Command::Stop => {
                 self.end_recorded();
-                if self.clock_pulse.take().is_some() {
+                if self.clock_pulse.take().is_some() && !std::mem::take(&mut self.clock_resume) {
                     self.midi.send(self.now, &[0xFC]);
                 }
                 self.count_in = None;
@@ -1466,7 +1481,7 @@ impl Engine {
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
             Command::SetMidiClock(on) => {
                 self.midi_clock = on;
-                if !on && self.clock_pulse.take().is_some() {
+                if !on && self.clock_pulse.take().is_some() && !std::mem::take(&mut self.clock_resume) {
                     self.midi.send(self.now, &[0xFC]);
                 }
             }
@@ -1901,16 +1916,26 @@ impl Engine {
         }
         if self.midi_clock {
             match e.entry.filter(|&i| self.song_mode && i > 0) {
-                // The song position counts 16th notes (MIDI beats).
+                // The song position counts 16th notes (MIDI beats), so an
+                // entry starting between two waits for the next one and
+                // continues there. Past the last position it can name, the
+                // receiver is not started at all rather than started wrong.
                 Some(i) => {
+                    let sixteenth = u64::from(PULSES_PER_BEAT / 4);
                     let pulses: u64 = self.song[..usize::from(i)].iter().map(|&p| self.pattern_pulses(p)).sum();
-                    let beats = (pulses / u64::from(PULSES_PER_BEAT / 4)).min(0x3FFF) as u16;
-                    self.midi.send(at, &[0xF2, (beats & 0x7F) as u8, (beats >> 7) as u8]);
-                    self.midi.send(at, &[0xFB]);
+                    let wait = (sixteenth - pulses % sixteenth) % sixteenth;
+                    let beats = (pulses + wait) / sixteenth;
+                    if beats <= 0x3FFF {
+                        self.midi.send(at, &[0xF2, (beats & 0x7F) as u8, (beats >> 7) as u8]);
+                        self.clock_resume = true;
+                        self.clock_pulse = Some(wait);
+                    }
                 }
-                None => self.midi.send(at, &[0xFA]),
+                None => {
+                    self.midi.send(at, &[0xFA]);
+                    self.clock_pulse = Some(0);
+                }
             }
-            self.clock_pulse = Some(0);
         }
     }
 
@@ -2465,6 +2490,8 @@ impl Engine {
                 if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
                     if t.midi_out && !on {
                         t.release_midi(now, midi);
+                    } else if !t.midi_out && on {
+                        t.instrument.release_all();
                     }
                     t.midi_out = on;
                 }
@@ -2489,13 +2516,25 @@ impl Engine {
     fn update_gains(&mut self) {
         let tracks = &mut self.tracks[..self.track_count];
         let any_solo = tracks.iter().any(|t| t.solo);
-        for t in tracks {
+        let (now, midi) = (self.now, &mut self.midi);
+        let mut silenced = 0u16;
+        for (i, t) in tracks.iter_mut().enumerate() {
             let audible = !t.mute && (!any_solo || t.solo);
+            // Its notes on the output stop, as a muted track's voices do.
+            if t.audible && !audible && t.midi_out {
+                t.release_midi(now, midi);
+                silenced |= 1 << i;
+            }
             t.audible = audible;
             let g = if audible { fader_gain(t.auto_gain.unwrap_or(t.gain_db)) } else { 0.0 };
             let (l, r) = pan_gains(t.auto_pan.unwrap_or(t.pan));
             t.gain_l.set_target(g * l);
             t.gain_r.set_target(g * r);
+        }
+        for k in (0..self.held_count).rev() {
+            if silenced & 1 << self.held[k].track != 0 && self.held[k].out.is_some() {
+                self.release_held(k);
+            }
         }
     }
 
@@ -2515,15 +2554,8 @@ impl Engine {
             self.commands = Some(rx);
         }
         self.midi.latency = self.mix.latency() as u64;
-        if let Some(q) = self.midi.out.as_mut() {
-            let anchor = OutEvent::Anchor {
-                frame: self.now,
-                frames: (out.len() / 2) as u32,
-                rate: self.sample_rate,
-                at: std::time::Instant::now(),
-            };
-            let _ = q.push(anchor);
-        }
+        let running = self.clock_pulse.is_some() && !self.clock_resume;
+        self.midi.anchor(self.now, (out.len() / 2) as u32, self.sample_rate, running);
         self.play_live();
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
@@ -2555,6 +2587,9 @@ impl Engine {
     /// ending exactly when the next note starts is free for reuse.
     fn fire_due(&mut self, frame: u64) {
         loop {
+            // Automation can switch the limiter inside a callback, also on
+            // the step whose hits fire in the next pass.
+            self.midi.latency = self.mix.latency() as u64;
             let (tracks, midi) = (&mut self.tracks[..self.track_count], &mut self.midi);
             for t in tracks.iter_mut() {
                 t.fire_offs(frame, midi);
@@ -2791,11 +2826,15 @@ impl Engine {
             // Nothing moves the transport inside a segment, so the clocks
             // due in it are on the same frames at any buffer size. One a
             // tempo change moved before the segment goes at its start.
+            self.midi.latency = self.mix.latency() as u64;
             if let Some(mut pulse) = self.clock_pulse {
                 loop {
                     let f = self.transport.pulse_frame(pulse);
                     if f >= next {
                         break;
+                    }
+                    if std::mem::take(&mut self.clock_resume) {
+                        self.midi.send(f.max(pos), &[0xFB]);
                     }
                     self.midi.send(f.max(pos), &[0xF8]);
                     pulse += 1;
@@ -3362,12 +3401,158 @@ mod tests {
         assert_eq!(reference.last().unwrap().1, [0xFC]);
         // Started at the second entry: its song position, then continue.
         assert_eq!(play(4096, 1)[..3], [(0, vec![0xF2, 16, 0]), (0, vec![0xFB]), (0, vec![0xF8])]);
+        // An entry on no 16th note waits for the next. Five 16th triplets
+        // are 20 clocks: the third 16th's is 4 clocks of 500 frames later
+        // (1/16T steps at 120 BPM).
+        let odd = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetPatternDivision { pattern: 1, division: Division::SixteenthTriplet },
+            Edit::SetPatternLength { pattern: 1, len: 5 },
+            Edit::InsertSongEntry { index: 0, pattern: 1 },
+            Edit::InsertSongEntry { index: 1, pattern: 0 },
+        ];
+        let (mut e, mut rx) = midi_engine(&odd);
+        e.handle(Command::SetMidiClock(true));
+        e.handle(Command::PlaySong { entry: 1 });
+        run(&mut e, 5500);
+        let got = sent(&mut rx);
+        assert_eq!(got, [(0, vec![0xF2, 4, 0]), (4000, vec![0xFB]), (4000, vec![0xF8]), (5000, vec![0xF8])]);
+        // Stopped before it continues: no Stop for a receiver never started.
+        let (mut e, mut rx) = midi_engine(&odd);
+        e.handle(Command::SetMidiClock(true));
+        e.handle(Command::PlaySong { entry: 1 });
+        run(&mut e, 2000);
+        e.handle(Command::Stop);
+        assert_eq!(sent(&mut rx), [(0, vec![0xF2, 4, 0])]);
+        // Past the last song position MIDI can name (16,383 16ths), the
+        // receiver is not started: entries of 64 eighth notes.
+        let mut far = vec![
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetPatternDivision { pattern: 0, division: Division::Eighth },
+            Edit::SetPatternLength { pattern: 0, len: 64 },
+        ];
+        far.extend((0..130).map(|index| Edit::InsertSongEntry { index, pattern: 0 }));
+        let (mut e, mut rx) = midi_engine(&far);
+        e.handle(Command::SetMidiClock(true));
+        e.handle(Command::PlaySong { entry: 127 });
+        run(&mut e, 100);
+        assert_eq!(sent(&mut rx)[..2], [(0, vec![0xF2, 0x00, 0x7F]), (0, vec![0xFB])], "16,256");
+        e.handle(Command::Stop);
+        sent(&mut rx);
+        e.handle(Command::PlaySong { entry: 128 });
+        run(&mut e, 5000);
+        assert!(sent(&mut rx).is_empty(), "16,384 is too far");
         // Without the clock on, nothing but notes.
         let (mut e, mut rx) = midi_engine(&edits);
         e.handle(Command::PlaySong { entry: 0 });
         run(&mut e, 10_000);
         e.handle(Command::Stop);
         assert!(sent(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn notes_sent_stop_when_the_track_is_muted_or_another_is_soloed() {
+        let long = Step::new(60, 100, 16);
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(long) },
+            Edit::SetMidiOut { track: 0, on: true },
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 100);
+        assert_eq!(sent(&mut rx), [(0, vec![0x90, 60, 100])]);
+        e.handle(Command::Edit(Edit::SetMute { track: 0, mute: true }));
+        run(&mut e, 64);
+        assert_eq!(sent(&mut rx), [(100, vec![0x80, 60, 0])]);
+        e.handle(Command::Edit(Edit::SetMute { track: 0, mute: false }));
+        run(&mut e, 64);
+        assert!(sent(&mut rx).is_empty(), "nothing is sent again until the next hit");
+        // A live note, ended by another track's solo.
+        let (mut e, live) = live_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetMidiOut { track: 0, on: true },
+        ]);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        press(&live, 64, 90);
+        run(&mut e, 64);
+        e.handle(Command::Edit(Edit::SetSolo { track: 1, solo: true }));
+        run(&mut e, 64);
+        assert_eq!(sent(&mut rx), [(0, vec![0x90, 64, 90]), (64, vec![0x80, 64, 0])]);
+        assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn a_track_going_to_midi_out_lets_its_own_voices_go() {
+        let (mut e, _rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(60, 100, 16)) },
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 2000);
+        let level = |e: &mut Engine| {
+            let mut out = vec![0.0; 2 * 4096];
+            e.process(&mut out);
+            out.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+        };
+        assert!(level(&mut e) > 0.01);
+        e.handle(Command::Edit(Edit::SetMidiOut { track: 0, on: true }));
+        for _ in 0..30 {
+            level(&mut e);
+        }
+        assert!(level(&mut e) < 1e-4, "the synth's note was released");
+    }
+
+    #[test]
+    fn a_lost_message_is_followed_by_a_reset_once_the_queue_has_room() {
+        let (tx, mut rx) = spsc::channel(4);
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Kick)]);
+        e.attach_midi_out(tx);
+        e.handle(Command::SetMidiClock(true));
+        e.handle(Command::Play);
+        run(&mut e, 6000);
+        assert!(e.midi.lost, "an anchor, Start and six clocks overflow four places");
+        while rx.pop().is_some() {}
+        run(&mut e, 64);
+        assert!(!e.midi.lost);
+        assert!(matches!(rx.pop(), Some(OutEvent::Reset { frame: 6000, running: true })));
+        assert!(matches!(rx.pop(), Some(OutEvent::Anchor { frame: 6000, .. })));
+    }
+
+    #[test]
+    fn midi_frames_follow_a_limiter_switched_inside_a_callback() {
+        let limiter = mix::MIX_PARAMS.iter().position(|s| s.id == "limiter").unwrap() as u8;
+        let mut edits = vec![
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::SetLane { track: 0, lane: 0, target: Some(MIX_TARGET + limiter), ramp: false },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(0.0) },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 8, value: Some(1.0) },
+        ];
+        for i in 0..16 {
+            edits.push(Edit::SetStep { track: 0, pattern: 0, step: i, value: step(36) });
+        }
+        let play = |block: usize| {
+            let (mut e, mut rx) = midi_engine(&edits);
+            e.handle(Command::Play);
+            let (mut left, mut got) = (60_000, Vec::new());
+            while left > 0 {
+                run(&mut e, block.min(left));
+                left -= block.min(left);
+                got.extend(sent(&mut rx));
+            }
+            got
+        };
+        let reference = play(64);
+        assert_eq!(play(4096), reference);
+        assert_eq!(play(1), reference);
+        // From the ninth hit, which switches it on, the limiter's look-ahead
+        // later.
+        let ons: Vec<u64> = reference.iter().filter(|m| m.1[0] == 0x99).map(|m| m.0).collect();
+        assert_eq!(ons[7], 7 * 6000);
+        assert!(ons[8] > 8 * 6000 && ons[9] - ons[8] == 6000, "{ons:?}");
     }
 
     #[test]
