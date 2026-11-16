@@ -44,8 +44,9 @@ impl OutEvent {
 /// that would start late, a clock), except what must not be lost: the
 /// release of a note sent, and start, stop, continue and song position.
 pub const LATE: Duration = Duration::from_millis(50);
-/// How long a message that must not be lost is retried when the output
-/// refuses it; a release given up on is sent again when the output closes.
+/// How long a message that must not be lost holds back those after it when
+/// the output refuses it. A release (or Stop) is then owed, and tried again
+/// until the output takes it.
 const GIVE_UP: Duration = Duration::from_secs(1);
 /// How long without an anchor, beyond four of the longest callbacks seen,
 /// means the engine is gone or stalled: every note still sounding is let go
@@ -94,8 +95,10 @@ pub struct Scheduler {
     /// each skips the next release of its key, so another note on it goes
     /// on sounding until its own.
     skipped: Keys,
-    /// Releases (and a Stop) the output refused while everything was let
-    /// go, tried again until [`GIVE_UP`] after `owed_since`.
+    /// Releases (and a Stop) the output refused for longer than
+    /// [`GIVE_UP`], or while everything was let go: tried again until it
+    /// takes them, holding back the engine's messages for [`GIVE_UP`] after
+    /// `owed_since`.
     owed: Keys,
     owe_stop: bool,
     owed_since: Option<Instant>,
@@ -181,7 +184,8 @@ impl Scheduler {
     /// Hands `send` every message due by `now`, in order; `send` says
     /// whether the output took it. Note-ons and clocks due more than
     /// [`LATE`] ago, or refused, are dropped. The rest must not be lost: one
-    /// refused is tried again on the next call, for up to [`GIVE_UP`].
+    /// refused is tried again on the next call, holding back the rest for up
+    /// to [`GIVE_UP`]; then a release or Stop is owed instead.
     pub fn send_due(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let mut taken = 0;
         while let Some(&(frame, bytes, len)) = self.pending.get(taken) {
@@ -191,9 +195,16 @@ impl Scheduler {
             }
             let late = now.saturating_duration_since(due);
             if len == 0 {
+                // Releases of starts dropped before it are not coming: they
+                // may have been what was lost.
+                self.skipped = [[0; 128]; 16];
                 // A reset the output refused part of stays first in line.
-                if !self.let_go(bytes[0] != 0, &mut send) && late <= GIVE_UP {
-                    break;
+                if !self.let_go(bytes[0] != 0, &mut send) {
+                    if late <= GIVE_UP {
+                        break;
+                    }
+                    let stop = self.running && bytes[0] == 0;
+                    self.owe(now, stop);
                 }
                 taken += 1;
                 continue;
@@ -240,8 +251,23 @@ impl Scheduler {
                     ok
                 }
             };
-            if !kept && late <= GIVE_UP {
-                break;
+            if !kept {
+                if late <= GIVE_UP {
+                    break;
+                }
+                match status & 0xF0 {
+                    0x80 | 0x90 => {
+                        self.sounding[channel][key] -= 1;
+                        self.owed[channel][key] = self.owed[channel][key].saturating_add(1);
+                        self.owed_since.get_or_insert(now);
+                    }
+                    _ if status == 0xFC => {
+                        self.owe_stop = true;
+                        self.running = false;
+                        self.owed_since.get_or_insert(now);
+                    }
+                    _ => {}
+                }
             }
             taken += 1;
         }
@@ -274,20 +300,38 @@ impl Scheduler {
     /// gone, or the output closes. What the output refuses is owed, and
     /// [`Scheduler::settle`] tries it again.
     pub fn release_all(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
-        for (owed, sounding) in self.owed.iter_mut().flatten().zip(self.sounding.iter().flatten()) {
-            *owed = owed.saturating_add(*sounding);
-        }
-        self.sounding = [[0; 128]; 16];
+        let running = self.running;
+        self.owe(now, running);
         self.skipped = [[0; 128]; 16];
-        self.owe_stop |= std::mem::take(&mut self.running);
-        self.owed_since.get_or_insert(now);
         self.pending.clear();
         self.timing = None;
         self.settle(now, &mut send);
     }
 
-    /// Sends what [`Scheduler::release_all`] owes, giving up [`GIVE_UP`]
-    /// after it first owed something. Says whether nothing is owed now.
+    /// Moves every note still sounding to what is owed, and a Stop if
+    /// `stop`, from `now`.
+    fn owe(&mut self, now: Instant, stop: bool) {
+        for (owed, sounding) in self.owed.iter_mut().flatten().zip(self.sounding.iter().flatten()) {
+            *owed = owed.saturating_add(*sounding);
+        }
+        self.sounding = [[0; 128]; 16];
+        if stop {
+            self.owe_stop = true;
+            self.running = false;
+        }
+        if self.owe_stop || self.owed.iter().flatten().any(|&n| n > 0) {
+            self.owed_since.get_or_insert(now);
+        }
+    }
+
+    /// Whether a release or Stop is still owed.
+    pub fn owes(&self) -> bool {
+        self.owed_since.is_some()
+    }
+
+    /// Sends what is owed. Says whether the engine's messages may go:
+    /// nothing is owed now, or it has been for longer than [`GIVE_UP`] (it
+    /// is still tried on every call).
     pub fn settle(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) -> bool {
         let Some(since) = self.owed_since else { return true };
         let mut done = release(&mut self.owed, &mut send);
@@ -298,13 +342,10 @@ impl Scheduler {
                 done = false;
             }
         }
-        if done || now.saturating_duration_since(since) > GIVE_UP {
-            self.owed = [[0; 128]; 16];
-            self.owe_stop = false;
+        if done {
             self.owed_since = None;
-            return true;
         }
-        false
+        done || now.saturating_duration_since(since) > GIVE_UP
     }
 
     /// Takes the queue of a new engine, or the same engine's from another
@@ -417,8 +458,9 @@ pub fn start(mut output: Output, slot: OutSlot, delay: Duration) -> Result<Outpu
             }
             let closing = Instant::now();
             sched.release_all(closing, &mut send);
-            while !sched.settle(Instant::now(), &mut send) && closing.elapsed() < CLOSING {
+            while sched.owes() && closing.elapsed() < CLOSING {
                 std::thread::sleep(POLL);
+                sched.settle(Instant::now(), &mut send);
             }
             // The next output thread takes the queue from here.
             if let (Some(q), Ok(mut s)) = (queue, slot.lock()) {
@@ -564,7 +606,8 @@ mod tests {
         });
         assert_eq!(tries, 1);
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(22)), [vec![0x80, 60, 0], vec![0x90, 62, 100]]);
-        // Refused for longer than it is tried: given up, and sent on close.
+        // Refused for longer than it holds the rest back: owed, and sent on
+        // close.
         s.push(OutEvent::message(960, &[0x80, 62, 0]));
         s.send_due(t0 + Duration::from_millis(1100), |_| false);
         assert_eq!(s.next_due(), None);
@@ -645,13 +688,58 @@ mod tests {
             true
         }));
         assert_eq!(out, [vec![0x80, 70, 0], vec![0xFC]]);
-        // Given up after a while.
+        // After a while it holds nothing back, but is still owed.
         s.push(anchor(t0, 960, 40));
         s.push(OutEvent::message(960, &[0x90, 72, 100]));
         sent(&mut s, t0 + Duration::from_millis(60));
         s.release_all(t0 + Duration::from_millis(60), |_| false);
         assert!(s.settle(t0 + Duration::from_millis(1100), |_| false));
-        assert!(s.settle(t0 + Duration::from_millis(1101), |_| panic!("nothing is owed")));
+        assert!(s.owes());
+        let mut out = Vec::new();
+        s.settle(t0 + Duration::from_secs(30), |m| {
+            out.push(m.to_vec());
+            true
+        });
+        assert_eq!((out, s.owes()), (vec![vec![0x80, 72, 0]], false));
+    }
+
+    #[test]
+    fn a_release_refused_for_long_is_sent_once_the_output_recovers() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::message(0, &[0xFA]));
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        sent(&mut s, t0 + Duration::from_millis(11));
+        s.push(OutEvent::message(480, &[0x80, 60, 0]));
+        s.push(OutEvent::message(480, &[0xFC]));
+        s.push(OutEvent::message(480, &[0x90, 62, 100]));
+        s.send_due(t0 + Duration::from_millis(500), |_| false);
+        assert_eq!(s.pending.len(), 3, "held back for a second");
+        s.push(anchor(t0, 48_000, 1100));
+        s.send_due(t0 + Duration::from_millis(1100), |_| false);
+        assert!(s.owes() && s.pending.is_empty(), "then owed");
+        let mut out = Vec::new();
+        s.run(t0 + Duration::from_millis(1101), |m| {
+            out.push(m.to_vec());
+            true
+        });
+        assert_eq!(out, [vec![0x80, 60, 0], vec![0xFC]]);
+        assert!(!s.owes());
+    }
+
+    #[test]
+    fn a_reset_forgets_the_releases_dropped_starts_were_waiting_for() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        // Dropped as late; its release was lost to a full queue.
+        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        assert!(sent(&mut s, t0 + Duration::from_millis(100)).is_empty());
+        s.push(OutEvent::Reset { frame: 4800, running: false });
+        s.push(OutEvent::message(4800, &[0x90, 60, 100]));
+        s.push(OutEvent::message(4800, &[0x80, 60, 0]));
+        assert_eq!(sent(&mut s, t0 + Duration::from_millis(111)), [vec![0x90, 60, 100], vec![0x80, 60, 0]]);
     }
 
     #[test]
