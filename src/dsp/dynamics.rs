@@ -71,6 +71,11 @@ impl Compressor {
         self.gr_db
     }
 
+    /// Forgets the reduction it was holding, keeping its settings.
+    pub fn reset(&mut self) {
+        self.gr_db = 0.0;
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         self.process_keyed(x, x)
@@ -79,17 +84,33 @@ impl Compressor {
     /// Compresses `x` by the level of `key` (sidechain compression).
     #[inline]
     pub fn process_keyed(&mut self, x: f32, key: f32) -> f32 {
+        let g = self.detect(key);
+        self.apply(x, g)
+    }
+
+    /// Moves the gain reduction one frame on for a detector reading `key`,
+    /// and returns the gain it applies (before the makeup). Channels
+    /// compressed alike (linked) share one detection a frame.
+    #[inline]
+    pub fn detect(&mut self, key: f32) -> f32 {
         let a = key.abs();
         let target =
             if self.ratio == 1.0 || a <= self.knee_floor { 0.0 } else { self.static_gain_db(20.0 * a.log10()) };
         if target == 0.0 && self.gr_db > -1e-4 {
             // Fully released and below the knee: nothing to compute.
             self.gr_db = 0.0;
-            return x * self.makeup;
+            return 1.0;
         }
         let coef = if target < self.gr_db { self.attack } else { self.release };
         self.gr_db = target + coef * (self.gr_db - target);
-        x * self.makeup * db_to_gain(self.gr_db)
+        db_to_gain(self.gr_db)
+    }
+
+    /// `x` through the makeup and a gain from [`Compressor::detect`]. A gain
+    /// of exactly 1 changes nothing: `x * makeup * 1.0` is `x * makeup`.
+    #[inline]
+    pub fn apply(&self, x: f32, gain: f32) -> f32 {
+        x * self.makeup * gain
     }
 }
 

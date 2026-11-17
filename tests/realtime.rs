@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
 use tinvo::engine::{Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Shared, Step, Take};
+use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use tinvo::instrument::InstrumentKind;
 use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
@@ -206,8 +207,10 @@ fn heavy_song() -> usize {
 }
 
 /// The heavy project's tracks again and again up to the limit, each sampler
-/// with a sample of its own. A copy's bus and master lanes are freed: only
-/// one lane in a project holds each.
+/// with a sample of its own, spread over as many groups as a project holds,
+/// each with every strip stage and send busy and its pan on a lane. A
+/// copy's bus and master lanes are freed: only one lane in a project holds
+/// each.
 fn full_song() -> usize {
     let mut p = heavy_project();
     let base = p.tracks.clone();
@@ -220,6 +223,28 @@ fn full_song() -> usize {
         p.tracks.push(t);
     }
     assert_eq!(p.tracks.len(), 32);
+    let ok = |r: Result<Edit, _>| r.map(drop).unwrap();
+    for g in 0..MAX_GROUPS as u8 {
+        ok(p.apply(Edit::InsertGroup(g)));
+        for i in 0..GROUP_PARAMS {
+            let spec = group_param(i).unwrap();
+            let at = (i + usize::from(g)) % 5;
+            let value = spec.min + (spec.max - spec.min) * at as f32 / 5.0;
+            ok(p.apply(Edit::SetGroupParam { group: g, index: i as u8, value }));
+        }
+        let pan = Some(LaneTarget::Group { group: g, index: 1 });
+        let t = 1 + g;
+        ok(p.apply(Edit::SetLane { track: t, lane: 3, target: pan, ramp: true }));
+        for (step, value) in [(0, -1.0), (8, 1.0)] {
+            ok(p.apply(Edit::SetPoint { track: t, lane: 3, pattern: 0, step, value: Some(value) }));
+        }
+    }
+    assert_eq!(p.groups.len(), 8);
+    // Every few tracks go straight to the master.
+    for t in 0..p.tracks.len() {
+        let group = (t % 5 != 0).then_some((t % MAX_GROUPS) as u8);
+        ok(p.apply(Edit::SetTrackGroup { track: t as u8, group }));
+    }
     let mut rig = Rig::new(&p);
     for (t, track) in p.tracks.iter().enumerate() {
         if track.kind == InstrumentKind::Sampler {
@@ -234,7 +259,8 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
     let mut r = |n: u64| rng.next_u64() % n;
     let track = r(MAX_TRACKS as u64 + 1) as u8;
     let kind = InstrumentKind::ALL[r(InstrumentKind::ALL.len() as u64) as usize];
-    let edit = match r(23) {
+    let group = r(MAX_GROUPS as u64 + 1) as u8;
+    let edit = match r(25) {
         0 => Edit::SetTempo(20.0 + r(281) as f32),
         1 => Edit::SetSwing(50.0 + r(26) as f32),
         2 => Edit::SetPatternLength { pattern: r(16) as u8, len: 1 + r(64) as u8 },
@@ -253,9 +279,10 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
         10 => Edit::RemoveSongEntry(r(8) as u16),
         11 => Edit::SetLoop((r(3) > 0).then(|| (r(4) as u16, 4 + r(4) as u16))),
         12 => {
-            let target = match r(3) {
+            let target = match r(4) {
                 0 => None,
                 1 => Some(LaneTarget::Mix(r(MIX_PARAMS.len() as u64) as u8)),
+                2 => Some(LaneTarget::Group { group, index: r(GROUP_PARAMS as u64 + 2) as u8 }),
                 _ => Some(LaneTarget::Track(r(30) as u8)),
             };
             Edit::SetLane { track, lane: r(4) as u8, target, ramp: r(2) == 0 }
@@ -283,6 +310,19 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
             };
             Edit::SetPart { track, index: r(8) as u16, part }
         }
+        22 | 23 => match r(7) {
+            0 => Edit::InsertGroup(group),
+            1 => Edit::RemoveGroup(group),
+            2 => Edit::SetGroupGain { group, db: r(73) as f32 - 60.0 },
+            3 => Edit::SetGroupPan { group, pan: r(201) as f32 / 100.0 - 1.0 },
+            4 => Edit::SetGroupMute { group, mute: r(2) == 0 },
+            5 => {
+                let index = r(GROUP_PARAMS as u64) as u8;
+                let spec = group_param(usize::from(index)).unwrap();
+                Edit::SetGroupParam { group, index, value: spec.min + (spec.max - spec.min) * (r(101) as f32 / 100.0) }
+            }
+            _ => Edit::SetTrackGroup { track, group: (r(4) > 0).then_some(group) },
+        },
         _ => {
             return match r(7) {
                 0 => Command::Play,

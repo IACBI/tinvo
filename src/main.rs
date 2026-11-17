@@ -230,12 +230,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         let out_path = std::path::Path::new(out);
         let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
         let mut files = Vec::new();
-        for i in render::stem_tracks(&project) {
-            let name: String =
-                project.tracks[i].name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
-            let path = out_path.with_file_name(format!("{stem}-{:02}-{name}.wav", i + 1));
+        for part in render::stems(&project) {
+            let path = out_path.with_file_name(format!("{stem}-{}.wav", part.file_part(&project)));
             let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
-            render::render_into(&render::stem_project(&project, i), &track_samples, &opts, &mut |b| file.write(b))?;
+            render::render_into(&render::stem_project(&project, part), &track_samples, &opts, &mut |b| file.write(b))?;
             files.push((path, file));
         }
         // Stems end at different times; pad them to one length so they line up.

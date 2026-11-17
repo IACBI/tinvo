@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 14
+//! tinvo 15
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -18,6 +18,13 @@
 //! tempo_ramp true            # ramp between tempo points; only when set
 //! mix reverb_decay 2.4       # buses and master; only values off their default
 //!
+//! group Drums                # a group bus and its name; groups come before tracks
+//! gain_db -3
+//! pan 0
+//! mute false
+//! param comp_ratio 2         # its strip and sends; only values off their default
+//! end
+//!
 //! track kick
 //! name Kick
 //! gain_db -2
@@ -26,10 +33,11 @@
 //! solo false
 //! midi_channel 3             # the MIDI channel (1-16) that plays it; only when set
 //! midi_out true              # its notes go to the MIDI output; only when set
+//! group 1                    # the group (1 is the first) it goes to; only when set
 //! parts . . B -              # per song entry: . the entry's pattern, a pattern, - rest
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
-//! lane 0 decay ramp          # lane, parameter id (volume, pan, or a mix id), hold or ramp
+//! lane 0 decay ramp          # lane, parameter id (volume, pan, a mix id, or group1.<id>), hold or ramp
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! point 0 0 0.2              # lane step value
 //! point 0 15 0.9
@@ -46,8 +54,8 @@
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
 //! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers),
 //! 10 (every track plays the entry's pattern), 11 (16th-note steps, up
-//! to 4 ratchets) and 12 (no MIDI channels, bend ranges or mod wheel) are
-//! still read.
+//! to 4 ratchets), 12 (no MIDI channels, bend ranges or mod wheel), 13
+//! (no MIDI output) and 14 (no groups, up to 16 tracks) are still read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
@@ -55,13 +63,14 @@ use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
     MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Meter, Part, Step, entry_tempo, loop_region, span_frames,
 };
+use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
 use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 14;
+pub const FORMAT_VERSION: u32 = 15;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -87,6 +96,8 @@ pub struct TrackData {
     pub channel: Option<u8>,
     /// Its notes go to the MIDI output instead of sounding.
     pub midi_out: bool,
+    /// The group it goes to; `None` is the master.
+    pub group: Option<u8>,
     /// `steps[pattern][step]`.
     pub steps: Box<[[Option<Step>; MAX_STEPS]; MAX_PATTERNS]>,
     /// Sampler tracks: the sample file. Absolute in memory; written relative
@@ -144,10 +155,34 @@ impl TrackData {
             solo: false,
             channel: None,
             midi_out: false,
+            group: None,
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
             parts: Box::new([Part::Follow; MAX_SONG]),
+        }
+    }
+}
+
+/// A group bus: its tracks run through its strip and fader together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupData {
+    pub name: String,
+    pub gain_db: f32,
+    pub pan: f32,
+    pub mute: bool,
+    /// One value per [`group_param`]: the strip's, then the bus sends.
+    pub params: [f32; GROUP_PARAMS],
+}
+
+impl GroupData {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            gain_db: 0.0,
+            pan: 0.0,
+            mute: false,
+            params: std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default)),
         }
     }
 }
@@ -163,6 +198,8 @@ pub struct Project {
     /// Each pattern's time signature.
     pub meters: [Meter; MAX_PATTERNS],
     pub master_gain_db: f32,
+    /// Group buses, at most [`MAX_GROUPS`]; tracks name them by index.
+    pub groups: Vec<GroupData>,
     pub tracks: Vec<TrackData>,
     /// Pattern numbers in playing order.
     pub song: Vec<u8>,
@@ -228,6 +265,10 @@ pub enum EditError {
     TooManyTracks,
     SongFull,
     BadLoop,
+    NoSuchGroup(u8),
+    TooManyGroups,
+    /// A track goes to the group, or a lane automates it.
+    GroupInUse(u8),
 }
 
 impl fmt::Display for EditError {
@@ -245,6 +286,11 @@ impl fmt::Display for EditError {
             EditError::TooManyTracks => write!(f, "track limit ({MAX_TRACKS}) reached"),
             EditError::SongFull => write!(f, "the song is full ({MAX_SONG} entries)"),
             EditError::BadLoop => write!(f, "loop region out of range"),
+            EditError::NoSuchGroup(g) => write!(f, "no group {}", u32::from(*g) + 1),
+            EditError::TooManyGroups => write!(f, "group limit ({MAX_GROUPS}) reached"),
+            EditError::GroupInUse(g) => {
+                write!(f, "group {} still has tracks or automation on it", u32::from(*g) + 1)
+            }
         }
     }
 }
@@ -276,6 +322,7 @@ impl Project {
             divisions: [Division::Sixteenth; MAX_PATTERNS],
             meters: [Meter::default(); MAX_PATTERNS],
             master_gain_db: 0.0,
+            groups: Vec::new(),
             tracks: Vec::new(),
             song: Vec::new(),
             loop_region: None,
@@ -581,8 +628,104 @@ impl Project {
                 self.track_mut(track)?.midi_out = on;
                 edit
             }
+            Edit::InsertGroup(index) => {
+                self.check_insert_group(index)?;
+                let name = self.free_group_name();
+                self.groups.insert(usize::from(index), GroupData::new(name));
+                self.renumber_groups(|g| if g >= index { g + 1 } else { g });
+                edit
+            }
+            Edit::RemoveGroup(index) => {
+                self.check_remove_group(index)?;
+                self.groups.remove(usize::from(index));
+                self.renumber_groups(|g| if g > index { g - 1 } else { g });
+                edit
+            }
+            Edit::SetGroupGain { group, db } => {
+                let db = VOLUME.clamp(db);
+                self.group_mut(group)?.gain_db = db;
+                Edit::SetGroupGain { group, db }
+            }
+            Edit::SetGroupPan { group, pan } => {
+                let pan = PAN.clamp(pan);
+                self.group_mut(group)?.pan = pan;
+                Edit::SetGroupPan { group, pan }
+            }
+            Edit::SetGroupMute { group, mute } => {
+                self.group_mut(group)?.mute = mute;
+                edit
+            }
+            Edit::SetGroupParam { group, index, value } => {
+                let spec = group_param(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                let value = spec.clamp(value);
+                self.group_mut(group)?.params[usize::from(index)] = value;
+                Edit::SetGroupParam { group, index, value }
+            }
+            Edit::SetTrackGroup { track, group } => {
+                self.check_destination(group)?;
+                self.track_mut(track)?.group = group;
+                edit
+            }
         };
         Ok(applied)
+    }
+
+    fn group_mut(&mut self, g: u8) -> Result<&mut GroupData, EditError> {
+        self.groups.get_mut(usize::from(g)).ok_or(EditError::NoSuchGroup(g))
+    }
+
+    fn group(&self, g: u8) -> Result<&GroupData, EditError> {
+        self.groups.get(usize::from(g)).ok_or(EditError::NoSuchGroup(g))
+    }
+
+    /// Validates sending a track to `group` (`None`: the master).
+    fn check_destination(&self, group: Option<u8>) -> Result<(), EditError> {
+        match group {
+            Some(g) => self.group(g).map(drop),
+            None => Ok(()),
+        }
+    }
+
+    fn check_insert_group(&self, index: u8) -> Result<(), EditError> {
+        if usize::from(index) > self.groups.len() {
+            return Err(EditError::NoSuchGroup(index));
+        }
+        if self.groups.len() >= MAX_GROUPS {
+            return Err(EditError::TooManyGroups);
+        }
+        Ok(())
+    }
+
+    /// A group can go once no track goes to it and no lane automates it.
+    fn check_remove_group(&self, index: u8) -> Result<(), EditError> {
+        self.group(index)?;
+        let lanes = self.tracks.iter().flat_map(|t| &t.lanes);
+        if self.tracks.iter().any(|t| t.group == Some(index))
+            || lanes.filter_map(|l| l.target).any(|x| x.group() == Some(index))
+        {
+            return Err(EditError::GroupInUse(index));
+        }
+        Ok(())
+    }
+
+    /// Moves every track's group and every lane on a group to `to(group)`.
+    fn renumber_groups(&mut self, to: impl Fn(u8) -> u8) {
+        for t in &mut self.tracks {
+            t.group = t.group.map(&to);
+            for l in &mut t.lanes {
+                if let Some(LaneTarget::Group { group, index }) = l.target {
+                    l.target = Some(LaneTarget::Group { group: to(group), index });
+                }
+            }
+        }
+    }
+
+    /// "Group N" for the lowest N no group is called.
+    fn free_group_name(&self) -> String {
+        (1..)
+            .map(|n| format!("Group {n}"))
+            .find(|name| self.groups.iter().all(|g| &g.name != name))
+            .expect("fewer groups than numbers")
     }
 
     fn track(&self, t: u8) -> Result<&TrackData, EditError> {
@@ -601,6 +744,9 @@ impl Project {
         }
         if let Some(x) = target {
             x.spec(t.kind).ok_or(EditError::NoSuchTarget(x))?;
+            if x.group().is_some_and(|g| usize::from(g) >= self.groups.len()) {
+                return Err(EditError::NoSuchTarget(x));
+            }
             if t.lanes.iter().enumerate().any(|(k, l)| k != usize::from(lane) && l.target == target) {
                 return Err(EditError::DuplicateLane);
             }
@@ -811,6 +957,10 @@ impl Project {
         for (index, &value) in self.mix.iter().enumerate() {
             e.push(Edit::SetMixParam { index: index as u8, value });
         }
+        for (i, g) in self.groups.iter().enumerate() {
+            e.push(Edit::InsertGroup(i as u8));
+            push_group_state(&mut e, i as u8, g);
+        }
         for (i, t) in self.tracks.iter().enumerate() {
             e.push(Edit::AddTrack(t.kind));
             push_track_state(&mut e, i as u8, t);
@@ -935,6 +1085,28 @@ impl Project {
             Edit::SetSolo { track, .. } => vec![Edit::SetSolo { track, solo: self.track(track)?.solo }],
             Edit::SetChannel { track, .. } => vec![Edit::SetChannel { track, channel: self.track(track)?.channel }],
             Edit::SetMidiOut { track, .. } => vec![Edit::SetMidiOut { track, on: self.track(track)?.midi_out }],
+            Edit::InsertGroup(index) => {
+                self.check_insert_group(index)?;
+                vec![Edit::RemoveGroup(index)]
+            }
+            Edit::RemoveGroup(index) => {
+                self.check_remove_group(index)?;
+                let mut e = vec![Edit::InsertGroup(index)];
+                push_group_state(&mut e, index, self.group(index)?);
+                e
+            }
+            Edit::SetGroupGain { group, .. } => vec![Edit::SetGroupGain { group, db: self.group(group)?.gain_db }],
+            Edit::SetGroupPan { group, .. } => vec![Edit::SetGroupPan { group, pan: self.group(group)?.pan }],
+            Edit::SetGroupMute { group, .. } => vec![Edit::SetGroupMute { group, mute: self.group(group)?.mute }],
+            Edit::SetGroupParam { group, index, .. } => {
+                let g = self.group(group)?;
+                let value = *g.params.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
+                vec![Edit::SetGroupParam { group, index, value }]
+            }
+            Edit::SetTrackGroup { track, group } => {
+                self.check_destination(group)?;
+                vec![Edit::SetTrackGroup { track, group: self.track(track)?.group }]
+            }
         };
         Ok(inv)
     }
@@ -991,6 +1163,19 @@ impl Project {
                 let _ = writeln!(s, "mix {} {v}", spec.id);
             }
         }
+        for g in &self.groups {
+            let _ = writeln!(s, "\ngroup {}", sanitize_group_name(&g.name));
+            let _ = writeln!(s, "gain_db {}", g.gain_db);
+            let _ = writeln!(s, "pan {}", g.pan);
+            let _ = writeln!(s, "mute {}", g.mute);
+            for (i, &v) in g.params.iter().enumerate() {
+                let spec = group_param(i).expect("one value per parameter");
+                if v != spec.default {
+                    let _ = writeln!(s, "param {} {v}", spec.id);
+                }
+            }
+            let _ = writeln!(s, "end");
+        }
         for t in &self.tracks {
             let _ = writeln!(s, "\ntrack {}", t.kind.id());
             let _ = writeln!(s, "name {}", sanitize_name(&t.name));
@@ -1007,6 +1192,9 @@ impl Project {
             if t.midi_out {
                 let _ = writeln!(s, "midi_out true");
             }
+            if let Some(g) = t.group {
+                let _ = writeln!(s, "group {}", u32::from(g) + 1);
+            }
             // Up to the last entry that does not follow; the rest follow.
             if let Some(last) = t.parts.iter().rposition(|&p| p != Part::Follow) {
                 let names: Vec<String> = t.parts[..=last].iter().map(|&p| part_name(p).to_string()).collect();
@@ -1022,8 +1210,8 @@ impl Project {
                 }
             }
             for (k, l) in t.lanes.iter().enumerate() {
-                if let Some(spec) = l.target.and_then(|x| x.spec(t.kind)) {
-                    let _ = writeln!(s, "lane {k} {} {}", spec.id, if l.ramp { "ramp" } else { "hold" });
+                if let Some(id) = l.target.and_then(|x| lane_id(x, t.kind)) {
+                    let _ = writeln!(s, "lane {k} {id} {}", if l.ramp { "ramp" } else { "hold" });
                 }
             }
             for (p, steps) in t.steps.iter().enumerate() {
@@ -1065,6 +1253,7 @@ impl Project {
         let mut p = Project::new();
         let mut version: Option<u32> = None;
         let mut current: Option<TrackData> = None;
+        let mut current_group: Option<GroupData> = None;
         // The pattern that `step` lines in the current track block fill.
         let mut pattern = 0usize;
         // Where each marker and `parts` line was read, for errors found once
@@ -1097,6 +1286,27 @@ impl Project {
                 continue;
             };
 
+            if let Some(g) = current_group.as_mut() {
+                match key {
+                    "gain_db" => g.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
+                    "pan" => g.pan = parse_in(rest, &PAN).map_err(err)?,
+                    "mute" => g.mute = parse_bool(rest).map_err(err)?,
+                    "param" => {
+                        let (id, value) = rest
+                            .split_once(char::is_whitespace)
+                            .ok_or_else(|| err("expected 'param <id> <value>'".into()))?;
+                        let (i, spec) = (0..GROUP_PARAMS)
+                            .filter_map(|i| group_param(i).map(|s| (i, s)))
+                            .find(|(_, s)| s.id == id)
+                            .ok_or_else(|| err(format!("unknown group parameter '{id}'")))?;
+                        g.params[i] = parse_in(value.trim(), spec).map_err(err)?;
+                    }
+                    "end" => p.groups.push(current_group.take().expect("inside a group block")),
+                    _ => return Err(err(format!("unknown group key '{key}'"))),
+                }
+                continue;
+            }
+
             if let Some(t) = current.as_mut() {
                 match key {
                     "name" => t.name = sanitize_name(rest),
@@ -1125,6 +1335,13 @@ impl Project {
                         t.channel = Some(c - 1);
                     }
                     "midi_out" if ver >= 14 => t.midi_out = parse_bool(rest).map_err(err)?,
+                    "group" if ver >= 15 => {
+                        let g: usize = parse_num(rest).map_err(err)?;
+                        if !(1..=p.groups.len()).contains(&g) {
+                            return Err(err(format!("no group {g} (groups come before tracks)")));
+                        }
+                        t.group = Some((g - 1) as u8);
+                    }
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
@@ -1137,11 +1354,16 @@ impl Project {
                         }
                         let count = track_param_count(t.kind) as u8;
                         let mix = if ver >= 9 { 0..MIX_PARAMS.len() as u8 } else { 0..0 };
+                        let groups = if ver >= 15 { 0..p.groups.len() as u8 } else { 0..0 };
+                        let group_targets = groups.flat_map(|group| {
+                            (0..2 + GROUP_PARAMS as u8).map(move |index| LaneTarget::Group { group, index })
+                        });
                         let target = (0..2 + count)
                             .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
                             .map(LaneTarget::Track)
                             .chain(mix.map(LaneTarget::Mix))
-                            .find(|&x| x.spec(t.kind).is_some_and(|s| s.id == id))
+                            .chain(group_targets)
+                            .find(|&x| lane_id(x, t.kind).is_some_and(|s| s == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
                         if target.is_global()
                             && p.tracks.iter().flat_map(|o| &o.lanes).any(|l| l.target == Some(target))
@@ -1358,6 +1580,15 @@ impl Project {
                     current = Some(TrackData::new(kind));
                     pattern = 0;
                 }
+                "group" if ver >= 15 => {
+                    if p.groups.len() >= MAX_GROUPS {
+                        return Err(err(format!("more than {MAX_GROUPS} groups")));
+                    }
+                    if !p.tracks.is_empty() {
+                        return Err(err("groups come before tracks".into()));
+                    }
+                    current_group = Some(GroupData::new(sanitize_group_name(rest)));
+                }
                 _ => return Err(err(format!("unknown key '{key}'"))),
             }
         }
@@ -1367,6 +1598,9 @@ impl Project {
         }
         if current.is_some() {
             return Err(ParseError { line: text.lines().count(), message: "track block missing 'end'".into() });
+        }
+        if current_group.is_some() {
+            return Err(ParseError { line: text.lines().count(), message: "group block missing 'end'".into() });
         }
         for (m, &line) in p.markers.iter().zip(&marker_lines) {
             if usize::from(m.entry) >= p.song.len() {
@@ -1428,6 +1662,16 @@ impl Project {
         }
         Ok(p)
     }
+}
+
+/// How a lane's target is named in the file: its parameter's id, behind
+/// `group<n>.` (1 for the first group) for a group's.
+fn lane_id(target: LaneTarget, kind: InstrumentKind) -> Option<String> {
+    let id = target.spec(kind)?.id;
+    Some(match target.group() {
+        Some(g) => format!("group{}.{id}", u32::from(g) + 1),
+        None => id.to_string(),
+    })
 }
 
 /// The letter of pattern `p` (A for 0).
@@ -1517,6 +1761,7 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     e.push(Edit::SetSolo { track, solo: t.solo });
     e.push(Edit::SetChannel { track, channel: t.channel });
     e.push(Edit::SetMidiOut { track, on: t.midi_out });
+    e.push(Edit::SetTrackGroup { track, group: t.group });
     for (index, &part) in t.parts.iter().enumerate() {
         if part != Part::Follow {
             e.push(Edit::SetPart { track, index: index as u16, part });
@@ -1537,6 +1782,17 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     }
 }
 
+/// Appends the edits that give group `group` (already inserted, at its
+/// defaults) the settings of `g`.
+fn push_group_state(e: &mut Vec<Edit>, group: u8, g: &GroupData) {
+    e.push(Edit::SetGroupGain { group, db: g.gain_db });
+    e.push(Edit::SetGroupPan { group, pan: g.pan });
+    e.push(Edit::SetGroupMute { group, mute: g.mute });
+    for (index, &value) in g.params.iter().enumerate() {
+        e.push(Edit::SetGroupParam { group, index: index as u8, value });
+    }
+}
+
 /// Appends a `SetPoint` for every point of lane `lane`.
 fn push_points(e: &mut Vec<Edit>, track: u8, lane: u8, l: &LaneData) {
     for (p, pts) in l.points.iter().enumerate() {
@@ -1550,9 +1806,17 @@ fn push_points(e: &mut Vec<Edit>, track: u8, lane: u8, l: &LaneData) {
 
 /// Track names are single-line, printable and bounded in length.
 pub fn sanitize_name(name: &str) -> String {
-    let s: String = name.chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
-    let s = s.trim().to_string();
-    if s.is_empty() { "Track".to_string() } else { s }
+    clean_name(name, "Track")
+}
+
+/// Group names follow the rules for track names.
+pub fn sanitize_group_name(name: &str) -> String {
+    clean_name(name, "Group")
+}
+
+fn clean_name(name: &str, empty: &str) -> String {
+    let s = clean_marker_name(name);
+    if s.is_empty() { empty.to_string() } else { s }
 }
 
 /// Marker names are cleaned as track names are, but may be empty: an empty
@@ -1618,7 +1882,7 @@ mod tests {
         p.tracks[4].parts[4] = Part::Pattern(0);
         p.tracks[2].midi_out = true;
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 14\n"));
+        assert!(text.starts_with("tinvo 15\n"));
         assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
         assert!(text.contains("\nparts . . . . A\n"), "{text}");
         assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
@@ -1927,6 +2191,131 @@ mod tests {
             assert!(Project::from_text(bad).is_err(), "{bad}");
         }
         assert!(Project::from_text("tinvo 8\ntrack kick\nparam send_reverb -6\nend").is_ok());
+    }
+
+    fn group_index(id: &str) -> u8 {
+        (0..GROUP_PARAMS).find(|&i| group_param(i).is_some_and(|s| s.id == id)).expect("a group parameter") as u8
+    }
+
+    #[test]
+    fn format_15_adds_group_buses() {
+        let mut p = Project::demo();
+        let group_lane = Some(LaneTarget::Group { group: 1, index: 0 });
+        let edits = [
+            Edit::InsertGroup(0),
+            Edit::InsertGroup(1),
+            Edit::SetGroupGain { group: 1, db: -3.5 },
+            Edit::SetGroupPan { group: 1, pan: 0.25 },
+            Edit::SetGroupMute { group: 0, mute: true },
+            Edit::SetGroupParam { group: 1, index: group_index("comp_ratio"), value: 4.0 },
+            Edit::SetGroupParam { group: 0, index: group_index("send_reverb"), value: -12.0 },
+            Edit::SetTrackGroup { track: 0, group: Some(1) },
+            Edit::SetTrackGroup { track: 1, group: Some(1) },
+            Edit::SetTrackGroup { track: 5, group: Some(0) },
+            Edit::SetLane { track: 2, lane: 0, target: group_lane, ramp: true },
+            Edit::SetPoint { track: 2, lane: 0, pattern: 0, step: 4, value: Some(-6.0) },
+        ];
+        for e in edits {
+            p.apply(e).unwrap();
+        }
+        let text = p.to_text();
+        assert!(text.contains("\ngroup Group 1\ngain_db 0\npan 0\nmute true\nparam send_reverb -12\nend\n"), "{text}");
+        assert!(
+            text.contains("\ngroup Group 2\ngain_db -3.5\npan 0.25\nmute false\nparam comp_ratio 4\nend\n"),
+            "{text}"
+        );
+        assert!(text.find("\ngroup Group 2").unwrap() < text.find("\ntrack ").unwrap(), "{text}");
+        assert_eq!(text.matches("\ngroup 2\n").count(), 2, "{text}");
+        assert_eq!(text.matches("\ngroup 1\n").count(), 1, "{text}");
+        assert!(text.contains("\nlane 0 group2.volume ramp\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+
+        let nine = "tinvo 15\n".to_string() + &"group G\nend\n".repeat(MAX_GROUPS + 1);
+        for bad in [
+            "tinvo 14\ngroup G\nend",
+            "tinvo 14\ntrack kick\ngroup 1\nend",
+            "tinvo 15\ntrack kick\ngroup 1\nend",
+            "tinvo 15\ngroup G\nend\ntrack kick\ngroup 0\nend",
+            "tinvo 15\ntrack kick\nend\ngroup G\nend",
+            "tinvo 15\ngroup G\nparam nope 1\nend",
+            "tinvo 15\ngroup G\nvolume 1\nend",
+            "tinvo 15\ngroup G\ngain_db -3",
+            "tinvo 15\ngroup G\nend\ntrack kick\nlane 0 group2.volume hold\nend",
+            "tinvo 15\ngroup G\nend\ntrack kick\nlane 0 group1.pan hold\nend\ntrack kick\nlane 1 group1.pan hold\nend",
+            &nine,
+        ] {
+            assert!(Project::from_text(bad).is_err(), "{bad}");
+        }
+        let eight = "tinvo 15\n".to_string() + &"group G\nend\n".repeat(MAX_GROUPS);
+        assert_eq!(Project::from_text(&eight).unwrap().groups.len(), MAX_GROUPS);
+        // A name is cleaned as a track's is; an empty one becomes "Group".
+        let named = Project::from_text("tinvo 15\ngroup   Drums  bus \nend\ngroup\nend").unwrap();
+        assert_eq!(named.groups[0].name, "Drums  bus");
+        assert_eq!(named.groups[1].name, "Group");
+    }
+
+    #[test]
+    fn groups_are_inserted_removed_and_undone_with_their_users() {
+        let mut p = Project::demo();
+        let undo = |p: &mut Project, e: Edit| {
+            let inv = p.inverse(&e).unwrap();
+            p.apply(e).unwrap();
+            inv
+        };
+        undo(&mut p, Edit::InsertGroup(0));
+        undo(&mut p, Edit::InsertGroup(1));
+        assert_eq!(p.groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Group 1", "Group 2"]);
+        p.apply(Edit::SetTrackGroup { track: 3, group: Some(1) }).unwrap();
+        let lane = Some(LaneTarget::Group { group: 1, index: 2 + group_index("comp_ratio") });
+        p.apply(Edit::SetLane { track: 0, lane: 2, target: lane, ramp: false }).unwrap();
+        // A group inserted in front renumbers the tracks and lanes on the ones behind it.
+        undo(&mut p, Edit::InsertGroup(0));
+        assert_eq!(p.tracks[3].group, Some(2));
+        assert_eq!(
+            p.tracks[0].lanes[2].target,
+            Some(LaneTarget::Group { group: 2, index: 2 + group_index("comp_ratio") })
+        );
+        assert_eq!(p.groups[0].name, "Group 3", "the lowest name no group has");
+        // In use, a group stays; free, it goes and the rest close up.
+        assert_eq!(p.apply(Edit::RemoveGroup(2)), Err(EditError::GroupInUse(2)));
+        p.apply(Edit::SetTrackGroup { track: 3, group: None }).unwrap();
+        assert_eq!(p.apply(Edit::RemoveGroup(2)), Err(EditError::GroupInUse(2)), "the lane still automates it");
+        p.apply(Edit::SetLane { track: 0, lane: 2, target: None, ramp: false }).unwrap();
+        p.apply(Edit::SetTrackGroup { track: 4, group: Some(2) }).unwrap();
+        p.apply(Edit::SetTrackGroup { track: 4, group: Some(1) }).unwrap();
+        p.apply(Edit::SetGroupGain { group: 2, db: -9.0 }).unwrap();
+        p.apply(Edit::SetGroupParam { group: 2, index: 0, value: 120.0 }).unwrap();
+        let before = p.clone();
+        let inv = undo(&mut p, Edit::RemoveGroup(2));
+        assert_eq!(p.groups.len(), 2);
+        assert_eq!(p.tracks[4].group, Some(1), "an earlier group keeps its number");
+        for e in inv {
+            p.apply(e).unwrap();
+        }
+        assert_eq!(p, before, "undoing the removal brings the group back as it was");
+        undo(&mut p, Edit::RemoveGroup(0));
+        assert_eq!(p.tracks[4].group, Some(0), "a later group moves up");
+        // Limits and missing groups.
+        for g in p.groups.len()..MAX_GROUPS {
+            p.apply(Edit::InsertGroup(g as u8)).unwrap();
+        }
+        assert_eq!(p.apply(Edit::InsertGroup(0)), Err(EditError::TooManyGroups));
+        let mut q = Project::demo();
+        assert_eq!(q.apply(Edit::InsertGroup(1)), Err(EditError::NoSuchGroup(1)));
+        assert_eq!(q.apply(Edit::SetTrackGroup { track: 0, group: Some(0) }), Err(EditError::NoSuchGroup(0)));
+        assert_eq!(q.apply(Edit::SetGroupMute { group: 0, mute: true }), Err(EditError::NoSuchGroup(0)));
+        let target = LaneTarget::Group { group: 0, index: 0 };
+        assert_eq!(
+            q.apply(Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false }),
+            Err(EditError::NoSuchTarget(target))
+        );
+        q.apply(Edit::InsertGroup(0)).unwrap();
+        assert_eq!(
+            q.apply(Edit::SetGroupParam { group: 0, index: GROUP_PARAMS as u8, value: 0.0 }),
+            Err(EditError::NoSuchParam(GROUP_PARAMS as u8))
+        );
+        q.apply(Edit::SetGroupGain { group: 0, db: 1e9 }).unwrap();
+        assert_eq!(q.groups[0].gain_db, crate::engine::VOLUME.max, "values are clamped");
     }
 
     #[test]

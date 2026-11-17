@@ -18,6 +18,7 @@ use crate::dsp::loudness::LiveLoudness;
 use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
+use crate::group::{self, Group, MAX_GROUPS};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
 use crate::midi::{MOD_WHEEL, Message, OutEvent, SUSTAIN};
 use crate::mix::{self, Mix, send};
@@ -63,6 +64,10 @@ pub enum LaneTarget {
     /// The bus or master setting `i` ([`mix::MIX_PARAMS`]), which a lane on
     /// any one track can automate.
     Mix(u8),
+    /// A setting of group `group`, numbered as a track's: 0 is the volume,
+    /// 1 the pan, `2 + i` the group's parameter `i` ([`group::group_param`]).
+    /// A lane on any one track can automate it.
+    Group { group: u8, index: u8 },
 }
 
 impl LaneTarget {
@@ -73,13 +78,24 @@ impl LaneTarget {
             LaneTarget::Track(1) => Some(&PAN),
             LaneTarget::Track(t) => track_param(kind, usize::from(t) - 2),
             LaneTarget::Mix(i) => mix::MIX_PARAMS.get(usize::from(i)),
+            LaneTarget::Group { index: 0, .. } => Some(&VOLUME),
+            LaneTarget::Group { index: 1, .. } => Some(&PAN),
+            LaneTarget::Group { index, .. } => group::group_param(usize::from(index) - 2),
         }
     }
 
-    /// Whether it is a setting of the whole project rather than of the
-    /// lane's track: then only one lane in the project may hold it.
+    /// Whether it is a setting shared by the whole project rather than of
+    /// the lane's track: then only one lane in the project may hold it.
     pub fn is_global(self) -> bool {
-        matches!(self, LaneTarget::Mix(_))
+        matches!(self, LaneTarget::Mix(_) | LaneTarget::Group { .. })
+    }
+
+    /// The group it is a setting of.
+    pub fn group(self) -> Option<u8> {
+        match self {
+            LaneTarget::Group { group, .. } => Some(group),
+            _ => None,
+        }
     }
 }
 
@@ -88,6 +104,7 @@ impl fmt::Display for LaneTarget {
         match self {
             LaneTarget::Track(i) => write!(f, "{i}"),
             LaneTarget::Mix(i) => write!(f, "mix {i}"),
+            LaneTarget::Group { group, index } => write!(f, "group {group} {index}"),
         }
     }
 }
@@ -479,6 +496,36 @@ pub enum Edit {
         index: u8,
         value: f32,
     },
+    /// Inserts a group at this index (at most the current group count);
+    /// the tracks and lanes on groups from there on move with them.
+    InsertGroup(u8),
+    /// Removes a group. A project removes only one no track goes to and no
+    /// lane automates; the engine sends a member left over to the master.
+    RemoveGroup(u8),
+    SetGroupGain {
+        group: u8,
+        db: f32,
+    },
+    SetGroupPan {
+        group: u8,
+        pan: f32,
+    },
+    SetGroupMute {
+        group: u8,
+        mute: bool,
+    },
+    /// Sets group parameter `index` (see [`group::group_param`]).
+    SetGroupParam {
+        group: u8,
+        index: u8,
+        value: f32,
+    },
+    /// Sends `track` to `group`, or to the master (`None`). The track
+    /// crossfades from where it went to where it goes over 10 ms.
+    SetTrackGroup {
+        track: u8,
+        group: Option<u8>,
+    },
 }
 
 /// Messages from the UI to the audio thread.
@@ -739,6 +786,9 @@ pub struct Shared {
     /// Deepest compressor gain reduction per track since the UI last took
     /// it, in dB as a positive number.
     pub track_reduction: [AtomicF32; MAX_TRACKS],
+    /// The same two for each group bus.
+    pub group_peaks: [AtomicF32; MAX_GROUPS],
+    pub group_reduction: [AtomicF32; MAX_GROUPS],
     /// The pattern and step each track played last, packed by
     /// [`pack_track_step`], or `u32::MAX`.
     track_steps: [AtomicU32; MAX_TRACKS],
@@ -774,6 +824,8 @@ impl Shared {
             track_peaks: std::array::from_fn(|_| AtomicF32::new(0.0)),
             master_peaks: [AtomicF32::new(0.0), AtomicF32::new(0.0)],
             track_reduction: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            group_peaks: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            group_reduction: std::array::from_fn(|_| AtomicF32::new(0.0)),
             track_steps: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
             limiter_reduction: AtomicF32::new(0.0),
             loudness: std::array::from_fn(|_| AtomicF32::new(f32::NAN)),
@@ -891,7 +943,13 @@ struct Track {
     channel: Option<u8>,
     /// Its notes go to the MIDI output ([`Edit::SetMidiOut`]).
     midi_out: bool,
-    /// Neither muted nor left out by a solo.
+    /// The group it goes to; `None` is the master.
+    group: Option<u8>,
+    /// Where it went before its last [`Edit::SetTrackGroup`], and the
+    /// frames left of the crossfade from there.
+    prev_group: Option<u8>,
+    route_left: u32,
+    /// Neither muted (itself or by its group) nor left out by a solo.
     audible: bool,
     midi_offs: [MidiOff; MAX_PENDING_OFFS],
     midi_off_count: usize,
@@ -933,6 +991,9 @@ impl Track {
             solo: false,
             channel: None,
             midi_out: false,
+            group: None,
+            prev_group: None,
+            route_left: 0,
             audible: true,
             midi_offs: [MidiOff { frame: 0, channel: 0, note: 0, tag: 0 }; MAX_PENDING_OFFS],
             midi_off_count: 0,
@@ -971,6 +1032,9 @@ impl Track {
         self.solo = false;
         self.channel = None;
         self.midi_out = false;
+        self.group = None;
+        self.prev_group = None;
+        self.route_left = 0;
         self.audible = true;
         self.midi_off_count = 0;
         self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
@@ -988,6 +1052,17 @@ impl Track {
 
     /// Writes an automation value (`None`: the base value) to `target`.
     /// Returns whether the mixer gains need updating.
+    /// Sends the track to `group` (`None`: the master) over a crossfade of
+    /// `fade` frames. Back where it came from before a fade is over, the
+    /// fade turns round where it is; a third place takes the share still on
+    /// its way out at once.
+    fn route_to(&mut self, group: Option<u8>, fade: u32) {
+        let left = if self.route_left > 0 && group == self.prev_group { fade - self.route_left } else { fade };
+        self.prev_group = self.group;
+        self.group = group;
+        self.route_left = left;
+    }
+
     fn write_target(&mut self, target: u8, value: Option<f32>) -> bool {
         match target {
             0 => self.auto_gain = value,
@@ -1231,6 +1306,13 @@ pub struct Engine {
     /// before any strip runs, so the key bus is complete when the
     /// compressors read it.
     track_bufs: Box<[[f32; BLOCK]]>,
+    /// Group buses: [`MAX_GROUPS`] slots, the first `group_count` in use.
+    groups: Box<[Group]>,
+    group_count: usize,
+    /// A track's output while it crossfades from one destination to
+    /// another.
+    route_l: [f32; BLOCK],
+    route_r: [f32; BLOCK],
     /// Removed tracks still fading out: [`MAX_FADING`] slots, so only
     /// removals faster than that many per fade time cut one short.
     fading: Box<[Fading]>,
@@ -1324,6 +1406,10 @@ impl Engine {
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
+            groups: (0..2 * MAX_GROUPS).map(|_| Group::new(SMOOTHING_TIME, sample_rate)).collect(),
+            group_count: 0,
+            route_l: [0.0; BLOCK],
+            route_r: [0.0; BLOCK],
             fading: (0..MAX_FADING)
                 .map(|_| Fading { track: Track::new(InstrumentKind::Synth, sample_rate), left: 0 })
                 .collect(),
@@ -1457,6 +1543,8 @@ impl Engine {
         let m = self.master.target();
         self.master.snap(m);
         for t in &mut self.tracks[..] {
+            // A project opened goes where it goes at once.
+            t.route_left = 0;
             let (l, r) = (t.gain_l.target(), t.gain_r.target());
             t.gain_l.snap(l);
             t.gain_r.snap(r);
@@ -1465,6 +1553,9 @@ impl Engine {
                 let v = s.target();
                 s.snap(v);
             }
+        }
+        for g in &mut self.groups[..] {
+            g.snap();
         }
         self.mix.snap();
     }
@@ -2459,10 +2550,12 @@ impl Engine {
             Edit::RemoveTrack(i) => {
                 let i = usize::from(i);
                 if i < n {
-                    for l in &self.tracks[i].lanes {
-                        if let (Some(LaneTarget::Mix(x)), Some(_)) = (l.target, l.applied) {
-                            self.mix.automate(usize::from(x), None);
-                        }
+                    let held: [Option<LaneTarget>; MAX_LANES] = std::array::from_fn(|k| {
+                        let l = &self.tracks[i].lanes[k];
+                        l.target.filter(|_| l.applied.is_some())
+                    });
+                    for target in held.into_iter().flatten() {
+                        self.release_global(target);
                     }
                     self.tracks[i..n].rotate_left(1);
                     self.fade_out(n - 1);
@@ -2492,19 +2585,21 @@ impl Engine {
             Edit::SetLane { track, lane, target, ramp } => {
                 let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
                 let kind = t.instrument.kind();
-                if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| x.spec(kind).is_none()) {
+                let groups = self.group_count;
+                let valid = |x: LaneTarget| x.spec(kind).is_some() && x.group().is_none_or(|g| usize::from(g) < groups);
+                if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| !valid(x)) {
                     return;
                 }
                 let old = t.lanes[usize::from(lane)];
                 if old.target != target {
+                    t.lanes[usize::from(lane)] = Lane { target, ..Lane::EMPTY };
                     match (old.target, old.applied) {
-                        (Some(LaneTarget::Mix(x)), Some(_)) => self.mix.automate(usize::from(x), None),
                         (Some(LaneTarget::Track(x)), Some(_)) => {
-                            t.write_target(x, None);
+                            self.tracks[usize::from(track)].write_target(x, None);
                         }
+                        (Some(x), Some(_)) => self.release_global(x),
                         _ => {}
                     }
-                    t.lanes[usize::from(lane)] = Lane { target, ..Lane::EMPTY };
                     self.update_gains();
                 }
                 self.tracks[usize::from(track)].lanes[usize::from(lane)].ramp = ramp;
@@ -2565,17 +2660,161 @@ impl Engine {
                 }
             }
             Edit::SetMixParam { index, value } => self.mix.set_param(usize::from(index), value),
+            Edit::InsertGroup(index) => {
+                let (i, count) = (usize::from(index), self.group_count);
+                if count < MAX_GROUPS && i <= count {
+                    self.groups[count].reset();
+                    self.groups[i..=count].rotate_right(1);
+                    self.group_count += 1;
+                    self.renumber_groups(|g| if usize::from(g) >= i { Some(g + 1) } else { Some(g) });
+                    self.update_gains();
+                }
+            }
+            Edit::RemoveGroup(index) => {
+                let (i, count) = (usize::from(index), self.group_count);
+                if i < count {
+                    let r = self.free_retiring_slot();
+                    self.groups[i..count].rotate_left(1);
+                    self.groups.swap(count - 1, r);
+                    self.groups[r].hold_on();
+                    self.group_count -= 1;
+                    // The group plays on from a slot of its own until the
+                    // tracks crossfading out of it are done and it has rung
+                    // out; a track still in it (which the project refuses)
+                    // fades to the master.
+                    let (fade, n) = (self.fade_frames, self.track_count);
+                    let retiring = Some(r as u8);
+                    for t in self.tracks[..n].iter_mut().chain(self.fading.iter_mut().map(|f| &mut f.track)) {
+                        if t.prev_group == Some(index) {
+                            t.prev_group = retiring;
+                        }
+                        if t.group == Some(index) {
+                            t.group = retiring;
+                            t.route_to(None, fade);
+                        }
+                    }
+                    self.renumber_groups(|g| match usize::from(g).cmp(&i) {
+                        std::cmp::Ordering::Less => Some(g),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(g - 1),
+                    });
+                    self.update_gains();
+                }
+            }
+            Edit::SetGroupGain { group, db } => {
+                if let Some(g) = self.groups[..self.group_count].get_mut(usize::from(group)) {
+                    g.gain_db = db;
+                    self.update_gains();
+                }
+            }
+            Edit::SetGroupPan { group, pan } => {
+                if let Some(g) = self.groups[..self.group_count].get_mut(usize::from(group)) {
+                    g.pan = pan.clamp(-1.0, 1.0);
+                    self.update_gains();
+                }
+            }
+            Edit::SetGroupMute { group, mute } => {
+                if let Some(g) = self.groups[..self.group_count].get_mut(usize::from(group)) {
+                    g.mute = mute;
+                    self.update_gains();
+                }
+            }
+            Edit::SetGroupParam { group, index, value } => {
+                let target = LaneTarget::Group { group, index: index.saturating_add(2) };
+                let automated = self.tracks[..n].iter().any(|t| t.automated(target));
+                if let Some(g) = self.groups[..self.group_count].get_mut(usize::from(group)) {
+                    g.set_base(usize::from(index), value, automated);
+                }
+            }
+            Edit::SetTrackGroup { track, group } => {
+                let group = group.filter(|&g| usize::from(g) < self.group_count);
+                let fade = self.fade_frames;
+                if let Some(t) = self.tracks[..n].get_mut(usize::from(track)) {
+                    if t.group != group {
+                        t.route_to(group, fade);
+                        self.update_gains();
+                    }
+                }
+            }
         }
     }
 
-    /// Recomputes every track's target gains from fader, pan, mute and solo.
+    /// Returns a project-wide setting a lane let go of to its value from
+    /// edits.
+    fn release_global(&mut self, target: LaneTarget) {
+        match target {
+            LaneTarget::Mix(x) => self.mix.automate(usize::from(x), None),
+            LaneTarget::Group { group, index } => {
+                if let Some(g) = self.groups[..self.group_count].get_mut(usize::from(group)) {
+                    g.write_target(index, None);
+                }
+            }
+            LaneTarget::Track(_) => {}
+        }
+    }
+
+    /// A slot past the project's groups for one taken out to play on in:
+    /// one no longer sounding, else one only ringing out (cut short), else
+    /// the first, whose tracks then drop the share still fading out of it
+    /// (the share fading in goes on).
+    fn free_retiring_slot(&mut self) -> usize {
+        let n = self.track_count;
+        let slots = MAX_GROUPS..2 * MAX_GROUPS;
+        let fading_out = |tracks: &[Track], fading: &[Fading], r: usize| {
+            let r = Some(r as u8);
+            // A removed track whose fade is over feeds nothing any more.
+            let sounding = fading.iter().filter(|f| f.left > 0).map(|f| &f.track);
+            tracks.iter().chain(sounding).any(|t| t.route_left > 0 && t.prev_group == r)
+        };
+        let r = slots
+            .clone()
+            .find(|&r| !self.groups[r].is_live())
+            .or_else(|| slots.clone().find(|&r| !fading_out(&self.tracks[..n], &self.fading, r)))
+            .unwrap_or(slots.start);
+        for t in self.tracks[..n].iter_mut().chain(self.fading.iter_mut().map(|f| &mut f.track)) {
+            if t.prev_group == Some(r as u8) {
+                t.prev_group = Some(DROPPED);
+            }
+        }
+        r
+    }
+
+    /// Moves every reference to a group of the project (tracks', removed
+    /// tracks', lanes') to the group `to` gives, or for `None` to the
+    /// master (a lane: to no target). Groups playing on after their removal
+    /// keep their slots.
+    fn renumber_groups(&mut self, to: impl Fn(u8) -> Option<u8>) {
+        let n = self.track_count;
+        let to = |g: u8| if usize::from(g) < MAX_GROUPS { to(g) } else { Some(g) };
+        let tracks = self.tracks[..n].iter_mut().chain(self.fading.iter_mut().map(|f| &mut f.track));
+        for t in tracks {
+            t.group = t.group.and_then(to);
+            t.prev_group = t.prev_group.and_then(to);
+            for l in &mut t.lanes {
+                if let Some(LaneTarget::Group { group, index }) = l.target {
+                    match to(group) {
+                        Some(g) => l.target = Some(LaneTarget::Group { group: g, index }),
+                        None => *l = Lane::EMPTY,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recomputes every track's and group's target gains from fader, pan,
+    /// mute and solo. A muted group silences its members, soloed or not.
     fn update_gains(&mut self) {
+        let groups = &mut self.groups[..self.group_count];
+        for g in groups.iter_mut() {
+            g.update_gains();
+        }
         let tracks = &mut self.tracks[..self.track_count];
         let any_solo = tracks.iter().any(|t| t.solo);
         let (now, midi) = (self.now, &mut self.midi);
         let mut silenced = 0u32;
         for (i, t) in tracks.iter_mut().enumerate() {
-            let audible = !t.mute && (!any_solo || t.solo);
+            let group_muted = t.group.and_then(|g| groups.get(usize::from(g))).is_some_and(|g| g.mute);
+            let audible = !t.mute && !group_muted && (!any_solo || t.solo);
             // Its notes on the output stop, as a muted track's voices do.
             if t.audible && !audible && t.midi_out {
                 t.release_midi(now, midi);
@@ -2649,6 +2888,12 @@ impl Engine {
             s.track_reduction[i].fetch_max_non_negative(t.reduction);
             t.peak = 0.0;
             t.reduction = 0.0;
+        }
+        for (i, g) in self.groups[..self.group_count].iter_mut().enumerate() {
+            s.group_peaks[i].fetch_max_non_negative(g.peak);
+            s.group_reduction[i].fetch_max_non_negative(g.reduction);
+            g.peak = 0.0;
+            g.reduction = 0.0;
         }
         s.limiter_reduction.fetch_max_non_negative(self.limiter_reduction);
         self.limiter_reduction = 0.0;
@@ -2798,7 +3043,8 @@ impl Engine {
     fn automate(&mut self, frame: u64) {
         let frame = frame - frame % AUTOMATION_TICK;
         let mut gains = false;
-        let Self { tracks, track_count, mix, .. } = self;
+        let Self { tracks, track_count, mix, groups, group_count, .. } = self;
+        let groups = &mut groups[..*group_count];
         for t in &mut tracks[..*track_count] {
             let kind = t.instrument.kind();
             for k in 0..MAX_LANES {
@@ -2810,6 +3056,11 @@ impl Engine {
                     match target {
                         LaneTarget::Mix(i) => mix.automate(usize::from(i), want),
                         LaneTarget::Track(i) => gains |= t.write_target(i, want),
+                        LaneTarget::Group { group, index } => {
+                            if let Some(g) = groups.get_mut(usize::from(group)) {
+                                gains |= g.write_target(index, want);
+                            }
+                        }
                     }
                 }
             }
@@ -2964,6 +3215,10 @@ impl Engine {
             mix_l,
             mix_r,
             mix,
+            groups,
+            group_count,
+            route_l,
+            route_r,
             fading,
             fading_count,
             fade_frames,
@@ -2972,6 +3227,12 @@ impl Engine {
             ..
         } = self;
         let tracks = &mut tracks[..*track_count];
+        for (i, g) in groups.iter_mut().enumerate() {
+            if i < *group_count || g.is_live() {
+                g.in_l[a..b].fill(0.0);
+                g.in_r[a..b].fill(0.0);
+            }
+        }
         let key = &mut key[a..b];
         key.fill(0.0);
         for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
@@ -2985,12 +3246,24 @@ impl Engine {
                 }
             }
         }
+        let mut route = Route {
+            mix_l,
+            mix_r,
+            groups,
+            group_count: *group_count,
+            scratch: (route_l, route_r),
+            a,
+            b,
+            fade: *fade_frames,
+            fed: [0; 2 * MAX_GROUPS],
+        };
         for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
             let buf = &mut buf[a..b];
             t.strip.process(buf, key);
-            mix_track(t, buf, &mut mix_l[a..b], &mut mix_r[a..b], 2 * a, mix);
+            route.track(t, buf, buf.len(), mix);
         }
         if *fading_count == 0 {
+            route.groups(key, mix);
             return;
         }
         // A removed track feeds no one's key: its key send went with it.
@@ -2999,14 +3272,108 @@ impl Engine {
             buf.fill(0.0);
             f.track.instrument.render(buf);
             f.track.strip.process(buf, key);
+            let sounding = buf.len().min(f.left as usize);
             for s in buf.iter_mut() {
                 *s *= f.left as f32 / *fade_frames as f32;
                 f.left = f.left.saturating_sub(1);
             }
-            mix_track(&mut f.track, buf, &mut mix_l[a..b], &mut mix_r[a..b], 2 * a, mix);
+            route.track(&mut f.track, buf, sounding, mix);
             if f.left == 0 {
                 *fading_count -= 1;
                 retire(retired, f.track.instrument.set_sample(None));
+            }
+        }
+        route.groups(key, mix);
+    }
+}
+
+/// Where tracks' signals go for one segment, frames `a..b` of the block:
+/// the master's sum, or a group's input.
+struct Route<'a> {
+    mix_l: &'a mut [f32; BLOCK],
+    mix_r: &'a mut [f32; BLOCK],
+    /// The project's groups first, then slots for removed ones playing on.
+    groups: &'a mut [Group],
+    group_count: usize,
+    scratch: (&'a mut [f32; BLOCK], &'a mut [f32; BLOCK]),
+    a: usize,
+    b: usize,
+    fade: u32,
+    /// How many of the segment's first frames a track fed each group.
+    fed: [usize; 2 * MAX_GROUPS],
+}
+
+/// Where a track crossfading out of a group that had to make room goes:
+/// nowhere, so the share on its way out is dropped.
+const DROPPED: u8 = u8::MAX;
+
+/// The sum for `to`: a group's input, or the master's for `None` (also for
+/// a group out of range).
+fn route_sum<'s>(
+    mix: (&'s mut [f32; BLOCK], &'s mut [f32; BLOCK]),
+    groups: &'s mut [Group],
+    a: usize,
+    b: usize,
+    to: Option<u8>,
+) -> (&'s mut [f32], &'s mut [f32]) {
+    match to.and_then(|g| groups.get_mut(usize::from(g))) {
+        Some(g) => (&mut g.in_l[a..b], &mut g.in_r[a..b]),
+        None => (&mut mix.0[a..b], &mut mix.1[a..b]),
+    }
+}
+
+impl Route<'_> {
+    /// Notes that `to` was fed the segment's first `frames` frames.
+    fn feed(&mut self, to: Option<u8>, frames: usize) {
+        if let Some(f) = to.and_then(|g| self.fed.get_mut(usize::from(g))) {
+            *f = (*f).max(frames);
+        }
+    }
+
+    /// Mixes track `t`'s signal `buf` where it goes, crossfading from where
+    /// it went while a change of group is under way. Only its first
+    /// `sounding` frames count as feeding a group (a removed track's fade
+    /// can end inside the segment).
+    fn track(&mut self, t: &mut Track, buf: &[f32], sounding: usize, mix: &mut Mix) {
+        let (n, at) = (buf.len(), 2 * self.a);
+        let Route { mix_l, mix_r, groups, scratch, a, b, fade, .. } = self;
+        if t.route_left == 0 {
+            let (l, r) = route_sum((mix_l, mix_r), groups, *a, *b, t.group);
+            mix_track(t, buf, l, r, at, mix);
+            self.feed(t.group, sounding);
+            return;
+        }
+        let (sl, sr) = (&mut scratch.0[..n], &mut scratch.1[..n]);
+        sl.fill(0.0);
+        sr.fill(0.0);
+        mix_track(t, buf, sl, sr, at, mix);
+        let (left, fade) = (t.route_left, *fade as f32);
+        let weight = |i: usize| left.saturating_sub(i as u32) as f32 / fade;
+        if t.prev_group != Some(DROPPED) {
+            let (l, r) = route_sum((mix_l, mix_r), groups, *a, *b, t.prev_group);
+            for i in 0..n {
+                l[i] += sl[i] * weight(i);
+                r[i] += sr[i] * weight(i);
+            }
+        }
+        let (l, r) = route_sum((mix_l, mix_r), groups, *a, *b, t.group);
+        for i in 0..n {
+            l[i] += sl[i] * (1.0 - weight(i));
+            r[i] += sr[i] * (1.0 - weight(i));
+        }
+        t.route_left = left.saturating_sub(n as u32);
+        self.feed(t.group, sounding);
+        self.feed(t.prev_group, sounding.min(left as usize));
+    }
+
+    /// Runs every group fed or still ringing out into the master's sum: the
+    /// project's, and removed ones playing on.
+    fn groups(&mut self, key: &[f32], mix: &mut Mix) {
+        let (a, b) = (self.a, self.b);
+        for (i, g) in self.groups.iter_mut().enumerate() {
+            let fed = self.fed[i];
+            if (i < self.group_count || i >= MAX_GROUPS) && (fed > 0 || g.is_live()) {
+                g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix);
             }
         }
     }
@@ -3149,6 +3516,591 @@ mod tests {
         assert_ne!(both, kick_only);
         assert_eq!(kick_only, solo_kick);
         assert!(all_muted.iter().all(|&x| x == 0.0));
+    }
+
+    /// A group parameter's index, by id.
+    fn group_index(id: &str) -> u8 {
+        (0..group::GROUP_PARAMS).find(|&i| group::group_param(i).is_some_and(|s| s.id == id)).unwrap() as u8
+    }
+
+    /// A kick, a synth panned right and a snare, each on its first step.
+    fn three_tracks() -> Vec<Edit> {
+        vec![
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::SetPan { track: 1, pan: 0.6 },
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) },
+            Edit::SetStep { track: 2, pattern: 0, step: 2, value: step(60) },
+        ]
+    }
+
+    fn play(edits: &[Edit], frames: usize) -> Vec<f32> {
+        let mut e = engine(edits);
+        e.handle(Command::Play);
+        run(&mut e, frames)
+    }
+
+    #[test]
+    fn a_group_at_its_defaults_passes_its_tracks_through_bit_exact() {
+        let plain = play(&three_tracks(), 24_000);
+        let mut grouped = three_tracks();
+        grouped.push(Edit::InsertGroup(0));
+        for track in 0..3 {
+            grouped.push(Edit::SetTrackGroup { track, group: Some(0) });
+        }
+        assert_eq!(play(&grouped, 24_000), plain);
+        assert!(plain.iter().any(|x| x.abs() > 0.1));
+    }
+
+    #[test]
+    fn a_group_sums_its_tracks_through_its_strip_fader_and_balance() {
+        let alone = |t: u8| {
+            let mut edits = three_tracks();
+            edits.extend((0..3).filter(|&o| o != t).map(|o| Edit::SetMute { track: o, mute: true }));
+            play(&edits, 24_000)
+        };
+        let (kick, synth, snare) = (alone(0), alone(1), alone(2));
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetTrackGroup { track: 1, group: Some(0) },
+            Edit::SetGroupGain { group: 0, db: -6.0 },
+            Edit::SetGroupPan { group: 0, pan: 0.5 },
+        ]);
+        let out = play(&edits, 24_000);
+        let g = fader_gain(-6.0);
+        let (bl, br) = group::balance_gains(0.5);
+        for k in 0..out.len() / 2 {
+            for (c, w) in [(0, g * bl), (1, g * br)] {
+                let i = 2 * k + c;
+                let want = (kick[i] + synth[i]) * w + snare[i];
+                assert!((out[i] - want).abs() < 1e-6, "sample {i}: {} against {want}", out[i]);
+            }
+        }
+        // A strip setting changes only the group's tracks: the snare is
+        // added on unchanged.
+        edits.push(Edit::SetGroupParam { group: 0, index: group_index("hp_freq"), value: 2000.0 });
+        let filtered = play(&edits, 24_000);
+        assert_ne!(filtered, out);
+        edits.push(Edit::SetMute { track: 2, mute: true });
+        let without_snare = play(&edits, 24_000);
+        for (i, ((f, w), s)) in filtered.iter().zip(&without_snare).zip(&snare).enumerate() {
+            assert!((f - w - s).abs() < 1e-6, "sample {i}");
+        }
+    }
+
+    #[test]
+    fn group_meters_reach_the_ui_and_a_tail_rings_out() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::InsertGroup(1),
+            Edit::SetTrackGroup { track: 0, group: Some(1) },
+            Edit::SetGroupParam { group: 1, index: group_index("comp_threshold"), value: -40.0 },
+            Edit::SetGroupParam { group: 1, index: group_index("comp_ratio"), value: 10.0 },
+            Edit::SetGroupParam { group: 1, index: group_index("eq_low_gain"), value: 12.0 },
+            Edit::SetMute { track: 1, mute: true },
+            Edit::SetMute { track: 2, mute: true },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        let s = e.shared.clone();
+        assert!(s.group_peaks[1].take() > 0.05);
+        assert!(s.group_reduction[1].take() > 6.0);
+        assert_eq!((s.group_peaks[0].take(), s.group_reduction[0].take()), (0.0, 0.0), "an empty group");
+        // Moved off the group, the kick's last hit still rings out of the
+        // group's boosted low band instead of stopping dead.
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        e.apply(Edit::SetMute { track: 0, mute: true });
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade);
+        s.group_peaks[1].take();
+        run(&mut e, 256);
+        assert!(s.group_peaks[1].take() > 0.0, "the group still sounds with no track in it");
+    }
+
+    #[test]
+    fn a_group_send_goes_to_the_bus_after_the_group_fader() {
+        let one = |extra: &[Edit]| {
+            let mut edits = vec![
+                Edit::AddTrack(InstrumentKind::Snare),
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            ];
+            edits.extend_from_slice(extra);
+            play(&edits, 48_000)
+        };
+        let send = (InstrumentKind::Snare.params().len() + strip::sp::COUNT + send::DELAY) as u8;
+        let on_track = one(&[Edit::SetParam { track: 0, index: send, value: -6.0 }]);
+        let grouped = [Edit::InsertGroup(0), Edit::SetTrackGroup { track: 0, group: Some(0) }];
+        let delay = Edit::SetGroupParam { group: 0, index: group_index("send_delay"), value: -6.0 };
+        let on_group = one(&[grouped[0], grouped[1], delay]);
+        let worst = on_track.iter().zip(&on_group).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-6, "a group of one sends as its track would ({worst})");
+        assert_ne!(on_group, one(&grouped));
+        // With its fader down, the group sends nothing either.
+        let silent = one(&[grouped[0], grouped[1], delay, Edit::SetGroupGain { group: 0, db: SILENT_DB }]);
+        assert!(silent.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn a_muted_group_silences_its_tracks_even_when_soloed() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetGroupMute { group: 0, mute: true },
+        ]);
+        let only = |extra: &[Edit]| {
+            let mut e = edits.clone();
+            e.extend_from_slice(extra);
+            play(&e, 24_000)
+        };
+        let without_kick = only(&[Edit::SetMute { track: 0, mute: true }]);
+        assert_eq!(only(&[]), without_kick);
+        let solo = only(&[Edit::SetSolo { track: 0, solo: true }]);
+        assert!(solo.iter().all(|&x| x == 0.0), "the soloed kick is in the muted group");
+        let unmuted = only(&[Edit::SetSolo { track: 0, solo: true }, Edit::SetGroupMute { group: 0, mute: false }]);
+        assert!(unmuted.iter().any(|x| x.abs() > 0.1));
+        // The kick's own send, which goes straight to the delay, is
+        // silenced with it.
+        let send = (InstrumentKind::Kick.params().len() + strip::sp::COUNT + send::DELAY) as u8;
+        let sent =
+            only(&[Edit::SetSolo { track: 0, solo: true }, Edit::SetParam { track: 0, index: send, value: 0.0 }]);
+        assert!(sent.iter().all(|&x| x == 0.0), "the muted group's track sends nothing");
+    }
+
+    #[test]
+    fn group_automation_is_the_same_at_any_buffer_size() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 1, group: Some(0) },
+            Edit::SetTrackGroup { track: 2, group: Some(0) },
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Group { group: 0, index: 1 }), ramp: true },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(-1.0) },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 3, value: Some(1.0) },
+            Edit::SetLane {
+                track: 2,
+                lane: 1,
+                target: Some(LaneTarget::Group { group: 0, index: 2 + group_index("eq_mid_gain") }),
+                ramp: false,
+            },
+            Edit::SetPoint { track: 2, lane: 1, pattern: 0, step: 1, value: Some(12.0) },
+        ]);
+        let reference = play(&edits, 50_000);
+        let still = play(&edits[..edits.len() - 5], 50_000);
+        assert_ne!(reference, still, "the lanes move the group");
+        for size in [1usize, 17, 64, 500, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut got = Vec::new();
+            let mut left = 50_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            assert_eq!(got, reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_track_changing_group_crossfades_instead_of_jumping() {
+        let held = || Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 };
+        let setup = [
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            Edit::SetGroupGain { group: 0, db: SILENT_DB },
+        ];
+        let mut e = engine(&setup);
+        let mut kept = engine(&setup);
+        e.handle(held());
+        kept.handle(held());
+        assert_eq!(run(&mut e, 4800), run(&mut kept, 4800));
+        e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        let fade = e.fade_frames as usize;
+        let out = run(&mut e, fade + 4800);
+        let full = run(&mut kept, fade + 4800);
+        // Into a silent group, the track fades out along the same line a
+        // removed one does...
+        for (k, (x, y)) in out.chunks_exact(2).zip(full.chunks_exact(2)).enumerate() {
+            let g = ((fade as f32 - k as f32) / fade as f32).max(0.0);
+            for c in 0..2 {
+                assert!((x[c] - y[c] * g).abs() <= 1e-5, "frame {k}: {} against {} x {g}", x[c], y[c]);
+            }
+        }
+        assert!(out[2 * fade..].iter().all(|&x| x == 0.0));
+        // ...and back out of it, fades in.
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        let out = run(&mut e, fade + 4800);
+        let full = run(&mut kept, fade + 4800);
+        for (k, (x, y)) in out.chunks_exact(2).zip(full.chunks_exact(2)).enumerate() {
+            let g = (k as f32 / fade as f32).min(1.0);
+            for c in 0..2 {
+                assert!((x[c] - y[c] * g).abs() <= 1e-5, "frame {k}: {} against {} x {g}", x[c], y[c]);
+            }
+        }
+    }
+
+    /// A held synth note on track 0 and a group 0 whose fader is down, and
+    /// the same engine left alone to compare against.
+    fn held_note_and_silent_group() -> (Box<Engine>, Box<Engine>) {
+        let held = || Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 };
+        let setup = [
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            Edit::SetGroupGain { group: 0, db: SILENT_DB },
+        ];
+        let (mut e, mut kept) = (engine(&setup), engine(&setup));
+        e.handle(held());
+        kept.handle(held());
+        run(&mut e, 4800);
+        run(&mut kept, 4800);
+        (e, kept)
+    }
+
+    /// Asserts `out` is `full` under the gain `g` gives each frame.
+    fn under(out: &[f32], full: &[f32], g: impl Fn(usize) -> f32) {
+        for (k, (x, y)) in out.chunks_exact(2).zip(full.chunks_exact(2)).enumerate() {
+            for c in 0..2 {
+                assert!((x[c] - y[c] * g(k)).abs() <= 1e-5, "frame {k}: {} against {} x {}", x[c], y[c], g(k));
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_of_group_undone_before_its_fade_ends_turns_round() {
+        let (mut e, mut kept) = held_note_and_silent_group();
+        let fade = e.fade_frames as usize;
+        // There and back before a frame is played: nothing changes.
+        e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        assert_eq!(run(&mut e, 480), run(&mut kept, 480));
+        // Halfway out, back in from where it got to.
+        e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        let out = [run(&mut e, fade / 2), {
+            e.apply(Edit::SetTrackGroup { track: 0, group: None });
+            run(&mut e, fade + 480)
+        }]
+        .concat();
+        let full = run(&mut kept, fade / 2 + fade + 480);
+        let half = fade / 2;
+        under(&out, &full, |k| {
+            if k < half { (fade - k) as f32 / fade as f32 } else { ((k - half + half) as f32 / fade as f32).min(1.0) }
+        });
+    }
+
+    #[test]
+    fn deleting_a_group_fades_its_tracks_to_the_master() {
+        // As the editor deletes it: its tracks to the master, then the group.
+        for edits in
+            [vec![Edit::SetTrackGroup { track: 0, group: None }, Edit::RemoveGroup(0)], vec![Edit::RemoveGroup(0)]]
+        {
+            let (mut e, mut kept) = held_note_and_silent_group();
+            e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+            run(&mut e, 4800);
+            run(&mut kept, 4800);
+            let fade = e.fade_frames as usize;
+            // The track as the master hears it, never in a group.
+            let full = run(&mut kept, fade + 480);
+            for edit in edits {
+                e.apply(edit);
+            }
+            assert_eq!(e.group_count, 0);
+            let out = run(&mut e, fade + 480);
+            under(&out, &full, |k| (k as f32 / fade as f32).min(1.0));
+        }
+    }
+
+    #[test]
+    fn a_group_rings_out_and_stops_on_the_same_frame_at_any_buffer_size() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetMute { track: 1, mute: true },
+            Edit::SetMute { track: 2, mute: true },
+            Edit::SetGroupParam { group: 0, index: group_index("eq_mid_gain"), value: 12.0 },
+            Edit::SetGroupParam { group: 0, index: group_index("eq_mid_q"), value: 8.0 },
+            Edit::SetGroupParam { group: 0, index: group_index("drive"), value: 12.0 },
+        ]);
+        let hold = (group::HOLD_TIME * SR) as usize;
+        let total = 4800 + hold + 4800;
+        let render = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = Vec::new();
+            while out.len() / 2 < total {
+                if out.len() / 2 == 4800 {
+                    // The kick leaves its group, silenced.
+                    e.apply(Edit::SetMute { track: 0, mute: true });
+                    e.apply(Edit::SetTrackGroup { track: 0, group: None });
+                }
+                out.extend(run(&mut e, size));
+            }
+            (out, e)
+        };
+        let (reference, mut e) = render(4800);
+        for size in [1usize, 16, 64, 100, 960] {
+            assert_eq!(render(size).0, reference, "buffer size {size}");
+        }
+        // The group goes quiet once its hold is over, and costs nothing.
+        e.shared.group_peaks[0].take();
+        run(&mut e, 4800);
+        assert_eq!(e.shared.group_peaks[0].take(), 0.0);
+        assert!(!e.groups[0].is_live());
+        // The hold counts from the last frame fed (the fade's end, which
+        // falls inside a callback here), not from the end of a callback.
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        e.apply(Edit::SetMute { track: 0, mute: true });
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        let mut left = e.fade_frames as usize + hold - 1;
+        while left > 0 {
+            left -= run(&mut e, left.min(64)).len() / 2;
+        }
+        assert!(e.groups[0].is_live(), "one frame of its hold left");
+        run(&mut e, 1);
+        assert!(!e.groups[0].is_live());
+    }
+
+    #[test]
+    fn an_empty_group_takes_its_settings_at_once() {
+        // Its fader moved while nothing played through it: a track routed
+        // in later hears the new setting, not a glide from the old one.
+        let setup = |db: f32| {
+            let (e, _) = held_note_and_silent_group();
+            let mut e = e;
+            e.apply(Edit::SetGroupGain { group: 0, db });
+            e
+        };
+        let mut moved = setup(-20.0);
+        let mut set = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            Edit::SetGroupGain { group: 0, db: -20.0 },
+        ]);
+        set.handle(Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 });
+        run(&mut set, 4800);
+        for e in [&mut moved, &mut set] {
+            run(e, 480);
+            e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        }
+        assert_eq!(run(&mut moved, 4800), run(&mut set, 4800));
+    }
+
+    #[test]
+    fn deleting_a_group_a_removed_track_was_fading_into_turns_its_fade_round() {
+        let (mut e, mut kept) = held_note_and_silent_group();
+        let fade = e.fade_frames as usize;
+        let half = fade / 2;
+        e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        run(&mut e, half);
+        run(&mut kept, half);
+        // Half its sound on the way into the silent group, the track goes,
+        // and then the group, which no track of the project is in now.
+        e.apply(Edit::RemoveTrack(0));
+        e.apply(Edit::RemoveGroup(0));
+        kept.apply(Edit::RemoveTrack(0));
+        let out = run(&mut e, fade + 480);
+        let full = run(&mut kept, fade + 480);
+        under(&out, &full, |k| ((half + k) as f32 / fade as f32).min(1.0));
+    }
+
+    #[test]
+    fn a_group_making_room_drops_the_share_fading_out_of_it_and_nothing_more() {
+        // Eight tracks each fading out of a silent group just removed take
+        // every slot a removed group plays on in; a ninth removal takes the
+        // first, and track 0 goes on fading in to the master as before.
+        let mut edits: Vec<Edit> = (0..8).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
+        let kept_edits = edits.clone();
+        for g in 0..MAX_GROUPS as u8 {
+            edits.extend([
+                Edit::InsertGroup(g),
+                Edit::SetGroupGain { group: g, db: SILENT_DB },
+                Edit::SetTrackGroup { track: g, group: Some(g) },
+            ]);
+        }
+        let held = || Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 };
+        let (mut e, mut kept) = (engine(&edits), engine(&kept_edits));
+        e.handle(held());
+        kept.handle(held());
+        run(&mut e, 4800);
+        run(&mut kept, 4800);
+        for t in 0..MAX_GROUPS as u8 {
+            e.apply(Edit::SetTrackGroup { track: t, group: None });
+            e.apply(Edit::RemoveGroup(0));
+        }
+        e.apply(Edit::InsertGroup(0));
+        e.apply(Edit::RemoveGroup(0));
+        let fade = e.fade_frames as usize;
+        let out = run(&mut e, fade + 480);
+        let full = run(&mut kept, fade + 480);
+        under(&out, &full, |k| (k as f32 / fade as f32).min(1.0));
+    }
+
+    #[test]
+    fn a_group_making_room_takes_a_slot_no_track_is_fading_out_of() {
+        // Track 0 fades out of group 0, removed first, as eight more groups
+        // with no tracks go; the ninth takes a slot nothing fades out of,
+        // so the track's way out through its old group plays on.
+        let mut edits = vec![Edit::AddTrack(InstrumentKind::Synth)];
+        let kept_edits = edits.clone();
+        edits.extend((0..MAX_GROUPS as u8).map(Edit::InsertGroup));
+        edits.push(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        let held = || Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 };
+        let (mut e, mut kept) = (engine(&edits), engine(&kept_edits));
+        e.handle(held());
+        kept.handle(held());
+        run(&mut e, 4800);
+        run(&mut kept, 4800);
+        for _ in 0..MAX_GROUPS {
+            e.apply(Edit::RemoveGroup(0));
+        }
+        e.apply(Edit::InsertGroup(0));
+        e.apply(Edit::RemoveGroup(0));
+        let fade = e.fade_frames as usize;
+        // A group at its defaults passes its tracks through: the two shares
+        // add up to the track as the master hears it.
+        let out = run(&mut e, fade + 480);
+        let full = run(&mut kept, fade + 480);
+        under(&out, &full, |_| 1.0);
+    }
+
+    #[test]
+    fn a_removed_track_whose_fade_is_over_holds_no_slot() {
+        // Seven removed tracks, each half way out of its group to the master
+        // when the groups go, are gone before the room is needed; the slots
+        // their groups play on in are free, and track 0 keeps its share
+        // through its old group.
+        let mut edits: Vec<Edit> = (0..8).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
+        let kept_edits = edits[..1].to_vec();
+        for g in 0..MAX_GROUPS as u8 {
+            edits.extend([Edit::InsertGroup(g), Edit::SetTrackGroup { track: g, group: Some(g) }]);
+        }
+        let held = |e: &mut Engine, t: u8| {
+            e.handle(Command::Audition { track: t, step: Step::new(48, 90, 1), frames: 1 << 20 });
+        };
+        let (mut e, mut kept) = (engine(&edits), engine(&kept_edits));
+        for t in 0..8 {
+            held(&mut e, t);
+        }
+        held(&mut kept, 0);
+        run(&mut e, 4800);
+        run(&mut kept, 4800);
+        let fade = e.fade_frames as usize;
+        for _ in 1..8 {
+            e.apply(Edit::RemoveTrack(1));
+        }
+        run(&mut e, fade / 2);
+        run(&mut kept, fade / 2);
+        for _ in 0..MAX_GROUPS {
+            e.apply(Edit::RemoveGroup(0));
+        }
+        run(&mut e, fade / 2 + 1);
+        run(&mut kept, fade / 2 + 1);
+        e.apply(Edit::InsertGroup(0));
+        e.apply(Edit::RemoveGroup(0));
+        let out = run(&mut e, fade + 480);
+        let full = run(&mut kept, fade + 480);
+        under(&out, &full, |_| 1.0);
+    }
+
+    #[test]
+    fn a_group_that_fell_silent_forgets_its_compression() {
+        // A loud kick pushes the group's slow compressor down, then leaves;
+        // a synth routed in seconds later sounds as through a fresh group.
+        let render = |kick_in_group: bool| {
+            let mut edits = vec![
+                Edit::AddTrack(InstrumentKind::Kick),
+                Edit::AddTrack(InstrumentKind::Synth),
+                Edit::InsertGroup(0),
+                Edit::SetGroupParam { group: 0, index: group_index("comp_threshold"), value: -40.0 },
+                Edit::SetGroupParam { group: 0, index: group_index("comp_ratio"), value: 10.0 },
+                Edit::SetGroupParam { group: 0, index: group_index("comp_release"), value: 1.0 },
+                Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            ];
+            if kick_in_group {
+                edits.push(Edit::SetTrackGroup { track: 0, group: Some(0) });
+            }
+            let mut e = engine(&edits);
+            e.handle(Command::Audition { track: 1, step: Step::new(60, 40, 1), frames: 1 << 20 });
+            e.handle(Command::Play);
+            run(&mut e, 4800);
+            e.apply(Edit::SetMute { track: 0, mute: true });
+            e.apply(Edit::SetTrackGroup { track: 0, group: None });
+            run(&mut e, (group::HOLD_TIME * SR) as usize + 4800);
+            e.apply(Edit::SetTrackGroup { track: 1, group: Some(0) });
+            run(&mut e, 4800)
+        };
+        assert_eq!(render(true), render(false));
+    }
+
+    #[test]
+    fn a_removed_track_feeds_its_group_only_while_it_fades() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 1, group: Some(0) },
+            Edit::SetMute { track: 0, mute: true },
+            Edit::SetMute { track: 2, mute: true },
+        ]);
+        let hold = (group::HOLD_TIME * SR) as usize;
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        e.apply(Edit::RemoveTrack(1));
+        // Its fade ends inside a callback of 64 frames.
+        let mut left = e.fade_frames as usize + hold - 1;
+        while left > 0 {
+            left -= run(&mut e, left.min(64)).len() / 2;
+        }
+        assert!(e.groups[0].is_live(), "one frame of its hold left");
+        run(&mut e, 1);
+        assert!(!e.groups[0].is_live());
+    }
+
+    #[test]
+    fn removing_a_group_renumbers_the_tracks_and_lanes_behind_it() {
+        let mut edits = three_tracks();
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::InsertGroup(1),
+            Edit::SetGroupPan { group: 1, pan: -1.0 },
+            Edit::SetTrackGroup { track: 1, group: Some(1) },
+            Edit::SetPan { track: 1, pan: 0.0 },
+        ]);
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        e.apply(Edit::RemoveGroup(0));
+        // The synth still goes through its group, now the first: hard left.
+        e.apply(Edit::SetMute { track: 0, mute: true });
+        e.apply(Edit::SetMute { track: 2, mute: true });
+        run(&mut e, 4800);
+        let out = run(&mut e, 19_200);
+        assert!(out.chunks(2).all(|f| f[1].abs() < 1e-6), "the right side is cut");
+        assert!(out.chunks(2).any(|f| f[0].abs() > 0.05));
+        // A lane on the group moves with it, and one on a removed group goes.
+        let mut e = engine(&edits);
+        let pan = |group| Some(LaneTarget::Group { group, index: 1 });
+        e.apply(Edit::SetLane { track: 0, lane: 0, target: pan(1), ramp: false });
+        e.apply(Edit::SetTrackGroup { track: 1, group: None });
+        e.apply(Edit::InsertGroup(2));
+        e.apply(Edit::SetLane {
+            track: 0,
+            lane: 1,
+            target: Some(LaneTarget::Group { group: 2, index: 0 }),
+            ramp: false,
+        });
+        e.apply(Edit::RemoveGroup(0));
+        assert_eq!(e.tracks[0].lanes[0].target, pan(0));
+        assert_eq!(e.tracks[0].lanes[1].target, Some(LaneTarget::Group { group: 1, index: 0 }));
+        assert_eq!(e.group_count, 2);
     }
 
     #[test]

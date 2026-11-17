@@ -125,7 +125,7 @@ actions! {
     Copy "copy" Global [c('y')] "copy the pattern";
     Paste "paste" Global [c('Y')] "paste the pattern";
     ClearPattern "clear_pattern" Global [c('X')] "clear the pattern";
-    Page "page" Global [c('f')] "parameter panel page: instrument, channel strip, buses and master";
+    Page "page" Global [c('f')] "parameter panel page: instrument, channel strip, the track's group, buses and master";
     Devices "devices" Global [c('O')] "audio output and input devices (Tab: low-latency output; ←→: output / input)";
     MidiInputs "midi_inputs" Global [c('M')] "MIDI input";
     MidiOutputs "midi_outputs" Global [c('Z')] "MIDI output: where MIDI-out tracks and the clock go (settings: clock, delay)";
@@ -142,6 +142,11 @@ actions! {
     LoadSample "load_sample" Track [c('o')] "load a WAV file into a sampler track";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";
     PianoRoll "piano_roll" Track [c('v')] "piano roll for a melodic track / back to the grid";
+    TrackGroup "track_group" Track [c('i')] "send the track to the next group, or from the last back to the master";
+    NewGroup "new_group" Track [c('d')] "a new group for the track (at most 8)";
+    RenameGroup "rename_group" Track [c('E')] "rename the track's group";
+    MuteGroup "mute_group" Track [c('Q')] "mute the track's group, and every track in it";
+    DeleteGroup "delete_group" Track [c('F')] "delete the track's group: its tracks go to the master, its lanes go";
     Left "left" Nav [Left] "step left; in the panel: value down; in lists: other page";
     Right "right" Nav [Right] "step right; in the panel: value up; in lists: other page";
     Up "up" Nav [Up] "track, pitch, lane, parameter or song row above";

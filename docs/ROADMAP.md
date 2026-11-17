@@ -464,6 +464,20 @@ It comes in four parts, each merged on its own; the project format they share is
 - A `tracks32` bench scenario, with an instruction budget.
 - Tests: the last track's own bit for its MIDI channel and for releasing the notes it sent when muted, inserting a track at the last place and removing it, a full project refusing another, and the allocation test with every track playing.
 
+#### 11b: Group buses ✅
+
+- Up to 8 group buses. A track goes to a group or to the master: `i` sends it to the next group, `d` makes a new group for it. A change of group crossfades over 10 ms, and a deleted group plays on in a slot of its own while its tracks fade to the master and its strip rings out.
+- A group runs while fed and for two seconds after, then costs nothing; its strip then lets go of what it held (filter states, the compressor's reduction).
+- A group has a stereo channel strip (one compressor detector for both sides), volume, balance, mute, and sends to the delay, reverb and chorus taken after its fader. Its page in the panel follows the strip page for a track in a group, with the group's name, size, level and gain reduction in the title. A lane on any track can automate it.
+- Muting a group silences its tracks ahead of solo, and MIDI-out tracks in it release their notes.
+- `E`, `Q` and `F` rename, mute and delete the track's group; deleting sends its tracks to the master and frees its lanes in one undo step.
+- Project format 15: `group` blocks before the tracks, `group <n>` in a track and lane ids `group<n>.<id>`. Older files load with no groups.
+- Stems: one per track that goes to the master and one per group with a heard track in it.
+- A `groups` bench scenario with an instruction budget. The allocation test plays 32 tracks through 8 busy groups and sends random group edits.
+- Tests: routed sums against a mix made by hand, bit-exact pass-through at the defaults, a group stopping on the same frame at any buffer size, deletion while playing, sends after the group fader, mute and solo, automation at any buffer size, the crossfade, renumbering, the stereo strip and its linked compressor, file round trips, stems per group, and the editor's keys and page.
+
+Known limits: a track sent to a third place while a change of group is still fading moves the share still on its way out at once; and when more than 8 removed groups are still playing on, the oldest is cut short.
+
 ### Phase 12: CLAP plugins (large)
 
 For professional instruments and effects: sampled pianos and orchestral libraries, amp models, mastering tools.

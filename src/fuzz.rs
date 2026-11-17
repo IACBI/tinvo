@@ -39,9 +39,10 @@ use crate::engine::{
     Command, Division, Edit, Engine, LaneTarget, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, Meter, Part, Shared,
     Step,
 };
+use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
-use crate::project::{LaneData, Project, TrackData, sanitize_name};
+use crate::project::{GroupData, LaneData, Project, TrackData, sanitize_group_name, sanitize_name};
 use crate::render::Source;
 use crate::sample::{self, Sample};
 use crate::smf;
@@ -397,7 +398,7 @@ fn mutate_bytes(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 // ---------------------------------------------------------------- projects
 
-const PROJECT_KEYS: [&str; 24] = [
+const PROJECT_KEYS: [&str; 25] = [
     "tinvo",
     "tempo",
     "swing",
@@ -408,6 +409,7 @@ const PROJECT_KEYS: [&str; 24] = [
     "marker",
     "mix",
     "track",
+    "group",
     "name",
     "sample",
     "gain_db",
@@ -579,6 +581,22 @@ fn project_seeds() -> Vec<Vec<u8>> {
         t.lanes[3] = LaneData::new(Some(target), false);
         t.lanes[3].points[2][5] = Some(MIX_PARAMS[mp::REVERB_DECAY].min);
     }
+    {
+        let mut drums = GroupData::new("Drums é".into());
+        drums.gain_db = -4.5;
+        drums.pan = 0.3;
+        drums.params[sp::COMP_RATIO] = 6.0;
+        drums.params[sp::COUNT + send::REVERB] = -9.0;
+        rich.groups = vec![drums, GroupData::new("Muted".into())];
+        rich.groups[1].mute = true;
+        rich.tracks[0].group = Some(0);
+        rich.tracks[1].group = Some(0);
+        rich.tracks[3].group = Some(1);
+        let t = &mut rich.tracks[2];
+        t.lanes[1] = LaneData::new(Some(LaneTarget::Group { group: 0, index: 1 }), true);
+        t.lanes[1].points[0][2] = Some(-1.0);
+        t.lanes[1].points[0][9] = Some(1.0);
+    }
     let mut sampler = TrackData::new(InstrumentKind::Sampler);
     sampler.name = "Loop é".into();
     sampler.sample = Some("drums/loop one.wav".into());
@@ -706,6 +724,9 @@ fn without_meta(p: &Project) -> Project {
     for t in &mut p.tracks {
         t.name.clear();
         t.sample = None;
+    }
+    for g in &mut p.groups {
+        g.name.clear();
     }
     p.markers.clear();
     p
@@ -1161,6 +1182,7 @@ impl Script<'_> {
 enum Action {
     Edit(Edit),
     Name(usize, String),
+    GroupName(usize, String),
     Sample(usize, String),
     Marker(u16, String),
 }
@@ -1170,8 +1192,9 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let pattern = s.below(MAX_PATTERNS + 1) as u8;
     let step = s.below(MAX_STEPS + 2) as u8;
     let entry = s.u16() % (MAX_SONG as u16 + 2);
+    let group = s.below(MAX_GROUPS + 1) as u8;
     let kind_of = |t: u8| p.tracks.get(usize::from(t)).map(|t| t.kind);
-    let edit = match s.below(24) {
+    let edit = match s.below(26) {
         0 => Edit::SetTempo(s.f32()),
         1 if s.byte() & 1 == 0 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
         1 if s.byte() & 1 == 0 => {
@@ -1199,9 +1222,10 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
         }
         13 => Edit::SetLoop(if s.below(4) == 0 { None } else { Some((entry, s.u16() % (MAX_SONG as u16 + 2))) }),
         14 => {
-            let target = match s.below(4) {
+            let target = match s.below(5) {
                 0 => None,
                 1 => Some(LaneTarget::Mix(s.below(MIX_PARAMS.len() + 1) as u8)),
+                2 => Some(LaneTarget::Group { group, index: s.below(GROUP_PARAMS + 3) as u8 }),
                 _ => Some(LaneTarget::Track(s.below(48) as u8)),
             };
             Edit::SetLane { track, lane: s.below(6) as u8, target, ramp: s.byte() & 1 == 1 }
@@ -1242,8 +1266,25 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
         }
         21 => {
             let t = usize::from(track);
-            return if s.byte() & 1 == 0 { Action::Name(t, s.text()) } else { Action::Sample(t, s.text()) };
+            return match s.below(3) {
+                0 => Action::Name(t, s.text()),
+                1 => Action::GroupName(usize::from(group), s.text()),
+                _ => Action::Sample(t, s.text()),
+            };
         }
+        22 | 23 => match s.below(8) {
+            0 => Edit::InsertGroup(s.below(MAX_GROUPS + 2) as u8),
+            1 => Edit::RemoveGroup(group),
+            2 => Edit::SetGroupGain { group, db: s.f32() },
+            3 => Edit::SetGroupPan { group, pan: s.f32() },
+            4 => Edit::SetGroupMute { group, mute: s.byte() & 1 == 1 },
+            5 => {
+                let index = s.below(GROUP_PARAMS + 2) as u8;
+                Edit::SetGroupParam { group, index, value: s.value(group_param(usize::from(index))) }
+            }
+            // Mostly onto a group, so groups fill up.
+            _ => Edit::SetTrackGroup { track, group: (s.below(4) != 0).then_some(group) },
+        },
         // Mostly entries in the song, so markers pile up and edits move them.
         _ => return Action::Marker(entry % (p.song.len() as u16 + 1), s.text()),
     };
@@ -1279,7 +1320,7 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
                 let inverse = before.inverse(&edit);
                 let applied = p.apply(edit);
                 let kind = std::mem::discriminant(&edit);
-                features.insert(hash_of((kind, applied.is_ok(), p.tracks.len().min(MAX_TRACKS))));
+                features.insert(hash_of((kind, applied.is_ok(), p.tracks.len().min(MAX_TRACKS), p.groups.len())));
                 match (inverse, applied) {
                     (Ok(inverse), Ok(_)) => {
                         let mut undone = p.clone();
@@ -1314,6 +1355,11 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
             Action::Name(t, name) => {
                 if let Some(t) = p.tracks.get_mut(t) {
                     t.name = sanitize_name(&name);
+                }
+            }
+            Action::GroupName(g, name) => {
+                if let Some(g) = p.groups.get_mut(g) {
+                    g.name = sanitize_group_name(&name);
                 }
             }
             Action::Sample(t, path) => {

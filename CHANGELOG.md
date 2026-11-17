@@ -9,6 +9,11 @@ Author: 𝓐.𝓒.𝓑
 ### Added
 - 32 tracks, up from 16, in the editor, project files and MIDI file import.
 - `tinvo bench tracks32`: the demo song's tracks repeated to 32.
+- Group buses, up to 8. `i` sends the selected track to the next group (from the last, back to the master), `d` makes a new group for it, and `E`, `Q` and `F` rename, mute and delete its group; deleting sends its tracks to the master and drops the lanes on the group, as one undo step. A change of group crossfades over 10 ms, and a group deleted while playing goes on sounding until its tracks have faded to the master and its strip has rung out.
+- A group runs its tracks through a stereo channel strip whose compressor ducks both sides together, then its volume, balance and mute, then sends to the delay, reverb and chorus after its fader. The panel's group page follows the strip page for a track in a group, with the group's level and gain reduction in its title, and any track's lanes can automate a group. A muted group silences its tracks even when soloed. A group with no track runs for two seconds after its last one left, so its strip rings out, then costs nothing and starts afresh. The track list shows a track's group before its name.
+- Project format 15: `group` blocks before the tracks, `group 1` in a track, and lanes such as `group1.comp_ratio`. Older files load with no groups.
+- Stems: a group is one stem holding all its heard tracks; tracks that go to the master keep one each.
+- `tinvo bench groups`: the demo song's tracks repeated to 8, each through a group of its own with every stage on.
 
 ## [0.24.1] - 2026-11-16
 

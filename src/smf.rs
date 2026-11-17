@@ -443,7 +443,7 @@ pub fn write(project: &Project, source: Source, loops: u32) -> Result<Vec<u8>, S
     let finish = end_pulse as f64 / PULSES_PER_16TH as f64;
     let mut tr = Transport::new(project.tempo, 48_000.0);
     tr.set_swing(project.swing);
-    let tracks = render::stem_tracks(project);
+    let tracks = render::audible_tracks(project);
     let mut hits: Vec<(Hit, usize)> = Vec::new();
     for (k, (&t, &channel)) in tracks.iter().zip(&channels(project, &tracks)).enumerate() {
         let more = track_hits(project, t, channel, &heard, finish, &tr, room - hits.len())?;
