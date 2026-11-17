@@ -454,6 +454,16 @@ For larger arrangements and the mix structure they need: drum and vocal groups, 
 - A new project format.
 - Tests: routed sums against a mix made by hand, chain order, click-free bypass, latency compensation for slots that look ahead, stems per group, and the allocation test while chains change during playback.
 
+It comes in four parts, each merged on its own; the project format they share is frozen when the phase is released.
+
+#### 11a: 32 tracks ✅
+
+- A project holds 32 tracks, in the editor, in project files (still format 14: an older TINVO refuses a file of more than 16 tracks with an error) and in MIDI file import.
+- A lane's target is a `LaneTarget` that says what it automates, a parameter of its own track or a bus or master setting, in place of a number with the mix settings from 128 up. The groups and insert slots to come are further kinds of target.
+- Removed tracks fade out in 16 slots of their own (`MAX_FADING`), as before.
+- A `tracks32` bench scenario, with an instruction budget.
+- Tests: the last track's own bit for its MIDI channel and for releasing the notes it sent when muted, inserting a track at the last place and removing it, a full project refusing another, and the allocation test with every track playing.
+
 ### Phase 12: CLAP plugins (large)
 
 For professional instruments and effects: sampled pianos and orchestral libraries, amp models, mastering tools.

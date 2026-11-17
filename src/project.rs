@@ -52,9 +52,8 @@
 //! and loading is lossless.
 
 use crate::engine::{
-    DEFAULT_PATTERN_LEN, Division, Edit, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_SWING, MAX_TEMPO,
-    MAX_TRACKS, MIN_SWING, MIN_TEMPO, MIX_TARGET, Meter, Part, Step, entry_tempo, loop_region, span_frames,
-    target_spec,
+    DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
+    MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Meter, Part, Step, entry_tempo, loop_region, span_frames,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
@@ -98,10 +97,10 @@ pub struct TrackData {
     pub parts: Box<[Part; MAX_SONG]>,
 }
 
-/// An automation lane: a parameter (see [`target_spec`]) and its points.
+/// An automation lane: a parameter (see [`LaneTarget`]) and its points.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaneData {
-    pub target: Option<u8>,
+    pub target: Option<LaneTarget>,
     /// Glide between points instead of holding each value.
     pub ramp: bool,
     /// `points[pattern][step]`.
@@ -109,7 +108,7 @@ pub struct LaneData {
 }
 
 impl LaneData {
-    pub fn new(target: Option<u8>, ramp: bool) -> Self {
+    pub fn new(target: Option<LaneTarget>, ramp: bool) -> Self {
         Self { target, ramp, points: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]) }
     }
 
@@ -220,7 +219,7 @@ pub enum EditError {
     NoSuchParam(u8),
     NoSuchPattern(u8),
     NoSuchLane(u8),
-    NoSuchTarget(u8),
+    NoSuchTarget(LaneTarget),
     /// Another lane of the track already automates that parameter.
     DuplicateLane,
     /// The lane has no parameter yet.
@@ -340,7 +339,7 @@ impl Project {
         // In B the bass filter opens across the bar (panel index 7 is the
         // cutoff).
         let lane = &mut p.tracks[b].lanes[0];
-        *lane = LaneData::new(Some(7), true);
+        *lane = LaneData::new(Some(LaneTarget::Track(7)), true);
         lane.points[1][0] = Some(380.0);
         lane.points[1][15] = Some(2400.0);
         // Channel strips: cut the lows under the hats, snare and clap, round
@@ -595,20 +594,20 @@ impl Project {
     }
 
     /// Validates giving lane `lane` of `track` the target `target`.
-    fn check_lane(&self, track: u8, lane: u8, target: Option<u8>) -> Result<(), EditError> {
+    fn check_lane(&self, track: u8, lane: u8, target: Option<LaneTarget>) -> Result<(), EditError> {
         let t = self.track(track)?;
         if usize::from(lane) >= MAX_LANES {
             return Err(EditError::NoSuchLane(lane));
         }
         if let Some(x) = target {
-            target_spec(t.kind, x).ok_or(EditError::NoSuchTarget(x))?;
+            x.spec(t.kind).ok_or(EditError::NoSuchTarget(x))?;
             if t.lanes.iter().enumerate().any(|(k, l)| k != usize::from(lane) && l.target == target) {
                 return Err(EditError::DuplicateLane);
             }
             // A bus or master setting is shared: one lane in the whole
             // project may automate it.
             let elsewhere = self.tracks.iter().enumerate().filter(|&(i, _)| i != usize::from(track));
-            if x >= MIX_TARGET && elsewhere.flat_map(|(_, o)| &o.lanes).any(|l| l.target == target) {
+            if x.is_global() && elsewhere.flat_map(|(_, o)| &o.lanes).any(|l| l.target == target) {
                 return Err(EditError::DuplicateLane);
             }
         }
@@ -620,7 +619,7 @@ impl Project {
     fn point_spec(&self, track: u8, lane: u8, pattern: u8, step: u8) -> Result<&'static ParamSpec, EditError> {
         let t = self.track(track)?;
         let l = t.lanes.get(usize::from(lane)).ok_or(EditError::NoSuchLane(lane))?;
-        let spec = l.target.and_then(|x| target_spec(t.kind, x)).ok_or(EditError::LaneUnassigned(lane))?;
+        let spec = l.target.and_then(|x| x.spec(t.kind)).ok_or(EditError::LaneUnassigned(lane))?;
         check_pattern(pattern)?;
         if usize::from(step) >= MAX_STEPS {
             return Err(EditError::NoSuchStep(step));
@@ -1023,7 +1022,7 @@ impl Project {
                 }
             }
             for (k, l) in t.lanes.iter().enumerate() {
-                if let Some(spec) = l.target.and_then(|x| target_spec(t.kind, x)) {
+                if let Some(spec) = l.target.and_then(|x| x.spec(t.kind)) {
                     let _ = writeln!(s, "lane {k} {} {}", spec.id, if l.ramp { "ramp" } else { "hold" });
                 }
             }
@@ -1137,13 +1136,14 @@ impl Project {
                             return Err(err(format!("lane {k} out of range (0..{MAX_LANES})")));
                         }
                         let count = track_param_count(t.kind) as u8;
-                        let mix = if ver >= 9 { MIX_TARGET..MIX_TARGET + MIX_PARAMS.len() as u8 } else { 0..0 };
+                        let mix = if ver >= 9 { 0..MIX_PARAMS.len() as u8 } else { 0..0 };
                         let target = (0..2 + count)
                             .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
-                            .chain(mix)
-                            .find(|&x| target_spec(t.kind, x).is_some_and(|s| s.id == id))
+                            .map(LaneTarget::Track)
+                            .chain(mix.map(LaneTarget::Mix))
+                            .find(|&x| x.spec(t.kind).is_some_and(|s| s.id == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
-                        if target >= MIX_TARGET
+                        if target.is_global()
                             && p.tracks.iter().flat_map(|o| &o.lanes).any(|l| l.target == Some(target))
                         {
                             return Err(err(format!("'{id}' has a lane on another track already")));
@@ -1166,7 +1166,7 @@ impl Project {
                             .lanes
                             .get(k)
                             .and_then(|l| l.target)
-                            .and_then(|x| target_spec(t.kind, x))
+                            .and_then(|x| x.spec(t.kind))
                             .ok_or_else(|| err(format!("lane {k} is not defined")))?;
                         if i >= MAX_STEPS {
                             return Err(err(format!("step index {i} out of range")));
@@ -1840,8 +1840,8 @@ mod tests {
         let bass = 5u8;
         let cutoff = 2 + 5; // panel index of the synth cutoff
         for e in [
-            Edit::SetLane { track: bass, lane: 1, target: Some(cutoff), ramp: true },
-            Edit::SetLane { track: bass, lane: 3, target: Some(0), ramp: false },
+            Edit::SetLane { track: bass, lane: 1, target: Some(LaneTarget::Track(cutoff)), ramp: true },
+            Edit::SetLane { track: bass, lane: 3, target: Some(LaneTarget::Track(0)), ramp: false },
             Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 0, value: Some(200.0) },
             Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 12, value: Some(1e9) },
             Edit::SetPoint { track: bass, lane: 3, pattern: 4, step: 63, value: Some(-6.5) },
@@ -1867,9 +1867,9 @@ mod tests {
         assert_eq!(q, p);
         for e in [
             Edit::SetLane { track: bass, lane: 1, target: None, ramp: false },
-            Edit::SetLane { track: bass, lane: 1, target: Some(1), ramp: false },
-            Edit::SetLane { track: bass, lane: 1, target: Some(cutoff), ramp: false },
-            Edit::SetLane { track: bass, lane: 0, target: Some(2), ramp: true },
+            Edit::SetLane { track: bass, lane: 1, target: Some(LaneTarget::Track(1)), ramp: false },
+            Edit::SetLane { track: bass, lane: 1, target: Some(LaneTarget::Track(cutoff)), ramp: false },
+            Edit::SetLane { track: bass, lane: 0, target: Some(LaneTarget::Track(2)), ramp: true },
             Edit::SetPoint { track: bass, lane: 1, pattern: 0, step: 12, value: None },
             Edit::SetPoint { track: bass, lane: 1, pattern: 9, step: 3, value: Some(500.0) },
             Edit::RemoveTrack(bass),
@@ -1903,7 +1903,7 @@ mod tests {
             },
             Edit::SetParam { track: 5, index: t(sp::COUNT + send::CHORUS), value: -8.0 },
             Edit::SetMixParam { index: mp::CHORUS_DEPTH as u8, value: 0.005 },
-            Edit::SetLane { track: 2, lane: 1, target: Some(MIX_TARGET + mp::REVERB_DECAY as u8), ramp: true },
+            Edit::SetLane { track: 2, lane: 1, target: Some(LaneTarget::Mix(mp::REVERB_DECAY as u8)), ramp: true },
             Edit::SetPoint { track: 2, lane: 1, pattern: 1, step: 4, value: Some(4.0) },
         ];
         for e in edits {
@@ -1933,27 +1933,27 @@ mod tests {
     fn lane_edits_are_validated() {
         let mut p = Project::demo();
         let lane = |lane, target| Edit::SetLane { track: 0, lane, target, ramp: false };
-        assert_eq!(p.apply(lane(4, Some(0))), Err(EditError::NoSuchLane(4)));
+        assert_eq!(p.apply(lane(4, Some(LaneTarget::Track(0)))), Err(EditError::NoSuchLane(4)));
         // The kick has 4 instrument parameters, 15 strip parameters and 4
         // sends after volume and pan: targets 0..25, so 6 is the strip's
-        // first. The bus and master settings follow from MIX_TARGET.
-        assert_eq!(p.apply(lane(0, Some(25))), Err(EditError::NoSuchTarget(25)));
-        assert_eq!(target_spec(p.tracks[0].kind, 24).map(|s| s.id), Some("send_key"));
-        assert_eq!(target_spec(p.tracks[0].kind, 6).map(|s| s.id), Some("hp_freq"));
-        assert_eq!(target_spec(p.tracks[0].kind, MIX_TARGET).map(|s| s.id), Some("delay_time"));
-        let past_mix = MIX_TARGET + mp::COUNT as u8;
+        // first. The bus and master settings are mix targets.
+        assert_eq!(p.apply(lane(0, Some(LaneTarget::Track(25)))), Err(EditError::NoSuchTarget(LaneTarget::Track(25))));
+        assert_eq!(LaneTarget::Track(24).spec(p.tracks[0].kind).map(|s| s.id), Some("send_key"));
+        assert_eq!(LaneTarget::Track(6).spec(p.tracks[0].kind).map(|s| s.id), Some("hp_freq"));
+        assert_eq!(LaneTarget::Mix(0).spec(p.tracks[0].kind).map(|s| s.id), Some("delay_time"));
+        let past_mix = LaneTarget::Mix(mp::COUNT as u8);
         assert_eq!(p.apply(lane(0, Some(past_mix))), Err(EditError::NoSuchTarget(past_mix)));
         // One lane in the project for each bus or master setting.
-        let decay = Some(MIX_TARGET + mp::REVERB_DECAY as u8);
+        let decay = Some(LaneTarget::Mix(mp::REVERB_DECAY as u8));
         p.apply(lane(3, decay)).unwrap();
         let other = Edit::SetLane { track: 1, lane: 0, target: decay, ramp: false };
         assert_eq!(p.apply(other), Err(EditError::DuplicateLane));
         p.apply(lane(3, None)).unwrap();
         p.apply(other).unwrap();
         p.apply(Edit::SetLane { track: 1, lane: 0, target: None, ramp: false }).unwrap();
-        p.apply(lane(0, Some(3))).unwrap();
-        assert_eq!(p.apply(lane(1, Some(3))), Err(EditError::DuplicateLane));
-        assert_eq!(p.inverse(&lane(1, Some(3))), Err(EditError::DuplicateLane));
+        p.apply(lane(0, Some(LaneTarget::Track(3)))).unwrap();
+        assert_eq!(p.apply(lane(1, Some(LaneTarget::Track(3)))), Err(EditError::DuplicateLane));
+        assert_eq!(p.inverse(&lane(1, Some(LaneTarget::Track(3)))), Err(EditError::DuplicateLane));
         let point = |lane, step| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(0.1) };
         assert_eq!(p.apply(point(1, 0)), Err(EditError::LaneUnassigned(1)));
         assert_eq!(p.apply(point(0, 64)), Err(EditError::NoSuchStep(64)));
@@ -1964,7 +1964,7 @@ mod tests {
     #[test]
     fn lane_values_hold_and_ramp_between_points() {
         let spec = &crate::engine::VOLUME;
-        let mut l = LaneData::new(Some(0), false);
+        let mut l = LaneData::new(Some(LaneTarget::Track(0)), false);
         l.points[0][2] = Some(-30.0);
         l.points[0][6] = Some(6.0);
         let at = |l: &LaneData, step| l.value_at(spec, 0, 8, step);
@@ -1977,7 +1977,7 @@ mod tests {
         assert_eq!(l.value_at(spec, 0, 5, 4), Some(-30.0));
         // Log parameters ramp geometrically.
         let cutoff = &InstrumentKind::Synth.params()[5];
-        let mut c = LaneData::new(Some(7), true);
+        let mut c = LaneData::new(Some(LaneTarget::Track(7)), true);
         c.points[0][0] = Some(100.0);
         c.points[0][2] = Some(10_000.0);
         assert!((c.value_at(cutoff, 0, 16, 1).unwrap() - 1000.0).abs() < 0.5);
@@ -2341,6 +2341,16 @@ pattern_division A 1/8
         assert_eq!(p.apply(Edit::AddTrack(InstrumentKind::Kick)), Err(EditError::TooManyTracks));
         p.apply(Edit::RemoveTrack(0)).unwrap();
         assert_eq!(p.tracks.len(), MAX_TRACKS - 1);
+        // The last place takes a track, and gives it back.
+        let last = 31;
+        assert_eq!(p.tracks.len(), 31);
+        p.apply(Edit::InsertTrack { index: last, kind: InstrumentKind::Sampler }).unwrap();
+        assert_eq!(p.tracks.len(), 32);
+        assert_eq!(p.tracks[usize::from(last)].kind, InstrumentKind::Sampler);
+        let full = Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick };
+        assert_eq!(p.apply(full), Err(EditError::TooManyTracks));
+        p.apply(Edit::RemoveTrack(last)).unwrap();
+        assert_eq!(p.apply(Edit::RemoveTrack(last)), Err(EditError::NoSuchTrack(last)));
     }
 
     #[test]

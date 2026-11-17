@@ -209,7 +209,7 @@ pub fn stem_project(project: &Project, i: usize) -> Project {
     }
     solo.mix[crate::mix::mp::LIMITER] = 0.0;
     // A lane could switch the limiter back on.
-    let limiter = crate::engine::MIX_TARGET + crate::mix::mp::LIMITER as u8;
+    let limiter = crate::engine::LaneTarget::Mix(crate::mix::mp::LIMITER as u8);
     for lane in solo.tracks.iter_mut().flat_map(|t| t.lanes.iter_mut()) {
         if lane.target == Some(limiter) {
             *lane = crate::project::LaneData::new(None, false);
@@ -419,7 +419,7 @@ mod tests {
         p.apply(Edit::SetLane {
             track: 0,
             lane: 1,
-            target: Some(crate::engine::MIX_TARGET + mp::LIMITER as u8),
+            target: Some(crate::engine::LaneTarget::Mix(mp::LIMITER as u8)),
             ramp: false,
         })
         .unwrap();

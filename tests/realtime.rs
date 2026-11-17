@@ -15,11 +15,11 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
-use tinvo::engine::{Command, Edit, Engine, MAX_TRACKS, MIX_TARGET, Part, Shared, Step, Take};
+use tinvo::engine::{Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Shared, Step, Take};
 use tinvo::instrument::InstrumentKind;
 use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
-use tinvo::project::Project;
+use tinvo::project::{LaneData, Project};
 use tinvo::record::{Meter, capture_into};
 use tinvo::rt::mailbox::Mailbox;
 use tinvo::rt::spsc::{self, Consumer, Producer};
@@ -162,13 +162,13 @@ fn heavy_project() -> Project {
         }
         // Volume, then the mid band's frequency, on ramps.
         let mid = (2 + n + sp::MID_FREQ) as u8;
-        ok(p.apply(Edit::SetLane { track: t, lane: 0, target: Some(mid), ramp: true }));
+        ok(p.apply(Edit::SetLane { track: t, lane: 0, target: Some(LaneTarget::Track(mid)), ramp: true }));
         let spec = track_param(kind, n + sp::MID_FREQ).unwrap();
         for (step, value) in [(0, spec.min), (8, spec.max)] {
             ok(p.apply(Edit::SetPoint { track: t, lane: 0, pattern: 0, step, value: Some(value) }));
         }
     }
-    let decay = MIX_TARGET + mp::REVERB_DECAY as u8;
+    let decay = LaneTarget::Mix(mp::REVERB_DECAY as u8);
     ok(p.apply(Edit::SetLane { track: 0, lane: 1, target: Some(decay), ramp: true }));
     for (step, value) in [(0, 0.5), (12, 8.0)] {
         ok(p.apply(Edit::SetPoint { track: 0, lane: 1, pattern: 0, step, value: Some(value) }));
@@ -205,6 +205,30 @@ fn heavy_song() -> usize {
     play_song(&mut rig, 2000)
 }
 
+/// The heavy project's tracks again and again up to the limit, each sampler
+/// with a sample of its own. A copy's bus and master lanes are freed: only
+/// one lane in a project holds each.
+fn full_song() -> usize {
+    let mut p = heavy_project();
+    let base = p.tracks.clone();
+    for mut t in base.iter().cycle().take(MAX_TRACKS - base.len()).cloned() {
+        for l in &mut t.lanes {
+            if l.target.is_some_and(LaneTarget::is_global) {
+                *l = LaneData::new(None, false);
+            }
+        }
+        p.tracks.push(t);
+    }
+    assert_eq!(p.tracks.len(), 32);
+    let mut rig = Rig::new(&p);
+    for (t, track) in p.tracks.iter().enumerate() {
+        if track.kind == InstrumentKind::Sampler {
+            rig.send(Command::SetSample { track: t as u8, sample: Some(sample(30_000, t as u64)) });
+        }
+    }
+    play_song(&mut rig, 2000)
+}
+
 /// A random edit or command, about what a busy user sends.
 fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
     let mut r = |n: u64| rng.next_u64() % n;
@@ -231,8 +255,8 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
         12 => {
             let target = match r(3) {
                 0 => None,
-                1 => Some(MIX_TARGET + r(MIX_PARAMS.len() as u64) as u8),
-                _ => Some(r(30) as u8),
+                1 => Some(LaneTarget::Mix(r(MIX_PARAMS.len() as u64) as u8)),
+                _ => Some(LaneTarget::Track(r(30) as u8)),
             };
             Edit::SetLane { track, lane: r(4) as u8, target, ramp: r(2) == 0 }
         }
@@ -442,9 +466,10 @@ fn midi() -> usize {
 type Check = fn() -> usize;
 
 fn main() {
-    let checks: [(&str, Check); 8] = [
+    let checks: [(&str, Check); 9] = [
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
+        ("as many tracks as a project holds, likewise", full_song),
         ("edits, samples and transport commands while playing", edits_while_playing),
         ("live notes", live_notes),
         ("recording notes and count-ins", recording_notes),
