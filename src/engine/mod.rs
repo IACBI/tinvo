@@ -26,12 +26,16 @@ use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
 use crate::strip::{self, Strip, track_param};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use transport::Transport;
 pub use transport::{Division, Meter, PULSES_PER_BEAT, entry_tempo, span_frames};
 
-pub const MAX_TRACKS: usize = 16;
+pub const MAX_TRACKS: usize = 32;
+/// Removed tracks fading out at once; a removal while all are busy cuts
+/// the oldest fade short.
+pub const MAX_FADING: usize = 16;
 pub const MAX_STEPS: usize = 64;
 /// Patterns per project, named A to P.
 pub const MAX_PATTERNS: usize = 16;
@@ -49,19 +53,42 @@ const AUTOMATION_TICK: u64 = 32;
 pub static VOLUME: ParamSpec = ParamSpec::linear("volume", "Volume", SILENT_DB, MAX_GAIN_DB, 0.0, 0.5, Unit::Decibels);
 pub static PAN: ParamSpec = ParamSpec::linear("pan", "Pan", -1.0, 1.0, 0.0, 0.05, Unit::Pan);
 
-/// Lane targets from here on are the bus and master settings
-/// ([`mix::MIX_PARAMS`]), which any one track's lane can automate.
-pub const MIX_TARGET: u8 = 128;
+/// What an automation lane controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LaneTarget {
+    /// A parameter of the lane's own track, in the order of the parameter
+    /// panel: 0 is the volume, 1 the pan, `2 + i` the track's parameter `i`
+    /// ([`track_param`]).
+    Track(u8),
+    /// The bus or master setting `i` ([`mix::MIX_PARAMS`]), which a lane on
+    /// any one track can automate.
+    Mix(u8),
+}
 
-/// What an automation lane controls: 0 is the volume, 1 the pan, `2 + i`
-/// the track's parameter `i` (the order of the parameter panel), and
-/// [`MIX_TARGET`]` + i` the bus or master setting `i`.
-pub fn target_spec(kind: InstrumentKind, target: u8) -> Option<&'static ParamSpec> {
-    match target {
-        0 => Some(&VOLUME),
-        1 => Some(&PAN),
-        t if t >= MIX_TARGET => mix::MIX_PARAMS.get(usize::from(t - MIX_TARGET)),
-        t => track_param(kind, usize::from(t) - 2),
+impl LaneTarget {
+    /// The parameter it names on a track of `kind`, if there is one.
+    pub fn spec(self, kind: InstrumentKind) -> Option<&'static ParamSpec> {
+        match self {
+            LaneTarget::Track(0) => Some(&VOLUME),
+            LaneTarget::Track(1) => Some(&PAN),
+            LaneTarget::Track(t) => track_param(kind, usize::from(t) - 2),
+            LaneTarget::Mix(i) => mix::MIX_PARAMS.get(usize::from(i)),
+        }
+    }
+
+    /// Whether it is a setting of the whole project rather than of the
+    /// lane's track: then only one lane in the project may hold it.
+    pub fn is_global(self) -> bool {
+        matches!(self, LaneTarget::Mix(_))
+    }
+}
+
+impl fmt::Display for LaneTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LaneTarget::Track(i) => write!(f, "{i}"),
+            LaneTarget::Mix(i) => write!(f, "mix {i}"),
+        }
     }
 }
 /// Internal processing block. Events inside a block are still sample-accurate.
@@ -395,13 +422,13 @@ pub enum Edit {
     /// reaches past the end of the song is ignored until the song is long
     /// enough again.
     SetLoop(Option<(u16, u16)>),
-    /// Points a lane at a parameter (see [`target_spec`]), or frees it.
+    /// Points a lane at a parameter (see [`LaneTarget::spec`]), or frees it.
     /// Giving a lane a different target clears its points. `ramp` lanes
     /// glide from point to point; others hold each value.
     SetLane {
         track: u8,
         lane: u8,
-        target: Option<u8>,
+        target: Option<LaneTarget>,
         ramp: bool,
     },
     /// An automation point: the lane's value from this step on.
@@ -827,7 +854,7 @@ impl Segment {
 
 #[derive(Clone, Copy)]
 struct Lane {
-    target: Option<u8>,
+    target: Option<LaneTarget>,
     ramp: bool,
     /// Point values per pattern and step; NaN means no point.
     points: [[f32; MAX_STEPS]; MAX_PATTERNS],
@@ -990,7 +1017,7 @@ impl Track {
     }
 
     /// Whether a lane currently overrides `target`.
-    fn automated(&self, target: u8) -> bool {
+    fn automated(&self, target: LaneTarget) -> bool {
         self.lanes.iter().any(|l| l.target == Some(target) && l.applied.is_some())
     }
 
@@ -1204,8 +1231,8 @@ pub struct Engine {
     /// before any strip runs, so the key bus is complete when the
     /// compressors read it.
     track_bufs: Box<[[f32; BLOCK]]>,
-    /// Removed tracks still fading out. There is one slot per track, so
-    /// only removals faster than one per `MAX_TRACKS` fade times share one.
+    /// Removed tracks still fading out: [`MAX_FADING`] slots, so only
+    /// removals faster than that many per fade time cut one short.
     fading: Box<[Fading]>,
     fading_count: usize,
     fade_frames: u32,
@@ -1297,7 +1324,7 @@ impl Engine {
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
-            fading: (0..MAX_TRACKS)
+            fading: (0..MAX_FADING)
                 .map(|_| Fading { track: Track::new(InstrumentKind::Synth, sample_rate), left: 0 })
                 .collect(),
             fading_count: 0,
@@ -2433,10 +2460,8 @@ impl Engine {
                 let i = usize::from(i);
                 if i < n {
                     for l in &self.tracks[i].lanes {
-                        if let (Some(x), Some(_)) = (l.target, l.applied) {
-                            if x >= MIX_TARGET {
-                                self.mix.automate(usize::from(x - MIX_TARGET), None);
-                            }
+                        if let (Some(LaneTarget::Mix(x)), Some(_)) = (l.target, l.applied) {
+                            self.mix.automate(usize::from(x), None);
                         }
                     }
                     self.tracks[i..n].rotate_left(1);
@@ -2458,7 +2483,7 @@ impl Engine {
                     let i = usize::from(index);
                     if let Some(spec) = track_param(t.instrument.kind(), i) {
                         t.base[i] = spec.clamp(value);
-                        if !t.automated(index.saturating_add(2)) {
+                        if !t.automated(LaneTarget::Track(index.saturating_add(2))) {
                             t.set_param(i, value);
                         }
                     }
@@ -2467,17 +2492,17 @@ impl Engine {
             Edit::SetLane { track, lane, target, ramp } => {
                 let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
                 let kind = t.instrument.kind();
-                if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| target_spec(kind, x).is_none()) {
+                if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| x.spec(kind).is_none()) {
                     return;
                 }
                 let old = t.lanes[usize::from(lane)];
                 if old.target != target {
-                    if let (Some(x), Some(_)) = (old.target, old.applied) {
-                        if x >= MIX_TARGET {
-                            self.mix.automate(usize::from(x - MIX_TARGET), None);
-                        } else {
+                    match (old.target, old.applied) {
+                        (Some(LaneTarget::Mix(x)), Some(_)) => self.mix.automate(usize::from(x), None),
+                        (Some(LaneTarget::Track(x)), Some(_)) => {
                             t.write_target(x, None);
                         }
+                        _ => {}
                     }
                     t.lanes[usize::from(lane)] = Lane { target, ..Lane::EMPTY };
                     self.update_gains();
@@ -2488,7 +2513,7 @@ impl Engine {
                 let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
                 let kind = t.instrument.kind();
                 let Some(l) = t.lanes.get_mut(usize::from(lane)) else { return };
-                let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { return };
+                let Some(spec) = l.target.and_then(|x| x.spec(kind)) else { return };
                 if let Some(slot) = l.points.get_mut(usize::from(pattern)).and_then(|p| p.get_mut(usize::from(step))) {
                     *slot = value.map_or(f32::NAN, |v| spec.clamp(v));
                 }
@@ -2548,7 +2573,7 @@ impl Engine {
         let tracks = &mut self.tracks[..self.track_count];
         let any_solo = tracks.iter().any(|t| t.solo);
         let (now, midi) = (self.now, &mut self.midi);
-        let mut silenced = 0u16;
+        let mut silenced = 0u32;
         for (i, t) in tracks.iter_mut().enumerate() {
             let audible = !t.mute && (!any_solo || t.solo);
             // Its notes on the output stop, as a muted track's voices do.
@@ -2744,7 +2769,7 @@ impl Engine {
         let kind = track.instrument.kind();
         let mut ramping = false;
         for l in &mut track.lanes {
-            let Some(spec) = l.target.and_then(|x| target_spec(kind, x)) else { continue };
+            let Some(spec) = l.target.and_then(|x| x.spec(kind)) else { continue };
             let Some(pattern) = k.pattern.map(usize::from) else {
                 l.segment = None;
                 continue;
@@ -2778,14 +2803,13 @@ impl Engine {
             let kind = t.instrument.kind();
             for k in 0..MAX_LANES {
                 let l = t.lanes[k];
-                let Some((target, spec)) = l.target.and_then(|x| Some((x, target_spec(kind, x)?))) else { continue };
+                let Some((target, spec)) = l.target.and_then(|x| Some((x, x.spec(kind)?))) else { continue };
                 let want = l.segment.map(|g| g.value_at(spec, frame));
                 if want != l.applied {
                     t.lanes[k].applied = want;
-                    if target >= MIX_TARGET {
-                        mix.automate(usize::from(target - MIX_TARGET), want);
-                    } else {
-                        gains |= t.write_target(target, want);
+                    match target {
+                        LaneTarget::Mix(i) => mix.automate(usize::from(i), want),
+                        LaneTarget::Track(i) => gains |= t.write_target(i, want),
                     }
                 }
             }
@@ -3276,24 +3300,24 @@ mod tests {
 
     #[test]
     fn removals_beyond_the_fading_slots_cut_the_oldest_fade() {
-        let edits: Vec<_> = (0..MAX_TRACKS).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
+        let edits: Vec<_> = (0..MAX_FADING).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
         let mut e = engine(&edits);
-        for i in 0..MAX_TRACKS {
+        for i in 0..MAX_FADING {
             e.handle(Command::Audition { track: i as u8, step: Step::new(60, 100, 1), frames: 1 << 20 });
         }
         run(&mut e, 256);
-        for _ in 0..MAX_TRACKS {
+        for _ in 0..MAX_FADING {
             e.apply(Edit::RemoveTrack(0));
             run(&mut e, 1);
         }
-        assert_eq!((e.track_count(), e.fading_count), (0, MAX_TRACKS));
+        assert_eq!((e.track_count(), e.fading_count), (0, MAX_FADING));
         // A new track, removed at once: the fade with the fewest frames left goes.
         e.apply(Edit::AddTrack(InstrumentKind::Kick));
         e.apply(Edit::RemoveTrack(0));
-        assert_eq!(e.fading_count, MAX_TRACKS);
+        assert_eq!(e.fading_count, MAX_FADING);
         let left: Vec<u32> = e.fading.iter().map(|f| f.left).collect();
         assert_eq!(left.iter().filter(|&&l| l == e.fade_frames).count(), 1, "{left:?}");
-        assert_eq!(*left.iter().min().unwrap(), e.fade_frames - (MAX_TRACKS as u32 - 1), "{left:?}");
+        assert_eq!(*left.iter().min().unwrap(), e.fade_frames - (MAX_FADING as u32 - 1), "{left:?}");
         let fade = e.fade_frames as usize;
         run(&mut e, fade);
         assert_eq!(e.fading_count, 0);
@@ -3693,7 +3717,7 @@ mod tests {
         let mut edits = vec![
             Edit::AddTrack(InstrumentKind::Kick),
             Edit::SetMidiOut { track: 0, on: true },
-            Edit::SetLane { track: 0, lane: 0, target: Some(MIX_TARGET + limiter), ramp: false },
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Mix(limiter)), ramp: false },
             Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(0.0) },
             Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 8, value: Some(1.0) },
         ];
@@ -4410,6 +4434,26 @@ mod tests {
     fn track_limit_is_enforced() {
         let edits: Vec<_> = (0..MAX_TRACKS + 3).map(|_| Edit::AddTrack(InstrumentKind::Kick)).collect();
         assert_eq!(engine(&edits).track_count(), MAX_TRACKS);
+        assert_eq!(MAX_TRACKS, 32, "the limit the docs and the 32-bit track masks are made for");
+    }
+
+    #[test]
+    fn the_last_track_has_a_bit_of_its_own() {
+        let last = 31;
+        let mut edits: Vec<_> = (0..32).map(|_| Edit::AddTrack(InstrumentKind::Synth)).collect();
+        edits.extend([Edit::SetChannel { track: last, channel: Some(3) }, Edit::SetMidiOut { track: last, on: true }]);
+        let (mut e, live) = live_engine(&edits);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        assert_eq!((e.targets(3), e.targets(0)), (1 << last, 1), "channel 3 plays the last track only");
+        send(&live, Message::note(3, 64, 90));
+        run(&mut e, 64);
+        assert_eq!(e.held[..e.held_count].iter().map(|h| h.track).collect::<Vec<_>>(), [last]);
+        // Muting it ends the note it sent.
+        e.handle(Command::Edit(Edit::SetMute { track: last, mute: true }));
+        run(&mut e, 64);
+        assert_eq!(sent(&mut rx), [(0, vec![0x93, 64, 90]), (64, vec![0x83, 64, 0])]);
+        assert_eq!(e.held_count, 0);
     }
 
     #[test]
@@ -5287,7 +5331,7 @@ mod tests {
         // A volume lane: B holds -12 dB from step 0 and ramps to -24 dB on
         // step 6, which entry 1 never reaches; C has no points.
         let mut edits = parted_song();
-        edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(0), ramp: true });
+        edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(0)), ramp: true });
         edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 1, step: 0, value: Some(-12.0) });
         edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 1, step: 6, value: Some(-24.0) });
         edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(-6.0) });
@@ -5362,7 +5406,7 @@ mod tests {
             set(id("lfo_wave"), 3.0),
             set(id("lfo_amp"), 1.0),
             Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(69, 127, 16)) },
-            Edit::SetLane { track: 0, lane: 0, target: Some(2 + id("lfo_sync") as u8), ramp: false },
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(2 + id("lfo_sync") as u8)), ramp: false },
             Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(9.0) },
         ];
         let mut e = engine(&edits);
@@ -5382,8 +5426,8 @@ mod tests {
             Edit::SetPatternLength { pattern: 0, len: 8 },
             Edit::AddTrack(InstrumentKind::Synth),
             Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(45, 100, 8)) },
-            Edit::SetLane { track: 0, lane: 0, target: Some(7), ramp: true },
-            Edit::SetLane { track: 0, lane: 2, target: Some(0), ramp: false },
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(7)), ramp: true },
+            Edit::SetLane { track: 0, lane: 2, target: Some(LaneTarget::Track(0)), ramp: false },
             point(0, 2, 1000.0),
             point(0, 6, 4000.0),
             point(2, 1, -12.0),
@@ -5413,7 +5457,7 @@ mod tests {
         // A hold point on the makeup sets the strip from its step on, and
         // stop returns it to the knob.
         let mut e = engine(&edits);
-        e.apply(Edit::SetLane { track: 0, lane: 0, target: Some(2 + makeup), ramp: false });
+        e.apply(Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(2 + makeup)), ramp: false });
         e.apply(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 1, value: Some(12.0) });
         e.handle(Command::Play);
         run(&mut e, 6001);
@@ -5526,7 +5570,7 @@ mod tests {
     fn a_lane_automates_a_bus_setting_until_its_track_goes() {
         use crate::mix::mp;
         let n = InstrumentKind::Snare.params().len();
-        let return_target = MIX_TARGET + mp::REVERB_RETURN as u8;
+        let return_target = LaneTarget::Mix(mp::REVERB_RETURN as u8);
         let edits = [
             Edit::AddTrack(InstrumentKind::Snare),
             Edit::AddTrack(InstrumentKind::Kick),
@@ -5612,8 +5656,8 @@ mod tests {
         let point = |lane, step, value| Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(value) };
         edits.extend([
             Edit::SetParam { track: 0, index: (n + strip::sp::COUNT + send::DELAY) as u8, value: 0.0 },
-            Edit::SetLane { track: 0, lane: 1, target: Some(MIX_TARGET + mp::LIMITER_CEILING as u8), ramp: false },
-            Edit::SetLane { track: 0, lane: 3, target: Some(MIX_TARGET + mp::DELAY_RETURN as u8), ramp: true },
+            Edit::SetLane { track: 0, lane: 1, target: Some(LaneTarget::Mix(mp::LIMITER_CEILING as u8)), ramp: false },
+            Edit::SetLane { track: 0, lane: 3, target: Some(LaneTarget::Mix(mp::DELAY_RETURN as u8)), ramp: true },
             point(1, 3, -20.0),
             point(3, 0, SILENT_DB),
             point(3, 5, 0.0),
@@ -5645,7 +5689,7 @@ mod tests {
                 Edit::SetStep { track: 0, pattern: 0, step: 1, value: step(60) },
             ];
             if automate {
-                edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(3), ramp: false });
+                edits.push(Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(3)), ramp: false });
                 edits.push(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 1, value: Some(2.0) });
             }
             let mut e = engine(&edits);

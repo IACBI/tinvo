@@ -15,7 +15,7 @@
 //!   compiler, not on the machine's load, so the budgets on it, in
 //!   `bench/instructions.txt`, catch a regression of a few percent.
 
-use crate::engine::{Command, Edit, Engine, MAX_LANES, MAX_PATTERNS, Shared, Step};
+use crate::engine::{Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
 use crate::instrument::InstrumentKind;
 use crate::project::Project;
 use crate::sample::Sample;
@@ -48,9 +48,10 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 4] = [
+pub const SCENARIOS: [Scenario; 5] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
+    Scenario { id: "tracks32", label: "Demo song's tracks repeated to 32", budget: 0.5, build: tracks32 },
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
     Scenario {
         id: "sampler",
@@ -172,7 +173,7 @@ fn strip() -> Setup {
         }
         let lanes = &p.tracks[usize::from(track)].lanes;
         let lane = (0..MAX_LANES as u8).find(|&l| lanes[usize::from(l)].target.is_none()).expect("a free lane");
-        let target = Some(2 + base + sp::MID_FREQ as u8);
+        let target = Some(LaneTarget::Track(2 + base + sp::MID_FREQ as u8));
         ok(p.apply(Edit::SetLane { track, lane, target, ramp: true }));
         for pattern in 0..MAX_PATTERNS as u8 {
             for (step, value) in [(0, 300.0), (8, 4000.0)] {
@@ -180,6 +181,14 @@ fn strip() -> Setup {
             }
         }
     }
+    Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+}
+
+/// A full project: the demo's tracks again and again, every one playing.
+fn tracks32() -> Setup {
+    let mut p = Project::demo();
+    let demo = p.tracks.clone();
+    p.tracks.extend(demo.iter().cycle().take(MAX_TRACKS - demo.len()).cloned());
     Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
@@ -270,6 +279,7 @@ mod tests {
             assert_eq!(find(s.id).map(|f| f.id), Some(s.id));
         }
         assert!(find("nothing").is_none());
+        assert_eq!(find("tracks32").map(|s| s.tracks()), Some(MAX_TRACKS));
     }
 
     #[test]

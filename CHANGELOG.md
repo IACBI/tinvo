@@ -6,6 +6,10 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- 32 tracks, up from 16, in the editor, project files and MIDI file import.
+- `tinvo bench tracks32`: the demo song's tracks repeated to 32.
+
 ## [0.24.1] - 2026-11-16
 
 ### Fixed

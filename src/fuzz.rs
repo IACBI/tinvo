@@ -36,8 +36,8 @@
 
 use crate::dsp::noise::Rng;
 use crate::engine::{
-    Command, Division, Edit, Engine, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, MIX_TARGET, Meter, Part, Shared,
-    Step, target_spec,
+    Command, Division, Edit, Engine, LaneTarget, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, Meter, Part, Shared,
+    Step,
 };
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
@@ -564,8 +564,8 @@ fn project_seeds() -> Vec<Vec<u8>> {
     rich.mix[mp::REVERB_DECAY] = MIX_PARAMS[mp::REVERB_DECAY].max;
     {
         let t = &mut rich.tracks[0];
-        let spec = target_spec(t.kind, 2).expect("an instrument parameter");
-        t.lanes[0] = LaneData::new(Some(2), true);
+        let spec = LaneTarget::Track(2).spec(t.kind).expect("an instrument parameter");
+        t.lanes[0] = LaneData::new(Some(LaneTarget::Track(2)), true);
         t.lanes[0].points[0][0] = Some(spec.min);
         t.lanes[0].points[1][6] = Some(spec.max);
         let n = t.kind.params().len();
@@ -575,7 +575,7 @@ fn project_seeds() -> Vec<Vec<u8>> {
     }
     {
         let t = &mut rich.tracks[1];
-        let target = MIX_TARGET + mp::REVERB_DECAY as u8;
+        let target = LaneTarget::Mix(mp::REVERB_DECAY as u8);
         t.lanes[3] = LaneData::new(Some(target), false);
         t.lanes[3].points[2][5] = Some(MIX_PARAMS[mp::REVERB_DECAY].min);
     }
@@ -1201,8 +1201,8 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
         14 => {
             let target = match s.below(4) {
                 0 => None,
-                1 => Some(MIX_TARGET + s.below(MIX_PARAMS.len() + 1) as u8),
-                _ => Some(s.below(48) as u8),
+                1 => Some(LaneTarget::Mix(s.below(MIX_PARAMS.len() + 1) as u8)),
+                _ => Some(LaneTarget::Track(s.below(48) as u8)),
             };
             Edit::SetLane { track, lane: s.below(6) as u8, target, ramp: s.byte() & 1 == 1 }
         }
@@ -1210,7 +1210,7 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
             let lane = s.below(6) as u8;
             let spec = kind_of(track)
                 .zip(p.tracks.get(usize::from(track)).and_then(|t| t.lanes.get(usize::from(lane))?.target))
-                .and_then(|(k, x)| target_spec(k, x));
+                .and_then(|(k, x)| x.spec(k));
             let value = if s.below(4) == 0 { None } else { Some(s.value(spec)) };
             Edit::SetPoint { track, lane, pattern, step, value }
         }

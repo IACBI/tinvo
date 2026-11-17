@@ -27,7 +27,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 
 ### Features
 
-- 16 tracks, up to 64 steps per pattern, tempo 20–300 BPM, swing 50–75 %. Each pattern has its own step length (1/8, 1/8 triplets, 1/16, 1/16 triplets or 1/32) and time signature (such as 3/4, 6/8 or 7/8), which places its beat and bar lines. Song entries can set a tempo that holds or ramps to the next.
+- 32 tracks, up to 64 steps per pattern, tempo 20–300 BPM, swing 50–75 %. Each pattern has its own step length (1/8, 1/8 triplets, 1/16, 1/16 triplets or 1/32) and time signature (such as 3/4, 6/8 or 7/8), which places its beat and bar lines. Song entries can set a tempo that holds or ramps to the next.
 - Per step: a note or a chord of up to 4 notes, velocity, length, chance (1–100 %), ratchets (1–8 hits) and micro-timing (up to half a step early or late).
 - A piano roll for melodic tracks.
 - 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. In any entry a track can play a pattern of its own or rest. Patterns switch at the end of the bar while playing.
@@ -194,7 +194,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 
 ### Özellikler
 
-- 16 kanal, pattern başına 64'e kadar adım, 20–300 BPM tempo, %50–75 swing. Her pattern'in kendi adım uzunluğu (1/8, 1/8 triole, 1/16, 1/16 triole ya da 1/32) ve ölçüsü (3/4, 6/8, 7/8 gibi) var; vuruş ve ölçü çizgileri buna göre çizilir. Şarkı girişleri kendi tempolarını koyabilir; tempo bir sonrakine kadar sabit kalır ya da ona doğru kayar.
+- 32 kanal, pattern başına 64'e kadar adım, 20–300 BPM tempo, %50–75 swing. Her pattern'in kendi adım uzunluğu (1/8, 1/8 triole, 1/16, 1/16 triole ya da 1/32) ve ölçüsü (3/4, 6/8, 7/8 gibi) var; vuruş ve ölçü çizgileri buna göre çizilir. Şarkı girişleri kendi tempolarını koyabilir; tempo bir sonrakine kadar sabit kalır ya da ona doğru kayar.
 - Her adımda bir nota ya da en fazla 4 notalık akor, velocity, uzunluk, olasılık (%1–100), ratchet (1–8 vuruş) ve mikro zamanlama (yarım adıma kadar erken ya da geç).
 - Melodik kanallar için piyano rulosu.
 - 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Her girişte bir kanal kendi pattern'ini çalabilir ya da susabilir. Çalarken pattern değişikliği ölçü sonunda devreye girer.

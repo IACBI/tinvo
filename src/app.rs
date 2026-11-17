@@ -10,8 +10,8 @@ use crate::autosave::{self, Autosave};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
-    Command, Division, Edit, Engine, LIVE_QUEUE, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS, MAX_RATCHET,
-    MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, MIX_TARGET, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared,
+    Command, Division, Edit, Engine, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS,
+    MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared,
     Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
 use crate::instrument::{InstrumentKind, ParamSpec};
@@ -316,13 +316,16 @@ pub enum Page {
 const MIX_INDEX: usize = 1 << 10;
 
 /// The lane target of panel parameter `i`.
-fn target_of_param(i: usize) -> u8 {
-    if i >= MIX_INDEX { MIX_TARGET + (i - MIX_INDEX) as u8 } else { i as u8 }
+fn target_of_param(i: usize) -> LaneTarget {
+    if i >= MIX_INDEX { LaneTarget::Mix((i - MIX_INDEX) as u8) } else { LaneTarget::Track(i as u8) }
 }
 
 /// The panel parameter a lane target controls.
-fn param_of_target(t: u8) -> usize {
-    if t >= MIX_TARGET { MIX_INDEX + usize::from(t - MIX_TARGET) } else { usize::from(t) }
+fn param_of_target(t: LaneTarget) -> usize {
+    match t {
+        LaneTarget::Track(i) => usize::from(i),
+        LaneTarget::Mix(i) => MIX_INDEX + usize::from(i),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2951,7 +2954,7 @@ impl App {
             .tracks
             .iter()
             .position(|o| o.lanes.iter().any(|l| l.target == Some(target)))
-            .filter(|&o| param >= MIX_INDEX && o != self.track);
+            .filter(|&o| target.is_global() && o != self.track);
         if let Some(o) = owner {
             let name = &self.project.tracks[o].name;
             self.set_status(format!("{label} is automated on a lane of track {} ({name})", o + 1));
@@ -3017,7 +3020,7 @@ impl App {
                     Some(_) => None,
                     None => Some(
                         self.lane_value(self.lane, self.step)
-                            .unwrap_or(self.param_value(param_of_target(target.unwrap_or(0)))),
+                            .unwrap_or(self.param_value(param_of_target(target.unwrap_or(LaneTarget::Track(0))))),
                     ),
                 };
                 self.edit(Edit::SetPoint { track, lane, pattern, step, value });
@@ -3028,7 +3031,7 @@ impl App {
             Some(a @ (Action::PointDown | Action::PointUp | Action::PointCoarseDown | Action::PointCoarseUp)) => {
                 match point {
                     Some(v) => {
-                        let spec = self.param_spec(param_of_target(target.unwrap_or(0)));
+                        let spec = self.param_spec(param_of_target(target.unwrap_or(LaneTarget::Track(0))));
                         let dir = if matches!(a, Action::PointDown | Action::PointCoarseDown) { -1 } else { 1 };
                         let value = spec.nudge(v, dir, matches!(a, Action::PointCoarseDown | Action::PointCoarseUp));
                         self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
@@ -3060,7 +3063,7 @@ impl App {
     fn lane_value(&self, k: usize, step: usize) -> Option<f32> {
         let t = &self.project.tracks[self.track];
         let l = &t.lanes[k];
-        let spec = crate::engine::target_spec(t.kind, l.target?)?;
+        let spec = l.target?.spec(t.kind)?;
         l.value_at(spec, self.pattern, self.pattern_len(), step)
     }
 
@@ -3691,7 +3694,7 @@ impl App {
             let y = 2 + k as u16;
             let selected = k == self.lane;
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
-            let spec = l.target.and_then(|x| crate::engine::target_spec(t.kind, x));
+            let spec = l.target.and_then(|x| x.spec(t.kind));
             let label = match spec {
                 Some(sp) => format!("{} {:<16.16} {}", k + 1, sp.label, if l.ramp { "ramp" } else { "hold" }),
                 None => format!("{} (free)", k + 1),
@@ -3722,7 +3725,7 @@ impl App {
         let info_y = 2 + MAX_LANES as u16 + 1;
         if info_y < 2 + rows {
             let l = &t.lanes[self.lane];
-            let info = match l.target.and_then(|x| crate::engine::target_spec(t.kind, x)) {
+            let info = match l.target.and_then(|x| x.spec(t.kind)) {
                 None => format!(
                     "Free lane. In the parameter panel ({}), {} gives the selected parameter a lane.",
                     self.k(Action::Focus),
@@ -3735,7 +3738,7 @@ impl App {
                         (None, Some(v)) => format!("{at}{} ({})", sp.format(v), if l.ramp { "ramp" } else { "held" }),
                         (None, None) => format!(
                             "{at}knob value {}",
-                            sp.format(self.param_value(param_of_target(l.target.unwrap_or(0))))
+                            sp.format(self.param_value(param_of_target(l.target.unwrap_or(LaneTarget::Track(0)))))
                         ),
                     }
                 }
@@ -5411,7 +5414,10 @@ mod tests {
         assert_eq!(got, Some(Edit::SetParam { track: 0, index: index as u8, value: 0.5 }));
         // Strip parameters can be automated like any other.
         keys(&mut a, &[Key::Char('A')]);
-        assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == Some(2 + index as u8)).count(), 1);
+        assert_eq!(
+            a.project.tracks[0].lanes.iter().filter(|l| l.target == Some(LaneTarget::Track(2 + index as u8))).count(),
+            1
+        );
         // On through the buses back to the instrument page; the cursor follows.
         keys(&mut a, &[Key::Tab, Key::Char('f'), Key::Char('f')]);
         assert!(a.page == Page::Instrument && a.param == 2);
@@ -5672,7 +5678,7 @@ mod tests {
         assert_eq!(got, Some(Edit::SetMixParam { index: mix::mp::DELAY_TIME as u8, value: 7.0 }));
         // A shared setting is automated on a lane of the current track, and
         // only one lane in the project can hold it.
-        let delay_time = Some(MIX_TARGET + mix::mp::DELAY_TIME as u8);
+        let delay_time = Some(LaneTarget::Mix(mix::mp::DELAY_TIME as u8));
         keys(&mut a, &[Key::Char('A')]);
         assert!(a.auto_view);
         assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == delay_time).count(), 1);
@@ -5956,12 +5962,12 @@ mod tests {
         assert_eq!(Arc::strong_count(&s), 1 + MAX_TRACKS);
         assert_eq!(link.in_flight, MAX_TRACKS);
         // Removing every track returns all of them once they have faded out:
-        // two callbacks take the removals (one takes at most eight), and
-        // eight more of 64 frames play the 10 ms fade.
+        // callbacks take the removals eight at a time, and eight more of 64
+        // frames play the last ones' 10 ms fade.
         for _ in 0..MAX_TRACKS {
             link.send(Command::Edit(Edit::RemoveTrack(0)));
         }
-        for _ in 0..2 + 8 {
+        for _ in 0..MAX_TRACKS.div_ceil(8) + 8 {
             e.process(&mut out);
             link.flush();
         }
@@ -6200,7 +6206,7 @@ mod tests {
         a.param = 7;
         keys(&mut a, &[Key::Char('A')]);
         assert_eq!((a.auto_view, a.focus, a.lane), (true, Focus::Grid, 0));
-        assert_eq!(a.project.tracks[5].lanes[0].target, Some(7));
+        assert_eq!(a.project.tracks[5].lanes[0].target, Some(LaneTarget::Track(7)));
         // A new point starts at the knob value; ] nudges it.
         a.step = 2;
         keys(&mut a, &[Key::Enter, Key::Char(']')]);
