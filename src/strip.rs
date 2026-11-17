@@ -1,5 +1,5 @@
 //! The channel strip: every track's insert chain between its instrument and
-//! its fader.
+//! its fader, and every group's in stereo.
 //!
 //! Order: high-pass, low shelf, mid bell, high shelf, compressor, drive.
 //! The compressor listens to its own input or, switched to the key bus, to
@@ -9,6 +9,12 @@
 //! state, so the output does not depend on how the audio is split into
 //! buffers. At its default settings the strip is bypassed bit-exactly and
 //! costs nothing.
+//!
+//! A strip of two channels ([`StereoStrip`]) runs every stage on both
+//! alike: one set of parameters and fades, a filter and a drive per
+//! channel, and one compressor whose detector reads the louder channel (or
+//! the key bus), so the image stays put while it compresses. The
+//! one-channel [`Strip`] does exactly the arithmetic it always did.
 
 use crate::dsp::biquad::{Biquad, Coefs, Shape};
 use crate::dsp::drive::Drive;
@@ -106,19 +112,24 @@ const GLIDE_SECONDS: f32 = 0.02;
 const FADE_SECONDS: f32 = 0.01;
 const BUTTERWORTH_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
+/// A track's strip: one channel.
+pub type Strip = ChannelStrip<1>;
+/// A group's strip: two channels, interleaved.
+pub type StereoStrip = ChannelStrip<2>;
+
 #[derive(Clone, Copy, Debug)]
-pub struct Strip {
+pub struct ChannelStrip<const C: usize> {
     /// Values set by edits.
     target: [f32; sp::COUNT],
     /// Values in use, gliding towards `target`.
     current: [f32; sp::COUNT],
     settled: bool,
-    hp: Biquad,
-    low: Biquad,
-    mid: Biquad,
-    high: Biquad,
+    hp: [Biquad; C],
+    low: [Biquad; C],
+    mid: [Biquad; C],
+    high: [Biquad; C],
     comp: Compressor,
-    drive: Drive,
+    drive: [Drive; C],
     /// Which stages run; all false means the strip is bypassed.
     on: [bool; 6],
     /// Whether the high-pass and the drive should be in the chain, and how
@@ -133,19 +144,19 @@ pub struct Strip {
     sample_rate: f32,
 }
 
-impl Strip {
+impl<const C: usize> ChannelStrip<C> {
     pub fn new(sample_rate: f32) -> Self {
         let defaults = PARAMS.map(|p| p.default);
         let mut s = Self {
             target: defaults,
             current: defaults,
             settled: false,
-            hp: Biquad::default(),
-            low: Biquad::default(),
-            mid: Biquad::default(),
-            high: Biquad::default(),
+            hp: [Biquad::default(); C],
+            low: [Biquad::default(); C],
+            mid: [Biquad::default(); C],
+            high: [Biquad::default(); C],
             comp: Compressor::new(sample_rate),
-            drive: Drive::default(),
+            drive: [Drive::default(); C],
             on: [false; 6],
             hp_want: false,
             hp_mix: 0.0,
@@ -169,10 +180,22 @@ impl Strip {
         self.hp_mix = if self.hp_want { 1.0 } else { 0.0 };
         self.on[0] = self.hp_want;
         if !self.hp_want {
-            self.hp.reset();
+            self.hp.iter_mut().for_each(Biquad::reset);
         }
         self.drive_mix = if self.drive_want { 1.0 } else { 0.0 };
         self.on[5] = self.drive_want;
+    }
+
+    /// Lets go of what every stage remembers (filter states, the
+    /// compressor's reduction, the drive's last sample), keeping the
+    /// settings: for a strip whose signal has died away, so it starts
+    /// afresh when sound comes again.
+    pub fn clear(&mut self) {
+        for f in self.hp.iter_mut().chain(&mut self.low).chain(&mut self.mid).chain(&mut self.high) {
+            f.reset();
+        }
+        self.drive.iter_mut().for_each(Drive::reset);
+        self.comp.reset();
     }
 
     pub fn set_param(&mut self, index: usize, value: f32) {
@@ -203,7 +226,7 @@ impl Strip {
                     .into_iter()
                     .enumerate()
             {
-                if self.on[1 + k] && self.current[gain] == 0.0 && filter.is_quiet() {
+                if self.on[1 + k] && self.current[gain] == 0.0 && filter.iter().all(Biquad::is_quiet) {
                     self.on[1 + k] = false;
                 }
             }
@@ -245,11 +268,14 @@ impl Strip {
         let hz = |i: usize| f64::from(c[i]);
         self.hp_want = c[sp::HP_FREQ] > PARAMS[sp::HP_FREQ].min;
         if self.hp_want {
-            self.hp.set(Coefs::new(Shape::HighPass { q: BUTTERWORTH_Q }, hz(sp::HP_FREQ), sr));
-            if !self.on[0] {
-                self.hp.reset();
-                self.on[0] = true;
+            let coefs = Coefs::new(Shape::HighPass { q: BUTTERWORTH_Q }, hz(sp::HP_FREQ), sr);
+            for hp in &mut self.hp {
+                hp.set(coefs);
+                if !self.on[0] {
+                    hp.reset();
+                }
             }
+            self.on[0] = true;
         }
         // A band is switched out once it is flat and its filter state is
         // zero. The gain glides to 0 dB first, where the filter is so close
@@ -265,8 +291,9 @@ impl Strip {
         {
             let freq = hz(gain - 1);
             let flat = c[gain] == 0.0;
-            filter.set(if flat { Coefs::IDENTITY } else { Coefs::new(shape, freq, sr) });
-            self.on[1 + k] = !flat || !filter.is_quiet();
+            let coefs = if flat { Coefs::IDENTITY } else { Coefs::new(shape, freq, sr) };
+            filter.iter_mut().for_each(|f| f.set(coefs));
+            self.on[1 + k] = !flat || !filter.iter().all(Biquad::is_quiet);
         }
         self.comp.set(
             c[sp::COMP_THRESHOLD],
@@ -276,10 +303,11 @@ impl Strip {
             c[sp::COMP_MAKEUP],
         );
         self.on[4] = self.comp_wanted() || self.comp.gain_reduction_db() != 0.0;
-        self.drive.set(c[sp::DRIVE]);
-        self.drive_want = c[sp::DRIVE] > 0.0;
+        let drive = c[sp::DRIVE];
+        self.drive.iter_mut().for_each(|d| d.set(drive));
+        self.drive_want = drive > 0.0;
         if self.drive_want && !self.on[5] {
-            self.drive.reset();
+            self.drive.iter_mut().for_each(Drive::reset);
             self.on[5] = true;
         }
     }
@@ -293,48 +321,52 @@ impl Strip {
         self.target[sp::COMP_KEY] >= 1.0
     }
 
-    /// Processes `buf` in place. `key` is the key bus for the same frames;
-    /// the compressor listens to it when switched to the key bus.
+    /// Processes `buf` in place: frames of `C` interleaved samples. `key`
+    /// is the key bus for the same frames; the compressor listens to it when
+    /// switched to the key bus.
     pub fn process(&mut self, buf: &mut [f32], key: &[f32]) {
-        debug_assert!(key.len() >= buf.len());
+        debug_assert!(buf.len() % C == 0 && key.len() >= buf.len() / C);
+        let frames = buf.len() / C;
         let mut i = 0;
-        while i < buf.len() {
+        while i < frames {
             if self.countdown == 0 {
                 self.update();
                 self.countdown = TICK;
             }
-            let n = (self.countdown as usize).min(buf.len() - i);
+            let n = (self.countdown as usize).min(frames - i);
             self.countdown -= n as u32;
             if self.is_active() {
                 let on = self.on;
                 let keyed = self.keyed();
-                for (x, &k) in buf[i..i + n].iter_mut().zip(&key[i..i + n]) {
-                    let mut y = *x;
+                for (x, &k) in buf[C * i..C * (i + n)].chunks_exact_mut(C).zip(&key[i..i + n]) {
+                    let mut y: [f32; C] = std::array::from_fn(|c| x[c]);
                     if on[0] {
-                        let w = self.hp.process(y);
-                        y = fade(y, w, &mut self.hp_mix, self.hp_want, self.fade_step);
+                        let w: [f32; C] = std::array::from_fn(|c| self.hp[c].process(y[c]));
+                        fade(&mut y, &w, &mut self.hp_mix, self.hp_want, self.fade_step);
                     }
-                    if on[1] {
-                        y = self.low.process(y);
-                    }
-                    if on[2] {
-                        y = self.mid.process(y);
-                    }
-                    if on[3] {
-                        y = self.high.process(y);
+                    for (stage, filter) in [&mut self.low, &mut self.mid, &mut self.high].into_iter().enumerate() {
+                        if on[1 + stage] {
+                            for (y, f) in y.iter_mut().zip(filter.iter_mut()) {
+                                *y = f.process(*y);
+                            }
+                        }
                     }
                     if on[4] {
-                        y = if keyed { self.comp.process_keyed(y, k) } else { self.comp.process(y) };
+                        let level = if keyed { k } else { y.iter().fold(0.0f32, |m, v| m.max(v.abs())) };
+                        let g = self.comp.detect(level);
+                        for y in &mut y {
+                            *y = self.comp.apply(*y, g);
+                        }
                     }
                     if on[5] {
-                        let w = self.drive.process(y);
-                        y = fade(y, w, &mut self.drive_mix, self.drive_want, self.fade_step);
+                        let w: [f32; C] = std::array::from_fn(|c| self.drive[c].process(y[c]));
+                        fade(&mut y, &w, &mut self.drive_mix, self.drive_want, self.fade_step);
                     }
-                    *x = y;
+                    x.copy_from_slice(&y);
                 }
                 if on[0] && !self.hp_want && self.hp_mix == 0.0 {
                     self.on[0] = false;
-                    self.hp.reset();
+                    self.hp.iter_mut().for_each(Biquad::reset);
                 }
                 if on[5] && !self.drive_want && self.drive_mix == 0.0 {
                     self.on[5] = false;
@@ -350,15 +382,19 @@ impl Strip {
     }
 }
 
-/// Output of a stage that is fading in or out: `dry` with `wet` mixed in by
-/// `mix`, which moves one step towards `want`.
+/// A stage fading in or out, on one frame: `y`, its input, becomes itself
+/// with `wet`, its output, mixed in by `mix`, which moves one step towards
+/// `want`.
 #[inline]
-fn fade(dry: f32, wet: f32, mix: &mut f32, want: bool, step: f32) -> f32 {
+fn fade<const C: usize>(y: &mut [f32; C], wet: &[f32; C], mix: &mut f32, want: bool, step: f32) {
     if want && *mix == 1.0 {
-        return wet;
+        *y = *wet;
+        return;
     }
     *mix = if want { (*mix + step).min(1.0) } else { (*mix - step).max(0.0) };
-    dry + *mix * (wet - dry)
+    for (dry, &wet) in y.iter_mut().zip(wet) {
+        *dry += *mix * (wet - *dry);
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +477,61 @@ mod tests {
         run(&mut s, &mut y);
         assert!(!s.is_active());
         assert_eq!(x, y);
+    }
+
+    /// Every stage busy: a cut, the three bands, a hard compressor, drive.
+    fn busy<const C: usize>(s: &mut ChannelStrip<C>) {
+        for (i, v) in [
+            (sp::HP_FREQ, 120.0),
+            (sp::LOW_GAIN, 4.0),
+            (sp::MID_GAIN, -5.0),
+            (sp::HIGH_GAIN, 3.0),
+            (sp::COMP_THRESHOLD, -24.0),
+            (sp::COMP_RATIO, 6.0),
+            (sp::COMP_MAKEUP, 4.0),
+            (sp::DRIVE, 8.0),
+        ] {
+            s.set_param(i, v);
+        }
+        s.snap();
+    }
+
+    #[test]
+    fn a_stereo_strip_fed_the_same_on_both_sides_is_the_mono_strip_twice() {
+        let x: Vec<f32> = sine(110.0, 0.8, 9600).iter().zip(sine(1750.0, 0.3, 9600)).map(|(a, b)| a + b).collect();
+        let mut mono = Strip::new(SR);
+        busy(&mut mono);
+        let mut m = x.clone();
+        run(&mut mono, &mut m);
+        let mut stereo = StereoStrip::new(SR);
+        busy(&mut stereo);
+        let mut y: Vec<f32> = x.iter().flat_map(|&v| [v, v]).collect();
+        stereo.process(&mut y, &vec![0.0; x.len()]);
+        for (k, (f, &v)) in y.chunks_exact(2).zip(&m).enumerate() {
+            assert!(f[0] == v && f[1] == v, "frame {k}: {f:?} against {v}");
+        }
+        assert_eq!(stereo.gain_reduction_db(), mono.gain_reduction_db());
+        assert!(mono.gain_reduction_db() < -3.0, "the compressor works");
+    }
+
+    #[test]
+    fn the_stereo_compressor_is_linked() {
+        let mut s = StereoStrip::new(SR);
+        s.set_param(sp::COMP_THRESHOLD, -30.0);
+        s.set_param(sp::COMP_RATIO, 10.0);
+        s.snap();
+        // A quiet tone on the left, loud on the right: both sides duck
+        // together, so the image holds still.
+        let (quiet, loud) = (sine(200.0, 0.01, 24_000), sine(200.0, 0.9, 24_000));
+        let mut y: Vec<f32> = quiet.iter().zip(&loud).flat_map(|(&l, &r)| [l, r]).collect();
+        s.process(&mut y, &vec![0.0; loud.len()]);
+        let tail = 12_000..24_000;
+        let left: Vec<f32> = y.chunks_exact(2).map(|f| f[0]).collect();
+        let right: Vec<f32> = y.chunks_exact(2).map(|f| f[1]).collect();
+        let cut_l = rms_db(&left[tail.clone()]) - rms_db(&quiet[tail.clone()]);
+        let cut_r = rms_db(&right[tail.clone()]) - rms_db(&loud[tail]);
+        assert!(cut_r < -12.0, "{cut_r}");
+        assert!((cut_l - cut_r).abs() < 0.1, "left {cut_l} dB, right {cut_r} dB");
     }
 
     #[test]

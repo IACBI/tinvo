@@ -33,6 +33,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - 16 patterns (A–P) and a song: a chain of up to 256 patterns with a loop region, and named markers that divide it into sections. In any entry a track can play a pattern of its own or rest. Patterns switch at the end of the bar while playing.
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
+- Up to 8 group buses. A track goes to a group or to the master, and a group has a stereo channel strip of its own (its compressor ducks both sides together), volume, balance, mute, sends and automation.
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
@@ -45,7 +46,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - A project is open in one TINVO session at a time: a second one is refused with the process that has it, and a crash never leaves it locked.
 - The editor's keys, colours and mouse can be changed on a settings page (`F2`) that applies them at once, or in the settings file it writes to. A light theme is built in.
 - Mouse support: click steps, tracks, notes and parameters, drag to fill steps or stretch a note, turn the wheel over a value to change it.
-- WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as per-track stems. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
+- WAV export at 16 or 24 bit (dithered) or 32-bit float: the song, one pattern, the loop region or the part between two markers, optionally as stems: one per track, and one per group for the tracks in groups. Each export reports its loudness (LUFS, BS.1770), true peak and any clipping.
 - Standard MIDI Files: export the song, a pattern or the loop region as notes for another program, and open a MIDI file as a new project.
 - MIDI output: any track can play an external synth or another program instead of sounding, in time with the audio, and MIDI clock keeps other gear on TINVO's tempo.
 
@@ -124,10 +125,12 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `n` `N` | next / previous pattern |
 | `y` `Y` `X` | copy / paste / clear the pattern |
 | `S` | song view: entries across, tracks down (`←` `→` entry, `↑` `↓` the song's row or a track's, `,` `.` the entry's pattern, or on a track row its own pattern, the entry's or a rest; `Enter` repeat, `Del` remove the entry or make the track follow it, `[` `]` loop, `m` name a marker, `PgUp` `PgDn` previous / next marker, `=` loop the section, `{` `}` the entry's tempo point, `0` remove it, `/` hold or ramp between points) |
-| `f` | parameter panel: instrument, channel strip and sends, buses and master |
+| `f` | parameter panel: instrument, channel strip and sends, the track's group, buses and master |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
 | `a` `D` `r` `m` `s` | add, delete, rename, mute, solo a track |
+| `i` `d` | send the track to the next group (from the last, back to the master); a new group for it |
+| `E` `Q` `F` | rename, mute or delete the track's group (its tracks go to the master) |
 | `H` | the MIDI channel (1–16) that plays the track whichever is selected; empty for none |
 | `o` | load a WAV file into a sampler track (`a` `7` adds one) |
 | `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
@@ -200,6 +203,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - 16 pattern (A–P) ve şarkı: döngü bölgesi olan, en fazla 256 pattern'lik bir zincir. İsimli marker'lar şarkıyı bölümlere ayırır. Her girişte bir kanal kendi pattern'ini çalabilir ya da susabilir. Çalarken pattern değişikliği ölçü sonunda devreye girer.
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
+- En fazla 8 grup bus'ı. Bir kanal ya bir gruba ya da master'a gider; grubun kendi stereo kanal şeridi (kompresörü iki tarafı birlikte bastırır), ses seviyesi, balansı, mute'u, send'leri ve otomasyonu vardır.
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.
@@ -212,7 +216,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Bir proje aynı anda tek bir TINVO oturumunda açık olur. İkinci oturum, projeyi tutan sürecin numarasıyla birlikte reddedilir. Çökme projeyi kilitli bırakmaz.
 - Editörün tuşları, renkleri ve faresi, değişikliği anında uygulayan bir ayar sayfasından (`F2`) ya da bu sayfanın yazdığı ayar dosyasından değiştirilebilir. Açık renkli terminaller için hazır bir tema da var.
 - Fare desteği: adımlara, kanallara, notalara ve parametrelere tıkla; sürükleyerek adımları doldur ya da bir notayı uzat; bir değerin üstünde tekerleği çevirerek onu değiştir.
-- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse her kanal ayrı dosyaya (stem). Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
+- 16 veya 24 bit (dither'lı) ya da 32-bit float WAV dışa aktarma: şarkının tamamı, tek bir pattern, döngü bölgesi ya da iki marker arası, istenirse stem olarak: her kanal ayrı dosyaya, gruptaki kanallar ise grup başına tek dosyaya. Her dışa aktarmada loudness (LUFS, BS.1770), true peak ve varsa clipping raporlanır.
 - Standard MIDI File: şarkı, bir pattern ya da döngü bölgesi başka bir programa nota olarak aktarılabilir; bir MIDI dosyası da yeni bir proje olarak açılabilir.
 - MIDI çıkışı: herhangi bir kanal kendi sesi yerine harici bir synth'i ya da başka bir programı, sesle aynı zamanda çalabilir; MIDI clock da diğer cihazları TINVO'nun temposunda tutar.
 
@@ -291,10 +295,12 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `n` `N` | sonraki / önceki pattern |
 | `y` `Y` `X` | pattern'i kopyala / yapıştır / temizle |
 | `S` | şarkı görünümü: girişler yan yana, kanallar alt alta (`←` `→` giriş, `↑` `↓` şarkı satırı ya da bir kanalın satırı, `,` `.` girişin pattern'i, kanal satırında ise kanalın kendi pattern'i, girişinki ya da sus; `Enter` tekrarla, `Del` girişi sil ya da kanalı girişe uydur, `[` `]` döngü, `m` marker koy, `PgUp` `PgDn` önceki / sonraki marker, `=` bölümü döngüye al, `{` `}` girişin tempo noktası, `0` noktayı sil, `/` noktalar arasında sabit tut ya da kaydır) |
-| `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, buslar ve master |
+| `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, kanalın grubu, buslar ve master |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
 | `a` `D` `r` `m` `s` | kanal ekle, sil, yeniden adlandır, mute, solo |
+| `i` `d` | kanalı sıradaki gruba gönder (sonuncudan sonra master'a döner); kanal için yeni grup aç |
+| `E` `Q` `F` | kanalın grubunu yeniden adlandır, mute et ya da sil (kanalları master'a gider) |
 | `H` | kanalı, seçili olmasa da çalan MIDI kanalı (1–16); boş bırakılırsa yok |
 | `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
 | `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |

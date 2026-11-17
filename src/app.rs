@@ -14,6 +14,7 @@ use crate::engine::{
     MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared,
     Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
+use crate::group::{MAX_GROUPS, group_param};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
 use crate::lock::{self, Lock};
@@ -208,10 +209,11 @@ struct TrackMeta {
 }
 
 /// What lives outside the [`Edit`] stream: each track's name and sample,
-/// and the song's markers.
+/// each group's name, and the song's markers.
 #[derive(Clone, Debug, PartialEq)]
 struct Meta {
     tracks: Vec<TrackMeta>,
+    groups: Vec<String>,
     markers: Vec<Marker>,
 }
 
@@ -249,6 +251,9 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetPoint { track, lane, pattern, step, .. } => (9 + lane, track, pattern, step),
         Edit::SetMixParam { index, .. } => (9 + MAX_LANES as u8, index, 0, 0),
         Edit::SetPart { track, index, .. } => (10 + MAX_LANES as u8, track, (index >> 8) as u8, index as u8),
+        Edit::SetGroupGain { group, .. } => (11 + MAX_LANES as u8, group, 0, 0),
+        Edit::SetGroupPan { group, .. } => (11 + MAX_LANES as u8, group, 1, 0),
+        Edit::SetGroupParam { group, index, .. } => (12 + MAX_LANES as u8, group, index, 0),
         _ => return None,
     })
 }
@@ -297,6 +302,13 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetChannel { .. } => "MIDI channel",
         Edit::SetMidiOut { .. } => "MIDI out",
         Edit::SetMixParam { .. } => "bus or master setting",
+        Edit::InsertGroup(_) => "add group",
+        Edit::RemoveGroup(_) => "delete group",
+        Edit::SetGroupGain { .. } => "group level",
+        Edit::SetGroupPan { .. } => "group pan",
+        Edit::SetGroupMute { .. } => "group mute",
+        Edit::SetGroupParam { .. } => "group parameter",
+        Edit::SetTrackGroup { .. } => "track group",
     }
 }
 
@@ -307,6 +319,8 @@ pub enum Page {
     Instrument,
     /// Volume, pan, the channel strip and the sends.
     Strip,
+    /// The selected track's group: its volume, pan, strip and sends.
+    Group,
     /// The buses and the master, shared by all tracks.
     Mix,
 }
@@ -314,10 +328,22 @@ pub enum Page {
 /// Panel index of the first bus and master parameter; lower indices are
 /// volume, pan and the track's parameters.
 const MIX_INDEX: usize = 1 << 10;
+/// Panel index of group 0's volume. Group `g`'s settings, numbered as a
+/// track's (volume, pan, then its parameters), start [`GROUP_STRIDE`] × `g`
+/// after it.
+const GROUP_INDEX: usize = 2 << 10;
+const GROUP_STRIDE: usize = 64;
 
 /// The lane target of panel parameter `i`.
 fn target_of_param(i: usize) -> LaneTarget {
-    if i >= MIX_INDEX { LaneTarget::Mix((i - MIX_INDEX) as u8) } else { LaneTarget::Track(i as u8) }
+    if i >= GROUP_INDEX {
+        let j = i - GROUP_INDEX;
+        LaneTarget::Group { group: (j / GROUP_STRIDE) as u8, index: (j % GROUP_STRIDE) as u8 }
+    } else if i >= MIX_INDEX {
+        LaneTarget::Mix((i - MIX_INDEX) as u8)
+    } else {
+        LaneTarget::Track(i as u8)
+    }
 }
 
 /// The panel parameter a lane target controls.
@@ -325,6 +351,7 @@ fn param_of_target(t: LaneTarget) -> usize {
     match t {
         LaneTarget::Track(i) => usize::from(i),
         LaneTarget::Mix(i) => MIX_INDEX + usize::from(i),
+        LaneTarget::Group { group, index } => GROUP_INDEX + usize::from(group) * GROUP_STRIDE + usize::from(index),
     }
 }
 
@@ -352,6 +379,8 @@ pub enum PromptKind {
     Style(Role),
     /// The selected track's MIDI channel.
     Channel,
+    /// The name of the selected track's group.
+    RenameGroup,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -573,6 +602,9 @@ pub struct App {
     /// Compressor gain reduction per track and the limiter's, in dB (>= 0),
     /// falling back slowly like the level meters.
     reduction: [f32; MAX_TRACKS],
+    /// Level and compressor gain reduction per group bus, likewise.
+    group_meters: [f32; MAX_GROUPS],
+    group_reduction: [f32; MAX_GROUPS],
     limiter_reduction: f32,
     /// Momentary, short-term and integrated loudness in LUFS (NaN: none).
     loudness: [f32; 3],
@@ -753,6 +785,8 @@ impl App {
             meters: [0.0; MAX_TRACKS],
             master_meter: [0.0; 2],
             reduction: [0.0; MAX_TRACKS],
+            group_meters: [0.0; MAX_GROUPS],
+            group_reduction: [0.0; MAX_GROUPS],
             limiter_reduction: 0.0,
             loudness: [f32::NAN; 3],
             cpu: 0.0,
@@ -855,6 +889,8 @@ impl App {
         self.meters = [0.0; MAX_TRACKS];
         self.master_meter = [0.0; 2];
         self.reduction = [0.0; MAX_TRACKS];
+        self.group_meters = [0.0; MAX_GROUPS];
+        self.group_reduction = [0.0; MAX_GROUPS];
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
     }
@@ -1317,6 +1353,7 @@ impl App {
                 .iter()
                 .map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone() })
                 .collect(),
+            groups: self.project.groups.iter().map(|g| g.name.clone()).collect(),
             markers: self.project.markers.clone(),
         }
     }
@@ -1327,6 +1364,11 @@ impl App {
         // should that ever not hold.
         if meta.markers.iter().all(|m| usize::from(m.entry) < self.project.song.len()) {
             self.project.markers.clone_from(&meta.markers);
+        }
+        if meta.groups.len() == self.project.groups.len() {
+            for (g, name) in self.project.groups.iter_mut().zip(&meta.groups) {
+                g.name.clone_from(name);
+            }
         }
         if meta.tracks.len() != self.project.tracks.len() {
             return;
@@ -1685,6 +1727,12 @@ impl App {
         for (m, r) in self.reduction.iter_mut().zip(&s.track_reduction) {
             *m = r.take().max(*m * 0.85);
         }
+        for (m, p) in self.group_meters.iter_mut().zip(&s.group_peaks) {
+            *m = p.take().max(*m * 0.85);
+        }
+        for (m, r) in self.group_reduction.iter_mut().zip(&s.group_reduction) {
+            *m = r.take().max(*m * 0.85);
+        }
         self.limiter_reduction = s.limiter_reduction.take().max(self.limiter_reduction * 0.85);
         for (m, l) in self.loudness.iter_mut().zip(&s.loudness) {
             *m = l.load();
@@ -1832,8 +1880,23 @@ impl App {
         self.lane = self.lane.min(MAX_LANES - 1);
         let page = self.page_params();
         if !page.contains(&self.param) {
-            self.param = page.iter().copied().find(|&p| p >= 2).unwrap_or(0);
+            self.param = self.first_setting(&page);
         }
+    }
+
+    /// Which of a fader's two settings parameter `p` is, a track's or a
+    /// group's: 0 for volume, 1 for pan.
+    fn fader_slot(p: usize) -> Option<usize> {
+        match p {
+            0 | 1 => Some(p),
+            GROUP_INDEX.. if (p - GROUP_INDEX) % GROUP_STRIDE < 2 => Some((p - GROUP_INDEX) % GROUP_STRIDE),
+            _ => None,
+        }
+    }
+
+    /// The first parameter of `page` after volume and pan.
+    fn first_setting(&self, page: &[usize]) -> usize {
+        page.iter().copied().find(|&p| Self::fader_slot(p).is_none()).unwrap_or(0)
     }
 
     /// The parameters on the panel's current page. Indices below
@@ -1845,9 +1908,14 @@ impl App {
             return (MIX_INDEX..MIX_INDEX + mix::mp::COUNT).collect();
         }
         let Some(t) = self.project.tracks.get(self.track) else { return Vec::new() };
+        if let (Page::Group, Some(g)) = (self.page, t.group) {
+            let first = GROUP_INDEX + usize::from(g) * GROUP_STRIDE;
+            return (first..first + 2 + crate::group::GROUP_PARAMS).collect();
+        }
         let n = t.kind.params().len();
         let rest = match self.page {
-            Page::Strip => 2 + n..2 + strip::track_param_count(t.kind),
+            // For a track in no group, the group page is its strip's.
+            Page::Strip | Page::Group => 2 + n..2 + strip::track_param_count(t.kind),
             _ => 2..2 + n,
         };
         [0, 1].into_iter().chain(rest).collect()
@@ -1857,12 +1925,26 @@ impl App {
         match i {
             0 => &VOLUME,
             1 => &PAN,
+            GROUP_INDEX.. => match (i - GROUP_INDEX) % GROUP_STRIDE {
+                0 => &VOLUME,
+                1 => &PAN,
+                j => group_param(j - 2).expect("group parameter index in range"),
+            },
             MIX_INDEX.. => &mix::MIX_PARAMS[i - MIX_INDEX],
             _ => track_param(self.project.tracks[self.track].kind, i - 2).expect("parameter index in range"),
         }
     }
 
     fn param_value(&self, i: usize) -> f32 {
+        if i >= GROUP_INDEX {
+            let j = i - GROUP_INDEX;
+            let Some(g) = self.project.groups.get(j / GROUP_STRIDE) else { return 0.0 };
+            return match j % GROUP_STRIDE {
+                0 => g.gain_db,
+                1 => g.pan,
+                k => g.params[k - 2],
+            };
+        }
         if i >= MIX_INDEX {
             return self.project.mix[i - MIX_INDEX];
         }
@@ -1879,6 +1961,15 @@ impl App {
         let e = match i {
             0 => Edit::SetGain { track, db: value },
             1 => Edit::SetPan { track, pan: value },
+            GROUP_INDEX.. => {
+                let j = i - GROUP_INDEX;
+                let group = (j / GROUP_STRIDE) as u8;
+                match j % GROUP_STRIDE {
+                    0 => Edit::SetGroupGain { group, db: value },
+                    1 => Edit::SetGroupPan { group, pan: value },
+                    k => Edit::SetGroupParam { group, index: (k - 2) as u8, value },
+                }
+            }
             MIX_INDEX.. => Edit::SetMixParam { index: (i - MIX_INDEX) as u8, value },
             _ => Edit::SetParam { track, index: (i - 2) as u8, value },
         };
@@ -2310,6 +2401,7 @@ impl App {
                     PromptKind::Marker => self.set_marker(&text),
                     PromptKind::Style(role) => self.set_style(role, &text),
                     PromptKind::Channel => self.set_channel(&text),
+                    PromptKind::RenameGroup => self.rename_group(&text),
                 }
                 return;
             }
@@ -2626,6 +2718,113 @@ impl App {
         Ok(format!("Settings saved to {}{also}", path.display()))
     }
 
+    /// Sends the selected track to the group after its own, or from the
+    /// last group back to the master. With no group yet, it makes one.
+    fn next_group(&mut self) {
+        let count = self.project.groups.len() as u8;
+        if count == 0 {
+            self.new_group();
+            return;
+        }
+        let next = match self.project.tracks[self.track].group {
+            None => Some(0),
+            Some(g) if g + 1 < count => Some(g + 1),
+            Some(_) => None,
+        };
+        self.edit(Edit::SetTrackGroup { track: self.track as u8, group: next });
+        self.group_status();
+    }
+
+    /// A new group, after the others, for the selected track.
+    fn new_group(&mut self) {
+        let count = self.project.groups.len();
+        if count >= MAX_GROUPS {
+            self.set_status(format!("A project has at most {MAX_GROUPS} groups"));
+            return;
+        }
+        let (track, group) = (self.track as u8, count as u8);
+        self.edit_group(vec![Edit::InsertGroup(group), Edit::SetTrackGroup { track, group: Some(group) }], "add group");
+        self.group_status();
+    }
+
+    /// Says where the selected track goes.
+    fn group_status(&mut self) {
+        let t = &self.project.tracks[self.track];
+        let status = match t.group {
+            Some(g) => format!(
+                "{} goes to {} ({}: next)",
+                t.name,
+                self.project.groups[usize::from(g)].name,
+                self.k(Action::TrackGroup)
+            ),
+            None => format!("{} goes to the master", t.name),
+        };
+        self.set_status(status);
+    }
+
+    fn no_group(&mut self) {
+        let status = format!(
+            "{} goes to the master, not a group ({} sends it to one)",
+            self.project.tracks[self.track].name,
+            self.k(Action::TrackGroup)
+        );
+        self.set_status(status);
+    }
+
+    /// The status line for the Group page, shown for a track in a group.
+    fn group_page_status(&self) -> String {
+        let f = self.k(Action::Page);
+        let name = self.track_group().map_or("", |g| self.project.groups[usize::from(g)].name.as_str());
+        format!("{name}: the track's group, its strip and sends ({f}: buses and master)")
+    }
+
+    /// The group the selected track goes to.
+    fn track_group(&self) -> Option<u8> {
+        self.project.tracks.get(self.track).and_then(|t| t.group)
+    }
+
+    /// Deletes group `g` in one undo step: its tracks go to the master and
+    /// the lanes automating it are removed first.
+    fn delete_group(&mut self, g: u8) {
+        let mut edits = Vec::new();
+        for (t, tr) in self.project.tracks.iter().enumerate() {
+            if tr.group == Some(g) {
+                edits.push(Edit::SetTrackGroup { track: t as u8, group: None });
+            }
+            for (k, l) in tr.lanes.iter().enumerate() {
+                if l.target.and_then(LaneTarget::group) == Some(g) {
+                    edits.push(Edit::SetLane { track: t as u8, lane: k as u8, target: None, ramp: false });
+                }
+            }
+        }
+        let name = self.project.groups[usize::from(g)].name.clone();
+        edits.push(Edit::RemoveGroup(g));
+        self.edit_group(edits, "delete group");
+        self.set_status(format!("Deleted {name}; its tracks go to the master"));
+    }
+
+    fn rename_group(&mut self, text: &str) {
+        let Some(g) = self.track_group() else { return };
+        let name = project::sanitize_group_name(text);
+        if self.project.groups[usize::from(g)].name == name {
+            return;
+        }
+        let meta_before = self.meta();
+        self.project.groups[usize::from(g)].name = name;
+        self.touch();
+        self.redo.clear();
+        let meta_after = self.meta();
+        self.push_change(Change {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            meta_before,
+            meta_after,
+            what: "rename group",
+            key: None,
+            at: Instant::now(),
+        });
+    }
+
     fn rename_track(&mut self, text: &str) {
         let name = project::sanitize_name(text);
         if self.project.tracks.get(self.track).is_none_or(|t| t.name == name) {
@@ -2771,13 +2970,20 @@ impl App {
                         Page::Strip,
                         format!("Channel strip: high-pass, EQ, compressor, drive, sends ({f}: buses and master)"),
                     ),
-                    Page::Strip => (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)")),
+                    Page::Strip if self.track_group().is_some() => (Page::Group, self.group_page_status()),
+                    Page::Strip | Page::Group => {
+                        (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)"))
+                    }
                     Page::Mix => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
                 };
                 self.page = page;
-                if self.param >= 2 {
-                    self.param = self.page_params().into_iter().find(|&p| p >= 2).unwrap_or(0);
-                }
+                // Volume and pan stay put from page to page; anything else
+                // goes to the page's first setting.
+                let params = self.page_params();
+                self.param = match Self::fader_slot(self.param) {
+                    Some(k) if params.get(k).is_some_and(|&p| Self::fader_slot(p) == Some(k)) => params[k],
+                    _ => self.first_setting(&params),
+                };
                 self.set_status(status);
             }
             Action::Quit => {
@@ -2894,6 +3100,26 @@ impl App {
                 let solo = !self.project.tracks[self.track].solo;
                 self.edit(Edit::SetSolo { track: self.track as u8, solo });
             }
+            Action::TrackGroup => self.next_group(),
+            Action::NewGroup => self.new_group(),
+            Action::RenameGroup => match self.project.tracks[self.track].group {
+                Some(g) => {
+                    let name = self.project.groups[usize::from(g)].name.clone();
+                    self.mode = Mode::Prompt(PromptKind::RenameGroup, name);
+                }
+                None => self.no_group(),
+            },
+            Action::MuteGroup => match self.project.tracks[self.track].group {
+                Some(group) => {
+                    let mute = !self.project.groups[usize::from(group)].mute;
+                    self.edit(Edit::SetGroupMute { group, mute });
+                }
+                None => self.no_group(),
+            },
+            Action::DeleteGroup => match self.project.tracks[self.track].group {
+                Some(g) => self.delete_group(g),
+                None => self.no_group(),
+            },
             Action::Preview => {
                 let b = self.brushes[self.track];
                 self.audition(b);
@@ -3971,7 +4197,11 @@ impl App {
                 Some(c) => format!("{:<5.5} {:>2}", t.kind.label(), c + 1),
                 None => t.kind.label().to_string(),
             };
-            s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, t.name, kind), name_style);
+            let name = match t.group {
+                Some(g) => format!("G{} {}", u32::from(g) + 1, t.name),
+                None => t.name.clone(),
+            };
+            s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, name, kind), name_style);
             s.put(26, y, "M", if t.mute { self.style(Role::Mute) } else { dim });
             s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
             self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
@@ -4060,8 +4290,18 @@ impl App {
                 )
             }
             (_, None) => return,
+            (Page::Group, Some(t)) if t.group.is_some() => {
+                let g = t.group.map_or(0, usize::from);
+                let members = self.project.tracks.iter().filter(|o| o.group == t.group).count();
+                let tracks = if members == 1 { "track" } else { "tracks" };
+                format!(
+                    " {} · group of {members} {tracks} · comp {} ",
+                    self.project.groups[g].name,
+                    reduction_text(self.group_reduction[g])
+                )
+            }
             (page, Some(t)) => {
-                let page = if page == Page::Strip {
+                let page = if matches!(page, Page::Strip | Page::Group) {
                     format!(" · channel strip · comp {}", reduction_text(self.reduction[self.track]))
                 } else {
                     String::new()
@@ -4083,7 +4323,10 @@ impl App {
         };
         let title_style = self.style(if self.focus == Focus::Params { Role::PanelFocus } else { Role::Panel });
         let x = s.put(2, y, &title, title_style);
-        s.put(2 + x, y, &part, title_style);
+        let x = 2 + x + s.put(2 + x, y, &part, title_style);
+        if let (Page::Group, Some(g)) = (self.page, self.track_group()) {
+            self.draw_meter(s, x + 1, y, 8, self.group_meters[usize::from(g)], Color::Default);
+        }
         if let Some(t) = track.filter(|_| self.page != Page::Mix) {
             let brush = match t.steps[self.pattern].get(self.step).copied().flatten() {
                 Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
@@ -4178,6 +4421,7 @@ impl App {
                 let label = match kind {
                     PromptKind::SaveAs => "Save as: ".to_string(),
                     PromptKind::Rename => "Track name: ".to_string(),
+                    PromptKind::RenameGroup => "Group name: ".to_string(),
                     PromptKind::LoadSample => "Load WAV sample: ".to_string(),
                     PromptKind::Marker => {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
@@ -5426,6 +5670,48 @@ mod tests {
     }
 
     #[test]
+    fn the_group_page_edits_and_automates_the_track_s_group() {
+        let (tx, mut rx) = spsc::channel(256);
+        let shared = Arc::new(Shared::new());
+        let mut a = App::new(Project::demo(), None, Some(EngineLink::new(tx, shared.clone())), 48_000, "t".into());
+        a.track = 0;
+        keys(&mut a, &[Key::Char('d'), Key::Tab, Key::Down, Key::Down, Key::Char('f'), Key::Char('f')]);
+        assert_eq!(a.page, Page::Group);
+        assert_eq!(a.param_spec(a.param).id, "hp_freq", "the page starts at the strip");
+        let text = screen_text(&a);
+        assert!(text.contains("Group 1 · group of 1 track · comp") && text.contains("Mid gain"), "{text}");
+        assert!(text.contains("Send reverb") && !text.contains("Send key"), "no key send: {text}");
+        while rx.pop().is_some() {}
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Right]);
+        assert_eq!(a.project.groups[0].params[strip::sp::MID_GAIN], 0.5);
+        let mut got = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            if let Command::Edit(e) = cmd {
+                got.push(e);
+            }
+        }
+        let index = strip::sp::MID_GAIN as u8;
+        assert_eq!(got, [Edit::SetGroupParam { group: 0, index, value: 0.5 }]);
+        // Volume and pan come first, as on a track's pages.
+        keys(&mut a, &[Key::Up; 6]);
+        assert_eq!(a.param_spec(a.param).id, "volume");
+        keys(&mut a, &[Key::Left]);
+        assert!(a.project.groups[0].gain_db < 0.0);
+        assert_eq!(a.project.tracks[0].gain_db, Project::demo().tracks[0].gain_db);
+        // A lane on a group parameter sits on the selected track.
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Down, Key::Down, Key::Char('A')]);
+        let target = Some(LaneTarget::Group { group: 0, index: 2 + index });
+        assert_eq!(a.project.tracks[0].lanes.iter().filter(|l| l.target == target).count(), 1);
+        // The group's compression shows in the title.
+        shared.group_reduction[0].fetch_max_non_negative(6.0);
+        shared.group_peaks[0].fetch_max_non_negative(0.5);
+        a.tick();
+        let text = screen_text(&a);
+        let title = text.lines().find(|l| l.contains("· comp GR -6")).unwrap_or_else(|| panic!("{text}"));
+        assert!(title.contains("███"), "the group's level: {title}");
+    }
+
+    #[test]
     fn meters_show_reduction_and_loudness() {
         let shared = Arc::new(Shared::new());
         let project = Project::demo();
@@ -5704,6 +5990,92 @@ mod tests {
         b.draw(&mut s);
         let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Buses & master") && text.contains("1/4T"), "{text}");
+    }
+
+    fn screen_text(a: &App) -> String {
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn groups_are_made_cycled_named_muted_and_deleted_from_a_track() {
+        let mut a = app();
+        let names = |a: &App| a.project.groups.iter().map(|g| g.name.clone()).collect::<Vec<_>>();
+        a.track = 1;
+        // With no group yet, sending the track to the next one makes one.
+        keys(&mut a, &[Key::Char('i')]);
+        assert_eq!((names(&a), a.project.tracks[1].group), (vec!["Group 1".to_string()], Some(0)));
+        keys(&mut a, &[Key::Char('u')]);
+        assert!(a.project.groups.is_empty() && a.project.tracks[1].group.is_none(), "one undo step");
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(a.project.tracks[1].group, Some(0));
+        a.track = 2;
+        keys(&mut a, &[Key::Char('d')]);
+        assert_eq!(names(&a), ["Group 1", "Group 2"]);
+        assert_eq!(a.project.tracks[2].group, Some(1));
+        // On from the last group to the master, then to the first.
+        keys(&mut a, &[Key::Char('i')]);
+        assert_eq!(a.project.tracks[2].group, None);
+        assert!(a.status_text().unwrap().contains("goes to the master"), "{:?}", a.status_text());
+        keys(&mut a, &[Key::Char('i')]);
+        assert_eq!(a.project.tracks[2].group, Some(0));
+        // A name is the track's group's, and undone like a track's.
+        keys(&mut a, &[Key::Char('E')]);
+        keys(&mut a, &[Key::Backspace; 7]);
+        type_text(&mut a, "Drums");
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(names(&a), ["Drums", "Group 2"]);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(names(&a), ["Group 1", "Group 2"]);
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(names(&a), ["Drums", "Group 2"]);
+        let row = |a: &App, t: usize| {
+            let text = screen_text(a);
+            text.lines().nth(2 + t).unwrap().to_string()
+        };
+        assert!(row(&a, 1).contains(" G1 "), "{}", row(&a, 1));
+        assert!(!row(&a, 0).contains(" G1 "), "{}", row(&a, 0));
+        // The group page follows the strip for a track in a group.
+        a.page = Page::Instrument;
+        keys(&mut a, &[Key::Char('f'), Key::Char('f')]);
+        assert_eq!(a.page, Page::Group);
+        assert!(screen_text(&a).contains(" Drums · group of 2 tracks · comp "), "{}", screen_text(&a));
+        keys(&mut a, &[Key::Char('Q')]);
+        assert!(a.project.groups[0].mute);
+        // On a track in no group the page shows the track and moves on.
+        a.track = 5;
+        assert!(!screen_text(&a).contains("group of"));
+        keys(&mut a, &[Key::Char('Q'), Key::Char('E'), Key::Char('F')]);
+        assert_eq!(names(&a).len(), 2, "nothing to mute, rename or delete");
+        assert!(a.status_text().unwrap().contains("not a group"), "{:?}", a.status_text());
+        keys(&mut a, &[Key::Char('f')]);
+        assert_eq!(a.page, Page::Mix);
+        // Deleting a group sends its tracks to the master and drops the
+        // lanes on it, all in one undo step that brings everything back.
+        assert!(a.edit(Edit::SetLane {
+            track: 0,
+            lane: 0,
+            target: Some(LaneTarget::Group { group: 0, index: 0 }),
+            ramp: false
+        }));
+        assert!(a.edit(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 3, value: Some(-12.0) }));
+        let before = a.project.clone();
+        a.track = 1;
+        keys(&mut a, &[Key::Char('F')]);
+        assert_eq!(names(&a), ["Group 2"]);
+        assert!(a.project.tracks.iter().all(|t| t.group.is_none()));
+        assert_eq!(a.project.tracks[0].lanes[0].target, None);
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project, before);
+        // A project holds at most 8 groups.
+        for _ in 2..MAX_GROUPS {
+            keys(&mut a, &[Key::Char('d')]);
+        }
+        assert_eq!(a.project.groups.len(), MAX_GROUPS);
+        keys(&mut a, &[Key::Char('d')]);
+        assert_eq!(a.project.groups.len(), MAX_GROUPS);
+        assert!(a.status_text().unwrap().contains("at most 8 groups"), "{:?}", a.status_text());
     }
 
     #[test]

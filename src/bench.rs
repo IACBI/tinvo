@@ -16,7 +16,9 @@
 //!   `bench/instructions.txt`, catch a regression of a few percent.
 
 use crate::engine::{Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
+use crate::group::MAX_GROUPS;
 use crate::instrument::InstrumentKind;
+use crate::mix::send;
 use crate::project::Project;
 use crate::sample::Sample;
 use crate::strip::sp;
@@ -48,9 +50,15 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 5] = [
+pub const SCENARIOS: [Scenario; 6] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
+    Scenario {
+        id: "groups",
+        label: "Demo song's tracks repeated to 8, each through a group, every stage on",
+        budget: 0.4,
+        build: groups,
+    },
     Scenario { id: "tracks32", label: "Demo song's tracks repeated to 32", budget: 0.5, build: tracks32 },
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
     Scenario {
@@ -184,6 +192,35 @@ fn strip() -> Setup {
     Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
+/// The demo's tracks repeated to as many as a project has groups, each
+/// through a group of its own with every strip stage and send on.
+fn groups() -> Setup {
+    let mut p = Project::demo();
+    let demo = p.tracks.clone();
+    p.tracks.extend(demo.iter().cycle().take(MAX_GROUPS - demo.len()).cloned());
+    for group in 0..MAX_GROUPS as u8 {
+        ok(p.apply(Edit::InsertGroup(group)));
+        for (i, value) in [
+            (sp::HP_FREQ, 40.0),
+            (sp::LOW_GAIN, 2.0),
+            (sp::MID_GAIN, -3.0),
+            (sp::HIGH_GAIN, 2.0),
+            (sp::COMP_THRESHOLD, -30.0),
+            (sp::COMP_RATIO, 4.0),
+            (sp::DRIVE, 6.0),
+            (sp::COUNT + send::DELAY, -12.0),
+            (sp::COUNT + send::REVERB, -12.0),
+            (sp::COUNT + send::CHORUS, -12.0),
+        ] {
+            ok(p.apply(Edit::SetGroupParam { group, index: i as u8, value }));
+        }
+    }
+    for track in 0..p.tracks.len() {
+        ok(p.apply(Edit::SetTrackGroup { track: track as u8, group: Some(track as u8) }));
+    }
+    Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+}
+
 /// A full project: the demo's tracks again and again, every one playing.
 fn tracks32() -> Setup {
     let mut p = Project::demo();
@@ -280,6 +317,9 @@ mod tests {
         }
         assert!(find("nothing").is_none());
         assert_eq!(find("tracks32").map(|s| s.tracks()), Some(MAX_TRACKS));
+        let groups = (find("groups").expect("a scenario").build)().project;
+        assert_eq!(groups.groups.len(), MAX_GROUPS);
+        assert!(groups.tracks.iter().all(|t| t.group.is_some()));
     }
 
     #[test]
