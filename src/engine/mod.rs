@@ -14,6 +14,7 @@
 
 pub mod transport;
 
+use crate::align::{self, Align};
 use crate::dsp::loudness::LiveLoudness;
 use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
@@ -1035,6 +1036,8 @@ struct Track {
     strip: Strip,
     /// Its insert chain, after the strip.
     chain: Chain,
+    /// The delay after its chain that lines it up with slower paths.
+    align: Align,
     gain_db: f32,
     pan: f32,
     /// Automated volume and pan, overriding `gain_db` and `pan`.
@@ -1087,6 +1090,7 @@ impl Track {
             base: base_params(kind),
             strip: Strip::new(sample_rate),
             chain: Chain::default(),
+            align: Align::new(align::longest(sample_rate), sample_rate),
             gain_db: 0.0,
             pan: 0.0,
             auto_gain: None,
@@ -1122,6 +1126,7 @@ impl Track {
     /// sample and effects must have been taken out already.
     fn reset(&mut self, kind: InstrumentKind, sample_rate: f32) {
         debug_assert!(self.chain.is_empty(), "effects freed on the audio thread");
+        self.align.reset();
         self.instrument = Instrument::new(kind, sample_rate);
         for p in &mut self.steps {
             p.fill(None);
@@ -1438,6 +1443,11 @@ pub struct Engine {
     retired: Option<Producer<Retired>>,
     /// The master's insert chain.
     master_chain: Chain,
+    /// How late the slowest path through look-ahead effects reaches the
+    /// master, in frames; the others are delayed to match.
+    compensation: usize,
+    /// The count-in's click, delayed as the tracks are.
+    click_align: Align,
     /// A track's signal in stereo, for its insert chain.
     stereo_buf: [f32; 2 * BLOCK],
     /// Loudness of the output since playback started.
@@ -1534,6 +1544,8 @@ impl Engine {
             rng: Rng::new(CHANCE_SEED),
             retired: None,
             master_chain: Chain::default(),
+            compensation: 0,
+            click_align: Align::new(align::longest(sample_rate), sample_rate),
             stereo_buf: [0.0; 2 * BLOCK],
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
@@ -1587,10 +1599,90 @@ impl Engine {
         e
     }
 
-    /// Frames by which the output lags the sequencer (the master limiter's
-    /// look-ahead while it is on).
+    /// Frames by which the output lags the sequencer: the look-ahead of
+    /// the effects on the slowest path, of the master's and of the master
+    /// limiter while it is on.
     pub fn latency(&self) -> usize {
-        self.mix.latency()
+        self.mix.latency() + self.compensation + self.master_chain.latency()
+    }
+
+    /// Makes the chain changes due now and delays every track and group so
+    /// that all paths reach the master as late as the slowest: a track in
+    /// a group as late as the group's slowest track, and every group and
+    /// track that goes to the master as late as the slowest of those.
+    fn plan_latency(&mut self) {
+        let (n, gn) = (self.track_count, self.group_count);
+        let retired = &mut self.retired;
+        let mut give_back = |x| retire_insert(retired, x);
+        for t in &mut self.tracks[..n] {
+            t.chain.apply_due(&mut give_back);
+        }
+        let playing_on = |g: &Group| g.is_live();
+        for (i, g) in self.groups.iter_mut().enumerate() {
+            if i < gn || (i >= MAX_GROUPS && playing_on(g)) {
+                g.chain.apply_due(&mut give_back);
+            }
+        }
+        self.master_chain.apply_due(&mut give_back);
+        let mut slowest = [0usize; MAX_GROUPS];
+        let mut fed = [false; MAX_GROUPS];
+        let mut total = 0;
+        let group_of = |t: &Track| t.group.map(usize::from).filter(|&g| g < gn);
+        for t in &self.tracks[..n] {
+            let own = t.chain.latency();
+            match group_of(t) {
+                Some(g) => (slowest[g], fed[g]) = (slowest[g].max(own), true),
+                None => total = total.max(own),
+            }
+        }
+        // A group ringing out with none of its tracks left keeps its place:
+        // as late as its tracks were.
+        for (g, group) in self.groups[..gn].iter_mut().enumerate() {
+            group.tracked = fed[g];
+            if fed[g] {
+                group.input_latency = slowest[g];
+            } else if group.is_live() {
+                (slowest[g], fed[g]) = (group.input_latency, true);
+            }
+            if fed[g] {
+                total = total.max(slowest[g] + group.chain.latency());
+            }
+        }
+        // So does a removed one playing on.
+        for group in self.groups[MAX_GROUPS..].iter_mut() {
+            group.tracked = false;
+            if group.is_live() {
+                total = total.max(group.input_latency + group.chain.latency());
+            }
+        }
+        for t in &mut self.tracks[..n] {
+            let ahead = group_of(t).map_or(total, |g| slowest[g]);
+            t.align.set(ahead - t.chain.latency());
+        }
+        for (g, group) in self.groups[..gn].iter_mut().enumerate() {
+            group.align.set(if fed[g] { total - slowest[g] - group.chain.latency() } else { 0 });
+        }
+        for group in self.groups[MAX_GROUPS..].iter_mut().filter(|g| g.is_live()) {
+            group.align.set(total - group.input_latency - group.chain.latency());
+        }
+        self.click_align.set(total);
+        self.compensation = total;
+    }
+
+    /// Frames until the paths' delays may change next: a chain change
+    /// falling due, or, while there is a delay to change, a group with no
+    /// track resting.
+    fn next_chain_change(&self) -> Option<usize> {
+        let gn = self.group_count;
+        let tracks = self.tracks[..self.track_count].iter().map(|t| &t.chain);
+        let groups = self.groups.iter().enumerate().filter(|&(i, g)| i < gn || (i >= MAX_GROUPS && g.is_live()));
+        let all = tracks.chain(groups.map(|(_, g)| &g.chain)).chain(std::iter::once(&self.master_chain));
+        let change = all.filter_map(Chain::frames_to_change).filter(|&k| k > 0).min();
+        if self.compensation == 0 {
+            return change;
+        }
+        let rest = self.groups.iter().filter(|g| !g.tracked).filter_map(Group::frames_to_rest).min();
+        change.into_iter().chain(rest).min()
     }
 
     /// Plays the MIDI messages pushed into `mailbox` live: each channel on
@@ -1741,12 +1833,22 @@ impl Engine {
         }
         self.master_chain.settle(&mut give_back);
         self.mix.snap();
+        self.plan_latency();
+        for t in &mut self.tracks[..] {
+            t.align.snap();
+        }
+        for g in &mut self.groups[..] {
+            g.align.snap();
+        }
+        self.click_align.snap();
     }
 
     /// Handles one command immediately.
     pub fn handle(&mut self, cmd: Command) {
-        // An earlier command may have switched the limiter.
-        self.midi.latency = self.mix.latency() as u64;
+        // An earlier command may have switched the limiter or changed a
+        // chain; what this one sends goes out as late as the sound.
+        self.plan_latency();
+        self.midi.latency = self.latency() as u64;
         match cmd {
             // A new effect comes built, as `Command::SetSlot`: building it
             // here would allocate on the audio thread.
@@ -1788,6 +1890,7 @@ impl Engine {
                 }
                 self.count_in = None;
                 self.click.gain = 0.0;
+                self.click_align.forget();
                 self.transport.stop();
                 self.current = None;
                 self.conductor = None;
@@ -3150,7 +3253,7 @@ impl Engine {
     }
 
     fn anchor_midi(&mut self, frames: u32) {
-        self.midi.latency = self.mix.latency() as u64;
+        self.midi.latency = self.latency() as u64;
         let running = self.clock_pulse.is_some() && !self.clock_resume;
         self.midi.anchor(self.now, frames, self.sample_rate, running);
     }
@@ -3162,7 +3265,7 @@ impl Engine {
         if self.anchored == 0 {
             self.anchor_midi(frames);
         } else {
-            self.midi.latency = self.mix.latency() as u64;
+            self.midi.latency = self.latency() as u64;
             self.anchored = self.anchored.saturating_sub(frames);
         }
         if let Some(mut rx) = self.commands.take() {
@@ -3177,7 +3280,8 @@ impl Engine {
             }
             self.commands = Some(rx);
         }
-        self.midi.latency = self.mix.latency() as u64;
+        self.plan_latency();
+        self.midi.latency = self.latency() as u64;
         self.play_live();
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
@@ -3217,7 +3321,7 @@ impl Engine {
         loop {
             // Automation can switch the limiter inside a callback, also on
             // the step whose hits fire in the next pass.
-            self.midi.latency = self.mix.latency() as u64;
+            self.midi.latency = self.latency() as u64;
             let (tracks, midi) = (&mut self.tracks[..self.track_count], &mut self.midi);
             for t in tracks.iter_mut() {
                 t.fire_offs(frame, midi);
@@ -3449,6 +3553,9 @@ impl Engine {
         let mut pos = start;
         while pos < end {
             self.cursor = pos;
+            // Events due now go out as late as the sound does.
+            self.plan_latency();
+            self.midi.latency = self.latency() as u64;
             self.count_in_at(pos);
             self.fire_due(pos);
             let mut next = end;
@@ -3467,12 +3574,16 @@ impl Engine {
                     next = next.min(f);
                 }
             }
+            // A change of the paths' delays lands on its own frame.
+            if let Some(k) = self.next_chain_change() {
+                next = next.min(pos + k as u64);
+            }
             // fire_due consumed everything at `pos`, so `next > pos`.
             debug_assert!(next > pos);
             // Nothing moves the transport inside a segment, so the clocks
             // due in it are on the same frames at any buffer size. One a
             // tempo change moved before the segment goes at its start.
-            self.midi.latency = self.mix.latency() as u64;
+            self.midi.latency = self.latency() as u64;
             if let Some(mut pulse) = self.clock_pulse {
                 loop {
                     let f = self.transport.pulse_frame(pulse);
@@ -3489,7 +3600,23 @@ impl Engine {
             }
             let (a, b) = ((pos - start) as usize, (next - start) as usize);
             self.render_segment(a, b);
-            self.click.render(&mut self.mix_l[a..b], &mut self.mix_r[a..b]);
+            if self.click_align.is_active() {
+                let (l, r) = (&mut self.route_l[..b - a], &mut self.route_r[..b - a]);
+                l.fill(0.0);
+                r.fill(0.0);
+                self.click.render(l, r);
+                let st = &mut self.stereo_buf[..2 * (b - a)];
+                for (f, (&x, &y)) in st.chunks_exact_mut(2).zip(l.iter().zip(r.iter())) {
+                    (f[0], f[1]) = (x, y);
+                }
+                self.click_align.process(st);
+                for (i, f) in st.chunks_exact(2).enumerate() {
+                    self.mix_l[a + i] += f[0];
+                    self.mix_r[a + i] += f[1];
+                }
+            } else {
+                self.click.render(&mut self.mix_l[a..b], &mut self.mix_r[a..b]);
+            }
             // The buses and master run segment by segment too, so an
             // automated bus or master setting changes on its own frame.
             self.mix.add_returns(&mut self.mix_l[a..b], &mut self.mix_r[a..b], a);
@@ -3586,12 +3713,13 @@ impl Engine {
         for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
             let buf = &mut buf[a..b];
             t.strip.process(buf, key);
-            if t.chain.is_empty() {
+            if t.chain.is_empty() && !t.align.is_active() {
                 route.track(t, Signal::Mono(buf), buf.len(), mix);
             } else {
                 let st = &mut stereo_buf[..2 * buf.len()];
                 stereo(buf, st);
                 t.chain.process(st, key, &mut |x| retire_insert(retired, x));
+                t.align.process(st);
                 route.track(t, Signal::Stereo(st), buf.len(), mix);
             }
         }
@@ -3607,7 +3735,7 @@ impl Engine {
             f.track.strip.process(buf, key);
             let sounding = buf.len().min(f.left as usize);
             let whole = *fade_frames as f32;
-            if f.track.chain.is_empty() {
+            if f.track.chain.is_empty() && !f.track.align.is_active() {
                 for s in buf.iter_mut() {
                     *s *= f.left as f32 / whole;
                     f.left = f.left.saturating_sub(1);
@@ -3617,6 +3745,7 @@ impl Engine {
                 let st = &mut stereo_buf[..2 * buf.len()];
                 stereo(buf, st);
                 f.track.chain.process(st, key, &mut |x| retire_insert(retired, x));
+                f.track.align.process(st);
                 for s in st.chunks_exact_mut(2) {
                     let g = f.left as f32 / whole;
                     s[0] *= g;
@@ -4783,6 +4912,41 @@ mod tests {
         run(&mut e, 480);
         e.handle(Command::Stop);
         assert_eq!(sent(&mut rx), [(960, vec![0x80, 65, 0]), (960, vec![0x90, 66, 60]), (1440, vec![0x80, 66, 0])]);
+    }
+
+    #[test]
+    fn a_live_note_is_sent_as_late_as_a_gate_just_put_in() {
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        let (mut e, live) = live_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::AddTrack(InstrumentKind::Synth),
+        ]);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        run(&mut e, 480);
+        let gate = Box::new(Insert::new(EffectKind::Gate, SR, 120.0));
+        e.handle(Command::SetSlot { chain: ChainId::Track(1), slot: 0, insert: Some(gate) });
+        press(&live, 64, 80);
+        run(&mut e, 480);
+        assert_eq!(sent(&mut rx), [(480 + l as u64, vec![0x90, 64, 80])]);
+    }
+
+    #[test]
+    fn a_note_auditioned_just_after_a_gate_goes_in_is_sent_as_late() {
+        let l = crate::dsp::gate::lookahead_frames(SR) as u64;
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::AddTrack(InstrumentKind::Synth),
+        ]);
+        run(&mut e, 480);
+        sent(&mut rx);
+        let gate = Box::new(Insert::new(EffectKind::Gate, SR, 120.0));
+        e.handle(Command::SetSlot { chain: ChainId::Track(1), slot: 0, insert: Some(gate) });
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 1), frames: 100 });
+        run(&mut e, 480);
+        assert_eq!(sent(&mut rx).first(), Some(&(480 + l, vec![0x90, 60, 100])));
     }
 
     #[test]
@@ -6412,12 +6576,13 @@ mod tests {
         ];
         assert_eq!(with(&bypassed), plain);
         // A drive into a delay is not a delay into a drive, and a swap
-        // turns one into the other.
+        // turns one into the other. (All wet, the delay would only delay,
+        // which a drive does not mind.)
         let drive_then_delay = [
             set_slot(t, 0, Drive),
             slot_param(t, 0, Drive, "drive", 18.0),
             set_slot(t, 4, Delay),
-            slot_param(t, 4, Delay, "mix", 1.0),
+            slot_param(t, 4, Delay, "mix", 0.5),
         ];
         let first = with(&drive_then_delay);
         assert_ne!(first, plain);
@@ -6702,6 +6867,236 @@ mod tests {
         // And back in outright once the lane goes.
         e.apply(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false });
         assert!(e.groups[0].chain.slot_mut(0).unwrap().is_in());
+    }
+
+    /// A gate that never closes: only its look-ahead is heard.
+    fn open_gate(chain: ChainId, slot: u8) -> [Edit; 2] {
+        [set_slot(chain, slot, EffectKind::Gate), slot_param(chain, slot, EffectKind::Gate, "gate_range", 0.0)]
+    }
+
+    /// Runs `frames` frames in buffers of `size`.
+    fn run_in(e: &mut Engine, frames: usize, size: usize) -> Vec<f32> {
+        let mut got = Vec::with_capacity(2 * frames);
+        let mut left = frames;
+        while left > 0 {
+            let n = size.min(left);
+            got.extend(run(e, n));
+            left -= n;
+        }
+        got
+    }
+
+    #[test]
+    fn paths_through_a_gate_are_lined_up_with_the_others() {
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        let plain = three_tracks();
+        let frames = 30_000;
+        let reference = play(&plain, frames);
+        let later_than = |edits: &[Edit], reference: &[f32], by: usize| {
+            let out = play(edits, frames);
+            assert!(out[..2 * by].iter().all(|&x| x == 0.0));
+            assert_eq!(&out[2 * by..], &reference[..2 * (frames - by)], "{by} frames late");
+        };
+        let later_by = |edits: &[Edit], by: usize| later_than(edits, &reference, by);
+        // One track through a gate: the others wait for it.
+        let one = [&plain[..], &open_gate(ChainId::Track(1), 2)].concat();
+        let e = engine(&one);
+        assert_eq!(e.latency(), l);
+        assert_eq!([0, 1, 2].map(|t| e.tracks[t].align.delay()), [l, 0, l]);
+        later_by(&one, l);
+        // A group of tracks without one waits as a whole. (The group sums
+        // its tracks before the master does, so the reference does too.)
+        let grouping = [
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetTrackGroup { track: 2, group: Some(0) },
+        ];
+        let grouped = [&one[..], &grouping].concat();
+        let e = engine(&grouped);
+        assert_eq!([0, 1, 2].map(|t| e.tracks[t].align.delay()), [0, 0, 0]);
+        assert_eq!(e.groups[0].align.delay(), l);
+        later_than(&grouped, &play(&[&plain[..], &grouping].concat(), frames), l);
+        // Two gates on a track in a group and one on the group: its other
+        // track waits for the two, and the track outside for all three.
+        let deep = [
+            &plain[..],
+            &[
+                Edit::InsertGroup(0),
+                Edit::SetTrackGroup { track: 0, group: Some(0) },
+                Edit::SetTrackGroup { track: 1, group: Some(0) },
+            ],
+            &open_gate(ChainId::Track(0), 0),
+            &open_gate(ChainId::Track(0), 5),
+            &open_gate(ChainId::Group(0), 1),
+        ]
+        .concat();
+        let e = engine(&deep);
+        assert_eq!(e.latency(), 3 * l);
+        assert_eq!([0, 1, 2].map(|t| e.tracks[t].align.delay()), [0, 2 * l, 3 * l]);
+        assert_eq!(e.groups[0].align.delay(), 0);
+        later_by(&deep, 3 * l);
+        // On the master, everything is late together.
+        let master = [&plain[..], &open_gate(ChainId::Master, 0)].concat();
+        let e = engine(&master);
+        assert_eq!(e.latency(), l);
+        assert!(e.tracks[..3].iter().all(|t| t.align.delay() == 0));
+        later_by(&master, l);
+    }
+
+    #[test]
+    fn a_gate_put_in_while_playing_lines_up_on_the_same_frame_at_any_buffer_size() {
+        let t = ChainId::Track(1);
+        // The gate replaces an effect, so it comes in once that has faded
+        // out, inside a callback.
+        let mut edits = three_tracks();
+        edits.push(set_slot(t, 0, EffectKind::Drive));
+        let go = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = run_in(&mut e, 6000, size);
+            let gate = Box::new(Insert::new(EffectKind::Gate, SR, 120.0));
+            e.handle(Command::SetSlot { chain: t, slot: 0, insert: Some(gate) });
+            out.extend(run_in(&mut e, 12_000, size));
+            e.handle(Command::SetSlot { chain: t, slot: 0, insert: None });
+            out.extend(run_in(&mut e, 12_000, size));
+            assert_eq!(e.latency(), 0, "back to none");
+            assert!(e.tracks[..3].iter().all(|t| !t.align.is_active()));
+            out
+        };
+        let one = go(1);
+        for size in [17, 64, 4096] {
+            assert_eq!(go(size), one, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_gate_comes_goes_and_is_bypassed_without_a_click() {
+        let t = ChainId::Track(0);
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth), Edit::AddTrack(InstrumentKind::Synth)]);
+        for track in 0..2 {
+            e.handle(Command::Audition { track, step: Step::new(48 + 7 * track, 90, 1), frames: 1 << 22 });
+        }
+        run(&mut e, 4800);
+        let fade = e.fade_frames as usize;
+        let open = || {
+            let mut g = Box::new(Insert::new(EffectKind::Gate, SR, 120.0));
+            g.set_param(usize::from(effect_param(EffectKind::Gate, "gate_range")), 0.0);
+            Some(g)
+        };
+        let changes: [&dyn Fn(&mut Engine); 4] = [
+            &|e| e.handle(Command::SetSlot { chain: t, slot: 3, insert: open() }),
+            &|e| e.apply(slot_param(t, 3, EffectKind::Gate, "bypass", 1.0)),
+            &|e| e.apply(slot_param(t, 3, EffectKind::Gate, "bypass", 0.0)),
+            &|e| e.handle(Command::SetSlot { chain: t, slot: 3, insert: None }),
+        ];
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        for (k, change) in changes.iter().enumerate() {
+            let before = largest_step(&run(&mut e, 4800));
+            change(&mut e);
+            let during = largest_step(&run(&mut e, 3 * fade));
+            let after = largest_step(&run(&mut e, 4800));
+            // Two copies of a tone crossfading move a little faster than one.
+            let bound = before.max(after) * 1.3;
+            assert!(during <= bound, "change {k}: a step of {during}, against {before} before and {after} after");
+            assert_eq!(e.latency(), if k < 3 { l } else { 0 }, "change {k}");
+        }
+    }
+
+    #[test]
+    fn a_group_ringing_out_keeps_its_place_in_time() {
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        let base = [
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            set_slot(ChainId::Group(0), 0, EffectKind::Delay),
+            slot_param(ChainId::Group(0), 0, EffectKind::Delay, "mix", 1.0),
+        ];
+        let gates = [open_gate(ChainId::Track(0), 0), open_gate(ChainId::Track(1), 0), open_gate(ChainId::Track(1), 1)];
+        let mut e = engine(&[&base[..], &gates.concat()].concat());
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        assert_eq!((e.compensation, e.groups[0].align.delay()), (2 * l, l));
+        // Its last track leaves; its echoes still sound in time.
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        run(&mut e, 4800);
+        assert!(e.groups[0].is_live());
+        assert_eq!((e.compensation, e.groups[0].align.delay()), (2 * l, l));
+        // Removed, it plays on, and the others stay as late as it is.
+        e.apply(Edit::RemoveGroup(0));
+        for (track, slot) in [(0, 0), (1, 0), (1, 1)] {
+            e.handle(Command::SetSlot { chain: ChainId::Track(track), slot, insert: None });
+        }
+        run(&mut e, 4800);
+        let gone = e.groups[MAX_GROUPS..].iter().find(|g| g.is_live()).expect("still ringing");
+        assert_eq!((e.compensation, gone.align.delay()), (l, 0));
+        assert!(e.tracks[..2].iter().all(|t| t.align.delay() == l));
+    }
+
+    #[test]
+    fn a_group_resting_moves_the_delays_on_the_same_frame_at_any_buffer_size() {
+        let mut edits = vec![
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+        ];
+        edits.extend(open_gate(ChainId::Group(0), 0));
+        let go = |size: usize| {
+            let mut e = engine(&edits);
+            for track in 0..2 {
+                e.handle(Command::Audition { track, step: Step::new(48 + 7 * track, 90, 1), frames: 1 << 22 });
+            }
+            let mut out = run_in(&mut e, 1000, size);
+            e.apply(Edit::SetTrackGroup { track: 0, group: None });
+            out.extend(run_in(&mut e, 100_000, size));
+            assert!(!e.groups[0].is_live());
+            assert_eq!(e.compensation, 0);
+            out
+        };
+        let one = go(1);
+        for size in [64, 4096] {
+            assert_eq!(go(size), one, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_count_in_stopped_leaves_no_click_behind() {
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[0]);
+        edits.push(Edit::AddTrack(InstrumentKind::Synth));
+        edits.extend(open_gate(ChainId::Track(1), 0));
+        let mut e = engine(&edits);
+        run(&mut e, 4800);
+        e.handle(Command::CountIn { bars: 1, bar_beats: 4, beat_pulses: 24, entry: None });
+        run(&mut e, 1);
+        e.handle(Command::Stop);
+        assert!(run(&mut e, 4800).iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn the_count_in_and_midi_out_are_as_late_as_the_tracks() {
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        let mut edits = hat_hits(Division::Sixteenth, 16, &[0]);
+        edits.push(Edit::AddTrack(InstrumentKind::Synth));
+        let count_in = || Command::CountIn { bars: 1, bar_beats: 4, beat_pulses: 24, entry: None };
+        let mut e = engine(&[&edits[..], &open_gate(ChainId::Track(1), 0)].concat());
+        e.handle(count_in());
+        let out = run(&mut e, 104_000);
+        assert_eq!(onsets(&out, 2000), [0, 24_000, 48_000, 72_000, 96_000].map(|f| f + l));
+        let (mut e, mut rx) = midi_engine(&[
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(36) },
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::AddTrack(InstrumentKind::Synth),
+            open_gate(ChainId::Track(1), 0)[0],
+            open_gate(ChainId::Track(1), 0)[1],
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 100);
+        rx.pop();
+        assert_eq!(sent(&mut rx), [(l as u64, vec![0x99, 36, 127])], "heard as late as the gated track");
     }
 
     #[test]

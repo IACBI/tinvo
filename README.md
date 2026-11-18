@@ -34,7 +34,8 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - Automation: up to 4 lanes per track for volume, pan or any instrument or strip parameter, holding or ramping between points set per step.
 - A channel strip on every track: high-pass, three-band EQ, compressor and antialiased drive.
 - Up to 8 group buses. A track goes to a group or to the master, and a group has a stereo channel strip of its own (its compressor ducks both sides together), volume, balance, mute, sends and automation.
-- Insert effects: 8 slots on every track, group and the master, 64 in a project, each holding an EQ, compressor, drive, delay, reverb or chorus, in any order. Every slot can be bypassed and automated, and putting an effect in, moving, bypassing or removing it crossfades instead of clicking.
+- Insert effects: 8 slots on every track, group and the master, 64 in a project, each holding an EQ, compressor, drive, delay, reverb, chorus, multimode filter, phaser, bit crusher or gate, in any order. Every slot can be bypassed and automated, and putting an effect in, moving, bypassing or removing it crossfades instead of clicking.
+- The gate looks 1.5 ms ahead, and every other path is delayed to match, so tracks stay in time with each other, in exports and stems too.
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
@@ -206,7 +207,8 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Otomasyon: her kanalda ses seviyesi, pan, herhangi bir enstrüman ya da kanal şeridi parametresi için en fazla 4 şerit. Adım adım konan noktalar arasında değer ya sabit kalır ya da kayarak geçer.
 - Her kanalda bir kanal şeridi (channel strip): high-pass, üç bantlı EQ, kompresör ve aliasing'i bastırılmış drive.
 - En fazla 8 grup bus'ı. Bir kanal ya bir gruba ya da master'a gider; grubun kendi stereo kanal şeridi (kompresörü iki tarafı birlikte bastırır), ses seviyesi, balansı, mute'u, send'leri ve otomasyonu vardır.
-- Insert efektleri: her kanalda, grupta ve master'da 8 slot, projede toplam 64. Her slota EQ, kompresör, drive, delay, reverb ya da chorus konur, sıra serbesttir. Her slot bypass edilebilir ve otomasyona bağlanabilir; efekt eklemek, taşımak, bypass etmek ya da kaldırmak tıklama yapmaz, yumuşak geçişle olur.
+- Insert efektleri: her kanalda, grupta ve master'da 8 slot, projede toplam 64. Her slota EQ, kompresör, drive, delay, reverb, chorus, çok modlu filtre, phaser, bit crusher ya da gate konur, sıra serbesttir. Her slot bypass edilebilir ve otomasyona bağlanabilir; efekt eklemek, taşımak, bypass etmek ya da kaldırmak tıklama yapmaz, yumuşak geçişle olur.
+- Gate 1,5 ms ileriyi dinler; diğer yollar da aynı kadar geciktirilir, böylece kanallar birbirine göre kaymaz. Export'ta ve stem'lerde de öyle.
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.

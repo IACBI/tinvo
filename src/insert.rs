@@ -6,7 +6,13 @@
 //! Every kind's first parameter is its bypass; the rest are the effect's.
 //! The EQ, compressor and drive are the channel strip's stages with the
 //! strip's parameters; the delay, reverb and chorus are the buses' effects
-//! with their parameters and a dry/wet mix.
+//! with their parameters and a dry/wet mix. The filter, phaser, bit
+//! crusher and gate are inserts only; the phaser and crusher have a mix.
+//!
+//! The gate looks ahead, so it delays the signal by [`Insert::latency`]
+//! frames, bypassed or not, and the engine delays the other paths to
+//! match. Taken out of or put into a chain, it crossfades with its input as
+//! it arrives, so the change of latency makes no jump.
 //!
 //! A slot fades between its input and its effect's output over 10 ms
 //! whenever it is bypassed or brought back, or taken out of or put into
@@ -17,7 +23,11 @@
 //! end on the same frame at any buffer size.
 
 use crate::dsp::chorus::Chorus;
+use crate::dsp::crusher::Crusher;
 use crate::dsp::echo::Echo;
+use crate::dsp::filter::Svf;
+use crate::dsp::gate::Gate;
+use crate::dsp::phaser::Phaser;
 use crate::dsp::reverb::Reverb;
 use crate::dsp::smooth::Smoother;
 use crate::engine::BLOCK;
@@ -41,6 +51,12 @@ const MIX_SMOOTHING: f32 = 0.01;
 
 const BYPASS_SPEC: ParamSpec = ParamSpec::stepped("bypass", "Bypass", &["off", "on"], 0.0);
 const MIX_SPEC: ParamSpec = ParamSpec::linear("mix", "Mix", 0.0, 1.0, 0.3, 0.01, Unit::Percent);
+const FULL_MIX_SPEC: ParamSpec = ParamSpec::linear("mix", "Mix", 0.0, 1.0, 1.0, 0.01, Unit::Percent);
+const HALF_MIX_SPEC: ParamSpec = ParamSpec::linear("mix", "Mix", 0.0, 1.0, 0.5, 0.01, Unit::Percent);
+const HZ_STEP: f32 = 1.059_463_1;
+const TIME_STEP: f32 = 1.1;
+/// Time constant of the filter's cutoff glide.
+const CUTOFF_SMOOTHING: f32 = 0.01;
 
 static EQ: [ParamSpec; 9] = [
     BYPASS_SPEC,
@@ -79,6 +95,34 @@ static REVERB: [ParamSpec; 5] = [
     MIX_SPEC,
 ];
 static CHORUS: [ParamSpec; 4] = [BYPASS_SPEC, mix::SPECS[mp::CHORUS_RATE], mix::SPECS[mp::CHORUS_DEPTH], MIX_SPEC];
+static FILTER: [ParamSpec; 4] = [
+    BYPASS_SPEC,
+    ParamSpec::stepped("filter_mode", "Mode", &["low-pass", "band-pass", "high-pass", "notch"], 0.0),
+    ParamSpec::log("filter_cutoff", "Cutoff", 20.0, 20_000.0, 1000.0, HZ_STEP, Unit::Hz),
+    ParamSpec::linear("filter_resonance", "Resonance", 0.0, 1.0, 0.2, 0.01, Unit::Percent),
+];
+static PHASER: [ParamSpec; 5] = [
+    BYPASS_SPEC,
+    ParamSpec::log("phaser_rate", "Rate", 0.05, 5.0, 0.5, TIME_STEP, Unit::Hz),
+    ParamSpec::linear("phaser_depth", "Depth", 0.0, 1.0, 0.7, 0.01, Unit::Percent),
+    ParamSpec::linear("phaser_feedback", "Feedback", 0.0, 0.9, 0.5, 0.01, Unit::Percent),
+    HALF_MIX_SPEC,
+];
+static CRUSHER: [ParamSpec; 4] = [
+    BYPASS_SPEC,
+    ParamSpec::linear("crusher_bits", "Bits", 1.0, 16.0, 8.0, 0.5, Unit::None),
+    ParamSpec::linear("crusher_hold", "Downsample", 1.0, 32.0, 1.0, 1.0, Unit::None),
+    FULL_MIX_SPEC,
+];
+static GATE: [ParamSpec; 7] = [
+    BYPASS_SPEC,
+    ParamSpec::linear("gate_threshold", "Threshold", -80.0, 0.0, -40.0, 0.5, Unit::Decibels),
+    ParamSpec::linear("gate_range", "Range", -80.0, 0.0, -80.0, 0.5, Unit::Decibels),
+    ParamSpec::log("gate_attack", "Attack", 0.0001, 0.05, 0.001, TIME_STEP, Unit::Seconds),
+    ParamSpec::log("gate_hold", "Hold", 0.001, 1.0, 0.05, TIME_STEP, Unit::Seconds),
+    ParamSpec::log("gate_release", "Release", 0.005, 2.0, 0.1, TIME_STEP, Unit::Seconds),
+    ParamSpec::stepped("gate_key", "Key", &["off", "on"], 0.0),
+];
 
 /// What an insert slot can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -89,16 +133,24 @@ pub enum EffectKind {
     Delay,
     Reverb,
     Chorus,
+    Filter,
+    Phaser,
+    Crusher,
+    Gate,
 }
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 6] = [
+    pub const ALL: [EffectKind; 10] = [
         EffectKind::Eq,
         EffectKind::Compressor,
         EffectKind::Drive,
         EffectKind::Delay,
         EffectKind::Reverb,
         EffectKind::Chorus,
+        EffectKind::Filter,
+        EffectKind::Phaser,
+        EffectKind::Crusher,
+        EffectKind::Gate,
     ];
 
     /// Stable identifier used in project files.
@@ -110,6 +162,10 @@ impl EffectKind {
             EffectKind::Delay => "delay",
             EffectKind::Reverb => "reverb",
             EffectKind::Chorus => "chorus",
+            EffectKind::Filter => "filter",
+            EffectKind::Phaser => "phaser",
+            EffectKind::Crusher => "crusher",
+            EffectKind::Gate => "gate",
         }
     }
 
@@ -125,6 +181,10 @@ impl EffectKind {
             EffectKind::Delay => "Delay",
             EffectKind::Reverb => "Reverb",
             EffectKind::Chorus => "Chorus",
+            EffectKind::Filter => "Filter",
+            EffectKind::Phaser => "Phaser",
+            EffectKind::Crusher => "Bit crusher",
+            EffectKind::Gate => "Gate",
         }
     }
 
@@ -137,7 +197,19 @@ impl EffectKind {
             EffectKind::Delay => &DELAY,
             EffectKind::Reverb => &REVERB,
             EffectKind::Chorus => &CHORUS,
+            EffectKind::Filter => &FILTER,
+            EffectKind::Phaser => &PHASER,
+            EffectKind::Crusher => &CRUSHER,
+            EffectKind::Gate => &GATE,
         }
+    }
+
+    /// Whether its last parameter is a dry/wet mix.
+    fn has_mix(self) -> bool {
+        matches!(
+            self,
+            EffectKind::Delay | EffectKind::Reverb | EffectKind::Chorus | EffectKind::Phaser | EffectKind::Crusher
+        )
     }
 
     /// The strip parameter its parameter 1 is, for the strip's stages.
@@ -159,6 +231,83 @@ enum Effect {
     Delay(Echo),
     Reverb(Reverb),
     Chorus(Chorus),
+    Filter(Filter),
+    Phaser(Phaser),
+    Crusher(Crusher),
+    Gate { gate: Gate, keyed: bool },
+}
+
+/// A stereo multimode filter whose cutoff glides.
+#[derive(Clone, Debug)]
+struct Filter {
+    svf: [Svf; 2],
+    mode: usize,
+    /// The cutoff in octaves above 1 Hz.
+    cutoff: Smoother,
+    resonance: f32,
+    sample_rate: f32,
+}
+
+impl Filter {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            svf: [Svf::new(); 2],
+            mode: 0,
+            cutoff: Smoother::new(1000f32.log2(), CUTOFF_SMOOTHING, sample_rate),
+            resonance: 0.0,
+            sample_rate,
+        }
+    }
+
+    fn set(&mut self, mode: usize, cutoff: f32, resonance: f32) {
+        self.mode = mode;
+        self.cutoff.set_target(cutoff.log2());
+        self.resonance = resonance;
+        self.tune(self.cutoff.current());
+    }
+
+    fn tune(&mut self, octaves: f32) {
+        let hz = octaves.exp2();
+        for s in &mut self.svf {
+            s.set(hz, self.resonance, self.sample_rate);
+        }
+    }
+
+    fn snap(&mut self) {
+        let t = self.cutoff.target();
+        self.cutoff.snap(t);
+        self.tune(t);
+    }
+
+    fn clear(&mut self) {
+        self.svf.iter_mut().for_each(Svf::reset);
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        for f in buf.chunks_exact_mut(2) {
+            if self.cutoff.current() != self.cutoff.target() {
+                let c = self.cutoff.tick();
+                self.tune(c);
+            }
+            for (x, s) in f.iter_mut().zip(&mut self.svf) {
+                let (low, band, high) = s.tick(*x);
+                let y = match self.mode {
+                    0 => low,
+                    1 => band,
+                    2 => high,
+                    _ => low + high,
+                };
+                // Resonant filters in a row can overflow: start afresh
+                // rather than carry the infinity on.
+                *x = if y.is_finite() {
+                    y
+                } else {
+                    s.reset();
+                    0.0
+                };
+            }
+        }
+    }
 }
 
 /// One effect in a slot, with its settings and its fade.
@@ -176,6 +325,9 @@ pub struct Insert {
     /// How far the effect is faded in, in frames: 0 the input passes,
     /// `fade_frames` the effect's output.
     fade: u32,
+    /// For the gate, which keeps its latency when bypassed: how far its
+    /// gating is faded in over its delayed input.
+    bypass_fade: u32,
     fade_frames: u32,
     /// Whether its chain holds it out, for a change of what the chain
     /// holds.
@@ -200,6 +352,10 @@ impl Insert {
             EffectKind::Delay => Effect::Delay(Echo::new(sample_rate, mix::max_delay_seconds())),
             EffectKind::Reverb => Effect::Reverb(Reverb::new(sample_rate)),
             EffectKind::Chorus => Effect::Chorus(Chorus::new(sample_rate)),
+            EffectKind::Filter => Effect::Filter(Filter::new(sample_rate)),
+            EffectKind::Phaser => Effect::Phaser(Phaser::new(sample_rate)),
+            EffectKind::Crusher => Effect::Crusher(Crusher::new()),
+            EffectKind::Gate => Effect::Gate { gate: Gate::new(sample_rate, BLOCK), keyed: false },
         };
         let mut base = [0.0; MAX_INSERT_PARAMS];
         for (b, spec) in base.iter_mut().zip(kind.params()) {
@@ -213,6 +369,7 @@ impl Insert {
             wet: Smoother::new(MIX_SPEC.default, MIX_SMOOTHING, sample_rate),
             tempo,
             fade: 0,
+            bypass_fade: 0,
             fade_frames: ((FADE_SECONDS * sample_rate) as u32).max(1),
             held_out: false,
             scratch: [0.0; 2 * BLOCK],
@@ -278,9 +435,8 @@ impl Insert {
         if index == BYPASS || index >= self.kind.params().len() {
             return;
         }
-        if !matches!(self.effect, Effect::Strip(_)) && index == self.kind.params().len() - 1 {
-            // The mix is the last setting of a delay, reverb and chorus;
-            // the effect itself (a reverb's eight decay gains) is unchanged.
+        if self.kind.has_mix() && index == self.kind.params().len() - 1 {
+            // The effect itself (a reverb's eight decay gains) is unchanged.
             self.wet.set_target(self.value(index));
             return;
         }
@@ -316,6 +472,41 @@ impl Insert {
                 }
                 self.wet.set_target(wet);
             }
+            Effect::Filter(_) => {
+                let (mode, cutoff, resonance) = (v(1) as usize, v(2), v(3));
+                if let Effect::Filter(f) = &mut self.effect {
+                    f.set(mode, cutoff, resonance);
+                }
+            }
+            Effect::Phaser(_) => {
+                let (rate, depth, feedback, wet) = (v(1), v(2), v(3), v(4));
+                if let Effect::Phaser(p) = &mut self.effect {
+                    p.set(rate, depth, feedback);
+                }
+                self.wet.set_target(wet);
+            }
+            Effect::Crusher(_) => {
+                let (bits, hold, wet) = (v(1), v(2), v(3));
+                if let Effect::Crusher(c) = &mut self.effect {
+                    c.set(bits, hold);
+                }
+                self.wet.set_target(wet);
+            }
+            Effect::Gate { .. } => {
+                let (threshold, range, attack, hold, release, key) = (v(1), v(2), v(3), v(4), v(5), v(6) >= 1.0);
+                if let Effect::Gate { gate, keyed } = &mut self.effect {
+                    gate.set(threshold, range, attack, hold, release);
+                    *keyed = key;
+                }
+            }
+        }
+    }
+
+    /// The frames it delays the signal by.
+    pub fn latency(&self) -> usize {
+        match &self.effect {
+            Effect::Gate { gate, .. } => gate.latency(),
+            _ => 0,
         }
     }
 
@@ -327,19 +518,23 @@ impl Insert {
             Effect::Delay(e) => e.snap(),
             Effect::Reverb(r) => r.snap(),
             Effect::Chorus(c) => c.snap(),
+            Effect::Filter(f) => f.snap(),
+            Effect::Phaser(_) | Effect::Crusher(_) | Effect::Gate { .. } => {}
         }
         let t = self.wet.target();
         self.wet.snap(t);
         self.fade = if self.wants_in() { self.fade_frames } else { 0 };
+        self.bypass_fade = if self.bypassed() { 0 } else { self.fade_frames };
     }
 
     fn bypassed(&self) -> bool {
         self.value(BYPASS) >= 1.0
     }
 
-    /// Whether it should be heard: neither bypassed nor held out.
+    /// Whether it should be heard: neither bypassed nor held out. A gate
+    /// bypassed is still heard, as its delayed input.
     fn wants_in(&self) -> bool {
-        !self.bypassed() && !self.held_out
+        !self.held_out && (self.kind == EffectKind::Gate || !self.bypassed())
     }
 
     /// Holds it out of the chain (fading to its input) or lets it back.
@@ -361,8 +556,13 @@ impl Insert {
     /// compressor's reduction), for a group that goes quiet; the other
     /// kinds are idle by then.
     fn rest(&mut self) {
-        if let Effect::Strip(s) = &mut self.effect {
-            s.clear();
+        match &mut self.effect {
+            Effect::Strip(s) => s.clear(),
+            Effect::Filter(f) => f.clear(),
+            Effect::Phaser(p) => p.clear(),
+            Effect::Crusher(c) => c.clear(),
+            Effect::Gate { gate, .. } => gate.clear(),
+            Effect::Delay(_) | Effect::Reverb(_) | Effect::Chorus(_) => {}
         }
     }
 
@@ -370,16 +570,20 @@ impl Insert {
     /// silence. The strip's stages ring out within a group's hold.
     pub fn is_idle(&self) -> bool {
         match &self.effect {
-            Effect::Strip(_) => true,
             Effect::Delay(e) => e.is_idle(),
             Effect::Reverb(r) => r.is_idle(),
             Effect::Chorus(c) => c.is_idle(),
+            _ => true,
         }
     }
 
     /// Processes `buf` (interleaved stereo, at most [`BLOCK`] frames) in
     /// place. `key` is the key bus for the same frames.
     pub fn process(&mut self, buf: &mut [f32], key: &[f32]) {
+        if self.kind == EffectKind::Gate {
+            self.process_gate(buf, key);
+            return;
+        }
         let want = self.wants_in();
         if !want && self.fade == 0 {
             self.drain(buf.len());
@@ -396,9 +600,10 @@ impl Insert {
             return;
         }
         if want && self.fade == self.fade_frames {
-            if let Effect::Strip(s) = &mut self.effect {
-                s.process(buf, key);
-                return;
+            match &mut self.effect {
+                Effect::Strip(s) => return s.process(buf, key),
+                Effect::Filter(f) => return f.process(buf),
+                _ => {}
             }
         }
         let wet = &mut self.scratch[..buf.len()];
@@ -407,18 +612,41 @@ impl Insert {
                 wet.copy_from_slice(buf);
                 s.process(wet, key);
             }
+            Effect::Filter(f) => {
+                wet.copy_from_slice(buf);
+                f.process(wet);
+            }
             effect => {
-                wet.fill(0.0);
                 match effect {
-                    Effect::Delay(e) => e.process(buf, wet),
-                    Effect::Reverb(r) => r.process(buf, wet),
-                    Effect::Chorus(c) => c.process(buf, wet),
-                    Effect::Strip(_) => {}
+                    Effect::Delay(e) => {
+                        wet.fill(0.0);
+                        e.process(buf, wet);
+                    }
+                    Effect::Reverb(r) => {
+                        wet.fill(0.0);
+                        r.process(buf, wet);
+                    }
+                    Effect::Chorus(c) => {
+                        wet.fill(0.0);
+                        c.process(buf, wet);
+                    }
+                    Effect::Phaser(p) => {
+                        wet.copy_from_slice(buf);
+                        p.process(wet);
+                    }
+                    Effect::Crusher(c) => {
+                        wet.copy_from_slice(buf);
+                        c.process(wet);
+                    }
+                    Effect::Strip(_) | Effect::Filter(_) | Effect::Gate { .. } => {}
                 }
                 for (w, x) in wet.chunks_exact_mut(2).zip(buf.chunks_exact(2)) {
+                    // All wet is the effect's output as it is.
                     let m = self.wet.tick();
-                    w[0] = x[0] + m * (w[0] - x[0]);
-                    w[1] = x[1] + m * (w[1] - x[1]);
+                    if m != 1.0 {
+                        w[0] = x[0] + m * (w[0] - x[0]);
+                        w[1] = x[1] + m * (w[1] - x[1]);
+                    }
                 }
             }
         }
@@ -439,8 +667,46 @@ impl Insert {
             }
         }
         if self.fade == 0 {
-            if let Effect::Strip(s) = &mut self.effect {
-                s.clear();
+            self.rest();
+        }
+    }
+
+    /// [`Insert::process`] for the gate: its gating fades over its delayed
+    /// input as it is bypassed and brought back, and the whole over the
+    /// input as it arrives as it is taken out or put in.
+    fn process_gate(&mut self, buf: &mut [f32], key: &[f32]) {
+        let (on, present) = (!self.bypassed(), !self.held_out);
+        let Self { effect, scratch, fade, bypass_fade, fade_frames, .. } = self;
+        let Effect::Gate { gate, keyed } = effect else { return };
+        let (whole, top) = (*fade_frames as f32, *fade_frames);
+        if !present && *fade == 0 {
+            // Out of the chain: it still hears its input, so it comes back
+            // with what is due out of its delay.
+            scratch[..buf.len()].copy_from_slice(buf);
+            gate.process(&mut scratch[..buf.len()], keyed.then_some(key));
+            let n = (buf.len() / 2) as u32;
+            *bypass_fade = if on { (*bypass_fade + n).min(top) } else { bypass_fade.saturating_sub(n) };
+            return;
+        }
+        let x = &mut scratch[..buf.len()];
+        x.copy_from_slice(buf);
+        gate.process(buf, keyed.then_some(key));
+        let dry = gate.dry();
+        for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            *bypass_fade = if on { (*bypass_fade + 1).min(top) } else { bypass_fade.saturating_sub(1) };
+            *fade = if present { (*fade + 1).min(top) } else { fade.saturating_sub(1) };
+            for c in 0..2 {
+                let (input, d, w) = (x[2 * i + c], dry[2 * i + c], f[c]);
+                let y = match *bypass_fade {
+                    b if b == top => w,
+                    0 => d,
+                    b => d + b as f32 / whole * (w - d),
+                };
+                f[c] = match *fade {
+                    p if p == top => y,
+                    0 => input,
+                    p => input + p as f32 / whole * (y - input),
+                };
             }
         }
     }
@@ -462,7 +728,7 @@ impl Insert {
                 Effect::Delay(e) => e.frames_to_idle(),
                 Effect::Reverb(r) => r.frames_to_idle(),
                 Effect::Chorus(c) => c.frames_to_idle(),
-                Effect::Strip(_) => 0,
+                _ => 0,
             };
             if soon == 0 {
                 break;
@@ -473,7 +739,7 @@ impl Insert {
                 Effect::Delay(e) => e.process(&silence[..k], &mut out[..k]),
                 Effect::Reverb(r) => r.process(&silence[..k], &mut out[..k]),
                 Effect::Chorus(c) => c.process(&silence[..k], &mut out[..k]),
-                Effect::Strip(_) => {}
+                _ => {}
             }
             left -= k;
         }
@@ -494,6 +760,8 @@ pub struct Chain {
     /// The change waiting: slot `i` will hold what `new[i]` says if it says
     /// anything, else what slot `order[i]` holds now.
     pending: Option<Pending>,
+    /// The latency of the slots not on their way out.
+    latency: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -575,10 +843,17 @@ impl Chain {
                 s.hold_out(p.touches(i));
             }
         }
+        self.count_latency();
+    }
+
+    /// A gate on its way out fades to its input as it arrives, so it no
+    /// longer counts; one coming in counts once it is in its slot.
+    fn count_latency(&mut self) {
+        self.latency = self.slots.iter().flatten().filter(|s| !s.held_out).map(|s| s.latency()).sum();
     }
 
     /// Frames until every slot the waiting change touches is out.
-    fn frames_to_change(&self) -> Option<usize> {
+    pub fn frames_to_change(&self) -> Option<usize> {
         let p = self.pending.as_ref()?;
         let touched = self.slots.iter().enumerate().filter(|&(i, _)| p.touches(i));
         Some(touched.filter_map(|(_, s)| s.as_ref().and_then(|s| s.frames_to_out())).max().unwrap_or(0))
@@ -588,6 +863,17 @@ impl Chain {
         if self.frames_to_change() == Some(0) {
             self.apply(retire);
         }
+    }
+
+    /// Makes a waiting change whose slots are all out, as processing would.
+    pub fn apply_due(&mut self, retire: &mut impl FnMut(Box<Insert>)) {
+        self.try_apply(retire);
+    }
+
+    /// The frames its slots delay the signal by, together, leaving out
+    /// those on their way out.
+    pub fn latency(&self) -> usize {
+        self.latency
     }
 
     fn apply(&mut self, retire: &mut impl FnMut(Box<Insert>)) {
@@ -603,6 +889,7 @@ impl Chain {
             }
         }
         old.into_iter().flatten().for_each(retire);
+        self.count_latency();
     }
 
     /// Makes a waiting change at once and lands every fade and glide, for a
@@ -639,6 +926,7 @@ impl Chain {
             p.new.into_iter().flatten().flatten().for_each(&mut *retire);
         }
         std::mem::take(&mut self.slots).into_iter().flatten().for_each(retire);
+        self.latency = 0;
     }
 
     /// Runs `buf` (interleaved stereo, at most [`BLOCK`] frames) through
@@ -729,7 +1017,12 @@ mod tests {
         let input = noise(2000);
         for k in EffectKind::ALL {
             let mut i = insert(k, &[(BYPASS, 1.0), (1, k.params()[1].max)]);
-            assert_eq!(through(&mut i, &input), input, "{k:?}");
+            // An effect that looks ahead delays it, bypassed too.
+            let late = 2 * i.latency();
+            assert_eq!(late > 0, k == EffectKind::Gate);
+            let out = through(&mut i, &input);
+            assert!(out[..late].iter().all(|&x| x == 0.0), "{k:?}");
+            assert_eq!(&out[late..], &input[..input.len() - late], "{k:?}");
         }
     }
 
@@ -922,6 +1215,130 @@ mod tests {
                 assert_eq!(run(size), one, "{kind:?} in blocks of {size}");
             }
         }
+    }
+
+    /// The level `kind` with `params` leaves of a sine at `freq`, in its
+    /// second half second.
+    fn level_of(kind: EffectKind, params: &[(usize, f32)], freq: f32) -> f32 {
+        let x: Vec<f32> = (0..48_000)
+            .flat_map(|i| {
+                let v = (std::f32::consts::TAU * freq * i as f32 / SR).sin();
+                [v, v]
+            })
+            .collect();
+        let mut i = insert(kind, params);
+        let y = through(&mut i, &x);
+        let power = |v: &[f32]| v[48_000..].iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+        (power(&y) / power(&x)).sqrt() as f32
+    }
+
+    #[test]
+    fn the_filter_passes_and_cuts_as_its_mode_says() {
+        use EffectKind::Filter;
+        let mode = |m: f32| [(1, m), (2, 1000.0), (3, 0.5)];
+        assert!(level_of(Filter, &mode(0.0), 100.0) > 0.99);
+        assert!(level_of(Filter, &mode(0.0), 8000.0) < 0.02);
+        assert!(level_of(Filter, &mode(2.0), 100.0) < 0.02);
+        assert!(level_of(Filter, &mode(2.0), 8000.0) > 0.99);
+        assert!(level_of(Filter, &mode(1.0), 1000.0) > 0.99);
+        assert!(level_of(Filter, &mode(1.0), 50.0) < 0.06);
+        assert!(level_of(Filter, &mode(3.0), 1000.0) < 0.01);
+        assert!(level_of(Filter, &mode(3.0), 8000.0) > 0.98);
+    }
+
+    #[test]
+    fn the_crusher_and_phaser_mix_their_output_with_the_dry_signal() {
+        let input = noise(3000);
+        // All wet, the crusher is the crusher.
+        let mut c = insert(EffectKind::Crusher, &[(1, 4.0), (2, 3.0), (3, 1.0)]);
+        let mut want = input.clone();
+        let mut raw = Crusher::new();
+        raw.set(4.0, 3.0);
+        raw.process(&mut want);
+        assert_eq!(through(&mut c, &input), want);
+        // All dry, either leaves the signal as it was.
+        for kind in [EffectKind::Crusher, EffectKind::Phaser] {
+            let mix = kind.params().len() - 1;
+            let mut i = insert(kind, &[(mix, 0.0)]);
+            assert_eq!(through(&mut i, &input), input, "{kind:?}");
+        }
+        // Half and half, the phaser cuts a notch at its corner.
+        let notch = level_of(EffectKind::Phaser, &[(1, 0.05), (2, 0.0), (3, 0.0), (4, 0.5)], 200.0);
+        assert!(notch < 0.05, "{notch}");
+    }
+
+    #[test]
+    fn a_gate_s_bypass_crossfades_over_its_delayed_input() {
+        let input = noise(3000);
+        let shut = [(1, 0.0), (2, -80.0), (4, 0.001), (5, 0.005)];
+        let mut gate = insert(EffectKind::Gate, &shut);
+        let l = gate.latency();
+        let gated = through(&mut gate.clone(), &input);
+        let mut out = through(&mut gate, &input[..2 * 2000]);
+        gate.set_param(BYPASS, 1.0);
+        out.extend(through(&mut gate, &input[2 * 2000..]));
+        assert!(gated[2 * 1500..2 * 2000].iter().all(|x| x.abs() < 1e-4), "shut");
+        for k in 2000..3000 {
+            let level = (FADE + 2000).saturating_sub(k + 1) as f32 / FADE as f32;
+            for c in 0..2 {
+                let (d, w) = (input[2 * (k - l) + c], gated[2 * k + c]);
+                assert!((out[2 * k + c] - (d + level * (w - d))).abs() < 1e-6, "frame {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_out_gate_s_bypass_lands_on_the_same_frame_at_any_buffer_size() {
+        use EffectKind::*;
+        let input = noise(3000);
+        let shut = [(1, 0.0), (2, -80.0), (4, 0.001), (5, 0.005)];
+        let run = |size: usize| {
+            let (mut c, mut r) = (Chain::default(), Vec::new());
+            c.place(1, Some(insert(Drive, &[])), &mut |x| r.push(x));
+            c.settle(&mut |x| r.push(x));
+            // Partway in, then moved, and bypassed where it is going.
+            c.place(0, Some(insert(Gate, &shut)), &mut |x| r.push(x));
+            let mut out = chain_out(&mut c, &input[..2 * 100], size, &mut r);
+            c.swap(0, 1, &mut |x| r.push(x));
+            c.slot_mut(1).unwrap().set_param(BYPASS, 1.0);
+            out.extend(chain_out(&mut c, &input[2 * 100..], size, &mut r));
+            out
+        };
+        assert_eq!(run(64), run(1));
+    }
+
+    #[test]
+    fn a_resonant_filter_that_overflows_starts_again() {
+        let mut f = insert(EffectKind::Filter, &[(2, 1000.0), (3, 1.0)]);
+        let mut loud: Vec<f32> = (0..2 * 64).map(|i| if i % 4 < 2 { f32::MAX } else { -f32::MAX }).collect();
+        f.process(&mut loud, &[0.0; 64]);
+        assert!(loud.iter().all(|x| x.is_finite()));
+        let mut quiet = noise(64);
+        f.process(&mut quiet, &[0.0; 64]);
+        assert!(quiet.iter().all(|x| x.is_finite() && x.abs() < 10.0));
+    }
+
+    #[test]
+    fn a_chain_s_latency_is_its_gates_together() {
+        let l = crate::dsp::gate::lookahead_frames(SR);
+        let mut c = Chain::default();
+        let mut retired = Vec::new();
+        for (slot, kind) in [(0, EffectKind::Gate), (3, EffectKind::Filter), (6, EffectKind::Gate)] {
+            c.place(slot, Some(insert(kind, &[])), &mut |x| retired.push(x));
+        }
+        c.settle(&mut |x| retired.push(x));
+        assert_eq!(c.latency(), 2 * l);
+        c.slot_mut(6).unwrap().set_param(BYPASS, 1.0);
+        assert_eq!(c.latency(), 2 * l, "a bypassed gate still looks ahead");
+        // On its way out it fades to its input as it arrives, and the other
+        // paths fade with it.
+        c.place(0, None, &mut |x| retired.push(x));
+        assert_eq!(c.latency(), l);
+        c.settle(&mut |x| retired.push(x));
+        assert_eq!(c.latency(), l);
+        // One coming in counts once it is in its slot.
+        c.place(1, Some(insert(EffectKind::Gate, &[])), &mut |x| retired.push(x));
+        assert_eq!(c.latency(), 2 * l);
     }
 
     #[test]

@@ -77,17 +77,25 @@ impl Svf {
         self.ic2 = 0.0;
     }
 
+    /// One sample through, giving the low-pass, band-pass and high-pass
+    /// outputs at once.
     #[inline]
-    pub fn process(&mut self, x: f32, mode: FilterMode) -> f32 {
+    pub fn tick(&mut self, x: f32) -> (f32, f32, f32) {
         let v3 = x - self.ic2;
         let v1 = self.a1 * self.ic1 + self.a2 * v3;
         let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
         self.ic1 = flush_denormal(2.0 * v1 - self.ic1);
         self.ic2 = flush_denormal(2.0 * v2 - self.ic2);
+        (v2, self.k * v1, x - self.k * v1 - v2)
+    }
+
+    #[inline]
+    pub fn process(&mut self, x: f32, mode: FilterMode) -> f32 {
+        let (low, band, high) = self.tick(x);
         match mode {
-            FilterMode::LowPass => v2,
-            FilterMode::BandPass => self.k * v1,
-            FilterMode::HighPass => x - self.k * v1 - v2,
+            FilterMode::LowPass => low,
+            FilterMode::BandPass => band,
+            FilterMode::HighPass => high,
         }
     }
 }

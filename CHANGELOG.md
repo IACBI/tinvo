@@ -19,8 +19,11 @@ Author: 𝓐.𝓒.𝓑
 - Project format 15 gains `insert <slot> <effect>` and `insert_param <slot> <id> <value>` lines in tracks and groups, `master_insert` lines before them, and lanes such as `insert2.mix`, `group1.insert0.comp_ratio` and `master.insert7.bypass`.
 - Stems are taken before the master's effects, as before its limiter; a group's stem has the group's effects on it.
 - `tinvo bench inserts`: the groups scenario with 64 busy effects.
+- Four more insert effects: a multimode filter (low-pass, band-pass, high-pass, notch, with resonance and a gliding cutoff), a six-stage phaser with feedback and a mix, a bit crusher (bits, downsampling and a mix) and a gate (threshold, range, attack, hold, release, and the key bus as its detector).
+- Latency compensation: the gate looks 1.5 ms ahead, so it delays its signal, bypassed too; every other track and group is delayed to match, so all paths reach the master equally late. A change crossfades over 10 ms on the same frame at any buffer size. MIDI out, export, stems and the count-in click take the whole delay into account.
 
 ### Changed
+- An insert's mix at 100 % gives the effect's output exactly.
 - The chorus, delay and reverb step through their delay lines without a division per sample, so they cost less, with the same output to the bit.
 - A reverb that has gone quiet forgets its tail without clearing its memory, so many going quiet together cost nothing.
 

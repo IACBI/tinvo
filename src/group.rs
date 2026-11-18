@@ -14,6 +14,7 @@
 //! costing anything. The hold is counted in frames, so a group stops on the
 //! same frame whatever the buffer size.
 
+use crate::align::{self, Align};
 use crate::dsp::smooth::Smoother;
 use crate::engine::{BLOCK, fader_gain};
 use crate::insert::{Chain, Insert};
@@ -55,6 +56,12 @@ pub struct Group {
     /// Its insert chain, after the strip. The engine changes it, and frees
     /// what it held, since freeing needs the retirement queue.
     pub chain: Chain,
+    /// The delay after its chain that lines it up with slower paths.
+    pub align: Align,
+    /// How late its slowest track reached it, kept while it rings out.
+    pub input_latency: usize,
+    /// Whether one of the project's tracks goes to it, as last planned.
+    pub tracked: bool,
     /// Parameter values set by edits; automation overrides them while a
     /// point is in force.
     base: [f32; GROUP_PARAMS],
@@ -87,6 +94,9 @@ impl Group {
         Self {
             strip: StereoStrip::new(sample_rate),
             chain: Chain::default(),
+            align: Align::new(align::longest(sample_rate), sample_rate),
+            input_latency: 0,
+            tracked: false,
             base: std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default)),
             gain_db: 0.0,
             pan: 0.0,
@@ -126,6 +136,8 @@ impl Group {
         self.peak = 0.0;
         self.reduction = 0.0;
         self.hold_left = 0;
+        self.align.reset();
+        (self.input_latency, self.tracked) = (0, false);
     }
 
     /// The frames a group runs for after a track last fed it.
@@ -136,6 +148,11 @@ impl Group {
     /// Whether it still has output to give: fed, or ringing out.
     pub fn is_live(&self) -> bool {
         self.hold_left > 0
+    }
+
+    /// Frames until it rests if nothing feeds it and no echo keeps it on.
+    pub fn frames_to_rest(&self) -> Option<usize> {
+        self.is_live().then_some(self.hold_left as usize)
     }
 
     /// Keeps a group running for its whole hold, as one that was just fed
@@ -202,6 +219,7 @@ impl Group {
     /// Jumps glides to their targets, as for a project that is opened.
     pub fn snap(&mut self) {
         self.strip.snap();
+        self.align.snap();
         for s in [&mut self.gain_l, &mut self.gain_r].into_iter().chain(&mut self.sends) {
             let t = s.target();
             s.snap(t);
@@ -282,6 +300,7 @@ impl Group {
         if !self.chain.is_empty() {
             self.chain.process(buf, key, retire);
         }
+        self.align.process(buf);
         let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
             let s = &self.sends[k];
             s.current() != 0.0 || s.target() != 0.0

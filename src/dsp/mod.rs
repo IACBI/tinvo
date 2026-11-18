@@ -12,16 +12,19 @@
 
 pub mod biquad;
 pub mod chorus;
+pub mod crusher;
 pub mod drive;
 pub mod dynamics;
 pub mod echo;
 pub mod env;
 pub mod fft;
 pub mod filter;
+pub mod gate;
 pub mod limiter;
 pub mod loudness;
 pub mod noise;
 pub mod osc;
+pub mod phaser;
 pub mod reverb;
 pub mod smooth;
 
