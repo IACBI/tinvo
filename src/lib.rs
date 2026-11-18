@@ -20,6 +20,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod align;
 pub mod app;
 pub mod audio;
 pub mod autosave;

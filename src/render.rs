@@ -127,13 +127,15 @@ pub fn render_into(
     // The master limiter delays the output; render that much ahead and drop
     // it, so the file still starts on the first beat. The transport stops
     // at the same musical point either way.
-    let mut skip = engine.latency() as u64;
+    // Read once: a lane can switch the limiter during the preroll.
+    let latency = engine.latency() as u64;
+    let mut skip = latency;
     while skip > 0 {
         let n = skip.min(CHUNK as u64) as usize;
         engine.process(&mut buf[..n * 2]);
         skip -= n as u64;
     }
-    let stop_at = main.saturating_sub(engine.latency() as u64);
+    let stop_at = main.saturating_sub(latency);
     let mut done = 0u64;
     let mut stopped = false;
     while done < main {
@@ -462,6 +464,8 @@ mod tests {
             Edit::SetSlot { chain: ChainId::Group(0), slot: 0, kind: Some(EffectKind::Delay) },
             Edit::SetSlotParam { chain: ChainId::Group(0), slot: 0, index: 5, value: 0.8 },
             Edit::SetSlot { chain: ChainId::Track(3), slot: 2, kind: Some(EffectKind::Chorus) },
+            // A gate on one track: the stems are lined up as the mix is.
+            Edit::SetSlot { chain: ChainId::Track(2), slot: 0, kind: Some(EffectKind::Gate) },
         ];
         for e in edits {
             p.apply(e).unwrap();
@@ -485,6 +489,28 @@ mod tests {
         p.apply(Edit::SetLane { track: 2, lane: 0, target: Some(lane), ramp: false }).unwrap();
         assert_ne!(render(&p, &[], &opts), mix);
         assert_eq!(sum(&p), sum(&plain));
+    }
+
+    #[test]
+    fn an_export_through_a_gate_starts_on_time() {
+        use crate::engine::ChainId;
+        use crate::insert::EffectKind;
+        let mut p = two_patterns();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        p.tracks[1].steps[0][1] = Some(Step::new(60, 100, 1));
+        p.tracks[1].steps[1][3] = Some(Step::new(60, 100, 1));
+        p.song = vec![0, 1];
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.5, source: Source::Song, ..Default::default() };
+        let plain = render(&p, &[], &opts);
+        // An open gate on a track only delays it, and the export takes its
+        // look-ahead off the front as it does the limiter's.
+        let range = EffectKind::Gate.params().iter().position(|s| s.id == "gate_range").unwrap() as u8;
+        for chain in [ChainId::Track(1), ChainId::Master] {
+            let mut q = p.clone();
+            q.apply(Edit::SetSlot { chain, slot: 4, kind: Some(EffectKind::Gate) }).unwrap();
+            q.apply(Edit::SetSlotParam { chain, slot: 4, index: range, value: 0.0 }).unwrap();
+            assert_eq!(render(&q, &[], &opts), plain, "{chain:?}");
+        }
     }
 
     #[test]

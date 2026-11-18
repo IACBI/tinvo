@@ -6657,8 +6657,9 @@ mod tests {
         // The track's chain, then (with no group) the master's.
         keys(&mut a, &[Key::Char(';')]);
         assert_eq!(a.insert_chain(), ChainId::Master);
+        // Back from none, the last kind.
         keys(&mut a, &[Key::Char(','), Key::Char(';')]);
-        assert_eq!(a.project.master_chain[0].map(|d| d.kind), Some(Chorus));
+        assert_eq!(a.project.master_chain[0].map(|d| d.kind), EffectKind::ALL.last().copied());
         assert_eq!(a.insert_chain(), ChainId::Track(0));
         // In a group, its chain comes between.
         a.edit(Edit::InsertGroup(0));

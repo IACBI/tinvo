@@ -2174,6 +2174,32 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_kind_and_setting_round_trips_through_a_file() {
+        let mut p = Project::demo();
+        for (k, kind) in EffectKind::ALL.into_iter().enumerate() {
+            let (chain, slot) = (ChainId::Track((k / MAX_SLOTS) as u8), (k % MAX_SLOTS) as u8);
+            p.apply(Edit::SetSlot { chain, slot, kind: Some(kind) }).unwrap();
+            for (i, spec) in kind.params().iter().enumerate().skip(1) {
+                let value = spec.clamp(spec.min + 0.75 * (spec.max - spec.min));
+                p.apply(Edit::SetSlotParam { chain, slot, index: i as u8, value }).unwrap();
+            }
+        }
+        let text = p.to_text();
+        for kind in EffectKind::ALL {
+            assert!(
+                text.contains(&format!(
+                    " {}
+",
+                    kind.id()
+                )),
+                "{}: {text}",
+                kind.id()
+            );
+        }
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+    }
+
+    #[test]
     fn insert_chains_round_trip_rebuild_and_invert() {
         use EffectKind::*;
         let mut p = Project::demo();

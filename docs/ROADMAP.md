@@ -490,7 +490,19 @@ Known limits: a track sent to a third place while a change of group is still fad
 - An `inserts` bench scenario with an instruction budget. The allocation test plays 64 busy effects, some automated, and sends random chain edits with effects built off the audio thread.
 - Tests: chain order and swaps, bypassed effects bit-exact, a group of one with an effect against its track with it, click-free insertion, bypass, moving and removal, effect automation at any buffer size, a chain change on the same frame at any buffer size, a group held on by its echoes, effects returning through the release queue (and the queue never overflowing), file round trips, edits rebuilding the chains, undo, malformed lines, the insert limit, locked slots, stems before the master's chain, and the editor's inserts page.
 
-Not yet: an effect that looks ahead (the gate in 11d) needs latency compensation, which comes with it.
+#### 11d: New effects and latency compensation ✅
+
+- Four more kinds: a multimode filter (low-pass, band-pass, high-pass, notch), a phaser, a bit crusher and a gate, each with its bypass and automatable settings, in project format 15 under the ids `filter`, `phaser`, `crusher` and `gate`.
+- The gate looks 1.5 ms ahead, so it delays its signal, bypassed too. Every track and group has a delay after its chain that the engine sets so that all paths reach the master equally late; a change crossfades over 10 ms on the same frame at any buffer size. `Engine::latency` includes it, so MIDI out, export and stems stay lined up, and the count-in click is delayed with the tracks.
+- The `inserts` bench scenario cycles through all ten kinds, and the allocation test plays them.
+- Tests: the new effects against their definitions, paths through gates on tracks, groups and the master lined up to the frame, a gate put in and taken out while playing at any buffer size and without a click, a chain's latency, an export through a gate starting on time, stems lined up with the mix, every kind through a file, and the review's fixes (a delay waiting for its history, following a change mid-crossfade and switched back on forgetting what it held, a short hit passing a gate whole, a 0 dB range opening a closed gate, a held-out gate's bypass on the same frame at any buffer size, a resonant filter recovering from an overflow, a group ringing out or removed keeping its latency and resting on the same frame at any buffer size, a delay set twice on one frame taking the second, a stopped count-in leaving no click, the count-in, MIDI out, a live note and an auditioned note as late as the tracks).
+
+Known limits:
+- A grouped track's own sends reach the buses ahead of its group's output by the group's latency and its compensation.
+- While a track's change of group crossfades, and while a removed track fades out, the path it leaves is delayed as the plan for its new place says, so for those 10 ms it can be off by a gate's look-ahead.
+- A sidechain key is not delayed: a keyed compressor or gate on a delayed path hears its key early by that delay.
+- A gate put in waits for its look-ahead of input before its crossfade while the paths around it start theirs at once, so for those 10 ms they can be apart by up to its look-ahead.
+- An export whose limiter a lane switches on or off at the very start keeps the latency the limiter had before.
 
 ### Phase 12: CLAP plugins (large)
 
