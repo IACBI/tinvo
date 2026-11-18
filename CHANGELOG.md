@@ -14,6 +14,15 @@ Author: 𝓐.𝓒.𝓑
 - Project format 15: `group` blocks before the tracks, `group 1` in a track, and lanes such as `group1.comp_ratio`. Older files load with no groups.
 - Stems: a group is one stem holding all its heard tracks; tracks that go to the master keep one each.
 - `tinvo bench groups`: the demo song's tracks repeated to 8, each through a group of its own with every stage on.
+- Insert effects: 8 slots on every track (after its strip), every group (after its strip) and the master (after its fader, before the limiter), 64 in a project. A slot holds an EQ, compressor or drive (the strip's stages), or a delay, reverb or chorus with a mix setting. Each slot has a bypass and can be automated. Putting an effect in, replacing, moving, bypassing or removing one crossfades over 10 ms, on the same frame at any buffer size, and a bypassed delay or reverb lets go of its echoes. A group stays on while an effect in it still rings.
+- The panel's inserts page, after the buses and master: `,` and `.` pick the selected slot's effect, `<` and `>` move it, `-` empties the slot and `;` shows the track's chain, its group's or the master's. A lane on an effect's setting keeps that effect in its slot until the lane goes.
+- Project format 15 gains `insert <slot> <effect>` and `insert_param <slot> <id> <value>` lines in tracks and groups, `master_insert` lines before them, and lanes such as `insert2.mix`, `group1.insert0.comp_ratio` and `master.insert7.bypass`.
+- Stems are taken before the master's effects, as before its limiter; a group's stem has the group's effects on it.
+- `tinvo bench inserts`: the groups scenario with 64 busy effects.
+
+### Changed
+- The chorus, delay and reverb step through their delay lines without a division per sample, so they cost less, with the same output to the bit.
+- A reverb that has gone quiet forgets its tail without clearing its memory, so many going quiet together cost nothing.
 
 ## [0.24.1] - 2026-11-16
 

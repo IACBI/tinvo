@@ -15,8 +15,9 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::dsp::noise::Rng;
-use tinvo::engine::{Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Shared, Step, Take};
+use tinvo::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Retired, Shared, Step, Take};
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
+use tinvo::insert::{EffectKind, Insert, MAX_INSERTS, MAX_SLOTS};
 use tinvo::instrument::InstrumentKind;
 use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
@@ -92,7 +93,7 @@ const SIZES: [usize; 8] = [1, 31, 64, 128, 256, 480, 1024, 4096];
 struct Rig {
     engine: Box<Engine>,
     commands: Producer<Command>,
-    retired: Consumer<Arc<Sample>>,
+    retired: Consumer<Retired>,
     live: Arc<Mailbox<Message>>,
     buf: Vec<f32>,
     rng: Rng,
@@ -118,7 +119,8 @@ impl Rig {
         let frames = SIZES[(self.rng.next_u64() % SIZES.len() as u64) as usize];
         let (engine, buf) = (&mut self.engine, &mut self.buf[..2 * frames]);
         let calls = armed(|| engine.process(buf));
-        // The UI thread's side: released samples are dropped here.
+        // The UI thread's side: released samples and effects are dropped
+        // here.
         while self.retired.pop().is_some() {}
         calls
     }
@@ -206,11 +208,22 @@ fn heavy_song() -> usize {
     play_song(&mut rig, 2000)
 }
 
+/// Effect `k` of a project, at settings of its own away from the defaults.
+fn busy_slot(p: &mut Project, chain: ChainId, slot: u8, k: usize) {
+    let kind = EffectKind::ALL[k % EffectKind::ALL.len()];
+    p.apply(Edit::SetSlot { chain, slot, kind: Some(kind) }).unwrap();
+    // Bypass stays off.
+    for (i, spec) in kind.params().iter().enumerate().skip(1) {
+        let value = spec.min + (spec.max - spec.min) * ((i + k) % 7) as f32 / 7.0;
+        p.apply(Edit::SetSlotParam { chain, slot, index: i as u8, value }).unwrap();
+    }
+}
+
 /// The heavy project's tracks again and again up to the limit, each sampler
 /// with a sample of its own, spread over as many groups as a project holds,
-/// each with every strip stage and send busy and its pan on a lane. A
-/// copy's bus and master lanes are freed: only one lane in a project holds
-/// each.
+/// each with every strip stage and send busy and its pan on a lane, and as
+/// many busy insert effects as a project holds, some on ramps. A copy's bus
+/// and master lanes are freed: only one lane in a project holds each.
 fn full_song() -> usize {
     let mut p = heavy_project();
     let base = p.tracks.clone();
@@ -245,6 +258,37 @@ fn full_song() -> usize {
         let group = (t % 5 != 0).then_some((t % MAX_GROUPS) as u8);
         ok(p.apply(Edit::SetTrackGroup { track: t as u8, group }));
     }
+    // A full master chain, four effects on each group and the rest on
+    // tracks, three apiece.
+    let mut chains = vec![ChainId::Master; MAX_SLOTS];
+    chains.extend((0..MAX_GROUPS as u8).flat_map(|g| [ChainId::Group(g); 4]));
+    chains.extend((0..).flat_map(|t| [ChainId::Track(t); 3]).take(MAX_INSERTS - chains.len()));
+    let mut next = [0u8; 2 * MAX_TRACKS];
+    for (k, &chain) in chains.iter().enumerate() {
+        let n = match chain {
+            ChainId::Track(t) => usize::from(t),
+            ChainId::Group(g) => MAX_TRACKS + usize::from(g),
+            ChainId::Master => MAX_TRACKS + MAX_GROUPS,
+        };
+        busy_slot(&mut p, chain, next[n], k);
+        next[n] += 1;
+    }
+    assert_eq!(p.insert_count(), MAX_INSERTS);
+    // Each track's first effect on a ramp, and the groups' second.
+    for t in 0..8u8 {
+        let kind = p.tracks[usize::from(t)].chain[0].unwrap().kind;
+        let target = Some(LaneTarget::Slot { slot: 0, kind, index: 1 });
+        ok(p.apply(Edit::SetLane { track: t, lane: 2, target, ramp: true }));
+        let g = p.groups[usize::from(t)].chain[1].unwrap().kind;
+        let target = Some(LaneTarget::GroupSlot { group: t, slot: 1, kind: g, index: 1 });
+        ok(p.apply(Edit::SetLane { track: 8 + t, lane: 2, target, ramp: true }));
+        for track in [t, 8 + t] {
+            let spec = target_spec(&p, track, 2);
+            for (step, value) in [(0, spec.min), (8, spec.max)] {
+                ok(p.apply(Edit::SetPoint { track, lane: 2, pattern: 0, step, value: Some(value) }));
+            }
+        }
+    }
     let mut rig = Rig::new(&p);
     for (t, track) in p.tracks.iter().enumerate() {
         if track.kind == InstrumentKind::Sampler {
@@ -254,13 +298,51 @@ fn full_song() -> usize {
     play_song(&mut rig, 2000)
 }
 
+/// What lane `lane` of track `track` automates.
+fn target_spec(p: &Project, track: u8, lane: usize) -> &'static tinvo::instrument::ParamSpec {
+    let t = &p.tracks[usize::from(track)];
+    t.lanes[lane].target.unwrap().spec(t.kind).unwrap()
+}
+
+/// A random insert-chain edit, with the effect built here as the editor
+/// builds it, off the audio thread.
+fn random_slot_command(rng: &mut Rng) -> Command {
+    let mut r = |n: u64| rng.next_u64() % n;
+    let chain = match r(4) {
+        0 => ChainId::Master,
+        1 => ChainId::Group(r(MAX_GROUPS as u64 + 1) as u8),
+        _ => ChainId::Track(r(MAX_TRACKS as u64 + 1) as u8),
+    };
+    let slot = r(MAX_SLOTS as u64 + 1) as u8;
+    let kind = EffectKind::ALL[r(EffectKind::ALL.len() as u64) as usize];
+    let edit = match r(6) {
+        0 => {
+            let insert = (r(4) > 0).then(|| Box::new(Insert::new(kind, SR, 120.0)));
+            return Command::SetSlot { chain, slot, insert };
+        }
+        1 => Edit::SetSlot { chain, slot, kind: None },
+        2 => Edit::SwapSlots { chain, a: slot, b: r(MAX_SLOTS as u64) as u8 },
+        3 => {
+            let target = match chain {
+                ChainId::Master => LaneTarget::MasterSlot { slot, kind, index: r(10) as u8 },
+                ChainId::Group(group) => LaneTarget::GroupSlot { group, slot, kind, index: r(10) as u8 },
+                ChainId::Track(_) => LaneTarget::Slot { slot, kind, index: r(10) as u8 },
+            };
+            let track = r(MAX_TRACKS as u64) as u8;
+            Edit::SetLane { track, lane: r(4) as u8, target: Some(target), ramp: r(2) == 0 }
+        }
+        _ => Edit::SetSlotParam { chain, slot, index: r(10) as u8, value: r(101) as f32 / 10.0 - 2.0 },
+    };
+    Command::Edit(edit)
+}
+
 /// A random edit or command, about what a busy user sends.
 fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
     let mut r = |n: u64| rng.next_u64() % n;
     let track = r(MAX_TRACKS as u64 + 1) as u8;
     let kind = InstrumentKind::ALL[r(InstrumentKind::ALL.len() as u64) as usize];
     let group = r(MAX_GROUPS as u64 + 1) as u8;
-    let edit = match r(25) {
+    let edit = match r(27) {
         0 => Edit::SetTempo(20.0 + r(281) as f32),
         1 => Edit::SetSwing(50.0 + r(26) as f32),
         2 => Edit::SetPatternLength { pattern: r(16) as u8, len: 1 + r(64) as u8 },
@@ -323,6 +405,7 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
             }
             _ => Edit::SetTrackGroup { track, group: (r(4) > 0).then_some(group) },
         },
+        24 | 25 => return random_slot_command(rng),
         _ => {
             return match r(7) {
                 0 => Command::Play,
@@ -510,7 +593,7 @@ fn main() {
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
         ("as many tracks as a project holds, likewise", full_song),
-        ("edits, samples and transport commands while playing", edits_while_playing),
+        ("edits, samples, effects and transport commands while playing", edits_while_playing),
         ("live notes", live_notes),
         ("recording notes and count-ins", recording_notes),
         ("MIDI out and its clock", midi_out),

@@ -9,12 +9,14 @@
 //! group passes its input through unchanged (gain 1 on both channels).
 //!
 //! A group runs while a track feeds it and for [`HOLD_TIME`] after the last
-//! frame one did, so its strip rings out, then stops costing anything. The
-//! hold is counted in frames, so a group stops on the same frame whatever
-//! the buffer size.
+//! frame one did, so its strip rings out, and for as long again whenever
+//! its insert chain still holds sound at the end (a long echo), then stops
+//! costing anything. The hold is counted in frames, so a group stops on the
+//! same frame whatever the buffer size.
 
 use crate::dsp::smooth::Smoother;
 use crate::engine::{BLOCK, fader_gain};
+use crate::insert::{Chain, Insert};
 use crate::instrument::ParamSpec;
 use crate::mix::{Mix, SEND_PARAMS, level_gain, send};
 use crate::strip::{self, StereoStrip, sp};
@@ -50,6 +52,9 @@ pub fn balance_gains(pan: f32) -> (f32, f32) {
 #[derive(Clone, Debug)]
 pub struct Group {
     strip: StereoStrip,
+    /// Its insert chain, after the strip. The engine changes it, and frees
+    /// what it held, since freeing needs the retirement queue.
+    pub chain: Chain,
     /// Parameter values set by edits; automation overrides them while a
     /// point is in force.
     base: [f32; GROUP_PARAMS],
@@ -81,6 +86,7 @@ impl Group {
     pub fn new(smoothing: f32, sample_rate: f32) -> Self {
         Self {
             strip: StereoStrip::new(sample_rate),
+            chain: Chain::default(),
             base: std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default)),
             gain_db: 0.0,
             pan: 0.0,
@@ -102,8 +108,10 @@ impl Group {
     }
 
     /// Turns the group into a fresh one in place: a whole new `Group` would
-    /// be built on the (audio thread's) stack first.
+    /// be built on the (audio thread's) stack first. Its chain must have
+    /// been emptied already.
     pub fn reset(&mut self) {
+        debug_assert!(self.chain.is_empty(), "effects freed on the audio thread");
         let (smoothing, sample_rate) = (self.smoothing, self.sample_rate);
         self.strip = StereoStrip::new(sample_rate);
         self.base = std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default));
@@ -205,7 +213,7 @@ impl Group {
     /// buses, where tracks fed the first `fed` of those frames. With none,
     /// it runs only for what is left of its hold. `key` is the key bus for
     /// the same frames; `at` is the segment's first sample in the
-    /// interleaved bus inputs.
+    /// interleaved bus inputs; effects its chain lets go of go to `retire`.
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
@@ -217,24 +225,63 @@ impl Group {
         mix_r: &mut [f32],
         at: usize,
         mix: &mut Mix,
+        retire: &mut impl FnMut(Box<Insert>),
     ) {
-        let n = if fed > 0 {
+        if fed > 0 {
             // The hold counts from the last frame fed.
             self.hold_left = self.hold().saturating_sub((b - a - fed) as u32);
-            b - a
-        } else {
-            let n = (b - a).min(self.hold_left as usize);
+            self.run(a, b - a, key, mix_l, mix_r, at, mix, retire);
+            return;
+        }
+        let mut done = 0;
+        while done < b - a {
+            let n = (b - a - done).min(self.hold_left as usize);
             self.hold_left -= n as u32;
-            n
-        };
-        let going_idle = self.hold_left == 0;
+            let from = a + done;
+            self.run(from, n, &key[done..], &mut mix_l[done..], &mut mix_r[done..], at + 2 * done, mix, retire);
+            done += n;
+            // An echo still in the chain keeps it running, from the frame
+            // the hold ran out on.
+            if self.hold_left > 0 || self.chain.is_idle() {
+                break;
+            }
+            self.hold_left = self.hold();
+        }
+        if self.hold_left == 0 {
+            self.strip.clear();
+            self.snap();
+            self.chain.rest(retire);
+        }
+    }
+
+    /// Runs `n` frames from frame `a` of the input, as [`Group::process`]
+    /// says, with `key`, `mix_l` and `mix_r` starting at those frames.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        a: usize,
+        n: usize,
+        key: &[f32],
+        mix_l: &mut [f32],
+        mix_r: &mut [f32],
+        at: usize,
+        mix: &mut Mix,
+        retire: &mut impl FnMut(Box<Insert>),
+    ) {
+        if n == 0 {
+            return;
+        }
         let b = a + n;
+        let key = &key[..n];
         let buf = &mut self.buf[..2 * n];
         for (f, (&l, &r)) in buf.chunks_exact_mut(2).zip(self.in_l[a..b].iter().zip(&self.in_r[a..b])) {
             f[0] = l;
             f[1] = r;
         }
         self.strip.process(buf, key);
+        if !self.chain.is_empty() {
+            self.chain.process(buf, key, retire);
+        }
         let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
             let s = &self.sends[k];
             s.current() != 0.0 || s.target() != 0.0
@@ -264,10 +311,6 @@ impl Group {
         let r = -self.strip.gain_reduction_db();
         if r > self.reduction {
             self.reduction = r;
-        }
-        if going_idle {
-            self.strip.clear();
-            self.snap();
         }
     }
 }

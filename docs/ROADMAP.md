@@ -478,6 +478,20 @@ It comes in four parts, each merged on its own; the project format they share is
 
 Known limits: a track sent to a third place while a change of group is still fading moves the share still on its way out at once; and when more than 8 removed groups are still playing on, the oldest is cut short.
 
+#### 11c: Insert chains ✅
+
+- 8 slots on every track and group (after the strip, before the fader) and on the master (after its fader, before the limiter), 64 effects in a project. A slot holds an EQ, compressor or drive, which are the strip's stages, or a delay, reverb or chorus with a mix setting; each kind's first setting is its bypass.
+- Effects are built on the UI thread and handed over in `Command::SetSlot`; the ones replaced or removed go back through the release queue, which now carries samples and effects and has room for 256.
+- A change to a chain (an effect in, out, replaced or moved) fades the slots it touches out over 10 ms, applies on the frame they are out and fades the new contents in. A change made during a fade joins it. Bypass crossfades too, and a bypassed delay or reverb runs silence through until it has rung out, so it comes back without old echoes. A group stays on while its chain rings, and an idle group takes changes at once.
+- Lanes can automate any effect setting (`LaneTarget::Slot`, `GroupSlot`, `MasterSlot`, naming the effect they expect). A lane locks its slot's effect; moving the effect takes the lane along.
+- The panel's inserts page: an effect key picks the slot's effect, others move it, empty it and show the track's chain, its group's or the master's.
+- Project format 15 (still unreleased) gains `insert`, `insert_param`, `master_insert` and `master_insert_param` lines and lane ids `insert<k>.<id>`, `group<n>.insert<k>.<id>` and `master.insert<k>.<id>`.
+- Stems are taken before the master's chain.
+- An `inserts` bench scenario with an instruction budget. The allocation test plays 64 busy effects, some automated, and sends random chain edits with effects built off the audio thread.
+- Tests: chain order and swaps, bypassed effects bit-exact, a group of one with an effect against its track with it, click-free insertion, bypass, moving and removal, effect automation at any buffer size, a chain change on the same frame at any buffer size, a group held on by its echoes, effects returning through the release queue (and the queue never overflowing), file round trips, edits rebuilding the chains, undo, malformed lines, the insert limit, locked slots, stems before the master's chain, and the editor's inserts page.
+
+Not yet: an effect that looks ahead (the gate in 11d) needs latency compensation, which comes with it.
+
 ### Phase 12: CLAP plugins (large)
 
 For professional instruments and effects: sampled pianos and orchestral libraries, amp models, mastering tools.

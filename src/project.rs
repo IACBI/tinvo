@@ -17,12 +17,15 @@
 //! tempo_point 4 128          # the tempo a song entry starts at
 //! tempo_ramp true            # ramp between tempo points; only when set
 //! mix reverb_decay 2.4       # buses and master; only values off their default
+//! master_insert 0 reverb     # an effect in slot 0 (of 0-7) of the master's insert chain
+//! master_insert_param 0 reverb_decay 3   # its settings; only values off their default
 //!
 //! group Drums                # a group bus and its name; groups come before tracks
 //! gain_db -3
 //! pan 0
 //! mute false
 //! param comp_ratio 2         # its strip and sends; only values off their default
+//! insert 1 compressor        # its insert chain, as a track's
 //! end
 //!
 //! track kick
@@ -37,7 +40,9 @@
 //! parts . . B -              # per song entry: . the entry's pattern, a pattern, - rest
 //! param decay 0.45
 //! param eq_mid_gain -3       # channel strip and sends; only values off their default
-//! lane 0 decay ramp          # lane, parameter id (volume, pan, a mix id, or group1.<id>), hold or ramp
+//! insert 2 delay             # an effect in slot 2 of its insert chain
+//! insert_param 2 mix 0.5     # its settings; only values off their default
+//! lane 0 decay ramp          # lane, parameter id, hold or ramp (see below)
 //! step 0 60 120 1 100 1 0 -  # index note velocity length chance ratchet offset chord
 //! point 0 0 0.2              # lane step value
 //! point 0 15 0.9
@@ -45,6 +50,12 @@
 //! step 0 60 120 1 100 1 0 -
 //! end
 //! ```
+//!
+//! A lane's parameter is a parameter of the track (`volume`, `pan`, an
+//! instrument, strip or send id), a mix id, `group<n>.<id>` (1 is the first
+//! group), or an insert's: `insert<k>.<id>` on the track's own chain,
+//! `group<n>.insert<k>.<id>` or `master.insert<k>.<id>`. Inserts come before
+//! the lanes on them.
 //!
 //! Steps and points before any `pattern` line belong to pattern A. `chord` is `-` or
 //! the extra notes as comma-separated semitones above `note`, ascending
@@ -59,11 +70,13 @@
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
+use crate::engine::ChainId;
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
     MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Meter, Part, Step, entry_tempo, loop_region, span_frames,
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
+use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_INSERTS, MAX_SLOTS};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
 use crate::strip::{sp, track_param, track_param_count, track_param_since};
@@ -106,7 +119,31 @@ pub struct TrackData {
     pub lanes: [LaneData; MAX_LANES],
     /// What the track plays in each song entry; `Follow` past the song's end.
     pub parts: Box<[Part; MAX_SONG]>,
+    /// Its insert chain.
+    pub chain: ChainData,
 }
+
+/// An effect in an insert slot and its settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlotData {
+    pub kind: EffectKind,
+    /// One value per [`EffectKind::params`]; the rest are unused.
+    pub params: [f32; MAX_INSERT_PARAMS],
+}
+
+impl SlotData {
+    /// A `kind` effect at its defaults.
+    pub fn new(kind: EffectKind) -> Self {
+        let mut params = [0.0; MAX_INSERT_PARAMS];
+        for (p, spec) in params.iter_mut().zip(kind.params()) {
+            *p = spec.default;
+        }
+        Self { kind, params }
+    }
+}
+
+/// An insert chain: what each slot holds, in the order they run.
+pub type ChainData = [Option<SlotData>; MAX_SLOTS];
 
 /// An automation lane: a parameter (see [`LaneTarget`]) and its points.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,6 +197,7 @@ impl TrackData {
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
             parts: Box::new([Part::Follow; MAX_SONG]),
+            chain: [None; MAX_SLOTS],
         }
     }
 }
@@ -173,6 +211,8 @@ pub struct GroupData {
     pub mute: bool,
     /// One value per [`group_param`]: the strip's, then the bus sends.
     pub params: [f32; GROUP_PARAMS],
+    /// Its insert chain.
+    pub chain: ChainData,
 }
 
 impl GroupData {
@@ -183,6 +223,7 @@ impl GroupData {
             pan: 0.0,
             mute: false,
             params: std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default)),
+            chain: [None; MAX_SLOTS],
         }
     }
 }
@@ -216,6 +257,8 @@ pub struct Project {
     pub tempo_points: Box<[Option<f32>; MAX_SONG]>,
     /// Whether the tempo ramps from each point to the next.
     pub tempo_ramp: bool,
+    /// The master's insert chain, after its fader and before the limiter.
+    pub master_chain: ChainData,
 }
 
 /// A named position in the song: the start of the entry it sits on.
@@ -269,6 +312,12 @@ pub enum EditError {
     TooManyGroups,
     /// A track goes to the group, or a lane automates it.
     GroupInUse(u8),
+    NoSuchSlot(u8),
+    /// The slot holds no effect.
+    EmptySlot(u8),
+    TooManyInserts,
+    /// A lane automates the effect in the slot, so it cannot change kind.
+    SlotAutomated(u8),
 }
 
 impl fmt::Display for EditError {
@@ -290,6 +339,12 @@ impl fmt::Display for EditError {
             EditError::TooManyGroups => write!(f, "group limit ({MAX_GROUPS}) reached"),
             EditError::GroupInUse(g) => {
                 write!(f, "group {} still has tracks or automation on it", u32::from(*g) + 1)
+            }
+            EditError::NoSuchSlot(s) => write!(f, "no insert slot {}", u32::from(*s) + 1),
+            EditError::EmptySlot(s) => write!(f, "insert slot {} is empty", u32::from(*s) + 1),
+            EditError::TooManyInserts => write!(f, "insert limit ({MAX_INSERTS}) reached"),
+            EditError::SlotAutomated(s) => {
+                write!(f, "a lane automates the effect in insert slot {}", u32::from(*s) + 1)
             }
         }
     }
@@ -330,6 +385,7 @@ impl Project {
             markers: Vec::new(),
             tempo_points: Box::new([None; MAX_SONG]),
             tempo_ramp: false,
+            master_chain: [None; MAX_SLOTS],
         }
     }
 
@@ -666,8 +722,102 @@ impl Project {
                 self.track_mut(track)?.group = group;
                 edit
             }
+            Edit::SetSlot { chain, slot, kind } => {
+                self.check_set_slot(chain, slot, kind)?;
+                self.chain_mut(chain)?[usize::from(slot)] = kind.map(SlotData::new);
+                edit
+            }
+            Edit::SwapSlots { chain, a, b } => {
+                self.check_swap(chain, a, b)?;
+                self.chain_mut(chain)?.swap(usize::from(a), usize::from(b));
+                let swap = |s: u8| {
+                    if s == a {
+                        b
+                    } else if s == b {
+                        a
+                    } else {
+                        s
+                    }
+                };
+                for (i, t) in self.tracks.iter_mut().enumerate() {
+                    for l in &mut t.lanes {
+                        let Some(x) = l.target else { continue };
+                        if x.slot(i as u8).is_some_and(|(c, ..)| c == chain) {
+                            l.target = Some(with_slot(x, swap));
+                        }
+                    }
+                }
+                edit
+            }
+            Edit::SetSlotParam { chain, slot, index, value } => {
+                let spec = self.slot_param(chain, slot, index)?;
+                let value = spec.clamp(value);
+                if let Some(d) = &mut self.chain_mut(chain)?[usize::from(slot)] {
+                    d.params[usize::from(index)] = value;
+                }
+                Edit::SetSlotParam { chain, slot, index, value }
+            }
         };
         Ok(applied)
+    }
+
+    /// The insert chain `c`.
+    pub fn chain(&self, c: ChainId) -> Result<&ChainData, EditError> {
+        Ok(match c {
+            ChainId::Track(t) => &self.track(t)?.chain,
+            ChainId::Group(g) => &self.group(g)?.chain,
+            ChainId::Master => &self.master_chain,
+        })
+    }
+
+    fn chain_mut(&mut self, c: ChainId) -> Result<&mut ChainData, EditError> {
+        Ok(match c {
+            ChainId::Track(t) => &mut self.track_mut(t)?.chain,
+            ChainId::Group(g) => &mut self.group_mut(g)?.chain,
+            ChainId::Master => &mut self.master_chain,
+        })
+    }
+
+    /// Effects in all the project's chains.
+    pub fn insert_count(&self) -> usize {
+        let chains = self.tracks.iter().map(|t| &t.chain).chain(self.groups.iter().map(|g| &g.chain));
+        chains.chain([&self.master_chain]).flatten().filter(|s| s.is_some()).count()
+    }
+
+    /// Whether a lane automates the effect in slot `slot` of chain `c`.
+    pub fn slot_automated(&self, c: ChainId, slot: u8) -> bool {
+        self.tracks.iter().enumerate().any(|(i, t)| {
+            let targets = t.lanes.iter().filter_map(|l| l.target);
+            targets.filter_map(|x| x.slot(i as u8)).any(|(chain, s, ..)| chain == c && s == slot)
+        })
+    }
+
+    fn check_slot(&self, c: ChainId, slot: u8) -> Result<&Option<SlotData>, EditError> {
+        self.chain(c)?.get(usize::from(slot)).ok_or(EditError::NoSuchSlot(slot))
+    }
+
+    /// Validates putting a `kind` effect (or none) in slot `slot` of `c`.
+    fn check_set_slot(&self, c: ChainId, slot: u8, kind: Option<EffectKind>) -> Result<(), EditError> {
+        let old = self.check_slot(c, slot)?;
+        if old.is_none() && kind.is_some() && self.insert_count() >= MAX_INSERTS {
+            return Err(EditError::TooManyInserts);
+        }
+        if old.map(|d| d.kind) != kind && self.slot_automated(c, slot) {
+            return Err(EditError::SlotAutomated(slot));
+        }
+        Ok(())
+    }
+
+    fn check_swap(&self, c: ChainId, a: u8, b: u8) -> Result<(), EditError> {
+        self.check_slot(c, a)?;
+        self.check_slot(c, b)?;
+        Ok(())
+    }
+
+    /// The spec of parameter `index` of the effect in slot `slot` of `c`.
+    fn slot_param(&self, c: ChainId, slot: u8, index: u8) -> Result<&'static ParamSpec, EditError> {
+        let d = self.check_slot(c, slot)?.ok_or(EditError::EmptySlot(slot))?;
+        d.kind.params().get(usize::from(index)).ok_or(EditError::NoSuchParam(index))
     }
 
     fn group_mut(&mut self, g: u8) -> Result<&mut GroupData, EditError> {
@@ -713,8 +863,14 @@ impl Project {
         for t in &mut self.tracks {
             t.group = t.group.map(&to);
             for l in &mut t.lanes {
-                if let Some(LaneTarget::Group { group, index }) = l.target {
-                    l.target = Some(LaneTarget::Group { group: to(group), index });
+                match l.target {
+                    Some(LaneTarget::Group { group, index }) => {
+                        l.target = Some(LaneTarget::Group { group: to(group), index });
+                    }
+                    Some(LaneTarget::GroupSlot { group, slot, kind, index }) => {
+                        l.target = Some(LaneTarget::GroupSlot { group: to(group), slot, kind, index });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -746,6 +902,12 @@ impl Project {
             x.spec(t.kind).ok_or(EditError::NoSuchTarget(x))?;
             if x.group().is_some_and(|g| usize::from(g) >= self.groups.len()) {
                 return Err(EditError::NoSuchTarget(x));
+            }
+            // An insert's parameter while the slot holds that effect.
+            if let Some((c, slot, kind, _)) = x.slot(track) {
+                if !self.check_slot(c, slot).is_ok_and(|d| d.is_some_and(|d| d.kind == kind)) {
+                    return Err(EditError::NoSuchTarget(x));
+                }
             }
             if t.lanes.iter().enumerate().any(|(k, l)| k != usize::from(lane) && l.target == target) {
                 return Err(EditError::DuplicateLane);
@@ -957,6 +1119,7 @@ impl Project {
         for (index, &value) in self.mix.iter().enumerate() {
             e.push(Edit::SetMixParam { index: index as u8, value });
         }
+        push_chain(&mut e, ChainId::Master, &self.master_chain);
         for (i, g) in self.groups.iter().enumerate() {
             e.push(Edit::InsertGroup(i as u8));
             push_group_state(&mut e, i as u8, g);
@@ -1107,6 +1270,21 @@ impl Project {
                 self.check_destination(group)?;
                 vec![Edit::SetTrackGroup { track, group: self.track(track)?.group }]
             }
+            Edit::SetSlot { chain, slot, kind } => {
+                self.check_set_slot(chain, slot, kind)?;
+                let mut v = Vec::new();
+                push_slot(&mut v, chain, slot, *self.check_slot(chain, slot)?);
+                v
+            }
+            Edit::SwapSlots { chain, a, b } => {
+                self.check_swap(chain, a, b)?;
+                vec![Edit::SwapSlots { chain, a, b }]
+            }
+            Edit::SetSlotParam { chain, slot, index, .. } => {
+                self.slot_param(chain, slot, index)?;
+                let old = self.check_slot(chain, slot)?.map_or(0.0, |d| d.params[usize::from(index)]);
+                vec![Edit::SetSlotParam { chain, slot, index, value: old }]
+            }
         };
         Ok(inv)
     }
@@ -1163,6 +1341,7 @@ impl Project {
                 let _ = writeln!(s, "mix {} {v}", spec.id);
             }
         }
+        write_chain(&mut s, "master_insert", &self.master_chain);
         for g in &self.groups {
             let _ = writeln!(s, "\ngroup {}", sanitize_group_name(&g.name));
             let _ = writeln!(s, "gain_db {}", g.gain_db);
@@ -1174,6 +1353,7 @@ impl Project {
                     let _ = writeln!(s, "param {} {v}", spec.id);
                 }
             }
+            write_chain(&mut s, "insert", &g.chain);
             let _ = writeln!(s, "end");
         }
         for t in &self.tracks {
@@ -1209,6 +1389,7 @@ impl Project {
                     let _ = writeln!(s, "param {} {}", spec.id, v);
                 }
             }
+            write_chain(&mut s, "insert", &t.chain);
             for (k, l) in t.lanes.iter().enumerate() {
                 if let Some(id) = l.target.and_then(|x| lane_id(x, t.kind)) {
                     let _ = writeln!(s, "lane {k} {id} {}", if l.ramp { "ramp" } else { "hold" });
@@ -1261,6 +1442,8 @@ impl Project {
         let mut marker_lines = Vec::new();
         let mut part_lines = Vec::new();
         let mut tempo_lines = Vec::new();
+        // Effects in all chains read so far.
+        let mut inserts = 0usize;
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -1300,6 +1483,9 @@ impl Project {
                             .find(|(_, s)| s.id == id)
                             .ok_or_else(|| err(format!("unknown group parameter '{id}'")))?;
                         g.params[i] = parse_in(value.trim(), spec).map_err(err)?;
+                    }
+                    "insert" | "insert_param" => {
+                        parse_insert_line(&mut g.chain, &mut inserts, key == "insert_param", rest).map_err(err)?;
                     }
                     "end" => p.groups.push(current_group.take().expect("inside a group block")),
                     _ => return Err(err(format!("unknown group key '{key}'"))),
@@ -1343,6 +1529,12 @@ impl Project {
                         t.group = Some((g - 1) as u8);
                     }
                     "pattern" if ver >= 5 => pattern = usize::from(parse_pattern(rest).map_err(err)?),
+                    "insert" | "insert_param" if ver >= 15 => {
+                        if t.lanes.iter().any(|l| l.target.is_some()) {
+                            return Err(err("inserts come before lanes".into()));
+                        }
+                        parse_insert_line(&mut t.chain, &mut inserts, key == "insert_param", rest).map_err(err)?;
+                    }
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
                         let [k, id, mode] = f[..] else {
@@ -1358,11 +1550,28 @@ impl Project {
                         let group_targets = groups.flat_map(|group| {
                             (0..2 + GROUP_PARAMS as u8).map(move |index| LaneTarget::Group { group, index })
                         });
+                        let slots = slot_targets(&t.chain, |slot, kind, index| LaneTarget::Slot { slot, kind, index });
+                        let group_slots = p.groups.iter().enumerate().flat_map(|(g, gd)| {
+                            slot_targets(&gd.chain, move |slot, kind, index| LaneTarget::GroupSlot {
+                                group: g as u8,
+                                slot,
+                                kind,
+                                index,
+                            })
+                        });
+                        let master_slots = slot_targets(&p.master_chain, |slot, kind, index| LaneTarget::MasterSlot {
+                            slot,
+                            kind,
+                            index,
+                        });
                         let target = (0..2 + count)
                             .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
                             .map(LaneTarget::Track)
                             .chain(mix.map(LaneTarget::Mix))
                             .chain(group_targets)
+                            .chain(slots)
+                            .chain(group_slots)
+                            .chain(master_slots)
                             .find(|&x| lane_id(x, t.kind).is_some_and(|s| s == id))
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
                         if target.is_global()
@@ -1563,6 +1772,13 @@ impl Project {
                     p.markers.push(Marker { entry, name: name.to_string() });
                 }
                 "master_gain_db" => p.master_gain_db = parse_in(rest, &VOLUME).map_err(err)?,
+                "master_insert" | "master_insert_param" if ver >= 15 => {
+                    if !p.tracks.is_empty() || !p.groups.is_empty() {
+                        return Err(err("the master's inserts come before groups and tracks".into()));
+                    }
+                    let param = key == "master_insert_param";
+                    parse_insert_line(&mut p.master_chain, &mut inserts, param, rest).map_err(err)?;
+                }
                 "mix" if ver >= 8 => {
                     let (id, value) = rest
                         .split_once(char::is_whitespace)
@@ -1665,13 +1881,78 @@ impl Project {
 }
 
 /// How a lane's target is named in the file: its parameter's id, behind
-/// `group<n>.` (1 for the first group) for a group's.
+/// `group<n>.` (1 for the first group) for a group's and `insert<k>.` for
+/// an insert's (`master.insert<k>.` on the master's chain).
 fn lane_id(target: LaneTarget, kind: InstrumentKind) -> Option<String> {
     let id = target.spec(kind)?.id;
-    Some(match target.group() {
-        Some(g) => format!("group{}.{id}", u32::from(g) + 1),
-        None => id.to_string(),
+    let group = |g: u8| u32::from(g) + 1;
+    Some(match target {
+        LaneTarget::Group { group: g, .. } => format!("group{}.{id}", group(g)),
+        LaneTarget::Slot { slot, .. } => format!("insert{slot}.{id}"),
+        LaneTarget::GroupSlot { group: g, slot, .. } => format!("group{}.insert{slot}.{id}", group(g)),
+        LaneTarget::MasterSlot { slot, .. } => format!("master.insert{slot}.{id}"),
+        LaneTarget::Track(_) | LaneTarget::Mix(_) => id.to_string(),
     })
+}
+
+/// Every lane target of an insert parameter on chain `chain`, as `make`
+/// gives it for a slot, the effect there and a parameter.
+fn slot_targets<'a>(
+    chain: &'a ChainData,
+    make: impl Fn(u8, EffectKind, u8) -> LaneTarget + Copy + 'a,
+) -> impl Iterator<Item = LaneTarget> + 'a {
+    chain
+        .iter()
+        .enumerate()
+        .filter_map(|(s, d)| d.map(|d| (s as u8, d.kind)))
+        .flat_map(move |(s, kind)| (0..kind.params().len() as u8).map(move |i| make(s, kind, i)))
+}
+
+/// Reads an `insert` or `insert_param` line's fields into `chain`, counting
+/// effects in `count`.
+fn parse_insert_line(chain: &mut ChainData, count: &mut usize, param: bool, rest: &str) -> Result<(), String> {
+    let (slot, rest) = rest.split_once(char::is_whitespace).ok_or("expected an insert slot and more")?;
+    let slot: usize = parse_num(slot)?;
+    let d = chain.get_mut(slot).ok_or_else(|| format!("insert slot {slot} out of range (0..{MAX_SLOTS})"))?;
+    let rest = rest.trim();
+    if !param {
+        if d.is_some() {
+            return Err(format!("insert slot {slot} given twice"));
+        }
+        if *count >= MAX_INSERTS {
+            return Err(format!("more than {MAX_INSERTS} inserts"));
+        }
+        let kind = EffectKind::from_id(rest).ok_or_else(|| format!("unknown effect '{rest}'"))?;
+        *d = Some(SlotData::new(kind));
+        *count += 1;
+        return Ok(());
+    }
+    let d = d.as_mut().ok_or_else(|| format!("insert slot {slot} holds no effect"))?;
+    let (id, value) = rest.split_once(char::is_whitespace).ok_or("expected '<id> <value>'")?;
+    let (i, spec) = d
+        .kind
+        .params()
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.id == id)
+        .ok_or_else(|| format!("unknown parameter '{id}' for {}", d.kind.id()))?;
+    d.params[i] = parse_in(value.trim(), spec)?;
+    Ok(())
+}
+
+/// Writes chain `c` as `<key> <slot> <effect>` lines, each followed by
+/// `<key>_param <slot> <id> <value>` lines for its settings off their
+/// default.
+fn write_chain(s: &mut String, key: &str, c: &ChainData) {
+    for (slot, d) in c.iter().enumerate() {
+        let Some(d) = d else { continue };
+        let _ = writeln!(s, "{key} {slot} {}", d.kind.id());
+        for (spec, &v) in d.kind.params().iter().zip(&d.params) {
+            if v != spec.default {
+                let _ = writeln!(s, "{key}_param {slot} {} {v}", spec.id);
+            }
+        }
+    }
 }
 
 /// The letter of pattern `p` (A for 0).
@@ -1755,6 +2036,7 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
     for (index, &value) in t.params.iter().enumerate() {
         e.push(Edit::SetParam { track, index: index as u8, value });
     }
+    push_chain(e, ChainId::Track(track), &t.chain);
     e.push(Edit::SetGain { track, db: t.gain_db });
     e.push(Edit::SetPan { track, pan: t.pan });
     e.push(Edit::SetMute { track, mute: t.mute });
@@ -1790,6 +2072,42 @@ fn push_group_state(e: &mut Vec<Edit>, group: u8, g: &GroupData) {
     e.push(Edit::SetGroupMute { group, mute: g.mute });
     for (index, &value) in g.params.iter().enumerate() {
         e.push(Edit::SetGroupParam { group, index: index as u8, value });
+    }
+    push_chain(e, ChainId::Group(group), &g.chain);
+}
+
+/// Appends the edits that fill the empty chain `chain` as `c` is.
+fn push_chain(e: &mut Vec<Edit>, chain: ChainId, c: &ChainData) {
+    for (slot, d) in c.iter().enumerate() {
+        if d.is_some() {
+            push_slot(e, chain, slot as u8, *d);
+        }
+    }
+}
+
+/// Appends the edits that put `d` (an effect and its settings, or nothing)
+/// in slot `slot` of `chain`.
+fn push_slot(e: &mut Vec<Edit>, chain: ChainId, slot: u8, d: Option<SlotData>) {
+    e.push(Edit::SetSlot { chain, slot, kind: d.map(|d| d.kind) });
+    if let Some(d) = d {
+        for (index, spec) in d.kind.params().iter().enumerate() {
+            let value = d.params[index];
+            if value != spec.default {
+                e.push(Edit::SetSlotParam { chain, slot, index: index as u8, value });
+            }
+        }
+    }
+}
+
+/// `x`, an insert's lane target, on the slot `to` gives for its own.
+fn with_slot(x: LaneTarget, to: impl Fn(u8) -> u8) -> LaneTarget {
+    match x {
+        LaneTarget::Slot { slot, kind, index } => LaneTarget::Slot { slot: to(slot), kind, index },
+        LaneTarget::GroupSlot { group, slot, kind, index } => {
+            LaneTarget::GroupSlot { group, slot: to(slot), kind, index }
+        }
+        LaneTarget::MasterSlot { slot, kind, index } => LaneTarget::MasterSlot { slot: to(slot), kind, index },
+        other => other,
     }
 }
 
@@ -1849,6 +2167,236 @@ fn parse_in(s: &str, spec: &ParamSpec) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::insert::BYPASS;
+
+    fn param_id(kind: EffectKind, id: &str) -> u8 {
+        kind.params().iter().position(|s| s.id == id).unwrap() as u8
+    }
+
+    #[test]
+    fn insert_chains_round_trip_rebuild_and_invert() {
+        use EffectKind::*;
+        let mut p = Project::demo();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        p.apply(Edit::SetTrackGroup { track: 1, group: Some(0) }).unwrap();
+        let before = p.clone();
+        let (t, g) = (ChainId::Track(2), ChainId::Group(0));
+        let delay_mix = param_id(Delay, "mix");
+        let edits = [
+            Edit::SetSlot { chain: t, slot: 0, kind: Some(Drive) },
+            Edit::SetSlot { chain: t, slot: 3, kind: Some(Delay) },
+            Edit::SetSlotParam { chain: t, slot: 3, index: delay_mix, value: 0.6 },
+            Edit::SetSlot { chain: g, slot: 1, kind: Some(Compressor) },
+            Edit::SetSlotParam { chain: g, slot: 1, index: BYPASS as u8, value: 1.0 },
+            Edit::SetSlot { chain: ChainId::Master, slot: 7, kind: Some(Reverb) },
+            Edit::SetLane {
+                track: 2,
+                lane: 0,
+                target: Some(LaneTarget::Slot { slot: 3, kind: Delay, index: delay_mix }),
+                ramp: true,
+            },
+            Edit::SetPoint { track: 2, lane: 0, pattern: 0, step: 0, value: Some(0.9) },
+            Edit::SetLane {
+                track: 0,
+                lane: 1,
+                target: Some(LaneTarget::MasterSlot { slot: 7, kind: Reverb, index: param_id(Reverb, "mix") }),
+                ramp: false,
+            },
+            Edit::SetLane {
+                track: 4,
+                lane: 0,
+                target: Some(LaneTarget::GroupSlot {
+                    group: 0,
+                    slot: 1,
+                    kind: Compressor,
+                    index: param_id(Compressor, "comp_ratio"),
+                }),
+                ramp: false,
+            },
+        ];
+        let mut undo = Vec::new();
+        for e in edits {
+            undo.push(p.inverse(&e).unwrap());
+            p.apply(e).unwrap();
+        }
+        assert_eq!(p.insert_count(), 4);
+        let text = p.to_text();
+        assert!(text.contains("\nmaster_insert 7 reverb\n"), "{text}");
+        assert!(text.find("\nmaster_insert").unwrap() < text.find("\ngroup ").unwrap(), "{text}");
+        assert!(text.contains("\ninsert 0 drive\ninsert 3 delay\ninsert_param 3 mix 0.6\n"), "{text}");
+        assert!(text.contains("\ninsert 1 compressor\ninsert_param 1 bypass 1\nend\n"), "{text}");
+        assert!(text.contains("\nlane 0 insert3.mix ramp\n"), "{text}");
+        assert!(text.contains("\nlane 1 master.insert7.mix hold\n"), "{text}");
+        assert!(text.contains("\nlane 0 group1.insert1.comp_ratio hold\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        let mut q = Project::new();
+        for e in p.to_edits() {
+            q.apply(e).unwrap();
+        }
+        for (a, b) in q.tracks.iter_mut().zip(&p.tracks) {
+            a.name = b.name.clone();
+        }
+        assert_eq!(q, p, "the edits rebuild the chains and their lanes");
+        for inv in undo.into_iter().rev() {
+            for e in inv {
+                p.apply(e).unwrap();
+            }
+        }
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn insert_edits_are_validated() {
+        use EffectKind::*;
+        let mut p = Project::demo();
+        let t = ChainId::Track(0);
+        assert_eq!(p.apply(Edit::SetSlot { chain: t, slot: 8, kind: Some(Eq) }), Err(EditError::NoSuchSlot(8)));
+        assert_eq!(
+            p.apply(Edit::SetSlot { chain: ChainId::Group(0), slot: 0, kind: Some(Eq) }),
+            Err(EditError::NoSuchGroup(0))
+        );
+        assert_eq!(
+            p.apply(Edit::SetSlotParam { chain: t, slot: 2, index: 0, value: 1.0 }),
+            Err(EditError::EmptySlot(2))
+        );
+        p.apply(Edit::SetSlot { chain: t, slot: 2, kind: Some(Drive) }).unwrap();
+        assert_eq!(
+            p.apply(Edit::SetSlotParam { chain: t, slot: 2, index: 2, value: 1.0 }),
+            Err(EditError::NoSuchParam(2))
+        );
+        assert_eq!(p.apply(Edit::SwapSlots { chain: t, a: 2, b: 8 }), Err(EditError::NoSuchSlot(8)));
+        // Values are clamped to the parameter's range.
+        p.apply(Edit::SetSlotParam { chain: t, slot: 2, index: 1, value: 1e9 }).unwrap();
+        assert_eq!(p.tracks[0].chain[2].unwrap().params[1], Drive.params()[1].max);
+        // A lane must automate the kind the slot holds.
+        let wrong = LaneTarget::Slot { slot: 2, kind: Eq, index: 1 };
+        assert!(p.apply(Edit::SetLane { track: 0, lane: 0, target: Some(wrong), ramp: false }).is_err());
+        let empty = LaneTarget::Slot { slot: 5, kind: Eq, index: 1 };
+        assert!(p.apply(Edit::SetLane { track: 0, lane: 0, target: Some(empty), ramp: false }).is_err());
+        let lane = LaneTarget::Slot { slot: 2, kind: Drive, index: 1 };
+        p.apply(Edit::SetLane { track: 0, lane: 0, target: Some(lane), ramp: false }).unwrap();
+        // An automated slot keeps its kind; a fresh one of the same kind is fine.
+        assert_eq!(p.apply(Edit::SetSlot { chain: t, slot: 2, kind: Some(Eq) }), Err(EditError::SlotAutomated(2)));
+        assert_eq!(p.apply(Edit::SetSlot { chain: t, slot: 2, kind: None }), Err(EditError::SlotAutomated(2)));
+        p.apply(Edit::SetSlot { chain: t, slot: 2, kind: Some(Drive) }).unwrap();
+        assert_eq!(
+            p.tracks[0].chain[2].unwrap().params[1],
+            Drive.params()[1].default,
+            "a new effect is at its defaults"
+        );
+        // A swap takes the lanes along, and undoes.
+        let before = p.clone();
+        let inv = p.inverse(&Edit::SwapSlots { chain: t, a: 2, b: 6 }).unwrap();
+        p.apply(Edit::SwapSlots { chain: t, a: 2, b: 6 }).unwrap();
+        assert!(p.tracks[0].chain[2].is_none() && p.tracks[0].chain[6].is_some());
+        assert_eq!(p.tracks[0].lanes[0].target, Some(LaneTarget::Slot { slot: 6, kind: Drive, index: 1 }));
+        for e in inv {
+            p.apply(e).unwrap();
+        }
+        assert_eq!(p, before);
+        // A track's slot targets are its own: another track's lane on slot 2 finds nothing there.
+        assert!(p.apply(Edit::SetLane { track: 1, lane: 0, target: Some(lane), ramp: false }).is_err());
+        // A group's and the master's slots are automated from one lane at most, on whichever track.
+        p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(Chorus) }).unwrap();
+        let master = LaneTarget::MasterSlot { slot: 0, kind: Chorus, index: 1 };
+        p.apply(Edit::SetLane { track: 1, lane: 0, target: Some(master), ramp: false }).unwrap();
+        assert!(p.apply(Edit::SetLane { track: 2, lane: 0, target: Some(master), ramp: false }).is_err());
+        p.apply(Edit::SwapSlots { chain: ChainId::Master, a: 0, b: 1 }).unwrap();
+        assert_eq!(p.tracks[1].lanes[0].target, Some(LaneTarget::MasterSlot { slot: 1, kind: Chorus, index: 1 }));
+    }
+
+    #[test]
+    fn a_project_holds_at_most_max_inserts() {
+        let mut p = Project::new();
+        while p.tracks.len() < MAX_INSERTS / MAX_SLOTS {
+            p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        }
+        for t in 0..p.tracks.len() as u8 {
+            for slot in 0..MAX_SLOTS as u8 {
+                p.apply(Edit::SetSlot { chain: ChainId::Track(t), slot, kind: Some(EffectKind::Eq) }).unwrap();
+            }
+        }
+        assert_eq!(p.insert_count(), MAX_INSERTS);
+        let more = Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Eq) };
+        assert_eq!(p.apply(more), Err(EditError::TooManyInserts));
+        // Replacing or removing one is still fine, and frees room.
+        p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Drive) }).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 1, kind: None }).unwrap();
+        p.apply(more).unwrap();
+        let text = p.to_text();
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        let over = text.replace("master_insert 0 eq\n", "master_insert 0 eq\nmaster_insert 1 eq\n");
+        assert_ne!(over, text);
+        assert!(Project::from_text(&over).is_err(), "one more than the limit: {over}");
+    }
+
+    #[test]
+    fn removed_tracks_and_groups_come_back_with_their_chains() {
+        let mut p = Project::demo();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Group(0), slot: 4, kind: Some(EffectKind::Delay) }).unwrap();
+        p.apply(Edit::SetSlotParam { chain: ChainId::Group(0), slot: 4, index: 1, value: 3.0 }).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Track(3), slot: 0, kind: Some(EffectKind::Reverb) }).unwrap();
+        let lane = LaneTarget::Slot { slot: 0, kind: EffectKind::Reverb, index: 1 };
+        p.apply(Edit::SetLane { track: 3, lane: 2, target: Some(lane), ramp: true }).unwrap();
+        let before = p.clone();
+        for e in [Edit::RemoveTrack(3), Edit::RemoveGroup(0)] {
+            let inv = p.inverse(&e).unwrap();
+            p.apply(e).unwrap();
+            for e in inv {
+                p.apply(e).unwrap();
+            }
+            assert_eq!(p, before);
+        }
+        // A group inserted in front renumbers the lanes on the chains behind it.
+        let glane = LaneTarget::GroupSlot { group: 0, slot: 4, kind: EffectKind::Delay, index: 1 };
+        p.apply(Edit::SetLane { track: 0, lane: 3, target: Some(glane), ramp: false }).unwrap();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        assert_eq!(
+            p.tracks[0].lanes[3].target,
+            Some(LaneTarget::GroupSlot { group: 1, slot: 4, kind: EffectKind::Delay, index: 1 })
+        );
+        assert!(p.groups[0].chain.iter().all(Option::is_none) && p.groups[1].chain[4].is_some());
+    }
+
+    #[test]
+    fn insert_lines_are_validated() {
+        for bad in [
+            "tinvo 14\nmaster_insert 0 eq",
+            "tinvo 14\ntrack kick\ninsert 0 eq\nend",
+            "tinvo 15\ntrack kick\ninsert 8 eq\nend",
+            "tinvo 15\ntrack kick\ninsert 0 flanger\nend",
+            "tinvo 15\ntrack kick\ninsert 0\nend",
+            "tinvo 15\ntrack kick\ninsert x eq\nend",
+            "tinvo 15\ntrack kick\ninsert 0 eq\ninsert 0 drive\nend",
+            "tinvo 15\ntrack kick\ninsert_param 0 bypass 1\nend",
+            "tinvo 15\ntrack kick\ninsert 0 eq\ninsert_param 0 nope 1\nend",
+            "tinvo 15\ntrack kick\ninsert 0 drive\ninsert_param 0 bypass\nend",
+            "tinvo 15\ntrack kick\ninsert 0 drive\ninsert_param 0 drive x\nend",
+            "tinvo 15\ntrack kick\ninsert 0 eq\nlane 0 insert0.mix hold\nend",
+            "tinvo 15\ntrack kick\nlane 0 insert0.bypass hold\nend",
+            "tinvo 15\ntrack kick\ninsert 0 eq\nlane 0 insert0.bypass hold\ninsert 1 eq\nend",
+            "tinvo 15\ntrack kick\nend\nmaster_insert 0 eq",
+            "tinvo 15\ngroup G\nend\nmaster_insert 0 eq",
+            "tinvo 15\nmaster_insert 0 eq\nmaster_insert 0 eq",
+            "tinvo 15\nmaster_insert_param 0 bypass 1",
+            "tinvo 15\ntrack kick\nlane 0 master.insert0.bypass hold\nend",
+            "tinvo 15\ngroup G\ninsert 0 eq\nend\ntrack kick\nlane 0 group1.insert0.mix hold\nend",
+            "tinvo 15\ngroup G\ninsert 0 eq\nend\ntrack kick\nlane 0 group2.insert0.bypass hold\nend",
+        ] {
+            assert!(Project::from_text(bad).is_err(), "{bad}");
+        }
+        let good = "tinvo 15\nmaster_insert 2 chorus\nmaster_insert_param 2 mix 0.5\ngroup G\ninsert 0 eq\nend\n\
+                    track kick\ninsert 7 drive\ninsert_param 7 drive 0.25\nlane 0 group1.insert0.bypass hold\nend";
+        let p = Project::from_text(good).unwrap();
+        assert_eq!(p.master_chain[2].unwrap().params[3], 0.5);
+        assert_eq!(p.groups[0].chain[0].unwrap().kind, EffectKind::Eq);
+        assert_eq!(p.tracks[0].chain[7].unwrap().params[1], 0.25);
+        assert_eq!(
+            p.tracks[0].lanes[0].target,
+            Some(LaneTarget::GroupSlot { group: 0, slot: 0, kind: EffectKind::Eq, index: 0 })
+        );
+    }
 
     #[test]
     fn the_showcase_example_loads_and_round_trips() {

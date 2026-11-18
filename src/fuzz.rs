@@ -36,13 +36,14 @@
 
 use crate::dsp::noise::Rng;
 use crate::engine::{
-    Command, Division, Edit, Engine, LaneTarget, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, Meter, Part, Shared,
-    Step,
+    ChainId, Command, Division, Edit, Engine, LaneTarget, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, Meter, Part,
+    Shared, Step,
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
+use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_SLOTS};
 use crate::instrument::InstrumentKind;
 use crate::mix::{MIX_PARAMS, mp, send};
-use crate::project::{GroupData, LaneData, Project, TrackData, sanitize_group_name, sanitize_name};
+use crate::project::{GroupData, LaneData, Project, SlotData, TrackData, sanitize_group_name, sanitize_name};
 use crate::render::Source;
 use crate::sample::{self, Sample};
 use crate::smf;
@@ -398,8 +399,12 @@ fn mutate_bytes(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 // ---------------------------------------------------------------- projects
 
-const PROJECT_KEYS: [&str; 25] = [
+const PROJECT_KEYS: [&str; 29] = [
     "tinvo",
+    "master_insert",
+    "master_insert_param",
+    "insert",
+    "insert_param",
     "tempo",
     "swing",
     "pattern_length",
@@ -477,7 +482,18 @@ const ODD_TOKENS: [&str; 44] = [
 const ODD_CHARS: [&str; 10] = ["\u{a0}", "\u{2028}", "\u{85}", "\t", "\u{0}", "\u{b}", "é", "#", "🎹", "\u{feff}"];
 
 fn token(rng: &mut Rng) -> String {
-    match below(rng, 7) {
+    match below(rng, 8) {
+        7 => {
+            // An effect, one of its parameters, or a lane on one.
+            let kind = EffectKind::ALL[below(rng, EffectKind::ALL.len())];
+            let id = kind.params()[below(rng, kind.params().len())].id;
+            match below(rng, 4) {
+                0 => kind.id().to_string(),
+                1 => id.to_string(),
+                2 => format!("insert{}.{id}", below(rng, MAX_SLOTS + 1)),
+                _ => format!("{}.insert{}.{id}", ["master", "group1", "group2"][below(rng, 3)], below(rng, MAX_SLOTS)),
+            }
+        }
         0 => ODD_TOKENS[below(rng, ODD_TOKENS.len())].to_string(),
         1 => {
             let kind = InstrumentKind::ALL[below(rng, InstrumentKind::ALL.len())];
@@ -596,6 +612,23 @@ fn project_seeds() -> Vec<Vec<u8>> {
         t.lanes[1] = LaneData::new(Some(LaneTarget::Group { group: 0, index: 1 }), true);
         t.lanes[1].points[0][2] = Some(-1.0);
         t.lanes[1].points[0][9] = Some(1.0);
+    }
+    {
+        // An effect in each kind of chain, one off its defaults, and lanes on them.
+        rich.master_chain[7] = Some(SlotData::new(EffectKind::Reverb));
+        let mut delay = SlotData::new(EffectKind::Delay);
+        delay.params[2] = 0.8;
+        rich.groups[0].chain[0] = Some(delay);
+        rich.tracks[4].chain[3] = Some(SlotData::new(EffectKind::Drive));
+        rich.tracks[4].chain[5] = Some(SlotData::new(EffectKind::Chorus));
+        let t = &mut rich.tracks[4];
+        t.lanes[0] = LaneData::new(Some(LaneTarget::Slot { slot: 3, kind: EffectKind::Drive, index: 1 }), true);
+        t.lanes[0].points[0][4] = Some(12.0);
+        let target = LaneTarget::GroupSlot { group: 0, slot: 0, kind: EffectKind::Delay, index: 5 };
+        t.lanes[1] = LaneData::new(Some(target), false);
+        t.lanes[1].points[0][0] = Some(0.9);
+        let target = LaneTarget::MasterSlot { slot: 7, kind: EffectKind::Reverb, index: 0 };
+        rich.tracks[5].lanes[2] = LaneData::new(Some(target), false);
     }
     let mut sampler = TrackData::new(InstrumentKind::Sampler);
     sampler.name = "Loop é".into();
@@ -1194,7 +1227,36 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
     let entry = s.u16() % (MAX_SONG as u16 + 2);
     let group = s.below(MAX_GROUPS + 1) as u8;
     let kind_of = |t: u8| p.tracks.get(usize::from(t)).map(|t| t.kind);
-    let edit = match s.below(26) {
+    let edit = match s.below(28) {
+        26 | 27 => {
+            let chain = match s.below(4) {
+                0 => ChainId::Master,
+                1 => ChainId::Group(group),
+                _ => ChainId::Track(track),
+            };
+            let slot = s.below(MAX_SLOTS + 1) as u8;
+            let held = p.chain(chain).ok().and_then(|c| c.get(usize::from(slot)).copied().flatten());
+            let kind = EffectKind::ALL[s.below(EffectKind::ALL.len())];
+            let index = s.below(MAX_INSERT_PARAMS + 1) as u8;
+            match s.below(5) {
+                0 | 1 => Edit::SetSlot { chain, slot, kind: (s.below(4) != 0).then_some(kind) },
+                2 => Edit::SwapSlots { chain, a: slot, b: s.below(MAX_SLOTS + 1) as u8 },
+                3 => {
+                    // Mostly the kind the slot holds, so lanes take.
+                    let kind = held.filter(|_| s.below(4) != 0).map_or(kind, |d| d.kind);
+                    let target = match chain {
+                        ChainId::Master => LaneTarget::MasterSlot { slot, kind, index },
+                        ChainId::Group(group) => LaneTarget::GroupSlot { group, slot, kind, index },
+                        ChainId::Track(_) => LaneTarget::Slot { slot, kind, index },
+                    };
+                    Edit::SetLane { track, lane: s.below(6) as u8, target: Some(target), ramp: s.byte() & 1 == 1 }
+                }
+                _ => {
+                    let spec = held.and_then(|d| d.kind.params().get(usize::from(index)));
+                    Edit::SetSlotParam { chain, slot, index, value: s.value(spec) }
+                }
+            }
+        }
         0 => Edit::SetTempo(s.f32()),
         1 if s.byte() & 1 == 0 => Edit::SetPatternLength { pattern, len: s.below(MAX_STEPS + 2) as u8 },
         1 if s.byte() & 1 == 0 => {

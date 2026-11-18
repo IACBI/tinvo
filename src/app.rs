@@ -10,11 +10,12 @@ use crate::autosave::{self, Autosave};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
-    Command, Division, Edit, Engine, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET, MAX_PATTERNS,
-    MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, RETIRE_QUEUE, Shared,
-    Step, TAKE_QUEUE, Take as TakeEvent, part_position,
+    ChainId, Command, Division, Edit, Engine, HELD_FOR_GOOD, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET,
+    MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition,
+    RETIRE_QUEUE, Retired, Shared, Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
 use crate::group::{MAX_GROUPS, group_param};
+use crate::insert::{EffectKind, Insert, MAX_SLOTS};
 use crate::instrument::{InstrumentKind, ParamSpec};
 use crate::keymap::{Action, Context, Keymap};
 use crate::lock::{self, Lock};
@@ -22,7 +23,7 @@ use crate::midi::schedule::{self, OutSlot, OutputThread};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::note_take::{MAX_TAKE_NOTES, NoteTake, follow_track};
-use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, VOLUME, pattern_name};
+use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, SlotData, VOLUME, pattern_name};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
@@ -76,16 +77,17 @@ const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 /// order and retried, so the engine never misses an edit. It also receives
 /// the samples the engine has released and frees them here, on the UI thread.
 ///
-/// Every sample the engine holds or releases arrived in a `SetSample`
-/// command and is released at most once, so the retirement queue never
-/// holds more than the samples sent and not yet received back. Keeping that
-/// count at most `RETIRE_QUEUE` means the engine's push into the queue
-/// cannot fail; a sample command waits in the backlog until there is room.
+/// Every sample or effect the engine holds or releases arrived in a
+/// `SetSample` or `SetSlot` command (or was built with the engine) and is
+/// released at most once, so the retirement queue never holds more than
+/// those sent and not yet received back. Keeping that count at most
+/// the queue's capacity means the engine's push into the queue cannot fail; a
+/// command carrying one waits in the backlog until there is room.
 pub struct EngineLink {
     tx: Producer<Command>,
     backlog: VecDeque<Command>,
     shared: Arc<Shared>,
-    retired: Option<Consumer<Arc<Sample>>>,
+    retired: Option<Consumer<Retired>>,
     in_flight: usize,
     takes: Option<Consumer<TakeEvent>>,
     /// [`Command::RecordNotes`] commands sent, to compare with the count
@@ -121,9 +123,13 @@ impl EngineLink {
     }
 
     /// Takes over the receiving end of the engine's retirement queue.
-    /// `held` is the number of samples the engine was given before this
-    /// link existed; they come back through the queue like any other.
-    pub fn with_retirement(mut self, retired: Consumer<Arc<Sample>>, held: usize) -> Self {
+    /// `held` is the number of samples and effects the engine was given
+    /// before this link existed; they come back through the queue like any
+    /// other. The queue needs room beyond [`HELD_FOR_GOOD`], for what is on
+    /// its way back, or a change could wait for a place forever.
+    pub fn with_retirement(mut self, retired: Consumer<Retired>, held: usize) -> Self {
+        assert!(retired.capacity() > HELD_FOR_GOOD, "a retirement queue of {} places is too small", retired.capacity());
+        debug_assert!(held <= HELD_FOR_GOOD, "the engine holds more than a project can");
         self.retired = Some(retired);
         self.in_flight = held;
         self
@@ -153,8 +159,9 @@ impl EngineLink {
     }
 
     fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
-        let carries = self.retired.is_some() && matches!(&cmd, Command::SetSample { sample: Some(_), .. });
-        if carries && self.in_flight >= RETIRE_QUEUE {
+        let carries = self.retired.is_some()
+            && matches!(&cmd, Command::SetSample { sample: Some(_), .. } | Command::SetSlot { insert: Some(_), .. });
+        if carries && self.in_flight >= self.retired.as_ref().map_or(0, Consumer::capacity) {
             return Err(cmd);
         }
         self.tx.push(cmd)?;
@@ -233,6 +240,18 @@ struct Change {
     at: Instant,
 }
 
+/// The command that hands `edit` to the engine. A new effect is built
+/// here, since building one allocates and the engine must not.
+pub fn engine_command(edit: Edit, sample_rate: u32) -> Command {
+    match edit {
+        Edit::SetSlot { chain, slot, kind } => {
+            let insert = kind.map(|k| Box::new(Insert::new(k, sample_rate as f32, 120.0)));
+            Command::SetSlot { chain, slot, insert }
+        }
+        e => Command::Edit(e),
+    }
+}
+
 /// Identifies the value an edit sets, for coalescing repeated nudges.
 fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
     Some(match *e {
@@ -254,6 +273,14 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
         Edit::SetGroupGain { group, .. } => (11 + MAX_LANES as u8, group, 0, 0),
         Edit::SetGroupPan { group, .. } => (11 + MAX_LANES as u8, group, 1, 0),
         Edit::SetGroupParam { group, index, .. } => (12 + MAX_LANES as u8, group, index, 0),
+        Edit::SetSlotParam { chain, slot, index, .. } => {
+            let c = match chain {
+                ChainId::Track(t) => t,
+                ChainId::Group(g) => MAX_TRACKS as u8 + g,
+                ChainId::Master => u8::MAX,
+            };
+            (13 + MAX_LANES as u8, c, slot, index)
+        }
         _ => return None,
     })
 }
@@ -308,6 +335,10 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetGroupPan { .. } => "group pan",
         Edit::SetGroupMute { .. } => "group mute",
         Edit::SetGroupParam { .. } => "group parameter",
+        Edit::SetSlot { kind: Some(_), .. } => "insert effect",
+        Edit::SetSlot { kind: None, .. } => "remove effect",
+        Edit::SwapSlots { .. } => "move effect",
+        Edit::SetSlotParam { .. } => "effect setting",
         Edit::SetTrackGroup { .. } => "track group",
     }
 }
@@ -323,6 +354,17 @@ pub enum Page {
     Group,
     /// The buses and the master, shared by all tracks.
     Mix,
+    /// An insert chain: the selected track's, its group's or the master's.
+    Inserts,
+}
+
+/// Which insert chain the inserts page shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertsOf {
+    Track,
+    /// The selected track's group, or the track's own chain if it has none.
+    Group,
+    Master,
 }
 
 /// Panel index of the first bus and master parameter; lower indices are
@@ -334,7 +376,42 @@ const MIX_INDEX: usize = 1 << 10;
 const GROUP_INDEX: usize = 2 << 10;
 const GROUP_STRIDE: usize = 64;
 
-/// The lane target of panel parameter `i`.
+/// Panel index of the first parameter of slot 0 of the selected track's
+/// insert chain; slot `k`'s parameter `i` is [`SLOT_STRIDE`] × `k` + `i`
+/// after it. Group `g`'s chain starts [`CHAIN_STRIDE`] × `g` after
+/// [`GROUP_SLOT_INDEX`], and the master's at [`MASTER_SLOT_INDEX`].
+const SLOT_INDEX: usize = 3 << 10;
+const GROUP_SLOT_INDEX: usize = 4 << 10;
+const MASTER_SLOT_INDEX: usize = 5 << 10;
+const SLOT_STRIDE: usize = 16;
+const CHAIN_STRIDE: usize = MAX_SLOTS * SLOT_STRIDE;
+
+/// The chain, slot and effect parameter of panel parameter `i`, if it is an
+/// insert's; `track` is the selected track.
+fn slot_of_param(i: usize, track: u8) -> Option<(ChainId, u8, u8)> {
+    let (chain, j) = match i {
+        MASTER_SLOT_INDEX.. => (ChainId::Master, i - MASTER_SLOT_INDEX),
+        GROUP_SLOT_INDEX.. => {
+            let j = i - GROUP_SLOT_INDEX;
+            (ChainId::Group((j / CHAIN_STRIDE) as u8), j % CHAIN_STRIDE)
+        }
+        SLOT_INDEX.. => (ChainId::Track(track), i - SLOT_INDEX),
+        _ => return None,
+    };
+    Some((chain, (j / SLOT_STRIDE) as u8, (j % SLOT_STRIDE) as u8))
+}
+
+/// The panel index of parameter `index` of slot `slot` of `chain`.
+fn param_of_slot(chain: ChainId, slot: u8, index: u8) -> usize {
+    let first = match chain {
+        ChainId::Track(_) => SLOT_INDEX,
+        ChainId::Group(g) => GROUP_SLOT_INDEX + usize::from(g) * CHAIN_STRIDE,
+        ChainId::Master => MASTER_SLOT_INDEX,
+    };
+    first + usize::from(slot) * SLOT_STRIDE + usize::from(index)
+}
+
+/// The lane target of panel parameter `i` (not an insert's).
 fn target_of_param(i: usize) -> LaneTarget {
     if i >= GROUP_INDEX {
         let j = i - GROUP_INDEX;
@@ -352,6 +429,9 @@ fn param_of_target(t: LaneTarget) -> usize {
         LaneTarget::Track(i) => usize::from(i),
         LaneTarget::Mix(i) => MIX_INDEX + usize::from(i),
         LaneTarget::Group { group, index } => GROUP_INDEX + usize::from(group) * GROUP_STRIDE + usize::from(index),
+        LaneTarget::Slot { slot, index, .. } => param_of_slot(ChainId::Track(0), slot, index),
+        LaneTarget::GroupSlot { group, slot, index, .. } => param_of_slot(ChainId::Group(group), slot, index),
+        LaneTarget::MasterSlot { slot, index, .. } => param_of_slot(ChainId::Master, slot, index),
     }
 }
 
@@ -541,6 +621,7 @@ pub struct App {
     pub lane: usize,
     /// What the parameter panel shows.
     pub page: Page,
+    pub inserts_of: InsertsOf,
     pub export_format: SampleFormat,
     pub export_loops: u32,
     /// What export plays; `Pattern` means the pattern being edited.
@@ -750,6 +831,7 @@ impl App {
             auto_view: false,
             lane: 0,
             page: Page::Instrument,
+            inserts_of: InsertsOf::Track,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
             export_source: Source::Auto,
@@ -1334,7 +1416,7 @@ impl App {
                     r.take.edited(&applied);
                 }
                 if let Some(l) = &mut self.link {
-                    l.send(Command::Edit(applied));
+                    l.send(engine_command(applied, self.sample_rate));
                 }
                 Some(applied)
             }
@@ -1889,7 +1971,7 @@ impl App {
     fn fader_slot(p: usize) -> Option<usize> {
         match p {
             0 | 1 => Some(p),
-            GROUP_INDEX.. if (p - GROUP_INDEX) % GROUP_STRIDE < 2 => Some((p - GROUP_INDEX) % GROUP_STRIDE),
+            GROUP_INDEX..SLOT_INDEX if (p - GROUP_INDEX) % GROUP_STRIDE < 2 => Some((p - GROUP_INDEX) % GROUP_STRIDE),
             _ => None,
         }
     }
@@ -1907,6 +1989,17 @@ impl App {
         if self.page == Page::Mix {
             return (MIX_INDEX..MIX_INDEX + mix::mp::COUNT).collect();
         }
+        if self.page == Page::Inserts {
+            // An empty slot shows as its bypass, so it can be selected.
+            let chain = self.insert_chain();
+            let Ok(slots) = self.project.chain(chain) else { return Vec::new() };
+            return (0..MAX_SLOTS as u8)
+                .flat_map(|k| {
+                    let n = slots[usize::from(k)].as_ref().map_or(1, |d| d.kind.params().len());
+                    (0..n as u8).map(move |i| param_of_slot(chain, k, i))
+                })
+                .collect();
+        }
         let Some(t) = self.project.tracks.get(self.track) else { return Vec::new() };
         if let (Page::Group, Some(g)) = (self.page, t.group) {
             let first = GROUP_INDEX + usize::from(g) * GROUP_STRIDE;
@@ -1921,7 +2014,63 @@ impl App {
         [0, 1].into_iter().chain(rest).collect()
     }
 
+    /// The chain the inserts page shows: the master's when there is no
+    /// track to show one of.
+    fn insert_chain(&self) -> ChainId {
+        let Some(t) = self.project.tracks.get(self.track) else { return ChainId::Master };
+        match (self.inserts_of, t.group) {
+            (InsertsOf::Master, _) => ChainId::Master,
+            (InsertsOf::Group, Some(g)) => ChainId::Group(g),
+            _ => ChainId::Track(self.track as u8),
+        }
+    }
+
+    /// The name the inserts page gives `chain`.
+    fn chain_name(&self, chain: ChainId) -> String {
+        match chain {
+            ChainId::Track(t) => self.project.tracks.get(usize::from(t)).map_or(String::new(), |t| t.name.clone()),
+            ChainId::Group(g) => self.project.groups.get(usize::from(g)).map_or(String::new(), |g| g.name.clone()),
+            ChainId::Master => "Master".to_string(),
+        }
+    }
+
+    /// The label and value text of panel parameter `i`. A slot's bypass
+    /// stands for the slot, so it shows the slot's number and effect.
+    fn param_text(&self, i: usize) -> (String, String) {
+        if let Some((chain, slot, 0)) = slot_of_param(i, self.track as u8) {
+            return match self.slot_data(chain, slot) {
+                Some(d) => {
+                    let state = if d.params[0] >= 1.0 { "bypassed" } else { "on" };
+                    (format!("{} {}", slot + 1, d.kind.label()), state.to_string())
+                }
+                None => (format!("{} -", slot + 1), "empty".to_string()),
+            };
+        }
+        let spec = self.param_spec(i);
+        (spec.label.to_string(), spec.format(self.param_value(i)))
+    }
+
+    /// The effect in slot `slot` of `chain`.
+    fn slot_data(&self, chain: ChainId, slot: u8) -> Option<&SlotData> {
+        self.project.chain(chain).ok()?.get(usize::from(slot))?.as_ref()
+    }
+
+    /// The lane target of panel parameter `i`.
+    fn target_of_param(&self, i: usize) -> LaneTarget {
+        let Some((chain, slot, index)) = slot_of_param(i, self.track as u8) else { return target_of_param(i) };
+        let kind = self.slot_data(chain, slot).map_or(EffectKind::Eq, |d| d.kind);
+        match chain {
+            ChainId::Track(_) => LaneTarget::Slot { slot, kind, index },
+            ChainId::Group(group) => LaneTarget::GroupSlot { group, slot, kind, index },
+            ChainId::Master => LaneTarget::MasterSlot { slot, kind, index },
+        }
+    }
+
     fn param_spec(&self, i: usize) -> &'static ParamSpec {
+        if let Some((chain, slot, index)) = slot_of_param(i, self.track as u8) {
+            let kind = self.slot_data(chain, slot).map_or(EffectKind::Eq, |d| d.kind);
+            return kind.params().get(usize::from(index)).unwrap_or(&kind.params()[0]);
+        }
         match i {
             0 => &VOLUME,
             1 => &PAN,
@@ -1936,6 +2085,9 @@ impl App {
     }
 
     fn param_value(&self, i: usize) -> f32 {
+        if let Some((chain, slot, index)) = slot_of_param(i, self.track as u8) {
+            return self.slot_data(chain, slot).map_or(0.0, |d| d.params[usize::from(index)]);
+        }
         if i >= GROUP_INDEX {
             let j = i - GROUP_INDEX;
             let Some(g) = self.project.groups.get(j / GROUP_STRIDE) else { return 0.0 };
@@ -1958,6 +2110,15 @@ impl App {
 
     fn set_param_value(&mut self, i: usize, value: f32, coalesce: bool) {
         let track = self.track as u8;
+        if let Some((chain, slot, index)) = slot_of_param(i, track) {
+            if self.slot_data(chain, slot).is_none() {
+                let keys = self.keys.labels(&[Action::PrevEffect, Action::NextEffect]);
+                self.set_status(format!("Slot {} is empty: {keys} puts an effect in it", slot + 1));
+                return;
+            }
+            self.edit_with(Edit::SetSlotParam { chain, slot, index, value }, coalesce);
+            return;
+        }
         let e = match i {
             0 => Edit::SetGain { track, db: value },
             1 => Edit::SetPan { track, pan: value },
@@ -2772,6 +2933,71 @@ impl App {
     }
 
     /// The status line for the Group page, shown for a track in a group.
+    fn inserts_page_status(&self) -> String {
+        let name = self.chain_name(self.insert_chain());
+        format!(
+            "Insert effects of {name} ({} chain, {} effect, {} move, {}: instrument)",
+            self.k(Action::InsertChain),
+            self.keys.labels(&[Action::PrevEffect, Action::NextEffect]),
+            self.keys.labels(&[Action::EffectEarlier, Action::EffectLater]),
+            self.k(Action::Page)
+        )
+    }
+
+    /// Changes the effect in the selected slot of the inserts page: the
+    /// next or previous kind (`step`), or none.
+    fn change_effect(&mut self, step: Option<isize>) {
+        let Some((chain, slot, _)) = slot_of_param(self.param, self.track as u8) else { return };
+        let current = self.slot_data(chain, slot).map(|d| d.kind);
+        let kind = match step {
+            None => None,
+            Some(step) => {
+                let kinds: Vec<Option<EffectKind>> =
+                    std::iter::once(None).chain(EffectKind::ALL.into_iter().map(Some)).collect();
+                let at = kinds.iter().position(|&k| k == current).unwrap_or(0) as isize;
+                kinds[(at + step).rem_euclid(kinds.len() as isize) as usize]
+            }
+        };
+        if kind == current {
+            return;
+        }
+        if self.edit(Edit::SetSlot { chain, slot, kind }) {
+            self.param = param_of_slot(chain, slot, 0);
+            let what = kind.map_or("empty", |k| k.label());
+            self.set_status(format!("{} slot {}: {what}", self.chain_name(chain), slot + 1));
+        }
+    }
+
+    /// Moves the selected slot's effect one slot earlier or later.
+    fn move_effect(&mut self, step: isize) {
+        let Some((chain, a, index)) = slot_of_param(self.param, self.track as u8) else { return };
+        if self.slot_data(chain, a).is_none() {
+            self.set_status(format!("Slot {} is empty: nothing to move", a + 1));
+            return;
+        }
+        let b = a as isize + step;
+        if !(0..MAX_SLOTS as isize).contains(&b) {
+            return;
+        }
+        let b = b as u8;
+        if self.edit(Edit::SwapSlots { chain, a, b }) {
+            self.param = param_of_slot(chain, b, index);
+        }
+    }
+
+    /// Shows the next chain on the inserts page: the track's, its group's
+    /// (if it has one), the master's.
+    fn next_insert_chain(&mut self) {
+        let grouped = self.track_group().is_some();
+        self.inserts_of = match self.inserts_of {
+            InsertsOf::Track if grouped => InsertsOf::Group,
+            InsertsOf::Track | InsertsOf::Group => InsertsOf::Master,
+            InsertsOf::Master => InsertsOf::Track,
+        };
+        self.param = param_of_slot(self.insert_chain(), 0, 0);
+        self.set_status(self.inserts_page_status());
+    }
+
     fn group_page_status(&self) -> String {
         let f = self.k(Action::Page);
         let name = self.track_group().map_or("", |g| self.project.groups[usize::from(g)].name.as_str());
@@ -2890,7 +3116,11 @@ impl App {
             return;
         }
         // The buses and master need no track.
-        if self.track_count() == 0 && !self.song_view && self.focus == Focus::Params && self.page == Page::Mix {
+        if self.track_count() == 0
+            && !self.song_view
+            && self.focus == Focus::Params
+            && matches!(self.page, Page::Mix | Page::Inserts)
+        {
             self.key_params(key);
             return;
         }
@@ -2974,7 +3204,8 @@ impl App {
                     Page::Strip | Page::Group => {
                         (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)"))
                     }
-                    Page::Mix => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
+                    Page::Mix => (Page::Inserts, self.inserts_page_status()),
+                    Page::Inserts => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
                 };
                 self.page = page;
                 // Volume and pan stay put from page to page; anything else
@@ -3167,7 +3398,7 @@ impl App {
     /// it has none.
     fn automate_param(&mut self, param: usize) {
         let label = self.param_spec(param).label;
-        let target = target_of_param(param);
+        let target = self.target_of_param(param);
         let Some(t) = self.project.tracks.get(self.track) else {
             let status =
                 format!("Automation lives on a track's lanes: add a track first ({})", self.k(Action::AddTrack));
@@ -3531,10 +3762,38 @@ impl App {
     }
 
     fn params_action(&mut self, a: Option<Action>) {
-        let i = self.param;
         let page = self.page_params();
+        if page.is_empty() {
+            return;
+        }
+        // Another track's group chain, say, is not this page's.
+        if self.page == Page::Inserts && !page.contains(&self.param) {
+            self.param = page[0];
+        }
+        let i = self.param;
         let at = page.iter().position(|&p| p == i).unwrap_or(0);
+        let effects = matches!(
+            a,
+            Some(
+                Action::PrevEffect
+                    | Action::NextEffect
+                    | Action::EffectEarlier
+                    | Action::EffectLater
+                    | Action::RemoveEffect
+                    | Action::InsertChain
+            )
+        );
+        if effects && self.page != Page::Inserts {
+            self.set_status(format!("Effects are on the inserts page ({})", self.k(Action::Page)));
+            return;
+        }
         match a {
+            Some(Action::PrevEffect) => self.change_effect(Some(-1)),
+            Some(Action::NextEffect) => self.change_effect(Some(1)),
+            Some(Action::RemoveEffect) => self.change_effect(None),
+            Some(Action::EffectEarlier) => self.move_effect(-1),
+            Some(Action::EffectLater) => self.move_effect(1),
+            Some(Action::InsertChain) => self.next_insert_chain(),
             Some(Action::Up) => self.param = page[at.saturating_sub(1)],
             Some(Action::Down) => self.param = page[(at + 1).min(page.len() - 1)],
             Some(a @ (Action::Left | Action::Right | Action::CoarseUp | Action::CoarseDown)) => {
@@ -4277,6 +4536,17 @@ impl App {
         };
         let track = self.project.tracks.get(self.track);
         let title = match (self.page, track) {
+            (Page::Inserts, _) => {
+                let chain = self.insert_chain();
+                let what = match chain {
+                    ChainId::Track(_) => "inserts, after the strip",
+                    ChainId::Group(_) => "group inserts, after its strip",
+                    ChainId::Master => "master inserts, before the limiter",
+                };
+                let n = self.project.chain(chain).map_or(0, |c| c.iter().flatten().count());
+                let effects = if n == 1 { "effect" } else { "effects" };
+                format!(" {} · {what} · {n} {effects} ", self.chain_name(chain))
+            }
             // Shared by all tracks, so shown with or without one.
             (Page::Mix, _) => {
                 let lufs = |v: f32| if v.is_nan() { "  -  ".to_string() } else { format!("{v:5.1}") };
@@ -4341,8 +4611,8 @@ impl App {
             }
             let x = col as u16 * PARAM_COL + 1;
             let yy = y + 1 + (row - first_row) as u16;
-            let spec = self.param_spec(i);
-            let text = format!("{:<15.15} {:>9.9}", spec.label, spec.format(self.param_value(i)));
+            let (label, value) = self.param_text(i);
+            let text = format!("{label:<15.15} {value:>9.9}");
             let role = if i == self.param && self.focus == Focus::Params {
                 Role::Cursor
             } else if i == self.param {
@@ -4383,6 +4653,19 @@ impl App {
                 k.label(Action::Undo),
                 k.label(Action::Play),
                 k.label(Action::Help),
+            ),
+            Focus::Params if self.page == Page::Inserts => format!(
+                "{} select  {} adjust  {} effect  {} move  {} remove  {} chain  {} default  {} page  {} automate  {} grid",
+                k.labels(&[Action::Up, Action::Down]),
+                k.labels(&[Action::Left, Action::Right]),
+                k.labels(&[Action::PrevEffect, Action::NextEffect]),
+                k.labels(&[Action::EffectEarlier, Action::EffectLater]),
+                k.label(Action::RemoveEffect),
+                k.label(Action::InsertChain),
+                k.label(Action::Default),
+                k.label(Action::Page),
+                k.label(Action::Automate),
+                k.label(Action::Focus),
             ),
             Focus::Params => format!(
                 "{} select  {} adjust  {} coarse  {} default  {} page  {} automate  {} mute  {} solo  {} grid  {} help",
@@ -4792,11 +5075,11 @@ pub fn start_audio(
     }
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
-    let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
+    let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
     let (take_tx, take_rx) = spsc::channel::<TakeEvent>(TAKE_QUEUE);
     let edits = project.to_edits();
     let samples = samples.to_vec();
-    let held = samples.iter().flatten().count();
+    let held = samples.iter().flatten().count() + project.insert_count();
     let cb_shared = shared.clone();
     let stream = audio::open_with(config, move |sample_rate| {
         let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
@@ -5662,8 +5945,9 @@ mod tests {
             a.project.tracks[0].lanes.iter().filter(|l| l.target == Some(LaneTarget::Track(2 + index as u8))).count(),
             1
         );
-        // On through the buses back to the instrument page; the cursor follows.
-        keys(&mut a, &[Key::Tab, Key::Char('f'), Key::Char('f')]);
+        // On through the buses and the inserts back to the instrument page;
+        // the cursor follows.
+        keys(&mut a, &[Key::Tab, Key::Char('f'), Key::Char('f'), Key::Char('f')]);
         assert!(a.page == Page::Instrument && a.param == 2);
         keys(&mut a, &[Key::Char('u'), Key::Char('u')]);
         assert_eq!(a.project.tracks[0].params[index], 0.0);
@@ -5736,7 +6020,7 @@ mod tests {
         assert!(t.contains(" LUFS  t  CPU"), "{t}");
         // The bass compresses.
         a.track = 5;
-        keys(&mut a, &[Key::Char('f')]);
+        keys(&mut a, &[Key::Char('f'), Key::Char('f')]);
         assert_eq!(a.page, Page::Instrument);
         keys(&mut a, &[Key::Char('f')]);
         let t = text(&a);
@@ -6298,11 +6582,160 @@ mod tests {
     }
 
     #[test]
+    fn the_inserts_page_builds_and_rearranges_a_chain() {
+        use EffectKind::*;
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a =
+            App::new(Project::demo(), None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "t".into());
+        let mut sent = move || std::iter::from_fn(|| rx.pop()).collect::<Vec<Command>>();
+        keys(&mut a, &[Key::Tab, Key::Char('f'), Key::Char('f'), Key::Char('f')]);
+        assert_eq!(a.page, Page::Inserts);
+        assert_eq!(a.page_params().len(), MAX_SLOTS, "eight empty slots");
+        sent();
+        // An empty slot has nothing to set.
+        keys(&mut a, &[Key::Right]);
+        assert!(a.status_text().unwrap().contains("Slot 1 is empty"), "{:?}", a.status_text());
+        assert!(sent().is_empty());
+        // The effect keys go through the kinds; each reaches the engine built.
+        keys(&mut a, &[Key::Char('.'), Key::Char('.')]);
+        assert_eq!(a.project.tracks[0].chain[0].map(|d| d.kind), Some(Compressor));
+        let built: Vec<_> = sent()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::SetSlot { chain: ChainId::Track(0), slot: 0, insert } => Some(insert.map(|i| i.kind())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(built, [Some(Eq), Some(Compressor)]);
+        // Its settings follow its bypass on the page.
+        assert_eq!(a.page_params().len(), MAX_SLOTS - 1 + Compressor.params().len());
+        keys(&mut a, &[Key::Down, Key::Down, Key::Right]);
+        let ratio = a.project.tracks[0].chain[0].unwrap().params[2];
+        assert!(ratio > Compressor.params()[2].default);
+        let edits: Vec<_> =
+            sent().into_iter().filter_map(|c| if let Command::Edit(e) = c { Some(e) } else { None }).collect();
+        assert_eq!(edits, [Edit::SetSlotParam { chain: ChainId::Track(0), slot: 0, index: 2, value: ratio }]);
+        // Moved a slot later, the cursor goes with it.
+        keys(&mut a, &[Key::Char('>')]);
+        assert!(a.project.tracks[0].chain[0].is_none() && a.project.tracks[0].chain[1].is_some());
+        assert_eq!(slot_of_param(a.param, 0), Some((ChainId::Track(0), 1, 2)));
+        // An empty slot has nothing to move, so its neighbour stays put.
+        sent();
+        keys(&mut a, &[Key::Up, Key::Up, Key::Up]);
+        assert_eq!(slot_of_param(a.param, 0), Some((ChainId::Track(0), 0, 0)));
+        keys(&mut a, &[Key::Char('>')]);
+        assert!(a.status_text().unwrap().contains("nothing to move"), "{:?}", a.status_text());
+        assert!(a.project.tracks[0].chain[0].is_none() && a.project.tracks[0].chain[1].is_some());
+        assert!(sent().is_empty());
+        keys(&mut a, &[Key::Down, Key::Down, Key::Down]);
+        keys(&mut a, &[Key::Up, Key::Up, Key::Right]);
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        let text: String = (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n");
+        for part in [
+            "inserts, after the strip · 1 effect",
+            "1 -",
+            "empty",
+            "2 Compressor",
+            "bypassed",
+            Compressor.params()[2].label,
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        // Emptied, and undone: back with its settings.
+        keys(&mut a, &[Key::Char('-')]);
+        assert!(a.project.tracks[0].chain[1].is_none());
+        sent();
+        keys(&mut a, &[Key::Char('u')]);
+        let back = a.project.tracks[0].chain[1].unwrap();
+        assert_eq!((back.kind, back.params[0], back.params[2]), (Compressor, 1.0, ratio));
+        let undone = sent();
+        assert!(
+            matches!(&undone[0], Command::SetSlot { slot: 1, insert: Some(i), .. } if i.kind() == Compressor),
+            "{undone:?}"
+        );
+        // The track's chain, then (with no group) the master's.
+        keys(&mut a, &[Key::Char(';')]);
+        assert_eq!(a.insert_chain(), ChainId::Master);
+        keys(&mut a, &[Key::Char(','), Key::Char(';')]);
+        assert_eq!(a.project.master_chain[0].map(|d| d.kind), Some(Chorus));
+        assert_eq!(a.insert_chain(), ChainId::Track(0));
+        // In a group, its chain comes between.
+        a.edit(Edit::InsertGroup(0));
+        a.edit(Edit::SetTrackGroup { track: 0, group: Some(0) });
+        keys(&mut a, &[Key::Char(';')]);
+        assert_eq!(a.insert_chain(), ChainId::Group(0));
+        keys(&mut a, &[Key::Char('.')]);
+        assert!(a.project.groups[0].chain[0].is_some());
+        // A slot's setting can be automated; its lane locks the effect in.
+        keys(&mut a, &[Key::Char(';'), Key::Char(';'), Key::Down, Key::Down, Key::Down, Key::Char('A')]);
+        let lane = LaneTarget::Slot { slot: 1, kind: Compressor, index: 2 };
+        assert!(a.project.tracks[0].lanes.iter().any(|l| l.target == Some(lane)));
+        a.focus = Focus::Params;
+        keys(&mut a, &[Key::Char('-')]);
+        assert!(a.status_text().unwrap().contains("Cannot"), "{:?}", a.status_text());
+        assert!(a.project.tracks[0].chain[1].is_some());
+        // Elsewhere, the effect keys only say where effects are.
+        keys(&mut a, &[Key::Char('f'), Key::Char('.')]);
+        assert_eq!(a.page, Page::Instrument);
+        assert!(a.status_text().unwrap().contains("inserts page"), "{:?}", a.status_text());
+    }
+
+    #[test]
+    fn effect_changes_never_overflow_the_retirement_queue() {
+        let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
+        let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
+        let shared = Arc::new(Shared::new());
+        let mut p = Project::new();
+        for _ in 0..4 {
+            p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        }
+        for slot in 0..MAX_SLOTS as u8 {
+            p.apply(Edit::SetSlot { chain: ChainId::Master, slot, kind: Some(EffectKind::Delay) }).unwrap();
+        }
+        let mut e = Engine::with_edits(48_000.0, &p.to_edits(), shared.clone(), Some(rx));
+        e.attach_retirement(retire_tx);
+        let mut link = EngineLink::new(tx, shared).with_retirement(retire_rx, p.insert_count());
+        let mut out = vec![0.0f32; 128];
+        for round in 0..10 {
+            for k in 0..300u32 {
+                let chain = ChainId::Track((k % 4) as u8);
+                let kind = EffectKind::ALL[k as usize % EffectKind::ALL.len()];
+                link.send(engine_command(Edit::SetSlot { chain, slot: (k / 4 % 8) as u8, kind: Some(kind) }, 48_000));
+            }
+            assert!(link.in_flight <= RETIRE_QUEUE, "round {round}: {}", link.in_flight);
+            e.process(&mut out);
+            link.flush();
+        }
+        while !link.backlog.is_empty() {
+            link.flush();
+            e.process(&mut out);
+        }
+        // Ten fades' worth of callbacks let the replaced ones go.
+        for _ in 0..100 {
+            e.process(&mut out);
+            link.flush();
+        }
+        assert_eq!(link.in_flight, 4 * MAX_SLOTS + MAX_SLOTS, "what the chains hold");
+        for _ in 0..4 {
+            link.send(Command::Edit(Edit::RemoveTrack(0)));
+        }
+        for slot in 0..MAX_SLOTS as u8 {
+            link.send(engine_command(Edit::SetSlot { chain: ChainId::Master, slot, kind: None }, 48_000));
+        }
+        for _ in 0..100 {
+            e.process(&mut out);
+            link.flush();
+        }
+        assert_eq!(link.in_flight, 0);
+    }
+
+    #[test]
     fn sample_changes_never_overflow_the_retirement_queue() {
         let tone: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin()).collect();
         let s = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
         let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
-        let (retire_tx, retire_rx) = spsc::channel::<Arc<Sample>>(RETIRE_QUEUE);
+        let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
         let shared = Arc::new(Shared::new());
         let tracks = [Edit::AddTrack(InstrumentKind::Sampler); MAX_TRACKS];
         let mut e = Engine::with_edits(48_000.0, &tracks, shared.clone(), Some(rx));

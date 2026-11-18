@@ -85,6 +85,11 @@ impl Echo {
         self.quiet >= self.frames
     }
 
+    /// The fewest frames of silence that leave it idle (0 when it is).
+    pub fn frames_to_idle(&self) -> usize {
+        self.frames.saturating_sub(self.quiet)
+    }
+
     /// Reads `input` (interleaved stereo) and adds the delayed signal to
     /// `out`.
     pub fn process(&mut self, input: &[f32], out: &mut [f32]) {
@@ -95,10 +100,10 @@ impl Echo {
             }
             let whole = self.time.floor();
             let frac = (self.time - whole) as f32;
-            let newer = (self.write + self.frames - whole as usize) % self.frames;
+            let newer = super::ring_back(self.write, whole as usize, self.frames);
             let (mut l, mut r) = (self.buf[2 * newer], self.buf[2 * newer + 1]);
             if frac > 0.0 {
-                let older = (newer + self.frames - 1) % self.frames;
+                let older = super::ring_back(newer, 1, self.frames);
                 l += frac * (self.buf[2 * older] - l);
                 r += frac * (self.buf[2 * older + 1] - r);
             }
@@ -120,7 +125,7 @@ impl Echo {
             let (wl, wr) = (flush(wl), flush(wr));
             self.buf[2 * self.write] = wl;
             self.buf[2 * self.write + 1] = wr;
-            self.write = (self.write + 1) % self.frames;
+            self.write = super::ring_next(self.write, self.frames);
             self.quiet = if wl.abs() < QUIET && wr.abs() < QUIET { self.quiet.saturating_add(1) } else { 0 };
         }
     }

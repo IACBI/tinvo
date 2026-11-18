@@ -15,8 +15,9 @@
 //!   compiler, not on the machine's load, so the budgets on it, in
 //!   `bench/instructions.txt`, catch a regression of a few percent.
 
-use crate::engine::{Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
+use crate::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
 use crate::group::MAX_GROUPS;
+use crate::insert::{EffectKind, MAX_INSERTS, MAX_SLOTS};
 use crate::instrument::InstrumentKind;
 use crate::mix::send;
 use crate::project::Project;
@@ -50,7 +51,7 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 6] = [
+pub const SCENARIOS: [Scenario; 7] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
     Scenario {
@@ -58,6 +59,12 @@ pub const SCENARIOS: [Scenario; 6] = [
         label: "Demo song's tracks repeated to 8, each through a group, every stage on",
         budget: 0.4,
         build: groups,
+    },
+    Scenario {
+        id: "inserts",
+        label: "The groups scenario with as many insert effects as a project holds, every kind busy",
+        budget: 0.75,
+        build: inserts,
     },
     Scenario { id: "tracks32", label: "Demo song's tracks repeated to 32", budget: 0.5, build: tracks32 },
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
@@ -221,6 +228,48 @@ fn groups() -> Setup {
     Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
+/// The groups scenario with [`MAX_INSERTS`] effects, the kinds in turn:
+/// four on each track, three on each group and a full master chain, every
+/// one set to work, and the first track's EQ swept on a ramp.
+fn inserts() -> Setup {
+    let mut setup = groups();
+    let p = &mut setup.project;
+    let mut chains: Vec<(ChainId, u8)> = Vec::new();
+    for t in 0..p.tracks.len() as u8 {
+        chains.extend((0..4).map(|s| (ChainId::Track(t), s)));
+    }
+    for g in 0..MAX_GROUPS as u8 {
+        chains.extend((0..3).map(|s| (ChainId::Group(g), s)));
+    }
+    chains.extend((0..MAX_SLOTS as u8).map(|s| (ChainId::Master, s)));
+    assert_eq!(chains.len(), MAX_INSERTS);
+    for (k, &(chain, slot)) in chains.iter().enumerate() {
+        let kind = EffectKind::ALL[k % EffectKind::ALL.len()];
+        ok(p.apply(Edit::SetSlot { chain, slot, kind: Some(kind) }));
+        let busy: &[(&str, f32)] = match kind {
+            EffectKind::Eq => &[("hp_freq", 40.0), ("eq_low_gain", 2.0), ("eq_mid_gain", -3.0), ("eq_high_gain", 2.0)],
+            EffectKind::Compressor => &[("comp_threshold", -30.0), ("comp_ratio", 4.0)],
+            EffectKind::Drive => &[("drive", 6.0)],
+            EffectKind::Delay | EffectKind::Reverb | EffectKind::Chorus => &[("mix", 0.4)],
+        };
+        for &(id, value) in busy {
+            let index = kind.params().iter().position(|s| s.id == id).unwrap_or_else(|| panic!("no parameter {id}"));
+            ok(p.apply(Edit::SetSlotParam { chain, slot, index: index as u8, value }));
+        }
+    }
+    let lanes = &p.tracks[0].lanes;
+    let lane = (0..MAX_LANES as u8).find(|&l| lanes[usize::from(l)].target.is_none()).expect("a free lane");
+    let index = EffectKind::Eq.params().iter().position(|s| s.id == "eq_mid_freq").expect("the mid band") as u8;
+    let target = Some(LaneTarget::Slot { slot: 0, kind: EffectKind::Eq, index });
+    ok(p.apply(Edit::SetLane { track: 0, lane, target, ramp: true }));
+    for pattern in 0..MAX_PATTERNS as u8 {
+        for (step, value) in [(0, 300.0), (8, 4000.0)] {
+            ok(p.apply(Edit::SetPoint { track: 0, lane, pattern, step, value: Some(value) }));
+        }
+    }
+    setup
+}
+
 /// A full project: the demo's tracks again and again, every one playing.
 fn tracks32() -> Setup {
     let mut p = Project::demo();
@@ -320,6 +369,8 @@ mod tests {
         let groups = (find("groups").expect("a scenario").build)().project;
         assert_eq!(groups.groups.len(), MAX_GROUPS);
         assert!(groups.tracks.iter().all(|t| t.group.is_some()));
+        let inserts = (find("inserts").expect("a scenario").build)().project;
+        assert_eq!(inserts.insert_count(), MAX_INSERTS);
     }
 
     #[test]

@@ -125,7 +125,7 @@ actions! {
     Copy "copy" Global [c('y')] "copy the pattern";
     Paste "paste" Global [c('Y')] "paste the pattern";
     ClearPattern "clear_pattern" Global [c('X')] "clear the pattern";
-    Page "page" Global [c('f')] "parameter panel page: instrument, channel strip, the track's group, buses and master";
+    Page "page" Global [c('f')] "parameter panel page: instrument, channel strip, the track's group, buses and master, insert effects";
     Devices "devices" Global [c('O')] "audio output and input devices (Tab: low-latency output; ←→: output / input)";
     MidiInputs "midi_inputs" Global [c('M')] "MIDI input";
     MidiOutputs "midi_outputs" Global [c('Z')] "MIDI output: where MIDI-out tracks and the clock go (settings: clock, delay)";
@@ -193,6 +193,12 @@ actions! {
     CoarseUp "coarse_up" Params [PageUp] "value up, coarse";
     CoarseDown "coarse_down" Params [PageDown] "value down, coarse";
     Default "default" Params [c('0')] "back to the default value";
+    PrevEffect "prev_effect" Params [c(',')] "inserts page: the slot's previous effect (none, EQ, compressor, drive, delay, reverb, chorus)";
+    NextEffect "next_effect" Params [c('.')] "inserts page: the slot's next effect";
+    EffectEarlier "effect_earlier" Params [c('<')] "inserts page: move the effect a slot earlier in the chain";
+    EffectLater "effect_later" Params [c('>')] "inserts page: move the effect a slot later";
+    RemoveEffect "remove_effect" Params [c('-')] "inserts page: empty the slot";
+    InsertChain "insert_chain" Params [c(';')] "inserts page: the track's chain, its group's or the master's";
 }
 
 impl Action {

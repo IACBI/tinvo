@@ -29,6 +29,7 @@ pub mod engine;
 pub mod fsutil;
 pub mod fuzz;
 pub mod group;
+pub mod insert;
 pub mod instrument;
 pub mod keymap;
 pub mod lock;
