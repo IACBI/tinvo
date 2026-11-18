@@ -48,7 +48,10 @@ const RATIO_STEP: f32 = 1.1;
 
 /// The strip's parameters. Defaults are neutral: the lowest high-pass
 /// frequency, 0 dB on every band, ratio 1, no makeup and no drive.
-pub static PARAMS: [ParamSpec; sp::COUNT] = [
+pub static PARAMS: [ParamSpec; sp::COUNT] = SPECS;
+
+/// [`PARAMS`] as a constant, for other parameter lists made of its entries.
+pub const SPECS: [ParamSpec; sp::COUNT] = [
     ParamSpec::log("hp_freq", "HP freq", 20.0, 2000.0, 20.0, HZ_STEP, Unit::Hz),
     ParamSpec::log("eq_low_freq", "Low freq", 30.0, 1000.0, 120.0, HZ_STEP, Unit::Hz),
     ParamSpec::linear("eq_low_gain", "Low gain", -18.0, 18.0, 0.0, 0.5, Unit::Decibels),

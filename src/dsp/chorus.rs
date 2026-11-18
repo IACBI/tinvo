@@ -84,6 +84,11 @@ impl Chorus {
         self.quiet >= self.frames
     }
 
+    /// The fewest frames of silence that leave it idle (0 when it is).
+    pub fn frames_to_idle(&self) -> usize {
+        self.frames.saturating_sub(self.quiet)
+    }
+
     /// Reads `input` (interleaved stereo) and adds the chorus to `out`.
     pub fn process(&mut self, input: &[f32], out: &mut [f32]) {
         for (x, y) in input.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
@@ -102,7 +107,7 @@ impl Chorus {
                 self.sin * self.step_cos + self.cos * self.step_sin,
                 self.cos * self.step_cos - self.sin * self.step_sin,
             );
-            self.write = (self.write + 1) % self.frames;
+            self.write = super::ring_next(self.write, self.frames);
             self.quiet = if x[0].abs() < QUIET && x[1].abs() < QUIET { self.quiet.saturating_add(1) } else { 0 };
         }
         // Rotation lets the amplitude drift by rounding; pull it back.
@@ -118,9 +123,13 @@ impl Chorus {
         let t = delay - whole;
         let n = self.frames;
         // Four neighbours, newest first: delays whole-1 .. whole+2.
-        let at = |k: usize| self.buf[2 * ((self.write + 2 * n - k) % n) + ch];
-        let w = whole as usize;
-        let (ym1, y0, y1, y2) = (at(w - 1), at(w), at(w + 1), at(w + 2));
+        let mut i = super::ring_back(self.write, whole as usize - 1, n);
+        let mut older = || {
+            let y = self.buf[2 * i + ch];
+            i = super::ring_back(i, 1, n);
+            y
+        };
+        let (ym1, y0, y1, y2) = (older(), older(), older(), older());
         // Hermite through y0 (t = 0) and y1 (t = 1).
         let c1 = 0.5 * (y1 - ym1);
         let c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;

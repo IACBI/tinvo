@@ -46,7 +46,11 @@ const TIME_STEP: f32 = 1.1;
 
 /// Global parameters of the buses and the master. Defaults leave the
 /// limiter off.
-pub static MIX_PARAMS: [ParamSpec; mp::COUNT] = [
+pub static MIX_PARAMS: [ParamSpec; mp::COUNT] = SPECS;
+
+/// [`MIX_PARAMS`] as a constant, for other parameter lists made of its
+/// entries.
+pub const SPECS: [ParamSpec; mp::COUNT] = [
     ParamSpec::stepped("delay_time", "Delay time", &DIVISIONS, 6.0),
     ParamSpec::linear("delay_feedback", "Delay feedback", 0.0, 0.95, 0.35, 0.01, Unit::Percent),
     ParamSpec::log("delay_tone", "Delay tone", 500.0, OPEN_TONE_HZ, 6000.0, HZ_STEP, Unit::Hz),
@@ -94,6 +98,11 @@ pub fn mix_param_since(index: usize) -> u32 {
         mp::CHORUS_RATE | mp::CHORUS_DEPTH | mp::CHORUS_RETURN => 9,
         _ => 8,
     }
+}
+
+/// Beats in delay time `value`, an index into [`DIVISIONS`].
+pub fn division_beats(value: f32) -> f32 {
+    DIVISION_BEATS[(value as usize).min(DIVISIONS.len() - 1)]
 }
 
 /// Linear gain of a send or return level (exactly zero at the lowest).
@@ -191,8 +200,7 @@ impl Mix {
 
     fn apply(&mut self) {
         let v: [f32; mp::COUNT] = std::array::from_fn(|i| self.value(i));
-        let beats = DIVISION_BEATS[(v[mp::DELAY_TIME] as usize).min(DIVISIONS.len() - 1)];
-        let frames = beats * 60.0 / self.tempo * self.sample_rate;
+        let frames = division_beats(v[mp::DELAY_TIME]) * 60.0 / self.tempo * self.sample_rate;
         // Whole frames: a settled delay then reads without interpolation.
         self.echo.set(frames.round(), v[mp::DELAY_FEEDBACK], v[mp::DELAY_TONE], v[mp::DELAY_MODE] >= 1.0);
         self.reverb.set(v[mp::REVERB_DECAY], v[mp::REVERB_DAMPING], v[mp::REVERB_PREDELAY]);

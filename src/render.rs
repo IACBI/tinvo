@@ -236,7 +236,8 @@ pub fn stems(project: &Project) -> Vec<Stem> {
 /// muted, not removed: they still use the chance generator and choke open
 /// hats exactly as in the mix, so the stems add up to it. A stem carries
 /// its own share of the delay and reverb returns, and is taken before the
-/// master limiter.
+/// master's insert chain and limiter. A group's stem has the group's own
+/// chain on it.
 pub fn stem_project(project: &Project, stem: Stem) -> Project {
     let heard = audible_tracks(project);
     let mut solo = project.clone();
@@ -248,10 +249,13 @@ pub fn stem_project(project: &Project, stem: Stem) -> Project {
         t.solo = false;
     }
     solo.mix[crate::mix::mp::LIMITER] = 0.0;
-    // A lane could switch the limiter back on.
+    solo.master_chain = Default::default();
+    // A lane could switch the limiter back on, or automates a master
+    // effect no longer there.
     let limiter = crate::engine::LaneTarget::Mix(crate::mix::mp::LIMITER as u8);
     for lane in solo.tracks.iter_mut().flat_map(|t| t.lanes.iter_mut()) {
-        if lane.target == Some(limiter) {
+        let master = matches!(lane.target, Some(crate::engine::LaneTarget::MasterSlot { .. }));
+        if lane.target == Some(limiter) || master {
             *lane = crate::project::LaneData::new(None, false);
         }
     }
@@ -443,6 +447,44 @@ mod tests {
             render(&Project { tracks: Project::demo().tracks, ..q.clone() }, &[], &opts),
             "the parts are heard"
         );
+    }
+
+    #[test]
+    fn stems_with_insert_chains_add_up_to_the_mix_before_the_master_s() {
+        use crate::engine::ChainId;
+        use crate::insert::EffectKind;
+        let mut p = Project::demo();
+        p.mix[crate::mix::mp::LIMITER] = 0.0;
+        let edits = [
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetTrackGroup { track: 1, group: Some(0) },
+            Edit::SetSlot { chain: ChainId::Group(0), slot: 0, kind: Some(EffectKind::Delay) },
+            Edit::SetSlotParam { chain: ChainId::Group(0), slot: 0, index: 5, value: 0.8 },
+            Edit::SetSlot { chain: ChainId::Track(3), slot: 2, kind: Some(EffectKind::Chorus) },
+        ];
+        for e in edits {
+            p.apply(e).unwrap();
+        }
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
+        let sum = |p: &Project| {
+            let stems = render_stems(p, &[], &opts);
+            assert!(stems.iter().any(|(s, _)| *s == Stem::Group(0)));
+            (0..stems[0].1.len()).map(|k| stems.iter().map(|(_, s)| s[k]).sum::<f32>()).collect::<Vec<_>>()
+        };
+        let mix = render(&p, &[], &opts);
+        let stems = sum(&p);
+        assert_eq!(stems.len(), mix.len());
+        let worst = stems.iter().zip(&mix).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "stems differ from the mix by {worst}");
+        // A master effect, and a lane on it, are left out of every stem.
+        let plain = p.clone();
+        p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Drive) }).unwrap();
+        p.apply(Edit::SetSlotParam { chain: ChainId::Master, slot: 0, index: 1, value: 24.0 }).unwrap();
+        let lane = crate::engine::LaneTarget::MasterSlot { slot: 0, kind: EffectKind::Drive, index: 0 };
+        p.apply(Edit::SetLane { track: 2, lane: 0, target: Some(lane), ramp: false }).unwrap();
+        assert_ne!(render(&p, &[], &opts), mix);
+        assert_eq!(sum(&p), sum(&plain));
     }
 
     #[test]

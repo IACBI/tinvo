@@ -74,6 +74,20 @@ pub fn decay_coef(seconds: f32, sample_rate: f32) -> f32 {
     (-LN_1000 / (seconds.max(1.0e-4) * sample_rate)).exp()
 }
 
+/// `(i + 1) % n` for `i < n`, without the division: ring buffers step
+/// every sample, and a division there is a large share of a delay's cost.
+#[inline]
+pub fn ring_next(i: usize, n: usize) -> usize {
+    if i + 1 == n { 0 } else { i + 1 }
+}
+
+/// `(i + n - back) % n` for `i < n` and `back <= n`, without the division.
+#[inline]
+pub fn ring_back(i: usize, back: usize, n: usize) -> usize {
+    let j = i + n - back;
+    if j >= n { j - n } else { j }
+}
+
 /// Replaces values too small to matter with exact zero so that recursive
 /// filters never decay into the (very slow) subnormal range.
 #[inline]

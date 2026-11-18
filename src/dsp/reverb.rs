@@ -27,27 +27,43 @@ const OUTPUT_GAIN: f32 = 0.35;
 struct Line {
     buf: Vec<f32>,
     pos: usize,
+    /// Samples written since it was last cleared, up to its length; older
+    /// places read as silence. Clearing this way costs nothing, where
+    /// filling the buffers of many reverbs going quiet on the same frame
+    /// would write megabytes at once.
+    fresh: usize,
 }
 
 impl Line {
     fn new(len: usize) -> Self {
-        Self { buf: vec![0.0; len], pos: 0 }
+        Self { buf: vec![0.0; len], pos: 0, fresh: 0 }
     }
 
     /// The sample written `len` samples ago.
     #[inline]
     fn read(&self) -> f32 {
-        self.buf[self.pos]
+        if self.fresh < self.buf.len() { 0.0 } else { self.buf[self.pos] }
+    }
+
+    /// The sample written `back` samples before the last one, for a line
+    /// just written to (`back` below its length).
+    #[inline]
+    fn read_back(&self, back: usize) -> f32 {
+        let n = self.buf.len();
+        if back < self.fresh { self.buf[super::ring_back(self.pos, back + 1, n)] } else { 0.0 }
     }
 
     #[inline]
     fn write(&mut self, x: f32) {
         self.buf[self.pos] = x;
-        self.pos = (self.pos + 1) % self.buf.len();
+        self.pos = super::ring_next(self.pos, self.buf.len());
+        if self.fresh < self.buf.len() {
+            self.fresh += 1;
+        }
     }
 
     fn clear(&mut self) {
-        self.buf.fill(0.0);
+        self.fresh = 0;
     }
 }
 
@@ -134,26 +150,27 @@ impl Reverb {
         self.quiet >= self.idle_after
     }
 
+    /// The fewest frames of silence that leave it idle (0 when it is).
+    pub fn frames_to_idle(&self) -> usize {
+        self.idle_after.saturating_sub(self.quiet)
+    }
+
     /// Reads `input` (interleaved stereo) and adds the reverb to `out`.
     pub fn process(&mut self, input: &[f32], out: &mut [f32]) {
         for (x, y) in input.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
             let mono = 0.5 * (x[0] + x[1]);
             // Pre-delay: write, then read `predelay_frames` back.
-            let pd = &mut self.predelay;
-            let n = pd.buf.len();
-            pd.buf[pd.pos] = mono;
+            self.predelay.write(mono);
             if self.predelay_frames != self.predelay_target {
                 let t = self.predelay_target + (self.predelay_frames - self.predelay_target) * self.predelay_glide;
                 self.predelay_frames = if (t - self.predelay_target).abs() < 1e-3 { self.predelay_target } else { t };
             }
             let whole = self.predelay_frames.floor();
             let frac = (self.predelay_frames - whole) as f32;
-            let newer = (pd.pos + n - whole as usize) % n;
-            let mut u = pd.buf[newer];
+            let mut u = self.predelay.read_back(whole as usize);
             if frac > 0.0 {
-                u += frac * (pd.buf[(newer + n - 1) % n] - u);
+                u += frac * (self.predelay.read_back(whole as usize + 1) - u);
             }
-            pd.pos = (pd.pos + 1) % n;
             for d in &mut self.diffusers {
                 let delayed = d.read();
                 let v = u + DIFFUSION * delayed;
@@ -250,6 +267,22 @@ mod tests {
         let t5 = (0..e.len()).find(|&i| db(i) < -5.0).unwrap();
         let t35 = (0..e.len()).find(|&i| db(i) < -35.0).unwrap();
         2.0 * (t35 - t5) as f32 / SR
+    }
+
+    #[test]
+    fn a_reverb_gone_quiet_starts_again_as_a_new_one() {
+        let mut r = Reverb::new(SR);
+        r.set(0.3, 6000.0, 0.02);
+        r.snap();
+        let mut fresh = r.clone();
+        let first = impulse_response(&mut r, 0.5);
+        let quiet = vec![0.0; 2 * 128];
+        let mut out = quiet.clone();
+        while !r.is_idle() {
+            r.process(&quiet, &mut out);
+        }
+        assert!(first.iter().any(|&x| x != 0.0));
+        assert_eq!(impulse_response(&mut r, 2.0), impulse_response(&mut fresh, 2.0));
     }
 
     #[test]

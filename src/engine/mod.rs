@@ -19,6 +19,7 @@ use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::group::{self, Group, MAX_GROUPS};
+use crate::insert::{Chain, EffectKind, Insert, MAX_SLOTS};
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
 use crate::midi::{MOD_WHEEL, Message, OutEvent, SUSTAIN};
 use crate::mix::{self, Mix, send};
@@ -68,6 +69,14 @@ pub enum LaneTarget {
     /// 1 the pan, `2 + i` the group's parameter `i` ([`group::group_param`]).
     /// A lane on any one track can automate it.
     Group { group: u8, index: u8 },
+    /// Parameter `index` ([`EffectKind::params`]) of the `kind` effect in
+    /// slot `slot` of the lane's own track's insert chain.
+    Slot { slot: u8, kind: EffectKind, index: u8 },
+    /// The same of a slot of group `group`'s chain, which a lane on any one
+    /// track can automate.
+    GroupSlot { group: u8, slot: u8, kind: EffectKind, index: u8 },
+    /// The same of a slot of the master's chain.
+    MasterSlot { slot: u8, kind: EffectKind, index: u8 },
 }
 
 impl LaneTarget {
@@ -81,19 +90,38 @@ impl LaneTarget {
             LaneTarget::Group { index: 0, .. } => Some(&VOLUME),
             LaneTarget::Group { index: 1, .. } => Some(&PAN),
             LaneTarget::Group { index, .. } => group::group_param(usize::from(index) - 2),
+            LaneTarget::Slot { kind, index, .. }
+            | LaneTarget::GroupSlot { kind, index, .. }
+            | LaneTarget::MasterSlot { kind, index, .. } => kind.params().get(usize::from(index)),
+        }
+    }
+
+    /// The insert slot it automates, of the chain on lane track `track`.
+    pub fn slot(self, track: u8) -> Option<(ChainId, u8, EffectKind, u8)> {
+        match self {
+            LaneTarget::Slot { slot, kind, index } => Some((ChainId::Track(track), slot, kind, index)),
+            LaneTarget::GroupSlot { group, slot, kind, index } => Some((ChainId::Group(group), slot, kind, index)),
+            LaneTarget::MasterSlot { slot, kind, index } => Some((ChainId::Master, slot, kind, index)),
+            _ => None,
         }
     }
 
     /// Whether it is a setting shared by the whole project rather than of
     /// the lane's track: then only one lane in the project may hold it.
     pub fn is_global(self) -> bool {
-        matches!(self, LaneTarget::Mix(_) | LaneTarget::Group { .. })
+        matches!(
+            self,
+            LaneTarget::Mix(_)
+                | LaneTarget::Group { .. }
+                | LaneTarget::GroupSlot { .. }
+                | LaneTarget::MasterSlot { .. }
+        )
     }
 
     /// The group it is a setting of.
     pub fn group(self) -> Option<u8> {
         match self {
-            LaneTarget::Group { group, .. } => Some(group),
+            LaneTarget::Group { group, .. } | LaneTarget::GroupSlot { group, .. } => Some(group),
             _ => None,
         }
     }
@@ -105,8 +133,24 @@ impl fmt::Display for LaneTarget {
             LaneTarget::Track(i) => write!(f, "{i}"),
             LaneTarget::Mix(i) => write!(f, "mix {i}"),
             LaneTarget::Group { group, index } => write!(f, "group {group} {index}"),
+            LaneTarget::Slot { slot, kind, index } => write!(f, "slot {slot} {} {index}", kind.id()),
+            LaneTarget::GroupSlot { group, slot, kind, index } => {
+                write!(f, "group {group} slot {slot} {} {index}", kind.id())
+            }
+            LaneTarget::MasterSlot { slot, kind, index } => write!(f, "master slot {slot} {} {index}", kind.id()),
         }
     }
+}
+
+/// Which insert chain an edit is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChainId {
+    /// A track's, after its strip and before its fader.
+    Track(u8),
+    /// A group's, after its strip and before its fader.
+    Group(u8),
+    /// The master's, after its fader and before the limiter.
+    Master,
 }
 /// Internal processing block. Events inside a block are still sample-accurate.
 pub const BLOCK: usize = 64;
@@ -526,6 +570,31 @@ pub enum Edit {
         track: u8,
         group: Option<u8>,
     },
+    /// Puts a new `kind` effect at its defaults in slot `slot` of `chain`,
+    /// or (`None`) empties the slot: the slot fades out to its input first,
+    /// then the new effect fades in. A project changes the kind only of a
+    /// slot no lane automates. The engine builds the effect when it applies
+    /// this edit itself, so the audio thread gets it as
+    /// [`Command::SetSlot`] instead.
+    SetSlot {
+        chain: ChainId,
+        slot: u8,
+        kind: Option<EffectKind>,
+    },
+    /// Swaps what two slots of `chain` hold, with the lanes on them.
+    SwapSlots {
+        chain: ChainId,
+        a: u8,
+        b: u8,
+    },
+    /// Sets parameter `index` ([`EffectKind::params`]) of the effect in
+    /// slot `slot` of `chain`.
+    SetSlotParam {
+        chain: ChainId,
+        slot: u8,
+        index: u8,
+        value: f32,
+    },
 }
 
 /// Messages from the UI to the audio thread.
@@ -557,6 +626,14 @@ pub enum Command {
     SetSample {
         track: u8,
         sample: Option<Arc<Sample>>,
+    },
+    /// [`Edit::SetSlot`] with the effect built by the sender, since
+    /// building one allocates. The effect it replaces goes back through
+    /// the retirement queue.
+    SetSlot {
+        chain: ChainId,
+        slot: u8,
+        insert: Option<Box<Insert>>,
     },
     /// The track live notes play on from now on.
     SetLiveTrack(u8),
@@ -704,20 +781,44 @@ fn command_cost(cmd: &Command) -> u32 {
     }
 }
 
-/// Capacity of the queue that returns released samples to the UI thread.
-pub const RETIRE_QUEUE: usize = 64;
+/// What the engine hands back to the UI thread to free.
+#[derive(Debug)]
+pub enum Retired {
+    Sample(Arc<Sample>),
+    Insert(Box<Insert>),
+}
+
+/// Capacity of the queue that returns released samples and effects to the
+/// UI thread. The engine holds at most 48 samples (32 tracks and 16 fading)
+/// and the 64 effects of a project for good; the rest of the room is for
+/// what is on its way back or out (replaced effects, removed tracks' and
+/// groups'), which a few seconds of playing let go.
+pub const RETIRE_QUEUE: usize = 256;
+/// The most samples and effects an engine playing a project holds for good.
+pub const HELD_FOR_GOOD: usize = MAX_TRACKS + MAX_FADING + crate::insert::MAX_INSERTS;
 
 /// Hands a sample the engine no longer uses to the UI thread, so the audio
 /// thread never frees it. Without a queue (offline rendering) it is dropped
 /// here, which is fine off the audio thread.
-fn retire(queue: &mut Option<Producer<Arc<Sample>>>, sample: Option<Arc<Sample>>) {
-    let (Some(q), Some(s)) = (queue.as_mut(), sample) else { return };
-    if let Err(s) = q.push(s) {
-        // Unreachable while the UI keeps at most `RETIRE_QUEUE` samples in
+fn retire(queue: &mut Option<Producer<Retired>>, sample: Option<Arc<Sample>>) {
+    if let Some(s) = sample {
+        retire_any(queue, Retired::Sample(s));
+    }
+}
+
+/// [`retire`] for an effect.
+fn retire_insert(queue: &mut Option<Producer<Retired>>, insert: Box<Insert>) {
+    retire_any(queue, Retired::Insert(insert));
+}
+
+fn retire_any(queue: &mut Option<Producer<Retired>>, item: Retired) {
+    let Some(q) = queue.as_mut() else { return };
+    if let Err(item) = q.push(item) {
+        // Unreachable while the UI keeps at most `RETIRE_QUEUE` items in
         // flight, as `EngineLink` does. Leaking is the real-time-safe
         // fallback if that bookkeeping is ever wrong.
         debug_assert!(false, "retirement queue overflow");
-        std::mem::forget(s);
+        std::mem::forget(item);
     }
 }
 
@@ -932,6 +1033,8 @@ struct Track {
     /// point is in force and returns to them afterwards.
     base: [f32; MAX_TRACK_PARAMS],
     strip: Strip,
+    /// Its insert chain, after the strip.
+    chain: Chain,
     gain_db: f32,
     pan: f32,
     /// Automated volume and pan, overriding `gain_db` and `pan`.
@@ -983,6 +1086,7 @@ impl Track {
             lanes: [Lane::EMPTY; MAX_LANES],
             base: base_params(kind),
             strip: Strip::new(sample_rate),
+            chain: Chain::default(),
             gain_db: 0.0,
             pan: 0.0,
             auto_gain: None,
@@ -1014,8 +1118,10 @@ impl Track {
     }
 
     /// Turns the slot into a fresh track of `kind` in place. A whole new
-    /// `Track` would be built on the (audio thread's) stack first.
+    /// `Track` would be built on the (audio thread's) stack first. Its
+    /// sample and effects must have been taken out already.
     fn reset(&mut self, kind: InstrumentKind, sample_rate: f32) {
+        debug_assert!(self.chain.is_empty(), "effects freed on the audio thread");
         self.instrument = Instrument::new(kind, sample_rate);
         for p in &mut self.steps {
             p.fill(None);
@@ -1327,8 +1433,13 @@ pub struct Engine {
     /// Decides step chances. Re-seeded on every Play so a pattern with
     /// chance steps plays (and exports) identically each time from the start.
     rng: Rng,
-    /// Where released samples go; `None` when not running in real time.
-    retired: Option<Producer<Arc<Sample>>>,
+    /// Where released samples and effects go; `None` when not running in
+    /// real time.
+    retired: Option<Producer<Retired>>,
+    /// The master's insert chain.
+    master_chain: Chain,
+    /// A track's signal in stereo, for its insert chain.
+    stereo_buf: [f32; 2 * BLOCK],
     /// Loudness of the output since playback started.
     loudness: LiveLoudness,
     limiter_reduction: f32,
@@ -1422,6 +1533,8 @@ impl Engine {
             shared,
             rng: Rng::new(CHANCE_SEED),
             retired: None,
+            master_chain: Chain::default(),
+            stereo_buf: [0.0; 2 * BLOCK],
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
             live: None,
@@ -1463,6 +1576,11 @@ impl Engine {
         for f in &mut e.fading[..] {
             f.left = 0;
             drop(f.track.instrument.set_sample(None));
+            f.track.chain = Chain::default();
+        }
+        // Nor do groups removed on the way ring out.
+        for g in &mut e.groups[MAX_GROUPS..] {
+            g.chain = Chain::default();
         }
         e.fading_count = 0;
         e.settle_smoothers();
@@ -1496,9 +1614,61 @@ impl Engine {
         self.takes = Some(queue);
     }
 
-    /// Routes every sample the engine releases from now on to `queue`.
-    pub fn attach_retirement(&mut self, queue: Producer<Arc<Sample>>) {
+    /// Routes every sample and effect the engine releases from now on to
+    /// `queue`.
+    pub fn attach_retirement(&mut self, queue: Producer<Retired>) {
         self.retired = Some(queue);
+    }
+
+    /// Puts `insert` in slot `slot` of `chain` (see [`Edit::SetSlot`]); the
+    /// effect it replaces, or `insert` for a chain that is not there, goes
+    /// back through the retirement queue.
+    fn place_slot(&mut self, id: ChainId, slot: u8, insert: Option<Box<Insert>>) {
+        let tempo = self.tempo_now;
+        let tracks = &self.tracks[..self.track_count];
+        let insert = insert.map(|mut b| {
+            b.set_tempo(tempo);
+            // A lane holding a value on the slot holds it on the new effect.
+            for (i, t) in tracks.iter().enumerate() {
+                for l in &t.lanes {
+                    let Some((c, s, kind, index)) = l.target.and_then(|x| x.slot(i as u8)) else { continue };
+                    if (c, s, kind) == (id, slot, b.kind()) && l.applied.is_some() {
+                        b.automate(usize::from(index), l.applied);
+                    }
+                }
+            }
+            b.snap();
+            b
+        });
+        let Self { tracks, track_count, groups, group_count, master_chain, retired, .. } = self;
+        let mut give_back = |b| retire_insert(retired, b);
+        let (chain, heard) = match id {
+            ChainId::Track(t) => (tracks[..*track_count].get_mut(usize::from(t)).map(|t| &mut t.chain), true),
+            ChainId::Group(g) => match groups[..*group_count].get_mut(usize::from(g)) {
+                Some(g) => {
+                    let live = g.is_live();
+                    (Some(&mut g.chain), live)
+                }
+                None => (None, true),
+            },
+            ChainId::Master => (Some(master_chain), true),
+        };
+        match chain {
+            Some(c) => {
+                c.place(usize::from(slot), insert, &mut give_back);
+                // A group no one hears changes at once.
+                if !heard {
+                    c.settle(&mut give_back);
+                }
+            }
+            None => insert.into_iter().for_each(give_back),
+        }
+    }
+
+    /// Takes every effect out of track slot `t`'s chain, back through the
+    /// retirement queue.
+    fn free_chain(tracks: &mut [Track], t: usize, retired: &mut Option<Producer<Retired>>) {
+        tracks[t].chain.clear(&mut |b| retire_insert(retired, b));
     }
 
     /// Same as handling [`Command::SetSample`].
@@ -1523,16 +1693,20 @@ impl Engine {
         f.left = self.fade_frames;
         let old = self.tracks[slot].instrument.set_sample(None);
         retire(&mut self.retired, old);
+        Self::free_chain(&mut self.tracks, slot, &mut self.retired);
     }
 
     pub fn track_count(&self) -> usize {
         self.track_count
     }
 
-    /// Whether the delay, reverb and chorus have nothing more to play: until
-    /// then a quiet output may still be followed by an echo.
+    /// Whether the buses' and the inserts' delays, reverbs and choruses have
+    /// nothing more to play: until then a quiet output may still be
+    /// followed by an echo.
     pub fn effects_idle(&self) -> bool {
-        self.mix.effects_idle()
+        let tracks = self.tracks[..self.track_count].iter().all(|t| t.chain.is_idle());
+        let groups = self.groups.iter().all(|g| !g.is_live() || g.chain.is_idle());
+        self.mix.effects_idle() && tracks && groups && self.master_chain.is_idle()
     }
 
     pub fn is_playing(&self) -> bool {
@@ -1557,6 +1731,15 @@ impl Engine {
         for g in &mut self.groups[..] {
             g.snap();
         }
+        let retired = &mut self.retired;
+        let mut give_back = |b| retire_insert(retired, b);
+        for t in &mut self.tracks[..] {
+            t.chain.settle(&mut give_back);
+        }
+        for g in &mut self.groups[..] {
+            g.chain.settle(&mut give_back);
+        }
+        self.master_chain.settle(&mut give_back);
         self.mix.snap();
     }
 
@@ -1565,6 +1748,9 @@ impl Engine {
         // An earlier command may have switched the limiter.
         self.midi.latency = self.mix.latency() as u64;
         match cmd {
+            // A new effect comes built, as `Command::SetSlot`: building it
+            // here would allocate on the audio thread.
+            Command::Edit(Edit::SetSlot { kind: Some(_), .. }) => {}
             Command::Edit(e) => {
                 // Track indices are about to shift; held notes would lose
                 // their tracks.
@@ -1628,6 +1814,7 @@ impl Engine {
                 self.automate(self.now);
             }
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
+            Command::SetSlot { chain, slot, insert } => self.place_slot(chain, slot, insert),
             Command::SetMidiClock(on) => {
                 self.midi_clock = on;
                 if !on && self.clock_pulse.take().is_some() && !std::mem::take(&mut self.clock_resume) {
@@ -2145,9 +2332,18 @@ impl Engine {
         if bpm != self.tempo_now {
             self.tempo_now = bpm;
             self.mix.set_tempo(bpm);
-            for t in &mut self.tracks {
+            for t in self.tracks.iter_mut().chain(self.fading.iter_mut().map(|f| &mut f.track)) {
                 t.instrument.set_tempo(bpm);
+                t.chain.set_tempo(bpm);
             }
+            let retired = &mut self.retired;
+            for g in &mut self.groups[..] {
+                g.chain.set_tempo(bpm);
+                if !g.is_live() {
+                    g.chain.settle(&mut |x| retire_insert(retired, x));
+                }
+            }
+            self.master_chain.set_tempo(bpm);
         }
     }
 
@@ -2521,6 +2717,7 @@ impl Engine {
                 if n < MAX_TRACKS && i <= n {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
+                    Self::free_chain(&mut self.tracks, n, &mut self.retired);
                     self.tracks[n].reset(kind, self.sample_rate);
                     self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.tracks[i..=n].rotate_right(1);
@@ -2538,6 +2735,7 @@ impl Engine {
                 if n < MAX_TRACKS {
                     let old = self.tracks[n].instrument.set_sample(None);
                     retire(&mut self.retired, old);
+                    Self::free_chain(&mut self.tracks, n, &mut self.retired);
                     self.tracks[n].reset(kind, self.sample_rate);
                     self.tracks[n].instrument.set_tempo(self.tempo_now);
                     self.track_count += 1;
@@ -2586,7 +2784,11 @@ impl Engine {
                 let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
                 let kind = t.instrument.kind();
                 let groups = self.group_count;
-                let valid = |x: LaneTarget| x.spec(kind).is_some() && x.group().is_none_or(|g| usize::from(g) < groups);
+                let valid = |x: LaneTarget| {
+                    x.spec(kind).is_some()
+                        && x.group().is_none_or(|g| usize::from(g) < groups)
+                        && x.slot(track).is_none_or(|(_, s, _, _)| usize::from(s) < MAX_SLOTS)
+                };
                 if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| !valid(x)) {
                     return;
                 }
@@ -2596,6 +2798,10 @@ impl Engine {
                     match (old.target, old.applied) {
                         (Some(LaneTarget::Track(x)), Some(_)) => {
                             self.tracks[usize::from(track)].write_target(x, None);
+                        }
+                        (Some(LaneTarget::Slot { slot, kind, index }), Some(_)) => {
+                            let c = &mut self.tracks[usize::from(track)].chain;
+                            automate_slot(c, slot, kind, index, None);
                         }
                         (Some(x), Some(_)) => self.release_global(x),
                         _ => {}
@@ -2663,6 +2869,8 @@ impl Engine {
             Edit::InsertGroup(index) => {
                 let (i, count) = (usize::from(index), self.group_count);
                 if count < MAX_GROUPS && i <= count {
+                    let retired = &mut self.retired;
+                    self.groups[count].chain.clear(&mut |b| retire_insert(retired, b));
                     self.groups[count].reset();
                     self.groups[i..=count].rotate_right(1);
                     self.group_count += 1;
@@ -2676,6 +2884,9 @@ impl Engine {
                     let r = self.free_retiring_slot();
                     self.groups[i..count].rotate_left(1);
                     self.groups.swap(count - 1, r);
+                    // What played on in the slot is cut short.
+                    let retired = &mut self.retired;
+                    self.groups[count - 1].chain.clear(&mut |b| retire_insert(retired, b));
                     self.groups[r].hold_on();
                     self.group_count -= 1;
                     // The group plays on from a slot of its own until the
@@ -2726,6 +2937,85 @@ impl Engine {
                     g.set_base(usize::from(index), value, automated);
                 }
             }
+            Edit::SetSlot { chain, slot, kind } => {
+                // Off the audio thread only: building an effect allocates.
+                let insert = kind.map(|k| Box::new(Insert::new(k, self.sample_rate, self.tempo_now)));
+                self.place_slot(chain, slot, insert);
+            }
+            Edit::SwapSlots { a, b, .. } if usize::from(a.max(b)) >= MAX_SLOTS => {}
+            Edit::SwapSlots { chain, a, b } => {
+                let (track_count, group_count) = (self.track_count, self.group_count);
+                let Self { tracks, groups, master_chain, retired, .. } = self;
+                let mut give_back = |x| retire_insert(retired, x);
+                let (sa, sb) = (usize::from(a), usize::from(b));
+                match chain {
+                    ChainId::Track(t) => {
+                        if let Some(t) = tracks[..track_count].get_mut(usize::from(t)) {
+                            t.chain.swap(sa, sb, &mut give_back);
+                        }
+                    }
+                    ChainId::Group(g) => {
+                        if let Some(g) = groups[..group_count].get_mut(usize::from(g)) {
+                            g.chain.swap(sa, sb, &mut give_back);
+                            if !g.is_live() {
+                                g.chain.settle(&mut give_back);
+                            }
+                        }
+                    }
+                    ChainId::Master => master_chain.swap(sa, sb, &mut give_back),
+                }
+                // The lanes on them follow.
+                let swap = |s: u8| {
+                    if s == a {
+                        b
+                    } else if s == b {
+                        a
+                    } else {
+                        s
+                    }
+                };
+                for (i, t) in tracks[..track_count].iter_mut().enumerate() {
+                    for l in &mut t.lanes {
+                        let Some(target) = l.target else { continue };
+                        if target.slot(i as u8).is_some_and(|(c, ..)| c == chain) {
+                            l.target = Some(match target {
+                                LaneTarget::Slot { slot, kind, index } => {
+                                    LaneTarget::Slot { slot: swap(slot), kind, index }
+                                }
+                                LaneTarget::GroupSlot { group, slot, kind, index } => {
+                                    LaneTarget::GroupSlot { group, slot: swap(slot), kind, index }
+                                }
+                                LaneTarget::MasterSlot { slot, kind, index } => {
+                                    LaneTarget::MasterSlot { slot: swap(slot), kind, index }
+                                }
+                                other => other,
+                            });
+                        }
+                    }
+                }
+            }
+            Edit::SetSlotParam { chain, slot, index, value } => {
+                let (track_count, group_count) = (self.track_count, self.group_count);
+                let (c, heard) = match chain {
+                    ChainId::Track(t) => {
+                        (self.tracks[..track_count].get_mut(usize::from(t)).map(|t| &mut t.chain), true)
+                    }
+                    ChainId::Group(g) => match self.groups[..group_count].get_mut(usize::from(g)) {
+                        Some(g) => {
+                            let live = g.is_live();
+                            (Some(&mut g.chain), live)
+                        }
+                        None => (None, true),
+                    },
+                    ChainId::Master => (Some(&mut self.master_chain), true),
+                };
+                if let Some(insert) = c.and_then(|c| c.slot_mut(usize::from(slot))) {
+                    insert.set_param(usize::from(index), value);
+                    if !heard {
+                        insert.snap();
+                    }
+                }
+            }
             Edit::SetTrackGroup { track, group } => {
                 let group = group.filter(|&g| usize::from(g) < self.group_count);
                 let fade = self.fade_frames;
@@ -2749,7 +3039,19 @@ impl Engine {
                     g.write_target(index, None);
                 }
             }
-            LaneTarget::Track(_) => {}
+            LaneTarget::GroupSlot { group, slot, kind, index } => {
+                let Self { groups, group_count, retired, .. } = self;
+                if let Some(g) = groups[..*group_count].get_mut(usize::from(group)) {
+                    automate_slot(&mut g.chain, slot, kind, index, None);
+                    if !g.is_live() {
+                        g.chain.settle(&mut |x| retire_insert(retired, x));
+                    }
+                }
+            }
+            LaneTarget::MasterSlot { slot, kind, index } => {
+                automate_slot(&mut self.master_chain, slot, kind, index, None);
+            }
+            LaneTarget::Track(_) | LaneTarget::Slot { .. } => {}
         }
     }
 
@@ -2791,11 +3093,16 @@ impl Engine {
             t.group = t.group.and_then(to);
             t.prev_group = t.prev_group.and_then(to);
             for l in &mut t.lanes {
-                if let Some(LaneTarget::Group { group, index }) = l.target {
-                    match to(group) {
+                match l.target {
+                    Some(LaneTarget::Group { group, index }) => match to(group) {
                         Some(g) => l.target = Some(LaneTarget::Group { group: g, index }),
                         None => *l = Lane::EMPTY,
-                    }
+                    },
+                    Some(LaneTarget::GroupSlot { group, slot, kind, index }) => match to(group) {
+                        Some(g) => l.target = Some(LaneTarget::GroupSlot { group: g, slot, kind, index }),
+                        None => *l = Lane::EMPTY,
+                    },
+                    _ => {}
                 }
             }
         }
@@ -3043,7 +3350,7 @@ impl Engine {
     fn automate(&mut self, frame: u64) {
         let frame = frame - frame % AUTOMATION_TICK;
         let mut gains = false;
-        let Self { tracks, track_count, mix, groups, group_count, .. } = self;
+        let Self { tracks, track_count, mix, groups, group_count, master_chain, retired, .. } = self;
         let groups = &mut groups[..*group_count];
         for t in &mut tracks[..*track_count] {
             let kind = t.instrument.kind();
@@ -3060,6 +3367,19 @@ impl Engine {
                             if let Some(g) = groups.get_mut(usize::from(group)) {
                                 gains |= g.write_target(index, want);
                             }
+                        }
+                        LaneTarget::Slot { slot, kind, index } => automate_slot(&mut t.chain, slot, kind, index, want),
+                        LaneTarget::GroupSlot { group, slot, kind, index } => {
+                            if let Some(g) = groups.get_mut(usize::from(group)) {
+                                automate_slot(&mut g.chain, slot, kind, index, want);
+                                // Unheard, it changes at once, as its own settings do.
+                                if !g.is_live() {
+                                    g.chain.settle(&mut |x| retire_insert(retired, x));
+                                }
+                            }
+                        }
+                        LaneTarget::MasterSlot { slot, kind, index } => {
+                            automate_slot(master_chain, slot, kind, index, want);
                         }
                     }
                 }
@@ -3178,6 +3498,11 @@ impl Engine {
                 out[2 * i] = self.mix_l[i] * g;
                 out[2 * i + 1] = self.mix_r[i] * g;
             }
+            if !self.master_chain.is_empty() {
+                let retired = &mut self.retired;
+                let key = &self.key[a..b];
+                self.master_chain.process(&mut out[2 * a..2 * b], key, &mut |x| retire_insert(retired, x));
+            }
             self.mix.master(&mut out[2 * a..2 * b]);
             pos = next;
         }
@@ -3224,6 +3549,7 @@ impl Engine {
             fade_frames,
             fade_buf,
             retired,
+            stereo_buf,
             ..
         } = self;
         let tracks = &mut tracks[..*track_count];
@@ -3260,10 +3586,17 @@ impl Engine {
         for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
             let buf = &mut buf[a..b];
             t.strip.process(buf, key);
-            route.track(t, buf, buf.len(), mix);
+            if t.chain.is_empty() {
+                route.track(t, Signal::Mono(buf), buf.len(), mix);
+            } else {
+                let st = &mut stereo_buf[..2 * buf.len()];
+                stereo(buf, st);
+                t.chain.process(st, key, &mut |x| retire_insert(retired, x));
+                route.track(t, Signal::Stereo(st), buf.len(), mix);
+            }
         }
         if *fading_count == 0 {
-            route.groups(key, mix);
+            route.groups(key, mix, &mut |x| retire_insert(retired, x));
             return;
         }
         // A removed track feeds no one's key: its key send went with it.
@@ -3273,17 +3606,32 @@ impl Engine {
             f.track.instrument.render(buf);
             f.track.strip.process(buf, key);
             let sounding = buf.len().min(f.left as usize);
-            for s in buf.iter_mut() {
-                *s *= f.left as f32 / *fade_frames as f32;
-                f.left = f.left.saturating_sub(1);
+            let whole = *fade_frames as f32;
+            if f.track.chain.is_empty() {
+                for s in buf.iter_mut() {
+                    *s *= f.left as f32 / whole;
+                    f.left = f.left.saturating_sub(1);
+                }
+                route.track(&mut f.track, Signal::Mono(buf), sounding, mix);
+            } else {
+                let st = &mut stereo_buf[..2 * buf.len()];
+                stereo(buf, st);
+                f.track.chain.process(st, key, &mut |x| retire_insert(retired, x));
+                for s in st.chunks_exact_mut(2) {
+                    let g = f.left as f32 / whole;
+                    s[0] *= g;
+                    s[1] *= g;
+                    f.left = f.left.saturating_sub(1);
+                }
+                route.track(&mut f.track, Signal::Stereo(st), sounding, mix);
             }
-            route.track(&mut f.track, buf, sounding, mix);
             if f.left == 0 {
                 *fading_count -= 1;
                 retire(retired, f.track.instrument.set_sample(None));
+                f.track.chain.clear(&mut |x| retire_insert(retired, x));
             }
         }
-        route.groups(key, mix);
+        route.groups(key, mix, &mut |x| retire_insert(retired, x));
     }
 }
 
@@ -3330,23 +3678,37 @@ impl Route<'_> {
         }
     }
 
-    /// Mixes track `t`'s signal `buf` where it goes, crossfading from where
-    /// it went while a change of group is under way. Only its first
-    /// `sounding` frames count as feeding a group (a removed track's fade
-    /// can end inside the segment).
-    fn track(&mut self, t: &mut Track, buf: &[f32], sounding: usize, mix: &mut Mix) {
-        let (n, at) = (buf.len(), 2 * self.a);
+    /// Mixes track `t`'s signal `sig` (`n` frames) where it goes,
+    /// crossfading from where it went while a change of group is under way.
+    /// Only its first `sounding` frames count as feeding a group (a removed
+    /// track's fade can end inside the segment).
+    fn track(&mut self, t: &mut Track, sig: Signal, sounding: usize, mix: &mut Mix) {
+        match sig {
+            Signal::Mono(buf) => self.track_with(t, buf.len(), |i| (buf[i], buf[i]), sounding, mix),
+            Signal::Stereo(buf) => self.track_with(t, buf.len() / 2, |i| (buf[2 * i], buf[2 * i + 1]), sounding, mix),
+        }
+    }
+
+    fn track_with(
+        &mut self,
+        t: &mut Track,
+        n: usize,
+        sig: impl Fn(usize) -> (f32, f32) + Copy,
+        sounding: usize,
+        mix: &mut Mix,
+    ) {
+        let at = 2 * self.a;
         let Route { mix_l, mix_r, groups, scratch, a, b, fade, .. } = self;
         if t.route_left == 0 {
             let (l, r) = route_sum((mix_l, mix_r), groups, *a, *b, t.group);
-            mix_track(t, buf, l, r, at, mix);
+            mix_track(t, n, sig, l, r, at, mix);
             self.feed(t.group, sounding);
             return;
         }
         let (sl, sr) = (&mut scratch.0[..n], &mut scratch.1[..n]);
         sl.fill(0.0);
         sr.fill(0.0);
-        mix_track(t, buf, sl, sr, at, mix);
+        mix_track(t, n, sig, sl, sr, at, mix);
         let (left, fade) = (t.route_left, *fade as f32);
         let weight = |i: usize| left.saturating_sub(i as u32) as f32 / fade;
         if t.prev_group != Some(DROPPED) {
@@ -3368,21 +3730,58 @@ impl Route<'_> {
 
     /// Runs every group fed or still ringing out into the master's sum: the
     /// project's, and removed ones playing on.
-    fn groups(&mut self, key: &[f32], mix: &mut Mix) {
+    fn groups(&mut self, key: &[f32], mix: &mut Mix, retire: &mut impl FnMut(Box<Insert>)) {
         let (a, b) = (self.a, self.b);
         for (i, g) in self.groups.iter_mut().enumerate() {
             let fed = self.fed[i];
             if (i < self.group_count || i >= MAX_GROUPS) && (fed > 0 || g.is_live()) {
-                g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix);
+                g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix, retire);
+                // A removed group that has rung out is done with its effects.
+                if i >= MAX_GROUPS && !g.is_live() {
+                    g.chain.clear(retire);
+                }
             }
         }
     }
 }
 
-/// Adds a track's signal for one segment to the mix and to the buses it
-/// sends to, through its fader and pan. `at` is the segment's first sample
-/// in the interleaved bus inputs.
-fn mix_track(t: &mut Track, buf: &[f32], mix_l: &mut [f32], mix_r: &mut [f32], at: usize, mix: &mut Mix) {
+/// A track's signal for a segment: one channel (its strip's output), or
+/// two interleaved (its insert chain's).
+#[derive(Clone, Copy)]
+enum Signal<'a> {
+    Mono(&'a [f32]),
+    Stereo(&'a [f32]),
+}
+
+/// `mono` on both channels of `out`, interleaved.
+fn stereo(mono: &[f32], out: &mut [f32]) {
+    for (f, &x) in out.chunks_exact_mut(2).zip(mono) {
+        f[0] = x;
+        f[1] = x;
+    }
+}
+
+/// Writes an automation value to parameter `index` of the effect in slot
+/// `slot` of `chain`, if it is a `kind` effect.
+fn automate_slot(chain: &mut Chain, slot: u8, kind: EffectKind, index: u8, value: Option<f32>) {
+    if let Some(insert) = chain.slot_mut(usize::from(slot)).filter(|i| i.kind() == kind) {
+        insert.automate(usize::from(index), value);
+    }
+}
+
+/// Adds a track's signal for one segment (`n` frames, frame `i` the pair
+/// `sig` gives) to the mix and to the buses it sends to, through its fader
+/// and pan. `at` is the segment's first sample in the interleaved bus
+/// inputs.
+fn mix_track(
+    t: &mut Track,
+    n: usize,
+    sig: impl Fn(usize) -> (f32, f32),
+    mix_l: &mut [f32],
+    mix_r: &mut [f32],
+    at: usize,
+    mix: &mut Mix,
+) {
     let mut peak = t.peak;
     let sending: [bool; send::BUSES] = std::array::from_fn(|k| {
         let s = &t.sends[k];
@@ -3390,9 +3789,10 @@ fn mix_track(t: &mut Track, buf: &[f32], mix_l: &mut [f32], mix_r: &mut [f32], a
     });
     if sending.contains(&true) {
         let mut inputs = mix.inputs(sending);
-        for (i, &s) in buf.iter().enumerate() {
-            let l = s * t.gain_l.tick();
-            let r = s * t.gain_r.tick();
+        for i in 0..n {
+            let (x, y) = sig(i);
+            let l = x * t.gain_l.tick();
+            let r = y * t.gain_r.tick();
             mix_l[i] += l;
             mix_r[i] += r;
             peak = peak.max(l.abs()).max(r.abs());
@@ -3406,9 +3806,10 @@ fn mix_track(t: &mut Track, buf: &[f32], mix_l: &mut [f32], mix_r: &mut [f32], a
             }
         }
     } else {
-        for (i, &s) in buf.iter().enumerate() {
-            let l = s * t.gain_l.tick();
-            let r = s * t.gain_r.tick();
+        for i in 0..n {
+            let (x, y) = sig(i);
+            let l = x * t.gain_l.tick();
+            let r = y * t.gain_r.tick();
             mix_l[i] += l;
             mix_r[i] += r;
             peak = peak.max(l.abs()).max(r.abs());
@@ -5969,6 +6370,416 @@ mod tests {
         assert!(e.commands.as_mut().unwrap().pop().is_none());
     }
 
+    fn effect_param(kind: EffectKind, id: &str) -> u8 {
+        kind.params().iter().position(|s| s.id == id).unwrap() as u8
+    }
+
+    fn set_slot(chain: ChainId, slot: u8, kind: EffectKind) -> Edit {
+        Edit::SetSlot { chain, slot, kind: Some(kind) }
+    }
+
+    fn slot_param(chain: ChainId, slot: u8, kind: EffectKind, id: &str, value: f32) -> Edit {
+        Edit::SetSlotParam { chain, slot, index: effect_param(kind, id), value }
+    }
+
+    /// The largest step from one frame to the next, of either channel.
+    fn largest_step(out: &[f32]) -> f32 {
+        out.chunks_exact(2)
+            .zip(out.chunks_exact(2).skip(1))
+            .fold(0.0f32, |m, (a, b)| m.max((a[0] - b[0]).abs()).max((a[1] - b[1]).abs()))
+    }
+
+    #[test]
+    fn inserts_run_in_slot_order_and_bypassed_ones_pass_bit_exact() {
+        use EffectKind::*;
+        let (t, m) = (ChainId::Track(1), ChainId::Master);
+        let plain = play(&three_tracks(), 24_000);
+        let with = |extra: &[Edit]| {
+            let mut edits = three_tracks();
+            edits.extend_from_slice(extra);
+            play(&edits, 24_000)
+        };
+        // Bypassed, or at settings that do nothing, an effect changes no sample.
+        let bypassed = [
+            set_slot(t, 0, Drive),
+            slot_param(t, 0, Drive, "drive", 18.0),
+            slot_param(t, 0, Drive, "bypass", 1.0),
+            set_slot(t, 5, Delay),
+            slot_param(t, 5, Delay, "bypass", 1.0),
+            set_slot(m, 2, Reverb),
+            slot_param(m, 2, Reverb, "bypass", 1.0),
+            set_slot(m, 3, Eq),
+        ];
+        assert_eq!(with(&bypassed), plain);
+        // A drive into a delay is not a delay into a drive, and a swap
+        // turns one into the other.
+        let drive_then_delay = [
+            set_slot(t, 0, Drive),
+            slot_param(t, 0, Drive, "drive", 18.0),
+            set_slot(t, 4, Delay),
+            slot_param(t, 4, Delay, "mix", 1.0),
+        ];
+        let first = with(&drive_then_delay);
+        assert_ne!(first, plain);
+        let swapped = [&drive_then_delay[..], &[Edit::SwapSlots { chain: t, a: 0, b: 4 }]].concat();
+        let second = with(&swapped);
+        assert_ne!(second, first);
+        let back = [&swapped[..], &[Edit::SwapSlots { chain: t, a: 4, b: 0 }]].concat();
+        assert_eq!(with(&back), first);
+        // The master's chain is heard after its fader.
+        let quiet = with(&[set_slot(m, 0, Drive), slot_param(m, 0, Drive, "drive", 18.0)]);
+        let quieter =
+            with(&[set_slot(m, 0, Drive), slot_param(m, 0, Drive, "drive", 18.0), Edit::SetMasterGain(-12.0)]);
+        assert_ne!(quiet, plain);
+        assert_ne!(quieter, quiet);
+    }
+
+    #[test]
+    fn a_group_of_one_with_an_insert_sounds_as_its_track_with_it_would() {
+        use EffectKind::*;
+        let kick = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::InsertGroup(0),
+        ];
+        let delay = |c: ChainId| [set_slot(c, 1, Delay), slot_param(c, 1, Delay, "mix", 0.7)];
+        let on_track = play(&[&kick[..], &delay(ChainId::Track(0))].concat(), 48_000);
+        let grouped =
+            [&kick[..], &[Edit::SetTrackGroup { track: 0, group: Some(0) }], &delay(ChainId::Group(0))].concat();
+        let on_group = play(&grouped, 48_000);
+        let worst = on_track.iter().zip(&on_group).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "a group's delay is its one track's ({worst})");
+        assert_ne!(on_group, play(&kick, 48_000));
+    }
+
+    #[test]
+    fn a_group_stays_live_while_its_insert_rings() {
+        use EffectKind::*;
+        let g = ChainId::Group(0);
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            set_slot(g, 0, Delay),
+            slot_param(g, 0, Delay, "mix", 1.0),
+            slot_param(g, 0, Delay, "delay_feedback", 0.8),
+        ];
+        let mut e = engine(&edits);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        e.apply(Edit::SetMute { track: 0, mute: true });
+        e.apply(Edit::SetTrackGroup { track: 0, group: None });
+        let hold = (group::HOLD_TIME * SR) as usize;
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade + hold + 4800);
+        e.shared.group_peaks[0].take();
+        run(&mut e, 4800);
+        assert!(e.shared.group_peaks[0].take() > 0.0, "the echoes ring on past the strip's hold");
+        assert!(e.groups[0].is_live());
+        // Once the echoes die away, it rests.
+        let mut left = 60 * SR as usize;
+        while e.groups[0].is_live() && left > 0 {
+            run(&mut e, 4096);
+            left = left.saturating_sub(4096);
+        }
+        assert!(!e.groups[0].is_live(), "the group never rested");
+        assert!(e.groups[0].chain.is_idle());
+    }
+
+    #[test]
+    fn inserts_come_and_go_and_bypass_without_a_click() {
+        use EffectKind::*;
+        let t = ChainId::Track(0);
+        let held = Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 22 };
+        let boost = |k: u8| {
+            let mut i = Box::new(Insert::new(Eq, SR, 120.0));
+            for (id, v) in [("eq_low_gain", 18.0), ("eq_mid_gain", 18.0), ("eq_high_gain", 18.0)] {
+                i.set_param(usize::from(effect_param(Eq, id)), v);
+            }
+            Command::SetSlot { chain: t, slot: k, insert: Some(i) }
+        };
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.handle(held);
+        run(&mut e, 4800);
+        let dry = largest_step(&run(&mut e, 4800));
+        let fade = e.fade_frames as usize;
+        // In, bypassed, back on, moved, out: each change is a crossfade.
+        let changes: [&dyn Fn(&mut Engine); 5] = [
+            &|e| e.handle(boost(2)),
+            &|e| e.apply(slot_param(t, 2, Eq, "bypass", 1.0)),
+            &|e| e.apply(slot_param(t, 2, Eq, "bypass", 0.0)),
+            &|e| e.apply(Edit::SwapSlots { chain: t, a: 2, b: 6 }),
+            &|e| e.handle(Command::SetSlot { chain: t, slot: 6, insert: None }),
+        ];
+        for (k, change) in changes.iter().enumerate() {
+            let before = largest_step(&run(&mut e, 4800));
+            change(&mut e);
+            let during = largest_step(&run(&mut e, 2 * fade));
+            let after = largest_step(&run(&mut e, 4800));
+            if k == 0 {
+                assert!(after > 2.0 * dry, "the boost is heard ({after} against {dry})");
+            }
+            let bound = before.max(after) * 1.05;
+            assert!(during <= bound, "change {k}: a step of {during}, against {before} before and {after} after");
+        }
+        assert!(e.tracks[0].chain.is_empty());
+    }
+
+    #[test]
+    fn insert_automation_is_the_same_at_any_buffer_size() {
+        use EffectKind::*;
+        let mut edits = three_tracks();
+        let mix_index = effect_param(Delay, "mix");
+        edits.extend([
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 2, group: Some(0) },
+            set_slot(ChainId::Track(1), 3, Drive),
+            set_slot(ChainId::Group(0), 0, Delay),
+            set_slot(ChainId::Master, 7, Chorus),
+        ]);
+        let still = play(&edits, 50_000);
+        edits.extend([
+            Edit::SetLane {
+                track: 1,
+                lane: 0,
+                target: Some(LaneTarget::Slot { slot: 3, kind: Drive, index: effect_param(Drive, "drive") }),
+                ramp: true,
+            },
+            Edit::SetPoint { track: 1, lane: 0, pattern: 0, step: 0, value: Some(0.0) },
+            Edit::SetPoint { track: 1, lane: 0, pattern: 0, step: 3, value: Some(18.0) },
+            Edit::SetLane {
+                track: 0,
+                lane: 1,
+                target: Some(LaneTarget::GroupSlot { group: 0, slot: 0, kind: Delay, index: mix_index }),
+                ramp: false,
+            },
+            Edit::SetPoint { track: 0, lane: 1, pattern: 0, step: 2, value: Some(1.0) },
+            Edit::SetLane {
+                track: 2,
+                lane: 0,
+                target: Some(LaneTarget::MasterSlot { slot: 7, kind: Chorus, index: crate::insert::BYPASS as u8 }),
+                ramp: false,
+            },
+            Edit::SetPoint { track: 2, lane: 0, pattern: 0, step: 1, value: Some(1.0) },
+        ]);
+        let reference = play(&edits, 50_000);
+        assert_ne!(reference, still, "the lanes move the effects");
+        for size in [1usize, 17, 64, 500, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut got = Vec::new();
+            let mut left = 50_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            assert_eq!(got, reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_swap_takes_the_lanes_on_its_slots_along() {
+        use EffectKind::*;
+        let t = ChainId::Track(0);
+        let lane = |slot| Some(LaneTarget::Slot { slot, kind: Drive, index: 1 });
+        let group = |slot| Some(LaneTarget::GroupSlot { group: 0, slot, kind: Delay, index: 5 });
+        let master = |slot| Some(LaneTarget::MasterSlot { slot, kind: Chorus, index: 3 });
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::InsertGroup(0),
+            set_slot(t, 0, Drive),
+            set_slot(ChainId::Track(1), 0, Drive),
+            set_slot(ChainId::Group(0), 2, Delay),
+            set_slot(ChainId::Master, 4, Chorus),
+            Edit::SetLane { track: 0, lane: 0, target: lane(0), ramp: false },
+            Edit::SetLane { track: 1, lane: 0, target: lane(0), ramp: false },
+            Edit::SetLane { track: 1, lane: 1, target: group(2), ramp: false },
+            Edit::SetLane { track: 0, lane: 2, target: master(4), ramp: false },
+        ]);
+        e.apply(Edit::SwapSlots { chain: t, a: 0, b: 5 });
+        e.apply(Edit::SwapSlots { chain: ChainId::Group(0), a: 2, b: 1 });
+        e.apply(Edit::SwapSlots { chain: ChainId::Master, a: 7, b: 4 });
+        assert_eq!(e.tracks[0].lanes[0].target, lane(5));
+        assert_eq!(e.tracks[1].lanes[0].target, lane(0), "another track's chain stays as it was");
+        assert_eq!(e.tracks[1].lanes[1].target, group(1));
+        assert_eq!(e.tracks[0].lanes[2].target, master(7));
+        // A swap with a slot out of range changes nothing, lanes included.
+        e.apply(Edit::SwapSlots { chain: ChainId::Master, a: 7, b: MAX_SLOTS as u8 });
+        assert_eq!(e.tracks[0].lanes[2].target, master(7));
+    }
+
+    #[test]
+    fn a_group_rings_out_the_same_at_any_buffer_size() {
+        use EffectKind::*;
+        let g = ChainId::Group(0);
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            set_slot(g, 0, Delay),
+            slot_param(g, 0, Delay, "mix", 1.0),
+            slot_param(g, 0, Delay, "delay_feedback", 0.8),
+        ];
+        let hold = (group::HOLD_TIME * SR) as usize;
+        let tail = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            run(&mut e, 4800);
+            e.apply(Edit::SetTrackGroup { track: 0, group: None });
+            e.apply(Edit::SetMute { track: 0, mute: true });
+            let mut got = Vec::new();
+            let mut left = 2 * hold + 30_000;
+            while left > 0 {
+                let n = size.min(left);
+                got.extend(run(&mut e, n));
+                left -= n;
+            }
+            got
+        };
+        let one = tail(1);
+        assert!(one[2 * (hold + 10_000)..].iter().any(|&x| x != 0.0), "the echoes ring past the hold");
+        for size in [64, 4096] {
+            assert_eq!(tail(size), one, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_new_effect_takes_the_value_a_lane_holds_on_its_slot() {
+        use EffectKind::*;
+        let t = ChainId::Track(0);
+        let drive = effect_param(Drive, "drive");
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            set_slot(t, 0, Drive),
+            Edit::SetLane {
+                track: 0,
+                lane: 0,
+                target: Some(LaneTarget::Slot { slot: 0, kind: Drive, index: drive }),
+                ramp: false,
+            },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(18.0) },
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        let held = |e: &mut Engine| e.tracks[0].chain.slot_mut(0).unwrap().automated(usize::from(drive));
+        assert_eq!(held(&mut e), Some(18.0));
+        let new = |k| Some(Box::new(Insert::new(k, SR, 120.0)));
+        e.handle(Command::SetSlot { chain: t, slot: 0, insert: new(Drive) });
+        assert_eq!(held(&mut e), Some(18.0), "the same kind takes the lane's value");
+        e.handle(Command::SetSlot { chain: t, slot: 0, insert: new(Eq) });
+        assert_eq!(e.tracks[0].chain.slot_mut(0).unwrap().automated(1), None, "another kind does not");
+    }
+
+    #[test]
+    fn an_unheard_group_takes_its_automation_at_once() {
+        use EffectKind::*;
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            set_slot(ChainId::Group(0), 0, Delay),
+            Edit::SetLane {
+                track: 0,
+                lane: 0,
+                target: Some(LaneTarget::GroupSlot {
+                    group: 0,
+                    slot: 0,
+                    kind: Delay,
+                    index: crate::insert::BYPASS as u8,
+                }),
+                ramp: false,
+            },
+            Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(1.0) },
+        ]);
+        e.handle(Command::Play);
+        run(&mut e, 4800);
+        assert!(!e.groups[0].is_live());
+        // Bypassed outright, so a track routed in later hears no fade.
+        assert_eq!(e.groups[0].chain.slot_mut(0).unwrap().frames_to_out(), Some(0));
+        // And back in outright once the lane goes.
+        e.apply(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false });
+        assert!(e.groups[0].chain.slot_mut(0).unwrap().is_in());
+    }
+
+    #[test]
+    fn a_queued_edit_never_builds_an_effect() {
+        let (mut tx, rx) = spsc::channel(16);
+        let t = ChainId::Track(0);
+        let mut e = Engine::with_edits(SR, &[Edit::AddTrack(InstrumentKind::Synth)], Arc::new(Shared::new()), Some(rx));
+        tx.push(Command::Edit(set_slot(t, 0, EffectKind::Delay))).unwrap();
+        run(&mut e, 64);
+        assert!(e.tracks[0].chain.is_empty(), "built on the audio thread");
+        // Emptying a slot builds nothing, so it may come as an edit.
+        let eq = Box::new(Insert::new(EffectKind::Eq, SR, 120.0));
+        e.handle(Command::SetSlot { chain: t, slot: 0, insert: Some(eq) });
+        tx.push(Command::Edit(Edit::SetSlot { chain: t, slot: 0, kind: None })).unwrap();
+        run(&mut e, 4800);
+        assert!(e.tracks[0].chain.is_empty());
+    }
+
+    #[test]
+    fn released_inserts_go_back_through_the_queue() {
+        use EffectKind::*;
+        let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::InsertGroup(0),
+        ]);
+        e.attach_retirement(tx);
+        let mut back = 0;
+        let mut drain = |rx: &mut spsc::Consumer<Retired>| {
+            while let Some(r) = rx.pop() {
+                assert!(matches!(r, Retired::Insert(_)), "only effects were sent");
+                back += 1;
+            }
+            back
+        };
+        let new = |k| Some(Box::new(Insert::new(k, SR, 120.0)));
+        let fade = e.fade_frames as usize;
+        e.handle(Command::Audition { track: 0, step: Step::new(48, 90, 1), frames: 1 << 20 });
+        for (chain, slot, kind) in [
+            (ChainId::Track(0), 0, Drive),
+            (ChainId::Track(0), 1, Delay),
+            (ChainId::Track(1), 0, Eq),
+            (ChainId::Group(0), 0, Reverb),
+            (ChainId::Master, 0, Chorus),
+        ] {
+            e.handle(Command::SetSlot { chain, slot, insert: new(kind) });
+        }
+        // To a chain that is not there, an effect goes straight back.
+        e.handle(Command::SetSlot { chain: ChainId::Track(5), slot: 0, insert: new(Eq) });
+        e.handle(Command::SetSlot { chain: ChainId::Group(3), slot: 0, insert: new(Eq) });
+        assert_eq!(drain(&mut rx), 2);
+        run(&mut e, 4800);
+        // A replaced effect comes back once it has faded out, not before.
+        e.handle(Command::SetSlot { chain: ChainId::Track(0), slot: 0, insert: new(Compressor) });
+        run(&mut e, fade - 1);
+        assert_eq!(drain(&mut rx), 2);
+        run(&mut e, 1);
+        assert_eq!(drain(&mut rx), 3);
+        // Removed, a track's and the master's come back too.
+        e.apply(Edit::RemoveTrack(0));
+        e.handle(Command::SetSlot { chain: ChainId::Master, slot: 0, insert: None });
+        run(&mut e, fade + 1);
+        assert_eq!(drain(&mut rx), 6);
+        // A group no one hears lets go of its effects at once.
+        assert!(!e.groups[0].is_live());
+        e.handle(Command::SetSlot { chain: ChainId::Group(0), slot: 0, insert: None });
+        assert_eq!(drain(&mut rx), 7);
+        // Edits the engine applies itself build and give back effects alike.
+        e.apply(set_slot(ChainId::Track(0), 2, Delay));
+        e.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 2, kind: None });
+        run(&mut e, 2 * fade);
+        assert_eq!(drain(&mut rx), 8);
+        e.apply(Edit::RemoveTrack(0));
+        run(&mut e, fade + 1);
+        assert_eq!(drain(&mut rx), 9, "the kick's EQ");
+    }
+
     #[test]
     fn released_samples_go_back_through_the_queue() {
         let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
@@ -5978,8 +6789,9 @@ mod tests {
         let mut e = engine(&[Edit::AddTrack(InstrumentKind::Sampler), Edit::AddTrack(InstrumentKind::Kick)]);
         e.attach_retirement(tx);
         let mut back = Vec::new();
-        let mut drain = |rx: &mut spsc::Consumer<Arc<Sample>>| {
-            while let Some(s) = rx.pop() {
+        let mut drain = |rx: &mut spsc::Consumer<Retired>| {
+            while let Some(r) = rx.pop() {
+                let Retired::Sample(s) = r else { panic!("only samples were sent") };
                 back.push(s);
             }
             back.len()
