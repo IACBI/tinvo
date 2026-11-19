@@ -61,10 +61,6 @@ pub const MAX_PARAMS: usize = 4096;
 pub const MAX_PARAM_EVENTS: usize = 256;
 /// The largest state saved or loaded, in bytes.
 pub const MAX_STATE: usize = 16 << 20;
-/// A flag of [`Request::Params`] beside CLAP's rescan flags: the plugin
-/// cleared what refers to a parameter (it is gone, or its id is used
-/// again), so automation on it is to be checked again.
-pub const PARAMS_CLEARED: u32 = 1 << 31;
 
 /// Events an instance can be given between two process calls, and notes it
 /// can hold: each held note keeps one of these for its release, so a
@@ -181,11 +177,17 @@ pub enum Request {
     /// processing failed, and it stays silent (or passes its input) until
     /// restarted.
     Failed(u64),
-    /// The parameters of the instance with this token changed as the flags
-    /// say: CLAP's rescan flags (values, as after loading a preset or a
-    /// change the plugin made itself; their text; their info; all of them,
-    /// read again at its next restart) and [`PARAMS_CLEARED`].
+    /// The parameters of the instance with this token changed as CLAP's
+    /// rescan flags say: their values (as after loading a preset, or a
+    /// change the plugin made itself), their text, their info (names and
+    /// whether hidden, already read again for its handles) or all of them
+    /// (read again at its next restart).
     Params(u64, u32),
+    /// The instance with this token asked for what refers to parameter
+    /// `id` to be cleared, as CLAP's clear flags say (all of it: the
+    /// parameter is gone, or its id names another one from its next
+    /// restart; its automation; its modulation).
+    Cleared { token: u64, id: u32, flags: u32 },
     /// The state of the instance with this token changed and should be
     /// saved again.
     StateDirty(u64),
@@ -227,14 +229,25 @@ impl ParamInfo {
         self.flags & CLAP_PARAM_IS_AUTOMATABLE != 0
     }
 
-    /// `value` in its range, a stepped one's truncated as CLAP says; `None`
-    /// for a value that is not a number.
+    /// `value` in its range, a stepped one's truncated as CLAP says (to a
+    /// whole number within the range); `None` for a value that is not a
+    /// number.
     pub fn clamp(&self, value: f64) -> Option<f64> {
         if !value.is_finite() {
             return None;
         }
-        let v = value.clamp(self.min, self.max);
-        Some(if self.is_stepped() { v.trunc() } else { v })
+        Some(if self.is_stepped() {
+            value.trunc().clamp(self.min.ceil(), self.max.floor())
+        } else {
+            value.clamp(self.min, self.max)
+        })
+    }
+
+    /// Whether a value can be set: a range, holding a whole number if it
+    /// is stepped.
+    fn has_values(&self) -> bool {
+        let (min, max) = (self.min, self.max);
+        min.is_finite() && max.is_finite() && if self.is_stepped() { min.ceil() <= max.floor() } else { min <= max }
     }
 }
 
@@ -258,13 +271,19 @@ struct HostData {
     exts: OnceLock<Exts>,
     /// Its parameters as last read, for its handles; on the main thread.
     params: Mutex<Arc<[ParamInfo]>>,
-    /// CLAP's rescan flags it set since the last poll, and
-    /// [`PARAMS_CLEARED`].
+    /// CLAP's rescan flags it set since the last poll.
     rescan: AtomicU32,
+    /// The parameters it asked to be cleared since the last poll, with
+    /// CLAP's clear flags, each id once.
+    cleared: Mutex<Vec<(u32, u32)>>,
+    /// The parameters it cleared all of: changes waiting for them are
+    /// dropped at its next restart, when the ids may name others.
+    forget: Mutex<Vec<u32>>,
     /// It asked for its parameter changes to be flushed.
     flush: AtomicBool,
     dirty: AtomicBool,
-    /// The last serial of a parameter change the plugin has.
+    /// Every parameter change with a serial up to this one has reached the
+    /// plugin, or was dropped with its parameter.
     delivered: AtomicU64,
 }
 
@@ -383,14 +402,25 @@ unsafe extern "C" fn host_get_extension(_host: *const ClapHost, id: *const c_cha
 unsafe extern "C" fn host_params_rescan(host: *const ClapHost, flags: u32) {
     // SAFETY: the pointer this instance was given.
     if let Some(h) = unsafe { host_data(host) } {
-        h.rescan.fetch_or(flags & !PARAMS_CLEARED, Ordering::AcqRel);
+        h.rescan.fetch_or(flags, Ordering::AcqRel);
     }
 }
 
-unsafe extern "C" fn host_params_clear(host: *const ClapHost, _param_id: ClapId, _flags: u32) {
+unsafe extern "C" fn host_params_clear(host: *const ClapHost, param_id: ClapId, flags: u32) {
     // SAFETY: as above.
-    if let Some(h) = unsafe { host_data(host) } {
-        h.rescan.fetch_or(PARAMS_CLEARED, Ordering::AcqRel);
+    let Some(h) = (unsafe { host_data(host) }) else { return };
+    let mut cleared = h.cleared.lock().unwrap_or_else(|e| e.into_inner());
+    match cleared.iter().position(|c| c.0 == param_id) {
+        Some(i) => cleared[i].1 |= flags,
+        None if cleared.len() < MAX_PARAMS => cleared.push((param_id, flags)),
+        None => {}
+    }
+    drop(cleared);
+    if flags & CLAP_PARAM_CLEAR_ALL != 0 {
+        let mut forget = h.forget.lock().unwrap_or_else(|e| e.into_inner());
+        if !forget.contains(&param_id) && forget.len() < MAX_PARAMS {
+            forget.push(param_id);
+        }
     }
 }
 
@@ -571,6 +601,8 @@ impl PluginHost {
             exts: OnceLock::new(),
             params: Mutex::new(Arc::from([])),
             rescan: AtomicU32::new(0),
+            cleared: Mutex::new(Vec::new()),
+            forget: Mutex::new(Vec::new()),
             flush: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             delivered: AtomicU64::new(0),
@@ -617,7 +649,8 @@ impl PluginHost {
             buffers: Buffers::default(),
             events: Vec::with_capacity(MAX_EVENTS + MAX_PARAM_EVENTS),
             params_queued: 0,
-            serial: 0,
+            serials: Vec::with_capacity(MAX_PARAM_EVENTS),
+            high: 0,
             exts,
             params: Arc::from([]),
             param_ids: Vec::new(),
@@ -659,6 +692,11 @@ impl PluginHost {
         let mut requests = Vec::new();
         self.live.retain(|w| {
             let Some(h) = w.upgrade() else { return false };
+            // A destroyed instance's host data may live on in a handle; what
+            // it asked for went with it.
+            if h.plugin.load(Ordering::Acquire).is_null() {
+                return false;
+            }
             // Taken before the call, so a request made during it is kept for
             // the next poll.
             if h.callback.swap(false, Ordering::AcqRel) {
@@ -679,14 +717,18 @@ impl PluginHost {
                 requests.push(Request::Failed(h.token));
             }
             let rescan = h.rescan.swap(0, Ordering::AcqRel);
+            if rescan & CLAP_PARAM_RESCAN_INFO != 0 {
+                refresh_info(&h);
+            }
             if rescan != 0 {
                 requests.push(Request::Params(h.token, rescan));
             }
+            let cleared = std::mem::take(&mut *h.cleared.lock().unwrap_or_else(|e| e.into_inner()));
+            requests.extend(cleared.into_iter().map(|(id, flags)| Request::Cleared { token: h.token, id, flags }));
             if h.dirty.swap(false, Ordering::AcqRel) {
                 requests.push(Request::StateDirty(h.token));
             }
-            // A destroyed instance's host data may live on in a handle.
-            !h.plugin.load(Ordering::Acquire).is_null()
+            true
         });
         let_go_of_unused_files();
         requests
@@ -870,8 +912,10 @@ pub struct Instance {
     /// Parameter changes first (`params_queued` of them), then notes.
     events: Vec<Event>,
     params_queued: usize,
-    /// The highest serial of the parameter changes queued.
-    serial: u64,
+    /// The serial of each parameter change queued, in its order.
+    serials: Vec<u64>,
+    /// The highest serial given.
+    high: u64,
     exts: Exts,
     params: Arc<[ParamInfo]>,
     /// (id, index into `params`), by id.
@@ -984,10 +1028,12 @@ impl Instance {
 
     /// Sets parameter `id` to `value` (in its range, a stepped one's
     /// truncated) from the start of the next process call, or the next
-    /// [`Instance::skip`] if it is not processed meanwhile. `serial` is
-    /// acknowledged once the plugin has it ([`PluginHandle::delivered`]).
-    /// False, with nothing queued, for an id it lacks, a read-only one, a
-    /// value that is not a number, or no room left. Never allocates.
+    /// [`Instance::skip`] if it is not processed meanwhile (one that needs
+    /// processing, CLAP's `REQUIRES_PROCESS`, waits for a process call).
+    /// `serial` is acknowledged once the plugin has it, or it was dropped
+    /// with its parameter ([`PluginHandle::delivered`]); serials are to
+    /// grow. False, with nothing queued, for an id it lacks, a read-only
+    /// one, a value that is not a number, or no room left. Never allocates.
     pub fn set_param(&mut self, id: u32, value: f64, serial: u64) -> bool {
         let Some(info) = self.param(id) else { return false };
         if info.is_readonly() {
@@ -996,11 +1042,12 @@ impl Instance {
         let Some(value) = info.clamp(value) else { return false };
         let pending = &mut self.events[..self.params_queued];
         // SAFETY: the first `params_queued` events are parameter changes.
-        if let Some(e) = pending.iter_mut().find(|e| unsafe { e.param.param_id } == id) {
+        if let Some(i) = pending.iter().position(|e| unsafe { e.param.param_id } == id) {
             // SAFETY: as above.
-            let mut p = unsafe { e.param };
+            let mut p = unsafe { pending[i].param };
             p.value = value;
-            *e = Event { param: p };
+            pending[i] = Event { param: p };
+            self.serials[i] = serial;
         } else if self.params_queued < MAX_PARAM_EVENTS {
             let param = ClapEventParamValue {
                 header: ClapEventHeader {
@@ -1018,13 +1065,14 @@ impl Instance {
                 key: -1,
                 value,
             };
-            // Within the capacity reserved: no allocation.
+            // Within the capacities reserved: no allocation.
             self.events.insert(self.params_queued, Event { param });
+            self.serials.push(serial);
             self.params_queued += 1;
         } else {
             return false;
         }
-        self.serial = self.serial.max(serial);
+        self.high = self.high.max(serial);
         true
     }
 
@@ -1102,61 +1150,8 @@ impl Instance {
     /// [`MAX_PARAMS`], passing over any it cannot describe, with a range
     /// that is not one, or an id already seen.
     fn read_params(&mut self) {
-        let mut params = Vec::new();
-        if let Some(p) = self.exts.params {
-            // SAFETY: main thread, a live plugin.
-            let n = unsafe { (p.count)(self.plugin) } as usize;
-            for i in 0..n.min(MAX_PARAMS) {
-                let mut info = ClapParamInfo {
-                    id: CLAP_INVALID_ID,
-                    flags: 0,
-                    cookie: null_mut(),
-                    name: [0; CLAP_NAME_SIZE],
-                    module: [0; CLAP_PATH_SIZE],
-                    min_value: 0.0,
-                    max_value: 0.0,
-                    default_value: 0.0,
-                };
-                // SAFETY: an index below its count, and room for the info.
-                if !unsafe { (p.get_info)(self.plugin, i as u32, &mut info) } {
-                    continue;
-                }
-                let (min, max) = (info.min_value, info.max_value);
-                if info.id == CLAP_INVALID_ID || !(min.is_finite() && max.is_finite() && min <= max) {
-                    continue;
-                }
-                let default = if info.default_value.is_finite() { info.default_value.clamp(min, max) } else { min };
-                params.push(ParamInfo {
-                    id: info.id,
-                    flags: info.flags,
-                    name: c_text(&info.name),
-                    module: c_text(&info.module),
-                    min,
-                    max,
-                    default,
-                });
-            }
-        }
-        let mut ids: Vec<(u32, u32)> = params.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
-        ids.sort_unstable();
-        ids.dedup_by_key(|p| p.0);
-        if ids.len() < params.len() {
-            // Each id once, the first described.
-            let keep: Vec<bool> = {
-                let mut keep = vec![false; params.len()];
-                for &(_, i) in &ids {
-                    keep[i as usize] = true;
-                }
-                keep
-            };
-            let mut i = 0;
-            params.retain(|_| {
-                i += 1;
-                keep[i - 1]
-            });
-            ids = params.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
-            ids.sort_unstable();
-        }
+        // SAFETY: main thread, a live plugin and its own extension.
+        let (params, ids) = self.exts.params.map(|p| unsafe { read_params(self.plugin, p) }).unwrap_or_default();
         self.params = Arc::from(params);
         self.param_ids = ids;
         *self.host.params.lock().unwrap_or_else(|e| e.into_inner()) = self.params.clone();
@@ -1278,11 +1273,32 @@ impl Instance {
             self.activated = false;
         }
         let activated = self.activate();
-        // Those of parameters it no longer has are dropped.
-        let ids = &self.param_ids;
-        // SAFETY: the events left are parameter changes.
-        self.events.retain(|e| ids.binary_search_by_key(&unsafe { e.param.param_id }, |p| p.0).is_ok());
+        // Those of parameters it no longer has (or cleared, or no longer
+        // lets the host set) are dropped, the rest kept to their ranges now.
+        let forget = std::mem::take(&mut *self.host.forget.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut i = 0;
+        while i < self.events.len() {
+            // SAFETY: the events left are parameter changes.
+            let mut p = unsafe { self.events[i].param };
+            let kept = (!forget.contains(&p.param_id))
+                .then(|| self.param(p.param_id))
+                .flatten()
+                .filter(|info| !info.is_readonly())
+                .and_then(|info| info.clamp(p.value));
+            match kept {
+                Some(v) => {
+                    p.value = v;
+                    self.events[i] = Event { param: p };
+                    i += 1;
+                }
+                None => {
+                    self.events.remove(i);
+                    self.serials.remove(i);
+                }
+            }
+        }
         self.params_queued = self.events.len();
+        settle(&self.serials, self.high, &self.host.delivered);
         activated
     }
 
@@ -1489,10 +1505,15 @@ impl Instance {
             // them, with the notes they belong to.
             return false;
         }
+        // By field: `b` still borrows the buffers. Changes the host made
+        // change what the plugin would save, as CLAP says.
+        if self.params_queued > 0 {
+            self.host.dirty.store(true, Ordering::Release);
+        }
         self.events.clear();
-        // As `delivered`, by field: `b` still borrows the buffers.
+        self.serials.clear();
         self.params_queued = 0;
-        self.host.delivered.fetch_max(self.serial, Ordering::AcqRel);
+        settle(&self.serials, self.high, &self.host.delivered);
         let out = b.input_planes;
         // SAFETY: as above, after the plugin returned.
         unsafe {
@@ -1518,9 +1539,9 @@ impl Instance {
 
     /// Moves its steady time on by `frames` not processed (CLAP's steady
     /// time counts every frame since it started).
-    /// Parameter changes waiting (or a flush the plugin asked for) reach
-    /// it through `flush`, on the audio thread (taken here) as CLAP asks of
-    /// an active plugin.
+    /// Parameter changes waiting (but those that need processing) reach
+    /// it through `flush`, as does a flush the plugin asked for: on the
+    /// audio thread (taken here), as CLAP asks of an active plugin.
     pub fn skip(&mut self, frames: usize) {
         self.tail = false;
         if self.params_queued > 0 || self.host.flush.load(Ordering::Acquire) {
@@ -1529,15 +1550,30 @@ impl Instance {
         self.advance(frames);
     }
 
-    /// Hands the plugin its parameter changes without processing.
+    /// Hands the plugin the parameter changes it can take without
+    /// processing.
     fn flush_params(&mut self) {
         let Some(flush) = self.exts.params.and_then(|p| p.flush) else { return };
         if !self.activated || self.failed {
             return;
         }
-        self.host.flush.store(false, Ordering::Release);
+        let asked = self.host.flush.swap(false, Ordering::AcqRel);
+        // Those flushed first; order does not matter, as each is of its
+        // own parameter.
+        let mut n = 0;
+        for i in 0..self.params_queued {
+            // SAFETY: the first `params_queued` events are parameter changes.
+            let id = unsafe { self.events[i].param.param_id };
+            if self.param(id).is_some_and(|p| p.flags & CLAP_PARAM_REQUIRES_PROCESS == 0) {
+                self.events.swap(i, n);
+                self.serials.swap(i, n);
+                n += 1;
+            }
+        }
+        if n == 0 && !asked {
+            return;
+        }
         let _role = AudioRole::enter();
-        let n = self.params_queued;
         let slice = EventSlice { ptr: self.events.as_ptr(), len: n };
         let in_events = ClapInputEvents {
             ctx: (&raw const slice).cast_mut().cast(),
@@ -1549,16 +1585,14 @@ impl Instance {
         // SAFETY: audio thread, active, not processing meanwhile (this
         // holds `&mut self`); the lists live until it returns.
         unsafe { flush(self.plugin, &in_events, &out_events) };
-        // No allocation: the notes behind move up.
+        // No allocation: what is behind moves up.
         self.events.drain(..n);
-        self.params_queued = 0;
-        self.delivered();
-    }
-
-    /// The parameter changes queued have reached the plugin.
-    fn delivered(&mut self) {
-        self.params_queued = 0;
-        self.host.delivered.fetch_max(self.serial, Ordering::AcqRel);
+        self.serials.drain(..n);
+        self.params_queued -= n;
+        settle(&self.serials, self.high, &self.host.delivered);
+        if n > 0 {
+            self.host.dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Whether its last process call said it has a tail still to play
@@ -1613,7 +1647,8 @@ impl Drop for Instance {
                 buffers: std::mem::take(&mut self.buffers),
                 events: std::mem::take(&mut self.events),
                 params_queued: self.params_queued,
-                serial: self.serial,
+                serials: std::mem::take(&mut self.serials),
+                high: self.high,
                 exts: self.exts,
                 params: std::mem::take(&mut self.params),
                 param_ids: std::mem::take(&mut self.param_ids),
@@ -1702,6 +1737,106 @@ unsafe extern "C" fn events_out(list: *const ClapOutputEvents, event: *const Cla
         }
     }
     true
+}
+
+/// Moves `delivered` on to the serial before the oldest change still
+/// waiting (`serials`), or with none waiting to `high`.
+fn settle(serials: &[u64], high: u64, delivered: &AtomicU64) {
+    let upto = serials.iter().min().map_or(high, |s| s.saturating_sub(1));
+    delivered.fetch_max(upto, Ordering::AcqRel);
+}
+
+/// Reads a plugin's parameters: at most [`MAX_PARAMS`], passing over any it
+/// cannot describe, with no values to set, or with an id already seen; with
+/// the (id, index) of each, by id.
+///
+/// # Safety
+/// Main thread, a live plugin and its own extension.
+unsafe fn read_params(plugin: *const ClapPlugin, p: ParamsFns) -> (Vec<ParamInfo>, Vec<(u32, u32)>) {
+    let mut params = Vec::new();
+    // SAFETY: by the caller's promise.
+    let n = unsafe { (p.count)(plugin) } as usize;
+    for i in 0..n.min(MAX_PARAMS) {
+        let mut info = ClapParamInfo {
+            id: CLAP_INVALID_ID,
+            flags: 0,
+            cookie: null_mut(),
+            name: [0; CLAP_NAME_SIZE],
+            module: [0; CLAP_PATH_SIZE],
+            min_value: 0.0,
+            max_value: 0.0,
+            default_value: 0.0,
+        };
+        // SAFETY: an index below its count, and room for the info.
+        if !unsafe { (p.get_info)(plugin, i as u32, &mut info) } {
+            continue;
+        }
+        let mut param = ParamInfo {
+            id: info.id,
+            flags: info.flags,
+            name: c_text(&info.name),
+            module: c_text(&info.module),
+            min: info.min_value,
+            max: info.max_value,
+            default: 0.0,
+        };
+        if info.id == CLAP_INVALID_ID || !param.has_values() {
+            continue;
+        }
+        param.default = param.clamp(info.default_value).unwrap_or(param.clamp(param.min).unwrap_or(param.min));
+        params.push(param);
+    }
+    let mut ids: Vec<(u32, u32)> = params.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
+    ids.sort_unstable();
+    ids.dedup_by_key(|p| p.0);
+    if ids.len() < params.len() {
+        // Each id once, the first described.
+        let mut keep = vec![false; params.len()];
+        for &(_, i) in &ids {
+            keep[i as usize] = true;
+        }
+        let mut i = 0;
+        params.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        ids = params.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
+        ids.sort_unstable();
+    }
+    (params, ids)
+}
+
+/// Reads again what CLAP's `RESCAN_INFO` says may change while a plugin is
+/// active (names, and whether a parameter is hidden or periodic) into the
+/// parameters its handles see. Its ranges and the rest cannot change then,
+/// so the instance's own copy still holds. On the host's thread.
+fn refresh_info(h: &HostData) {
+    const LIVE_FLAGS: u32 = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_PERIODIC;
+    let plugin = h.plugin.load(Ordering::Acquire);
+    let Some(p) = h.exts.get().and_then(|e| e.params) else { return };
+    if plugin.is_null() || h.owner != thread_key() {
+        return;
+    }
+    // SAFETY: main thread, a live plugin (destroyed on this thread only)
+    // and its own extension; CLAP lets these run while it processes.
+    let (fresh, ids) = unsafe { read_params(plugin, p) };
+    let mut params = h.params.lock().unwrap_or_else(|e| e.into_inner());
+    let updated: Vec<ParamInfo> = params
+        .iter()
+        .map(|old| match ids.binary_search_by_key(&old.id, |p| p.0) {
+            Ok(i) => {
+                let new = &fresh[ids[i].1 as usize];
+                ParamInfo {
+                    name: new.name.clone(),
+                    module: new.module.clone(),
+                    flags: (old.flags & !LIVE_FLAGS) | (new.flags & LIVE_FLAGS),
+                    ..old.clone()
+                }
+            }
+            Err(_) => old.clone(),
+        })
+        .collect();
+    *params = Arc::from(updated);
 }
 
 /// A C string in a fixed array, up to its NUL (or the whole array).
@@ -1819,7 +1954,9 @@ impl PluginHandle {
         !self.host.plugin.load(Ordering::Acquire).is_null()
     }
 
-    /// Its parameters, as last read.
+    /// Its parameters, as last read: at its last activation, with names
+    /// and what is hidden as of the last poll that followed a change of
+    /// them.
     pub fn params(&self) -> Arc<[ParamInfo]> {
         self.host.params.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1867,8 +2004,9 @@ impl PluginHandle {
         unsafe { save_state(plugin, state) }.map(Some)
     }
 
-    /// The highest serial of the parameter changes the plugin has had
-    /// ([`Instance::set_param`]).
+    /// The serial up to which every parameter change
+    /// ([`Instance::set_param`]) has reached the plugin, or was dropped
+    /// with its parameter.
     pub fn delivered(&self) -> u64 {
         self.host.delivered.load(Ordering::Acquire)
     }

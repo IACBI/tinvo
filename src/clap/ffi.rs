@@ -324,6 +324,7 @@ pub const CLAP_PARAM_IS_HIDDEN: u32 = 1 << 2;
 pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;
 pub const CLAP_PARAM_IS_BYPASS: u32 = 1 << 4;
 pub const CLAP_PARAM_IS_AUTOMATABLE: u32 = 1 << 5;
+pub const CLAP_PARAM_REQUIRES_PROCESS: u32 = 1 << 15;
 pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 16;
 
 /// `clap_param_info_t`.
@@ -368,6 +369,9 @@ pub const CLAP_PARAM_RESCAN_VALUES: u32 = 1;
 pub const CLAP_PARAM_RESCAN_TEXT: u32 = 1 << 1;
 pub const CLAP_PARAM_RESCAN_INFO: u32 = 1 << 2;
 pub const CLAP_PARAM_RESCAN_ALL: u32 = 1 << 3;
+pub const CLAP_PARAM_CLEAR_ALL: u32 = 1;
+pub const CLAP_PARAM_CLEAR_AUTOMATIONS: u32 = 1 << 1;
+pub const CLAP_PARAM_CLEAR_MODULATIONS: u32 = 1 << 2;
 
 /// `clap_host_params_t`.
 #[repr(C)]
