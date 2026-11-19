@@ -233,7 +233,8 @@ impl Playing {
     /// is done in place; a failure fails the render.
     fn serve(&mut self, engine: &mut Engine, plugins: &mut dyn PluginSource) -> Result<(), String> {
         for request in plugins.poll() {
-            let (Request::Restart(token) | Request::Failed(token)) = request;
+            // What its parameters and state did is no render's concern.
+            let (Request::Restart(token) | Request::Failed(token)) = request else { continue };
             let name = self.tokens.iter().find(|t| t.0 == token).map_or_else(String::new, |t| plugins.name(t.1));
             if let Request::Failed(_) = request {
                 return Err(format!("{name} failed while rendering"));

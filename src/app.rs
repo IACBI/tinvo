@@ -3369,7 +3369,7 @@ impl App {
         }
         let mut tokens: Vec<(u64, bool)> = Vec::new();
         for request in requests {
-            let (Request::Restart(token) | Request::Failed(token)) = request;
+            let (Request::Restart(token) | Request::Failed(token)) = request else { continue };
             let failed = matches!(request, Request::Failed(_));
             match tokens.iter_mut().find(|t| t.0 == token) {
                 Some(t) => t.1 |= failed,

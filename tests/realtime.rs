@@ -609,8 +609,9 @@ fn fixture() -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("{name} is not built: run cargo test, or cargo build --example clap_fixture"))
 }
 
-/// A plugin instrument and a plugin effect: notes, releases and processing
-/// at every buffer size, a start, and the stop before they leave, on a
+/// A plugin instrument and a plugin effect: notes, releases, parameter
+/// changes (some flushed while the effect is skipped) and processing at
+/// every buffer size, a start, and the stop before they leave, on a
 /// fresh thread that has called `prepare_audio_thread`, as an audio
 /// callback's would. (On macOS a thread's first use of thread-local storage
 /// may call the system's allocator directly, which this allocator cannot
@@ -649,8 +650,18 @@ fn plugins() -> usize {
                         sine.release_all();
                         held.clear();
                     }
+                    let serial = i as u64 + 1;
+                    for _ in 0..rng.next_u64() % 4 {
+                        let value = (rng.next_u64() % 100) as f64 / 100.0;
+                        sine.set_param(20, value, serial);
+                        gain.set_param(10 + (rng.next_u64() % 2) as u32, 2.0 * value, serial);
+                    }
                     played &= sine.process(io);
-                    played &= gain.process(io);
+                    if i % 5 == 0 {
+                        gain.skip(frames);
+                    } else {
+                        played &= gain.process(io);
+                    }
                     if i == 399 {
                         sine.stop();
                         gain.stop();

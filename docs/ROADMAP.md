@@ -553,6 +553,12 @@ In parts, each merged on its own.
 
 - `clap.params` in the panel and on automation lanes, by stable id; `clap.latency` in the latency compensation; `clap.state` in the project file. A missing plugin: an insert passes its input through and an instrument stays silent; both keep their state and are named when the project opens.
 
+In parts, each merged on its own.
+
+- **The host** ✅: an instance reads its parameters each time it is activated and its latency right after; parameter changes by stable id go to the next process call in room of their own (or to `flush` on the audio thread when it is skipped), acknowledged by serial; a state of at most 16 MiB is loaded before the first activation and saved through a `PluginHandle`, which also reads values and text while the plugin plays elsewhere; the plugin's own parameter changes, its rescans and a dirty state are reported by the poll. The test plugin's gain and sine gained parameters, a state, and modes for latency, a meter, an oversized state and failing saves and loads.
+- **In the engine**: parameter changes and automation lanes by stable id, and plugin latency in the compensation, the dry path of a plugin insert kept in line.
+- **In projects and the editor**: the state in project format 17, kept through undo, reconnects and exports, and a plugin's parameters in the panel and on lanes.
+
 #### 12d: The plugin's window
 
 - `clap.gui` as a floating window, its platform's event loop running alongside the terminal's.
