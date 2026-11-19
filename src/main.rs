@@ -58,6 +58,9 @@ USAGE:
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
     tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
+    tinvo plugins [--rescan]            list the CLAP plugins in CLAP's folders and in
+                                        CLAP_PATH; files read before are taken from a
+                                        cache until they change, unless --rescan
     tinvo settings [FILE]               check the settings file (keys and colours) and print
                                         every setting it gives, ready to copy and edit
     tinvo --help | --version
@@ -79,6 +82,17 @@ AUDIO:
 ";
 
 fn main() -> ExitCode {
+    // The child a plugin scan runs for each file: its paths need not be
+    // Unicode, so they are read before the arguments become strings.
+    let mut raw = std::env::args_os().skip(1);
+    if raw.next().is_some_and(|a| a == "scan-clap") {
+        let rest: Vec<std::ffi::OsString> = raw.collect();
+        return match rest.as_slice() {
+            // SAFETY: this process is the child a scan started for this file.
+            [file, result] => ExitCode::from(unsafe { tinvo::clap::scan::worker(file.as_ref(), result.as_ref()) }),
+            _ => ExitCode::from(2),
+        };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         None => cmd_edit(&[]),
@@ -94,6 +108,7 @@ fn main() -> ExitCode {
         Some("demo") => cmd_demo(&args[1..]),
         Some("probe") => cmd_probe(&args[1..]),
         Some("loopback") => cmd_loopback(&args[1..]),
+        Some("plugins") => cmd_plugins(&args[1..]),
         Some(c @ ("devices" | "midi" | "inputs")) if args.len() > 1 => {
             Err(format!("{c} takes no arguments, not '{}'{SEE_HELP}", shown(&args[1])))
         }
@@ -533,6 +548,54 @@ fn cmd_devices() -> Result<(), String> {
     }
     if devices.iter().any(|d| d.is_default) {
         println!("(* is the system default)");
+    }
+    Ok(())
+}
+
+fn cmd_plugins(args: &[String]) -> Result<(), String> {
+    use tinvo::clap::scan;
+    let rescan = match args {
+        [] => false,
+        [a] if a == "--rescan" => true,
+        [a, ..] => return Err(format!("plugins takes only --rescan, not '{}'{SEE_HELP}", shown(a))),
+    };
+    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
+    let cache = tinvo::autosave::state_dir().map(|d| d.join("plugins.txt"));
+    let roots = scan::default_roots();
+    let options = scan::Options { worker, per_file: scan::PER_FILE, budget: scan::BUDGET, rescan };
+    let catalog = scan::scan(&roots, cache.as_deref(), &options);
+    let path = |p: &std::path::Path| shown(&p.display().to_string());
+    let plugins = catalog.plugins();
+    for (file, p) in &plugins {
+        let mut title = shown(&p.name);
+        for (before, text) in [("", &p.version), ("by ", &p.vendor)].into_iter().filter(|(_, t)| !t.is_empty()) {
+            title.push_str(&format!(" {before}{}", shown(text)));
+        }
+        println!("{title} ({})\n    {}\n    {}", p.roles.label(), shown(&p.id), path(file));
+    }
+    if plugins.is_empty() {
+        println!("No CLAP plugins found. Searched:");
+        for root in &roots {
+            println!("    {}", path(root));
+        }
+    }
+    let failures = catalog.failures();
+    if !failures.is_empty() {
+        println!("\nNot loaded:");
+        for (file, why) in failures {
+            println!("  {}\n    {}", path(file), shown(why));
+        }
+    }
+    for (id, used, other) in catalog.duplicates() {
+        println!("\n{} is in two files: {} is used, not {}", shown(id), path(used), path(other));
+    }
+    match catalog.left {
+        0 => {}
+        1 => println!("\n1 file is not read yet; tinvo plugins reads it next time."),
+        n => println!("\n{n} files are not read yet; tinvo plugins reads them next time."),
+    }
+    for note in &catalog.notes {
+        eprintln!("note: {}", shown(note));
     }
     Ok(())
 }

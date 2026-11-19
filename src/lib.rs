@@ -7,6 +7,7 @@
 //!   tui        terminal I/O (raw mode, key decoding, diffing screen buffer)
 //!   audio      native real-time output backends (WASAPI / ALSA / JACK / CoreAudio)
 //!   autosave   crash-safe autosave of unsaved edits, and their recovery
+//!   clap       CLAP plugin files: finding them and reading what they offer
 //!   render     offline rendering, sharing the exact real-time code path
 //!   project    document model, edits, persistence
 //!   smf        Standard MIDI File export and import
@@ -25,6 +26,7 @@ pub mod app;
 pub mod audio;
 pub mod autosave;
 pub mod bench;
+pub mod clap;
 pub mod dsp;
 pub mod engine;
 pub mod fsutil;
