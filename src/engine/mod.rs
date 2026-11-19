@@ -651,6 +651,15 @@ pub enum Command {
         track: u8,
         instance: Box<Instance>,
     },
+    /// Puts a plugin instance in the plugin insert in slot `slot` of
+    /// `chain` (the one it will hold, if a change there waits), if it fits
+    /// there. The one it replaces, or one that fits no insert there, goes
+    /// back through the retirement queue.
+    SetSlotPlugin {
+        chain: ChainId,
+        slot: u8,
+        instance: Box<Instance>,
+    },
     /// Lends out the instance with this token, wherever it plays, to be
     /// restarted: it comes back as [`Retired::Lent`], stopped, and its
     /// place waits for it ([`Command::Return`]), silent or passing its
@@ -1921,6 +1930,24 @@ impl Engine {
         }
     }
 
+    /// Same as handling [`Command::SetSlotPlugin`].
+    pub fn set_slot_plugin(&mut self, chain: ChainId, slot: u8, instance: Box<Instance>) {
+        debug_assert!(self.retired.is_some(), "an engine taking plugin instances needs a retirement queue");
+        let chain = match chain {
+            ChainId::Track(t) => self.tracks[..self.track_count].get_mut(usize::from(t)).map(|t| &mut t.chain),
+            ChainId::Group(g) => self.groups[..self.group_count].get_mut(usize::from(g)).map(|g| &mut g.chain),
+            ChainId::Master => Some(&mut self.master_chain),
+        };
+        let attached = match chain.and_then(|c| c.slot_mut(usize::from(slot))) {
+            Some(insert) => insert.attach(instance),
+            None => Err(instance),
+        };
+        match attached {
+            Ok(old) => old.into_iter().for_each(|i| retire_any(&mut self.retired, Retired::Plugin(i))),
+            Err(i) => retire_instance(&mut self.retired, i),
+        }
+    }
+
     /// Calls `f` on every plugin slot (instruments of the tracks and of
     /// those fading out, then every chain's inserts, waiting ones too)
     /// until it returns true. Returns the track whose instrument it
@@ -1996,11 +2023,11 @@ impl Engine {
         self.track_count
     }
 
-    /// Whether the buses' and the inserts' delays, reverbs and choruses have
-    /// nothing more to play: until then a quiet output may still be
-    /// followed by an echo.
+    /// Whether the buses' and the inserts' delays, reverbs and choruses, and
+    /// plugins with a tail to play, have nothing more to play: until then a
+    /// quiet output may still be followed by an echo.
     pub fn effects_idle(&self) -> bool {
-        let tracks = self.tracks[..self.track_count].iter().all(|t| t.chain.is_idle());
+        let tracks = self.tracks[..self.track_count].iter().all(|t| t.chain.is_idle() && !t.instrument.has_tail());
         let groups = self.groups.iter().all(|g| !g.is_live() || g.chain.is_idle());
         self.mix.effects_idle() && tracks && groups && self.master_chain.is_idle()
     }
@@ -2123,6 +2150,7 @@ impl Engine {
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
             Command::SetSlot { chain, slot, insert } => self.place_slot(chain, slot, insert),
             Command::SetPlugin { track, instance } => self.set_plugin(usize::from(track), instance),
+            Command::SetSlotPlugin { chain, slot, instance } => self.set_slot_plugin(chain, slot, instance),
             Command::Lend(token) => {
                 let mut lent = None;
                 if let Some(track) = self.find_slot(|s| {

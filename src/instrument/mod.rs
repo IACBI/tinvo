@@ -482,6 +482,11 @@ impl Instrument {
         }
     }
 
+    /// Whether it is a plugin whose last call said it has a tail to play.
+    pub fn has_tail(&self) -> bool {
+        matches!(self, Instrument::Plugin(p) if p.has_tail())
+    }
+
     /// A plugin instrument's slot.
     pub fn plugin_slot(&mut self) -> Option<&mut PluginSlot> {
         match self {

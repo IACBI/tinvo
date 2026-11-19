@@ -666,7 +666,7 @@ fn plugins() -> usize {
 }
 
 /// Plugin tracks and a plugin insert in the engine, through its command
-/// queue: instances put in, replaced, lent out and returned to be
+/// queue: instances put in (an insert's too), replaced, lent out and returned to be
 /// restarted, a plugin track added and removed (its instance coming back
 /// when its fade ends), while a song plays at every buffer size.
 fn plugins_in_the_engine() -> usize {
@@ -690,7 +690,7 @@ fn plugins_in_the_engine() -> usize {
     let mut sine_token = first.token();
     send(Command::SetPlugin { track: 0, instance: first });
     let effect = make(gain, Role::Effect);
-    let gain_token = effect.token();
+    let mut gain_token = effect.token();
     let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain), SR, 120.0));
     assert!(insert.attach(effect).unwrap().is_none());
     send(Command::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
@@ -708,6 +708,12 @@ fn plugins_in_the_engine() -> usize {
                 expected.push(added.token());
                 send(Command::SetPlugin { track: 2, instance: added });
                 send(Command::Edit(Edit::SetStep { track: 2, pattern: 0, step: 3, value: Some(Step::new(70, 90, 2)) }));
+            }
+            1800 => {
+                let next = make(gain, Role::Effect);
+                expected.push(gain_token);
+                gain_token = next.token();
+                send(Command::SetSlotPlugin { chain: ChainId::Track(0), slot: 0, instance: next });
             }
             2000 => send(Command::Edit(Edit::RemoveTrack(2))),
             2500 => {
@@ -741,7 +747,9 @@ fn plugins_in_the_engine() -> usize {
     while retired.pop().is_some() {}
     let _ = host.poll();
     assert!(heard && lent == 10, "the plugins played ({heard}) and were lent out ten times ({lent})");
-    assert_eq!(gone, expected, "the removed instance came back, then the replaced one");
+    gone.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(gone, expected, "the removed and replaced instances came back");
     calls
 }
 

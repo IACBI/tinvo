@@ -14,6 +14,8 @@ use tinvo::clap::{PluginRef, Roles};
 use tinvo::engine::{ChainId, Command as EngineCommand, Edit, Engine, RETIRE_QUEUE, Retired, Shared, Step};
 use tinvo::insert::{EffectKind, Insert};
 use tinvo::instrument::InstrumentKind;
+use tinvo::project::Project;
+use tinvo::render::{CatalogPlugins, NoPlugins, PluginSource, RenderOptions, render_into};
 use tinvo::rt::spsc::{self, Consumer};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_tinvo");
@@ -1362,7 +1364,7 @@ fn a_bypassed_plugin_insert_keeps_its_time() {
 }
 
 #[test]
-fn a_plugin_insert_s_tail_keeps_its_effects_going() {
+fn a_plugin_s_tail_keeps_the_render_going() {
     let dir = temp_dir("engine-tail");
     let mut host = PluginHost::new();
     for (stem, tail) in [("tail", true), ("notail", false)] {
@@ -1377,6 +1379,11 @@ fn a_plugin_insert_s_tail_keeps_its_effects_going() {
         e.handle(EngineCommand::Edit(Edit::SetSlotParam { chain: ChainId::Master, slot: 0, index: 0, value: 1.0 }));
         render(&mut e, 2048, 64);
         assert!(e.effects_idle(), "{stem}");
+        // An instrument's holds the render's end as long.
+        let (mut e, _rx) = plugin_engine(&[Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))]);
+        e.set_plugin(0, Box::new(create(&mut host, &file, SINE, Role::Instrument).unwrap()));
+        render(&mut e, 128, 64);
+        assert_eq!(e.effects_idle(), !tail, "{stem}: an instrument");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1422,5 +1429,184 @@ fn a_removed_synth_track_s_plugin_insert_plays_no_further_than_its_fade() {
     assert_eq!(back.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), [("insert", Some(token))]);
     let s = stats(back[0].2.as_ref().unwrap());
     assert_eq!((s.frames, s.broken), (64 + 480, 0), "{s:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_instance_goes_into_the_plugin_insert_a_slot_will_hold() {
+    let dir = temp_dir("engine-slot");
+    let file = install(&dir, "slot");
+    let mut host = PluginHost::new();
+    let (mut e, mut rx) = plugin_engine(&[
+        Edit::AddTrack(InstrumentKind::Synth),
+        Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) },
+        Edit::SetSlot { chain: ChainId::Track(0), slot: 1, kind: Some(EffectKind::Delay) },
+    ]);
+    let mut give = |e: &mut Engine, chain, slot| {
+        let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+        let token = gain.token();
+        e.handle(EngineCommand::SetSlotPlugin { chain, slot, instance: Box::new(gain) });
+        token
+    };
+    let first = give(&mut e, ChainId::Track(0), 0);
+    assert!(came_back(&mut rx).is_empty(), "taken");
+    // No plugin insert there: another effect, an empty slot, a chain that
+    // is not there.
+    for (chain, slot) in
+        [(ChainId::Track(0), 1), (ChainId::Track(0), 2), (ChainId::Track(3), 0), (ChainId::Group(0), 0)]
+    {
+        let token = give(&mut e, chain, slot);
+        assert_eq!(came_back(&mut rx).iter().map(|b| b.1).collect::<Vec<_>>(), [Some(token)], "{chain:?} {slot}");
+    }
+    render(&mut e, 64, 64);
+    // Replaced, the one before comes back stopped.
+    let second = give(&mut e, ChainId::Track(0), 0);
+    assert_eq!(came_back(&mut rx).iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), [("plugin", Some(first))]);
+    // A swap waiting for its fade: the insert is already where it goes.
+    e.handle(EngineCommand::Edit(Edit::SwapSlots { chain: ChainId::Track(0), a: 0, b: 3 }));
+    let third = give(&mut e, ChainId::Track(0), 0);
+    assert_eq!(came_back(&mut rx).iter().map(|b| b.1).collect::<Vec<_>>(), [Some(third)], "slot 0 will be empty");
+    let _ = give(&mut e, ChainId::Track(0), 3);
+    assert_eq!(came_back(&mut rx).iter().map(|b| b.1).collect::<Vec<_>>(), [Some(second)]);
+    // A removed group plays out in a slot past the groups in use, its
+    // inserts with it: not a place for an instance.
+    e.apply(Edit::InsertGroup(0));
+    e.apply(Edit::SetSlot { chain: ChainId::Group(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) });
+    let _ = give(&mut e, ChainId::Group(0), 0);
+    assert!(came_back(&mut rx).is_empty(), "in the group's insert");
+    e.apply(Edit::RemoveGroup(0));
+    let token = give(&mut e, ChainId::Group(8), 0);
+    let back: Vec<_> = came_back(&mut rx).into_iter().filter(|b| b.0 == "plugin").map(|b| b.1).collect();
+    assert_eq!(back, [Some(token)], "a retiring group's insert");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The test plugin installed as `stem`, alone in a folder, for renders.
+fn catalog_plugins(dir: &Path, stem: &str) -> CatalogPlugins {
+    let folder = dir.join(stem);
+    std::fs::create_dir_all(&folder).unwrap();
+    install(&folder, stem);
+    let catalog = scan::scan(&[folder], None, &options(Duration::from_secs(30)));
+    // SAFETY: the test plugin, loaded only through plugin hosts here, which
+    // takes the thread that made its host as main.
+    unsafe { CatalogPlugins::new(catalog) }
+}
+
+/// A sine track playing one note.
+fn sine_song() -> Project {
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    p.apply(Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(69, 100, 4)) }).unwrap();
+    p
+}
+
+fn export(p: &Project, plugins: &mut dyn PluginSource) -> Result<Vec<f32>, String> {
+    let opts = RenderOptions { loops: 1, ..Default::default() };
+    let mut out = Vec::new();
+    render_into(p, &[], &opts, plugins, &mut |b| {
+        out.extend_from_slice(b);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+#[test]
+fn an_export_plays_its_plugins_offline() {
+    let dir = temp_dir("render");
+    let mut plugins = catalog_plugins(&dir, "render");
+    let mut p = sine_song();
+    let dry = export(&p, &mut plugins).unwrap();
+    assert!(dry.iter().any(|x| x.abs() > 0.05), "the sine plays");
+    for f in dry.chunks_exact(2) {
+        assert!((f[1] - 0.5 * f[0]).abs() <= 1e-6, "its right channel half its left: {f:?}");
+    }
+    // A plugin on the master halves it.
+    p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let wet = export(&p, &mut plugins).unwrap();
+    let n = dry.len().min(wet.len());
+    assert!(n > 2 * 6000);
+    for i in 2 * 1000..n {
+        assert!((wet[i] - 0.5 * dry[i]).abs() <= 1e-5, "sample {i}: {} {}", wet[i], dry[i]);
+    }
+    // One that asks to be restarted while it renders is, between chunks:
+    // the note playing ends with it, the next one plays as it would have.
+    let mut twice = sine_song();
+    twice.apply(Edit::SetStep { track: 0, pattern: 0, step: 8, value: Some(Step::new(69, 100, 4)) }).unwrap();
+    let dry = export(&twice, &mut plugins).unwrap();
+    let restarted = export(&twice, &mut catalog_plugins(&dir, "restart")).unwrap();
+    let (chunk, step8) = (2 * 4096, 2 * 8 * 6000);
+    assert_eq!(restarted.len(), dry.len());
+    assert_eq!(restarted[..chunk], dry[..chunk], "as it was until it asked");
+    assert!(restarted[chunk..step8].iter().all(|&x| x == 0.0), "its note ended");
+    assert!(dry[chunk..step8].iter().any(|&x| x != 0.0));
+    assert_eq!(restarted[step8..], dry[step8..], "plays on");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_export_names_the_plugin_that_cannot_play() {
+    let dir = temp_dir("render-fail");
+    let p = sine_song();
+    let mut missing = Project::new();
+    missing.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    let none = PluginRef::new("org.tinvo.test.none").unwrap();
+    missing.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 4, kind: Some(EffectKind::Plugin(none)) }).unwrap();
+    let mut plugins = catalog_plugins(&dir, "fine");
+    assert_eq!(
+        export(&missing, &mut plugins).unwrap_err(),
+        "org.tinvo.test.none cannot load: not found in the plugin catalog"
+    );
+    assert_eq!(export(&p, &mut NoPlugins).unwrap_err(), "org.tinvo.test.sine cannot load: no plugin catalog was read");
+    for (stem, why) in [
+        ("noactivate", "Test Sine cannot load: "),
+        ("hardrt", "Test Sine cannot load: "),
+        ("offlinerefuse", "Test Sine cannot load: "),
+        ("nostart", "Test Sine failed while rendering"),
+        ("procerror", "Test Sine failed while rendering"),
+    ] {
+        let e = export(&p, &mut catalog_plugins(&dir, stem)).unwrap_err();
+        assert!(e.starts_with(why), "{stem}: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tinvo_render_plays_plugins_and_names_a_missing_one() {
+    let dir = temp_dir("cli-render");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    install(&plugins, "fixture");
+    let home = dir.join("home");
+    let render = |project: &str, out: &str, extra: &[&str]| {
+        let song = dir.join(project);
+        Command::new(WORKER)
+            .arg("render")
+            .arg(&song)
+            .arg(dir.join(out))
+            .args(extra)
+            .env("CLAP_PATH", &plugins)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("LOCALAPPDATA", home.join("local"))
+            .env("COMMONPROGRAMFILES", home.join("common"))
+            .output()
+            .unwrap()
+    };
+    let song = "tinvo 16\ntrack plugin org.tinvo.test.sine\nname Sine\nstep 0 69 100 4 100 1 0 -\nend\n";
+    std::fs::write(dir.join("song.tvo"), song).unwrap();
+    let out = render("song.tvo", "song.wav", &["--loops", "1", "--stems"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(dir.join("song.wav").exists() && dir.join("song-01-Sine.wav").exists());
+    // A plugin that is not installed: nothing is written, and what was
+    // there is left as it was.
+    let broken = format!("tinvo 16\nmaster_insert 0 plugin org.tinvo.test.none\n{}", &song["tinvo 16\n".len()..]);
+    std::fs::write(dir.join("broken.tvo"), broken).unwrap();
+    std::fs::write(dir.join("broken.wav"), "before").unwrap();
+    let out = render("broken.tvo", "broken.wav", &["--stems"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("org.tinvo.test.none cannot load: not found in the plugin catalog"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join("broken.wav")).unwrap(), "before");
+    assert!(!dir.join("broken-01-Sine.wav").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -79,7 +79,9 @@ pub const MAX_ID: usize = 1023;
 /// in project and cache files). The scanner, the cache and
 /// [`PluginRef::new`] all take ids by this.
 pub fn is_valid_id(id: &str) -> bool {
-    !id.trim().is_empty() && id.len() <= MAX_ID && !id.chars().any(char::is_control)
+    // A project file trims its lines: an id is written as it is only if
+    // nothing at its ends would be trimmed.
+    !id.is_empty() && id.trim() == id && id.len() <= MAX_ID && !id.chars().any(char::is_control)
 }
 /// The most plugin ids one run of TINVO keeps ([`PluginRef::new`]).
 pub const MAX_REFS: usize = 4096;
@@ -145,7 +147,17 @@ mod tests {
         assert_eq!((a.id(), b.id()), ("org.tinvo.test.ref-a", "org.tinvo.test.ref-b"));
         let long = "x".repeat(MAX_ID);
         assert_eq!(PluginRef::new(&long).map(PluginRef::id), Some(long.as_str()));
-        for bad in [String::new(), " \t".into(), "x".repeat(MAX_ID + 1), "a\nb".into(), "a\u{7f}".into()] {
+        assert_eq!(PluginRef::new("org.tinvo.test.ref c").map(PluginRef::id), Some("org.tinvo.test.ref c"));
+        let bad = [
+            String::new(),
+            " \t".into(),
+            "x".repeat(MAX_ID + 1),
+            "a\nb".into(),
+            "a\u{7f}".into(),
+            " a".into(),
+            "a ".into(),
+        ];
+        for bad in bad {
             assert_eq!(PluginRef::new(&bad), None, "{bad:?}");
         }
     }

@@ -249,15 +249,34 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         render::check_destination(&project, Some(project_path), path)
             .map_err(|e| format!("{} {e}", shown(&path.display().to_string())))?;
     }
+    let mut plugins = plugin_source(&project)?;
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
     let mut meter = ExportMeter::new(opts.sample_rate);
-    let frames = render::render_into(&project, &track_samples, &opts, &mut |b| {
+    let frames = render::render_into(&project, &track_samples, &opts, &mut *plugins, &mut |b| {
         meter.push(b);
         file.write(b)
     })?;
-    let stats = file.finish()?;
     let elapsed = start.elapsed();
+    // Every file is written whole before any is put in place, so a stem
+    // that fails leaves the mix as it was too.
+    let mut files = Vec::new();
+    for (path, part) in stem_paths {
+        let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
+        let stem = render::stem_project(&project, part);
+        render::render_into(&stem, &track_samples, &opts, &mut *plugins, &mut |b| file.write(b))?;
+        files.push((path, file));
+    }
+    // Stems end at different times; padded to one length they line up.
+    let len = files.iter().map(|(_, f)| f.frames()).max().unwrap_or(0);
+    let silence = [0.0f32; 2 * 1024];
+    for (_, file) in &mut files {
+        while file.frames() < len {
+            let n = (len - file.frames()).min(1024) as usize;
+            file.write(&silence[..2 * n])?;
+        }
+    }
+    let stats = file.finish()?;
     let secs = frames as f64 / f64::from(opts.sample_rate);
     println!(
         "Rendered {what}, {secs:.2} s ({}, {} Hz), to {} in {:.3} s; {}; sample peak {:.2} dBFS; {} clipped samples",
@@ -269,24 +288,9 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         tinvo::dsp::gain_to_db(stats.peak),
         stats.clipped
     );
-    if stems {
-        let mut files = Vec::new();
-        for (path, part) in stem_paths {
-            let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
-            render::render_into(&render::stem_project(&project, part), &track_samples, &opts, &mut |b| file.write(b))?;
-            files.push((path, file));
-        }
-        // Stems end at different times; pad them to one length so they line up.
-        let len = files.iter().map(|(_, f)| f.frames()).max().unwrap_or(0);
-        let silence = [0.0f32; 2 * 1024];
-        for (path, mut file) in files {
-            while file.frames() < len {
-                let n = (len - file.frames()).min(1024) as usize;
-                file.write(&silence[..2 * n])?;
-            }
-            let st = file.finish()?;
-            println!("  stem {}: peak {:.2} dBFS", shown(&path.display().to_string()), tinvo::dsp::gain_to_db(st.peak));
-        }
+    for (path, file) in files {
+        let st = file.finish()?;
+        println!("  stem {}: peak {:.2} dBFS", shown(&path.display().to_string()), tinvo::dsp::gain_to_db(st.peak));
     }
     Ok(())
 }
@@ -552,18 +556,36 @@ fn cmd_devices() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_plugins(args: &[String]) -> Result<(), String> {
+/// Scans the plugin folders, with the cache: the catalog and the folders
+/// searched.
+fn scan_plugins(rescan: bool) -> Result<(tinvo::clap::scan::Catalog, Vec<std::path::PathBuf>), String> {
     use tinvo::clap::scan;
+    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
+    let cache = tinvo::autosave::state_dir().map(|d| d.join("plugins.txt"));
+    let roots = scan::default_roots();
+    let options = scan::Options { worker, per_file: scan::PER_FILE, budget: scan::BUDGET, rescan };
+    Ok((scan::scan(&roots, cache.as_deref(), &options), roots))
+}
+
+/// What makes the plugins a render of `project` plays: the scan's catalog
+/// if it names any.
+fn plugin_source(project: &Project) -> Result<Box<dyn render::PluginSource>, String> {
+    if project.plugin_places().is_empty() {
+        return Ok(Box::new(render::NoPlugins));
+    }
+    let catalog = scan_plugins(false)?.0;
+    // SAFETY: the program's main thread; the plugins installed where CLAP
+    // says to look, which the project asks to run.
+    Ok(Box::new(unsafe { render::CatalogPlugins::new(catalog) }))
+}
+
+fn cmd_plugins(args: &[String]) -> Result<(), String> {
     let rescan = match args {
         [] => false,
         [a] if a == "--rescan" => true,
         [a, ..] => return Err(format!("plugins takes only --rescan, not '{}'{SEE_HELP}", shown(a))),
     };
-    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
-    let cache = tinvo::autosave::state_dir().map(|d| d.join("plugins.txt"));
-    let roots = scan::default_roots();
-    let options = scan::Options { worker, per_file: scan::PER_FILE, budget: scan::BUDGET, rescan };
-    let catalog = scan::scan(&roots, cache.as_deref(), &options);
+    let (catalog, roots) = scan_plugins(rescan)?;
     let path = |p: &std::path::Path| shown(&p.display().to_string());
     let plugins = catalog.plugins();
     for (file, p) in &plugins {
