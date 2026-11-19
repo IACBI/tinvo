@@ -695,7 +695,7 @@ pub struct Options {
 }
 
 /// What a scan knows.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Catalog {
     /// Each plugin file, in the order found, then those kept from the cache
     /// under folders that could not be searched to the end.
@@ -751,6 +751,17 @@ impl Catalog {
         }
         out
     }
+}
+
+/// Scans CLAP's folders ([`default_roots`]) with TINVO's own program as
+/// the scanner and the cache in TINVO's state folder: the catalog and the
+/// folders searched.
+pub fn installed(rescan: bool) -> Result<(Catalog, Vec<PathBuf>), String> {
+    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
+    let cache = crate::autosave::state_dir().map(|d| d.join("plugins.txt"));
+    let roots = default_roots();
+    let options = Options { worker, per_file: PER_FILE, budget: BUDGET, rescan };
+    Ok((scan(&roots, cache.as_deref(), &options), roots))
 }
 
 /// Searches `roots` and reads each plugin file new or changed since the

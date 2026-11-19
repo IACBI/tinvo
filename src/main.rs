@@ -556,24 +556,13 @@ fn cmd_devices() -> Result<(), String> {
     Ok(())
 }
 
-/// Scans the plugin folders, with the cache: the catalog and the folders
-/// searched.
-fn scan_plugins(rescan: bool) -> Result<(tinvo::clap::scan::Catalog, Vec<std::path::PathBuf>), String> {
-    use tinvo::clap::scan;
-    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
-    let cache = tinvo::autosave::state_dir().map(|d| d.join("plugins.txt"));
-    let roots = scan::default_roots();
-    let options = scan::Options { worker, per_file: scan::PER_FILE, budget: scan::BUDGET, rescan };
-    Ok((scan::scan(&roots, cache.as_deref(), &options), roots))
-}
-
 /// What makes the plugins a render of `project` plays: the scan's catalog
 /// if it names any.
 fn plugin_source(project: &Project) -> Result<Box<dyn render::PluginSource>, String> {
     if project.plugin_places().is_empty() {
         return Ok(Box::new(render::NoPlugins));
     }
-    let catalog = scan_plugins(false)?.0;
+    let catalog = tinvo::clap::scan::installed(false)?.0;
     // SAFETY: the program's main thread; the plugins installed where CLAP
     // says to look, which the project asks to run.
     Ok(Box::new(unsafe { render::CatalogPlugins::new(catalog) }))
@@ -585,7 +574,7 @@ fn cmd_plugins(args: &[String]) -> Result<(), String> {
         [a] if a == "--rescan" => true,
         [a, ..] => return Err(format!("plugins takes only --rescan, not '{}'{SEE_HELP}", shown(a))),
     };
-    let (catalog, roots) = scan_plugins(rescan)?;
+    let (catalog, roots) = tinvo::clap::scan::installed(rescan)?;
     let path = |p: &std::path::Path| shown(&p.display().to_string());
     let plugins = catalog.plugins();
     for (file, p) in &plugins {

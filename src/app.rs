@@ -7,7 +7,8 @@
 
 use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::autosave::{self, Autosave};
-use crate::clap::host::Instance;
+use crate::clap::PluginRef;
+use crate::clap::host::{Instance, Request, Role as PluginRole};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
@@ -24,7 +25,8 @@ use crate::midi::schedule::{self, OutSlot, OutputThread};
 use crate::midi::{self, Message};
 use crate::mix;
 use crate::note_take::{MAX_TAKE_NOTES, NoteTake, follow_track};
-use crate::project::{self, FILE_EXTENSION, Marker, PAN, Project, SlotData, VOLUME, pattern_name};
+use crate::plugins::Plugins;
+use crate::project::{self, FILE_EXTENSION, Marker, PAN, PluginPlace, Project, SlotData, VOLUME, pattern_name};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
@@ -66,6 +68,9 @@ const TOO_MUCH_SAMPLE: &str = "Not done: the samples it brings back, as loaded n
 const FRAME: Duration = Duration::from_millis(16);
 /// How often it draws when nothing has moved for [`IDLE_AFTER`].
 const IDLE_FRAME: Duration = Duration::from_millis(50);
+/// Idle with plugins playing: CLAP asks for their requests to be served
+/// within about 30 ms.
+const PLUGIN_IDLE_FRAME: Duration = Duration::from_millis(25);
 const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// Rows the grid keeps however many parameters the panel has.
 const MIN_GRID_ROWS: u16 = 3;
@@ -521,6 +526,32 @@ pub enum Mode {
     MidiInputs(MidiPicker),
     /// The settings page; where it is lives in [`App::settings_page`].
     Settings,
+    Plugins(PluginPicker),
+}
+
+/// What the plugin list picks a plugin for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginFor {
+    /// A new track playing it.
+    Track,
+    /// An insert slot: the chain and the slot.
+    Slot(ChainId, u8),
+}
+
+impl PluginFor {
+    fn role(self) -> PluginRole {
+        match self {
+            PluginFor::Track => PluginRole::Instrument,
+            PluginFor::Slot(..) => PluginRole::Effect,
+        }
+    }
+}
+
+/// The plugin list: the plugins that fit, then what could not play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PluginPicker {
+    pub target: PluginFor,
+    pub cursor: usize,
 }
 
 /// The settings page's tabs.
@@ -778,6 +809,12 @@ pub struct App {
     stroke: Option<Stroke>,
     /// The undo step the drag is building, so each cell it crosses joins it.
     stroke_at: Option<Instant>,
+    /// The catalog of installed plugins and the host of the engine's
+    /// instances.
+    plugins: Plugins,
+    /// An instance made before the edit that needs it, so a plugin that
+    /// cannot load leaves the project as it was.
+    ready: Option<(PluginRef, Instance)>,
 }
 
 /// Something on screen the mouse can point at.
@@ -947,7 +984,42 @@ impl App {
             roll_top: Cell::new(None),
             stroke: None,
             stroke_at: None,
+            plugins: Plugins::new(),
+            ready: None,
         }
+    }
+
+    /// Scans the installed plugins in the background; the engine gets
+    /// instances once the catalog has come.
+    ///
+    /// # Safety
+    /// As [`Plugins::start_scan`]: on the thread CLAP calls main, trusting
+    /// the plugins installed.
+    pub unsafe fn scan_plugins(&mut self) {
+        // SAFETY: by the caller's promise.
+        unsafe { self.plugins.start_scan() }
+    }
+
+    /// Uses `catalog` for the plugins, as a finished scan would.
+    ///
+    /// # Safety
+    /// As [`Plugins::with_catalog`].
+    pub unsafe fn with_plugin_catalog(mut self, catalog: crate::clap::scan::Catalog) -> Self {
+        // SAFETY: by the caller's promise.
+        self.plugins = unsafe { std::mem::take(&mut self.plugins).with_catalog(catalog) };
+        self.catalog_arrived();
+        self
+    }
+
+    /// Whether plugins play in the engine, whose requests want serving
+    /// often.
+    pub fn plugins_playing(&self) -> bool {
+        self.link.is_some() && self.plugins.any_made()
+    }
+
+    /// What could not play, as the plugin list shows it.
+    pub fn plugin_problems(&self) -> &[String] {
+        self.plugins.problems()
     }
 
     /// Uses the key bindings and colours of `settings`.
@@ -1033,6 +1105,9 @@ impl App {
         self.group_reduction = [0.0; MAX_GROUPS];
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
+        // A new engine has no instances: the old ones went with the old.
+        self.plugins.forget_made();
+        self.attach_all();
     }
 
     /// Whether a recording is running.
@@ -1485,6 +1560,7 @@ impl App {
                 if let Some(l) = &mut self.link {
                     l.send(engine_command(applied, self.sample_rate));
                 }
+                self.attach_edit(applied);
                 Some(applied)
             }
             Err(err) => {
@@ -1880,6 +1956,7 @@ impl App {
     pub fn tick(&mut self) {
         self.tick_autosave(Instant::now());
         self.tick_recording();
+        self.tick_plugins();
         // A finished take may have selected its track.
         self.clamp_cursor();
         if self.link.is_some() && self.live_track_sent != Some(self.track) {
@@ -2156,7 +2233,7 @@ impl App {
             return match self.slot_data(chain, slot) {
                 Some(d) => {
                     let state = if d.params[0] >= 1.0 { "bypassed" } else { "on" };
-                    (format!("{} {}", slot + 1, d.kind.label()), state.to_string())
+                    (format!("{} {}", slot + 1, self.effect_label(d.kind)), state.to_string())
                 }
                 None => (format!("{} -", slot + 1), "empty".to_string()),
             };
@@ -2270,6 +2347,7 @@ impl App {
             Mode::Prompt(kind, text) => self.key_prompt(kind, text, key),
             Mode::Devices(p) => self.key_devices(p, key),
             Mode::MidiInputs(p) => self.key_midi(p, key),
+            Mode::Plugins(p) => self.key_plugins(p, key),
             Mode::Settings => self.key_settings(key),
             Mode::Normal => self.key_normal(key),
         }
@@ -2331,6 +2409,15 @@ impl App {
                 }
                 (MouseKind::ScrollUp, _) => self.settings_move(-1),
                 (MouseKind::ScrollDown, _) => self.settings_move(1),
+                _ => {}
+            },
+            Mode::Plugins(mut p) => match (m.kind, target) {
+                (MouseKind::Press(Button::Left), Some(Target::Item(i))) => {
+                    p.cursor = i;
+                    self.plugins_action(p, Some(Action::Enter));
+                }
+                (MouseKind::ScrollUp, _) => self.plugins_action(p, Some(Action::Up)),
+                (MouseKind::ScrollDown, _) => self.plugins_action(p, Some(Action::Down)),
                 _ => {}
             },
             Mode::Normal => self.mouse_normal(m, target),
@@ -2639,6 +2726,8 @@ impl App {
                 self.track = self.track_count() - 1;
                 self.set_status(format!("Added {} track", kind.label()));
             }
+        } else if key == Key::Char('8') {
+            self.open_plugins(PluginFor::Track);
         }
     }
 
@@ -3122,12 +3211,239 @@ impl App {
     fn inserts_page_status(&self) -> String {
         let name = self.chain_name(self.insert_chain());
         format!(
-            "Insert effects of {name} ({} chain, {} effect, {} move, {}: instrument)",
+            "Insert effects of {name} ({} chain, {} effect, {} plugin, {} move, {}: instrument)",
             self.k(Action::InsertChain),
             self.keys.labels(&[Action::PrevEffect, Action::NextEffect]),
+            self.k(Action::Plugins),
             self.keys.labels(&[Action::EffectEarlier, Action::EffectLater]),
             self.k(Action::Page)
         )
+    }
+
+    /// A track kind as the editor shows it: a plugin by its name.
+    fn kind_label(&self, kind: InstrumentKind) -> String {
+        kind.plugin().map_or_else(|| kind.label().to_string(), |r| self.plugins.name(r))
+    }
+
+    /// An effect kind as the editor shows it: a plugin by its name.
+    fn effect_label(&self, kind: EffectKind) -> String {
+        kind.plugin().map_or_else(|| kind.label().to_string(), |r| self.plugins.name(r))
+    }
+
+    /// Where a plugin plays, in words.
+    fn place_text(&self, place: PluginPlace) -> String {
+        match place {
+            PluginPlace::Track(t) => self.chain_name(ChainId::Track(t)),
+            PluginPlace::Slot(chain, slot) => format!("{} slot {}", self.chain_name(chain), slot + 1),
+        }
+    }
+
+    /// Notes what could not play, for the plugin list and the status line.
+    fn plugin_problem(&mut self, line: String) {
+        self.set_status(line.clone());
+        self.plugins.add_problem(line);
+    }
+
+    /// Gives the engine an instance for the plugin `place` holds: the one
+    /// made ready for it, or a new one. Without an engine or a catalog
+    /// there is nothing to do yet.
+    fn attach_place(&mut self, place: PluginPlace, plugin: PluginRef) {
+        if self.link.is_none() {
+            return;
+        }
+        let made = match self.ready.take() {
+            Some((r, i)) if r == plugin => Ok(i),
+            _ if self.plugins.catalog().is_none() => return,
+            _ => self.plugins.make(plugin, place.role(), self.sample_rate),
+        };
+        match made {
+            Ok(i) => self.send(match place {
+                PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
+                PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
+            }),
+            Err(e) => {
+                let line = format!("{}: {} cannot load: {e}", self.place_text(place), self.plugins.name(plugin));
+                self.plugin_problem(line);
+            }
+        }
+    }
+
+    /// Gives the engine an instance for the plugin place an applied edit
+    /// made, whether the user, undo or redo made it.
+    fn attach_edit(&mut self, applied: Edit) {
+        let (place, plugin) = match applied {
+            Edit::AddTrack(InstrumentKind::Plugin(r)) => {
+                (PluginPlace::Track(self.project.tracks.len().saturating_sub(1) as u8), r)
+            }
+            Edit::InsertTrack { index, kind: InstrumentKind::Plugin(r) } => (PluginPlace::Track(index), r),
+            Edit::SetSlot { chain, slot, kind: Some(EffectKind::Plugin(r)) } => (PluginPlace::Slot(chain, slot), r),
+            _ => return,
+        };
+        self.attach_place(place, plugin);
+    }
+
+    /// Gives a new engine, or the one playing when the catalog comes, an
+    /// instance for every plugin place, and says what could not play.
+    fn attach_all(&mut self) {
+        if self.link.is_none() || self.plugins.catalog().is_none() {
+            return;
+        }
+        self.plugins.clear_problems();
+        for (place, plugin) in self.project.plugin_places() {
+            self.attach_place(place, plugin);
+        }
+        self.summarize_problems();
+    }
+
+    /// With the catalog come: instances for the engine playing, or without
+    /// one, the plugins not installed named.
+    fn catalog_arrived(&mut self) {
+        if self.link.is_some() { self.attach_all() } else { self.report_missing() }
+    }
+
+    /// Without an engine to play them: names the plugins not installed.
+    fn report_missing(&mut self) {
+        self.plugins.clear_problems();
+        for (place, plugin) in self.project.plugin_places() {
+            if self.plugins.info(plugin).is_none() {
+                let line = format!("{}: {} is not installed", self.place_text(place), plugin.id());
+                self.plugins.add_problem(line);
+            }
+        }
+        self.summarize_problems();
+    }
+
+    fn summarize_problems(&mut self) {
+        let problems = self.plugins.problems();
+        if let Some(first) = problems.first() {
+            let msg = match problems.len() {
+                1 => format!("{first} ({} lists plugins)", self.k(Action::Plugins)),
+                n => format!("{n} plugins cannot play, e.g. {first} ({} lists them)", self.k(Action::Plugins)),
+            };
+            self.set_status(msg);
+        }
+    }
+
+    /// Takes the scan's catalog when it comes, and serves what the
+    /// instances ask for: a restart (lent by the engine, restarted here,
+    /// given back) or, after a failure, one restart.
+    fn tick_plugins(&mut self) {
+        match self.plugins.poll_scan() {
+            Some(Ok(_)) => self.catalog_arrived(),
+            Some(Err(e)) if !self.project.plugin_places().is_empty() => {
+                self.plugin_problem(format!("Plugins cannot play: {e}"));
+            }
+            _ => {}
+        }
+        for request in self.plugins.poll() {
+            let (Request::Restart(token) | Request::Failed(token)) = request;
+            let name = self.plugins.plugin_of(token).map_or_else(|| "A plugin".to_string(), |r| self.plugins.name(r));
+            if let Request::Failed(_) = request {
+                if !self.plugins.restart_after_failure(token) {
+                    self.plugin_problem(format!("{name} failed again and stays silent"));
+                    continue;
+                }
+                self.plugin_problem(format!("{name} failed while playing; restarted"));
+            }
+            if self.link.is_some() {
+                self.send(Command::Lend(token));
+            }
+        }
+        let lent = match &mut self.link {
+            Some(link) => link.take_lent(),
+            None => return,
+        };
+        for mut instance in lent {
+            match instance.restart() {
+                Ok(()) => self.send(Command::Return(instance)),
+                Err(e) => {
+                    let name = self
+                        .plugins
+                        .plugin_of(instance.token())
+                        .map_or_else(|| "A plugin".to_string(), |r| self.plugins.name(r));
+                    self.plugin_problem(format!("{name} could not restart and stays silent: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Shows the plugin list for `target`.
+    fn open_plugins(&mut self, target: PluginFor) {
+        self.mode = Mode::Plugins(PluginPicker { target, cursor: 0 });
+    }
+
+    /// The plugin list's lines: the plugins that fit `target` (their ids),
+    /// then what could not play.
+    fn plugin_rows(&self, target: PluginFor) -> (Vec<String>, usize) {
+        let ids: Vec<String> = self.plugins.choices(target.role()).iter().map(|p| p.id.clone()).collect();
+        let n = ids.len();
+        (ids, n + self.plugins.problems().len())
+    }
+
+    fn key_plugins(&mut self, p: PluginPicker, key: Key) {
+        if self.closes_list(key, Action::Plugins) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let a = self.keys.action(&[Context::Nav], key);
+        self.plugins_action(p, a);
+    }
+
+    fn plugins_action(&mut self, mut p: PluginPicker, a: Option<Action>) {
+        let (ids, rows) = self.plugin_rows(p.target);
+        match a {
+            Some(Action::Up) => p.cursor = p.cursor.saturating_sub(1),
+            Some(Action::Down) => p.cursor = (p.cursor + 1).min(rows.saturating_sub(1)),
+            Some(Action::First) => p.cursor = 0,
+            Some(Action::Last) => p.cursor = rows.saturating_sub(1),
+            Some(Action::Enter) => {
+                if let Some(id) = ids.get(p.cursor) {
+                    self.mode = Mode::Normal;
+                    self.pick_plugin(p.target, id);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Plugins(p);
+    }
+
+    /// Puts plugin `id` where `target` says: the instance is made first,
+    /// so a plugin that cannot load changes nothing.
+    fn pick_plugin(&mut self, target: PluginFor, id: &str) {
+        let Some(plugin) = PluginRef::new(id) else {
+            let max = crate::clap::MAX_REFS;
+            return self.set_status(format!("Cannot use {id}: too many plugin ids in this session (at most {max})"));
+        };
+        let name = self.plugins.name(plugin);
+        let kind = EffectKind::Plugin(plugin);
+        if let PluginFor::Slot(chain, slot) = target {
+            if self.slot_data(chain, slot).map(|d| d.kind) == Some(kind) {
+                return self.set_status(format!("{} slot {} already plays {name}", self.chain_name(chain), slot + 1));
+            }
+        }
+        if self.link.is_some() {
+            match self.plugins.make(plugin, target.role(), self.sample_rate) {
+                Ok(i) => self.ready = Some((plugin, i)),
+                Err(e) => return self.set_status(format!("{name} cannot load: {e}")),
+            }
+        }
+        match target {
+            PluginFor::Track => {
+                if self.edit(Edit::AddTrack(InstrumentKind::Plugin(plugin))) {
+                    self.track = self.track_count() - 1;
+                    self.set_status(format!("Added a {name} track"));
+                }
+            }
+            PluginFor::Slot(chain, slot) => {
+                if self.edit(Edit::SetSlot { chain, slot, kind: Some(kind) }) {
+                    self.param = param_of_slot(chain, slot, 0);
+                    self.set_status(format!("{} slot {}: {name}", self.chain_name(chain), slot + 1));
+                }
+            }
+        }
+        // Not taken: the edit was refused.
+        self.ready = None;
     }
 
     /// Changes the effect in the selected slot of the inserts page: the
@@ -3149,7 +3465,7 @@ impl App {
         }
         if self.edit(Edit::SetSlot { chain, slot, kind }) {
             self.param = param_of_slot(chain, slot, 0);
-            let what = kind.map_or("empty", |k| k.label());
+            let what = kind.map_or_else(|| "empty".to_string(), |k| self.effect_label(k));
             self.set_status(format!("{} slot {}: {what}", self.chain_name(chain), slot + 1));
         }
     }
@@ -3430,6 +3746,12 @@ impl App {
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
             Action::AddTrack => self.mode = Mode::AddTrack,
+            Action::Plugins => {
+                let slot = (self.focus == Focus::Params && self.page == Page::Inserts)
+                    .then(|| slot_of_param(self.param, self.track as u8))
+                    .flatten();
+                self.open_plugins(slot.map_or(PluginFor::Track, |(chain, slot, _)| PluginFor::Slot(chain, slot)));
+            }
             Action::TempoDown | Action::TempoUp => {
                 let d = if a == Action::TempoUp { 1.0 } else { -1.0 };
                 self.edit_with(Edit::SetTempo(self.project.tempo.round() + d), true);
@@ -4086,11 +4408,23 @@ impl App {
             let load = self.k(Action::LoadSample);
             return self.set_status(format!("Not exported: the sample {p} is missing; {load} loads it again"));
         }
+        let mut plugins: Box<dyn render::PluginSource> = if self.project.plugin_places().is_empty() {
+            Box::new(render::NoPlugins)
+        } else {
+            match self.plugins.catalog() {
+                // SAFETY: the editor's catalog, which its maker promised to
+                // trust, on the editor's thread, which plays CLAP's main
+                // thread. The export's host is its own, so its requests
+                // are not the editor's.
+                Some(c) => Box::new(unsafe { render::CatalogPlugins::new(c.clone()) }),
+                None => return self.set_status(format!("Not exported: {}", self.plugins.why_no_catalog())),
+            }
+        };
         let started = Instant::now();
         let samples = self.track_samples();
         let mut meter = ExportMeter::new(self.sample_rate);
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
-            let frames = render::render_into(&self.project, &samples, &opts, &mut render::NoPlugins, &mut |b| {
+            let frames = render::render_into(&self.project, &samples, &opts, &mut *plugins, &mut |b| {
                 meter.push(b);
                 file.write(b)
             })?;
@@ -4149,6 +4483,10 @@ impl App {
         }
         if let Mode::MidiInputs(p) = &self.mode {
             self.draw_midi(s, p);
+            return;
+        }
+        if let Mode::Plugins(p) = &self.mode {
+            self.draw_plugins(s, p);
             return;
         }
         if matches!(self.mode, Mode::Settings | Mode::Prompt(PromptKind::Style(_), _)) {
@@ -4671,10 +5009,11 @@ impl App {
             let selected = ti == self.track;
             let name_style = self.style(if selected { Role::SelectedName } else { Role::Text });
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
+            let label = self.kind_label(t.kind);
             let kind = match t.channel {
-                _ if t.midi_out => format!("{:<5.5}→{:>2}", t.kind.label(), out_channel(t) + 1),
-                Some(c) => format!("{:<5.5} {:>2}", t.kind.label(), c + 1),
-                None => t.kind.label().to_string(),
+                _ if t.midi_out => format!("{}→{:>2}", screen::pad(&label, 5), out_channel(t) + 1),
+                Some(c) => format!("{} {:>2}", screen::pad(&label, 5), c + 1),
+                None => label,
             };
             let name = match t.group {
                 Some(g) => format!("G{} {}", u32::from(g) + 1, t.name),
@@ -4807,12 +5146,12 @@ impl App {
                             .file_name()
                             .map_or(std::borrow::Cow::Borrowed(path.as_str()), |n| n.to_string_lossy());
                         let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
-                        format!(" {} · {} · {file}{missing}{page} ", t.name, t.kind.label())
+                        format!(" {} · {} · {file}{missing}{page} ", t.name, self.kind_label(t.kind))
                     }
                     (None, InstrumentKind::Sampler) => {
                         format!(" {} · Sampler · no sample, press {}{page} ", t.name, self.k(Action::LoadSample))
                     }
-                    (None, kind) => format!(" {} · {}{page} ", t.name, kind.label()),
+                    (None, kind) => format!(" {} · {}{page} ", t.name, self.kind_label(kind)),
                 }
             }
         };
@@ -5002,7 +5341,7 @@ impl App {
                 s.put(
                     0,
                     y,
-                    "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  7 Sampler  (Esc cancels)",
+                    "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  7 Sampler  8 Plugin  (Esc cancels)",
                     prompt,
                 );
             }
@@ -5052,6 +5391,47 @@ impl App {
         self.draw_list(s, &entries, p.cursor);
         let hint = format!(
             "{} choose  {} open  Esc cancel",
+            self.keys.labels(&[Action::Up, Action::Down]),
+            self.k(Action::Enter)
+        );
+        s.put(2, h.saturating_sub(2), &hint, dim);
+    }
+
+    fn draw_plugins(&self, s: &mut Screen, p: &PluginPicker) {
+        let h = s.height();
+        let dim = self.style(Role::Dim);
+        let (title, current) = match p.target {
+            PluginFor::Track => ("CLAP instruments, for a new track".to_string(), None),
+            PluginFor::Slot(chain, slot) => (
+                format!("CLAP effects, for {} slot {}", self.chain_name(chain), slot + 1),
+                self.slot_data(chain, slot).and_then(|d| d.kind.plugin()),
+            ),
+        };
+        s.put(2, 1, &title, self.style(Role::Title));
+        let choices = self.plugins.choices(p.target.role());
+        let about = match (self.plugins.catalog(), self.plugins.scan_error()) {
+            _ if self.plugins.scanning() => "Reading the installed plugins...".to_string(),
+            (None, Some(e)) => format!("The plugin scan failed: {e}"),
+            (None, None) => "No plugins were read".to_string(),
+            (Some(_), _) => {
+                format!("{} found in CLAP's folders and CLAP_PATH (tinvo plugins lists every file)", choices.len())
+            }
+        };
+        s.put(2, 2, &about, dim);
+        let mut entries: Vec<(String, bool)> = choices
+            .iter()
+            .map(|c| {
+                let by = if c.vendor.is_empty() { String::new() } else { format!("  {}", c.vendor) };
+                (format!("{}{by}  ({})", c.name, c.id), current.is_some_and(|r| r.id() == c.id))
+            })
+            .collect();
+        entries.extend(self.plugins.problems().iter().map(|line| (format!("! {line}"), false)));
+        if entries.is_empty() {
+            entries.push(("(none to choose from)".to_string(), false));
+        }
+        self.draw_list(s, &entries, p.cursor);
+        let hint = format!(
+            "{} choose  {} use  Esc close",
             self.keys.labels(&[Action::Up, Action::Down]),
             self.k(Action::Enter)
         );
@@ -5227,7 +5607,7 @@ impl App {
         entries.push((String::new(), String::new(), "Fixed keys".into()));
         for (keys, text) in [
             ("y n", "answer a question (quit, delete a track)"),
-            ("1-7", "the type of a new track, after add_track"),
+            ("1-8", "the type of a new track, after add_track (8: a CLAP plugin, from a list)"),
             ("Esc Ctrl+C", "cancel a prompt, close a list"),
             ("Enter Del r Esc", "on the settings page: add a key or change a setting, remove a key, default, close"),
             ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
@@ -5835,6 +6215,9 @@ pub fn run(
     };
     app.lock = lock;
     app.input_device = input;
+    // SAFETY: the program's main thread; the plugins installed where CLAP
+    // says to look, which the project or the user asks to play.
+    unsafe { app.scan_plugins() };
     let mut midi = MidiSession::new();
     let mut midi_out = MidiOutSession::new();
     let mut output = Output::new(config, Some(midi.live.clone()), Some(midi_out.slot.clone()));
@@ -5872,7 +6255,11 @@ pub fn run(
         loop {
             // Idle, the screen is drawn less often: nothing on it moves.
             let idle = last_change.elapsed() > IDLE_AFTER;
-            let mut timeout = if idle { IDLE_FRAME } else { FRAME };
+            let mut timeout = match idle {
+                false => FRAME,
+                true if app.plugins_playing() => PLUGIN_IDLE_FRAME,
+                true => IDLE_FRAME,
+            };
             // From the first event: the wait for it is not work.
             let mut batch = None;
             // A click aims at the frame the user sees: after a key or a
@@ -8967,6 +9354,8 @@ mod tests {
                     Mode::Help(usize::MAX),
                     Mode::AddTrack,
                     Mode::Prompt(PromptKind::Export, "x".into()),
+                    Mode::Plugins(PluginPicker { target: PluginFor::Track, cursor: 0 }),
+                    Mode::Plugins(PluginPicker { target: PluginFor::Slot(ChainId::Master, 7), cursor: 3 }),
                     Mode::Devices(picker.clone()),
                     Mode::Devices(input_picker.clone()),
                     Mode::MidiInputs(MidiPicker {
