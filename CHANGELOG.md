@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-19
+
 ### Added
 - 32 tracks, up from 16, in the editor, project files and MIDI file import.
 - `tinvo bench tracks32`: the demo song's tracks repeated to 32.
@@ -451,7 +453,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/IACBI/tinvo/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/IACBI/tinvo/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/IACBI/tinvo/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/IACBI/tinvo/compare/v0.22.0...v0.23.0
