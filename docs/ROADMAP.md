@@ -444,7 +444,7 @@ Known limits (found bounded, and left for later):
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
 
-### Phase 11: Mixer (medium)
+### Phase 11: Mixer (medium) ✅ (0.25.0)
 
 For larger arrangements and the mix structure they need: drum and vocal groups, parallel compression, more parts.
 - 32 tracks.
@@ -454,7 +454,7 @@ For larger arrangements and the mix structure they need: drum and vocal groups, 
 - A new project format.
 - Tests: routed sums against a mix made by hand, chain order, click-free bypass, latency compensation for slots that look ahead, stems per group, and the allocation test while chains change during playback.
 
-It comes in four parts, each merged on its own; the project format they share is frozen when the phase is released.
+It came in four parts, each merged on its own; the project format they share, format 15, is frozen with 0.25.0.
 
 #### 11a: 32 tracks ✅
 
@@ -485,7 +485,7 @@ Known limits: a track sent to a third place while a change of group is still fad
 - A change to a chain (an effect in, out, replaced or moved) fades the slots it touches out over 10 ms, applies on the frame they are out and fades the new contents in. A change made during a fade joins it. Bypass crossfades too, and a bypassed delay or reverb runs silence through until it has rung out, so it comes back without old echoes. A group stays on while its chain rings, and an idle group takes changes at once.
 - Lanes can automate any effect setting (`LaneTarget::Slot`, `GroupSlot`, `MasterSlot`, naming the effect they expect). A lane locks its slot's effect; moving the effect takes the lane along.
 - The panel's inserts page: an effect key picks the slot's effect, others move it, empty it and show the track's chain, its group's or the master's.
-- Project format 15 (still unreleased) gains `insert`, `insert_param`, `master_insert` and `master_insert_param` lines and lane ids `insert<k>.<id>`, `group<n>.insert<k>.<id>` and `master.insert<k>.<id>`.
+- Project format 15 gains `insert`, `insert_param`, `master_insert` and `master_insert_param` lines and lane ids `insert<k>.<id>`, `group<n>.insert<k>.<id>` and `master.insert<k>.<id>`.
 - Stems are taken before the master's chain.
 - An `inserts` bench scenario with an instruction budget. The allocation test plays 64 busy effects, some automated, and sends random chain edits with effects built off the audio thread.
 - Tests: chain order and swaps, bypassed effects bit-exact, a group of one with an effect against its track with it, click-free insertion, bypass, moving and removal, effect automation at any buffer size, a chain change on the same frame at any buffer size, a group held on by its echoes, effects returning through the release queue (and the queue never overflowing), file round trips, edits rebuilding the chains, undo, malformed lines, the insert limit, locked slots, stems before the master's chain, and the editor's inserts page.
@@ -503,6 +503,16 @@ Known limits:
 - A sidechain key is not delayed: a keyed compressor or gate on a delayed path hears its key early by that delay.
 - A gate put in waits for its look-ahead of input before its crossfade while the paths around it start theirs at once, so for those 10 ms they can be apart by up to its look-ahead.
 - An export whose limiter a lane switches on or off at the very start keeps the latency the limiter had before.
+
+#### Review: front end and back end, fourth pass ✅ (0.25.0)
+
+A review of the whole project before the release, the terminal front end as closely as the engine, made by two independent reviewers who checked each other's findings over three rounds. Each finding was checked against the code, and the fixes that change behaviour have tests that fail without them (mutation-checked):
+- Terminal input: a sequence cut short is dropped whole within 25 ms; bracketed paste finds its end marker first, and a cut paste or a full prompt says so on the prompt line; Windows key repeats (at most 64) and surrogate pairs; SIGTERM and SIGHUP end the session cleanly, also at the recovery question; a click aimed at a screen that has since changed is dropped; the editor draws less often once idle.
+- Drawing: prompts edit at a cursor and step over a letter with its accents; text is cut and padded by columns; small screens keep the panel, the automation lanes, the song view's rows, the top bar and the hints apart and in view; the key list wraps.
+- Files: an export refuses the project, its samples and folders, and `render --stems` checks every stem before the mix is written; lock files are checked through the handle that holds the lock and deleted only by their holder; the settings are saved under their lock, keeping each line's own ending; only plain files are read, and a named pipe is opened without waiting.
+- Engine: an unfed delay plays every repeat, and groups and the chorus come to rest on the same frame, at any buffer size; a tempo edit reaches every chain's delay; a take's layout reports keep room of their own; a MIDI release after a reset leaves a newer note alone; one-shot voices; the samples' budget is checked on load, undo and redo.
+
+Known limits: the main loop's stale-click and idle handling, signal delivery, Windows key-repeat delivery and the CoreAudio stop failure have no unit tests, since they need a real terminal or device. A screen cell keeps one combining mark.
 
 ### Phase 12: CLAP plugins (large)
 
