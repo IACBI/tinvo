@@ -186,7 +186,7 @@ unsafe fn describe(desc: *const ClapPluginDescriptor) -> Option<PluginInfo> {
     // SAFETY: as above.
     let id = unsafe { bounded(d.id) }.filter(|b| b.len() < MAX_STRING).and_then(|b| String::from_utf8(b).ok())?;
     let name = text(d.name);
-    if id.trim().is_empty() || name.trim().is_empty() {
+    if !super::is_valid_id(&id) || name.trim().is_empty() {
         return None;
     }
     let mut features = Vec::new();

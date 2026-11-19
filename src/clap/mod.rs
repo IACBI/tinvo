@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod host;
 pub mod library;
 pub mod scan;
+pub mod slot;
 
 /// What a plugin is for, from its descriptor's features: it can be more
 /// than one, or none TINVO knows.
@@ -70,6 +71,56 @@ pub struct PluginInfo {
     pub roles: Roles,
 }
 
+/// The longest plugin id kept, in bytes.
+pub const MAX_ID: usize = 1023;
+
+/// Whether a plugin can have `id` as TINVO keeps ids: not blank, at most
+/// [`MAX_ID`] bytes, no control characters (it goes on a line of its own
+/// in project and cache files). The scanner, the cache and
+/// [`PluginRef::new`] all take ids by this.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= MAX_ID && !id.chars().any(char::is_control)
+}
+/// The most plugin ids one run of TINVO keeps ([`PluginRef::new`]).
+pub const MAX_REFS: usize = 4096;
+
+/// Every plugin id named in this run, in the order first named; each is
+/// leaked once, so a [`PluginRef`] can lend it out for good.
+static IDS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// A plugin, by its id, as a number: so the kinds of instrument and effect
+/// that name one stay `Copy`. The same id always gives the same number in
+/// one run; numbers mean nothing across runs (projects keep the id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginRef(u32);
+
+impl PluginRef {
+    /// The number for `id`: `None` for an id no plugin can have
+    /// ([`is_valid_id`]), or once [`MAX_REFS`] different ids have been
+    /// named. Locks: off the audio thread.
+    pub fn new(id: &str) -> Option<PluginRef> {
+        if !is_valid_id(id) {
+            return None;
+        }
+        let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = ids.iter().position(|&s| s == id) {
+            return Some(PluginRef(i as u32));
+        }
+        if ids.len() >= MAX_REFS {
+            return None;
+        }
+        ids.push(Box::leak(id.into()));
+        Some(PluginRef(ids.len() as u32 - 1))
+    }
+
+    /// Its plugin's id. Locks: off the audio thread.
+    pub fn id(self) -> &'static str {
+        let ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
+        // Only `new` makes one, from a place it filled.
+        ids[self.0 as usize]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +134,19 @@ mod tests {
         assert_eq!(f(&["utility"]).label(), "other");
         assert!(f(&["instrument", "audio-effect"]).contains(Roles::EFFECT));
         assert!(!Roles::default().contains(Roles::default()));
+    }
+
+    #[test]
+    fn a_plugin_id_is_one_number_for_good() {
+        let a = PluginRef::new("org.tinvo.test.ref-a").unwrap();
+        assert_eq!(PluginRef::new("org.tinvo.test.ref-a"), Some(a));
+        let b = PluginRef::new("org.tinvo.test.ref-b").unwrap();
+        assert_ne!(a, b);
+        assert_eq!((a.id(), b.id()), ("org.tinvo.test.ref-a", "org.tinvo.test.ref-b"));
+        let long = "x".repeat(MAX_ID);
+        assert_eq!(PluginRef::new(&long).map(PluginRef::id), Some(long.as_str()));
+        for bad in [String::new(), " \t".into(), "x".repeat(MAX_ID + 1), "a\nb".into(), "a\u{7f}".into()] {
+            assert_eq!(PluginRef::new(&bad), None, "{bad:?}");
+        }
     }
 }

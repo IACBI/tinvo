@@ -60,7 +60,19 @@ pub(super) fn params(kind: InstrumentKind) -> &'static [ParamSpec] {
         InstrumentKind::HatClosed => &HAT_CLOSED,
         InstrumentKind::HatOpen => &HAT_OPEN,
         InstrumentKind::Clap => &CLAP,
-        InstrumentKind::Synth | InstrumentKind::Sampler => &[],
+        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => &[],
+    }
+}
+
+/// Each kind's own noise, as it has always been seeded.
+fn noise_seed(kind: InstrumentKind) -> u64 {
+    match kind {
+        InstrumentKind::Kick => 3,
+        InstrumentKind::Snare => 4,
+        InstrumentKind::HatClosed => 5,
+        InstrumentKind::HatOpen => 6,
+        InstrumentKind::Clap => 7,
+        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => 1,
     }
 }
 
@@ -138,7 +150,7 @@ impl Drum {
             metal: [Oscillator::new(); 6],
             f1: Svf::new(),
             f2: Svf::new(),
-            rng: Rng::new(kind as u64 + 1),
+            rng: Rng::new(noise_seed(kind)),
             spread: 1,
             bursts: 0,
             next_burst: 0,
@@ -198,7 +210,9 @@ impl Drum {
                 self.bursts = 0;
                 self.next_burst = 0;
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler => unreachable!("Drum is only constructed for drum kinds"),
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => {
+                unreachable!("Drum is only constructed for drum kinds")
+            }
         }
         self.follow_params();
     }
@@ -245,7 +259,9 @@ impl Drum {
                 self.spread = spread;
                 self.f1.set_q(p[0] * self.pitch, 1.5, sr);
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler => unreachable!("Drum is only constructed for drum kinds"),
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => {
+                unreachable!("Drum is only constructed for drum kinds")
+            }
         }
     }
 
@@ -335,7 +351,7 @@ impl Drum {
                 self.amp2 = flush_denormal(self.amp2 * self.amp2_coef);
                 1.4 * y
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler => 0.0,
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => 0.0,
         };
         self.t = self.t.saturating_add(1);
         let tail_started = self.kind != InstrumentKind::Clap || self.bursts == 4;

@@ -11,10 +11,17 @@
 //! Real-time rules enforced here: after construction, `process` never
 //! allocates, never locks and never blocks. All per-track storage is sized at
 //! construction time.
+//!
+//! Plugin instances come in commands and leave through the retirement
+//! queue, stopped, like samples and effects: the engine never drops one. A
+//! plugin track plays in stereo, through a stereo strip and a balance
+//! rather than a pan.
 
 pub mod transport;
 
 use crate::align::{self, Align};
+use crate::clap::host::Instance;
+use crate::clap::slot::PluginSlot;
 use crate::dsp::loudness::LiveLoudness;
 use crate::dsp::noise::Rng;
 use crate::dsp::smooth::Smoother;
@@ -28,7 +35,7 @@ use crate::rt::AtomicF32;
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{Consumer, Producer};
 use crate::sample::Sample;
-use crate::strip::{self, Strip, track_param};
+use crate::strip::{self, StereoStrip, Strip, track_param};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -599,7 +606,7 @@ pub enum Edit {
 }
 
 /// Messages from the UI to the audio thread.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Command {
     Edit(Edit),
     /// Start playing the cued pattern on repeat, from its first step.
@@ -636,6 +643,23 @@ pub enum Command {
         slot: u8,
         insert: Option<Box<Insert>>,
     },
+    /// Puts a plugin instance in plugin track `track`, if it fits there
+    /// ([`PluginSlot::fits`]). The one it replaces, or one that fits no
+    /// track there, goes back through the retirement queue; the notes the
+    /// track's instrument held are forgotten.
+    SetPlugin {
+        track: u8,
+        instance: Box<Instance>,
+    },
+    /// Lends out the instance with this token, wherever it plays, to be
+    /// restarted: it comes back as [`Retired::Lent`], stopped, and its
+    /// place waits for it ([`Command::Return`]), silent or passing its
+    /// input meanwhile. Ignored if no instance plays with that token.
+    Lend(u64),
+    /// Puts back an instance lent out, in the place that waits for it; with
+    /// none (its track or slot went, or another instance took it) it goes
+    /// back as [`Retired::Plugin`].
+    Return(Box<Instance>),
     /// The track live notes play on from now on.
     SetLiveTrack(u8),
     /// Hands the live notes and the steps the live track passes to the
@@ -781,25 +805,46 @@ const COMMAND_BUDGET: u32 = 4096;
 fn command_cost(cmd: &Command) -> u32 {
     match cmd {
         Command::Edit(Edit::AddTrack(_) | Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) => 512,
+        // A search of every track and chain.
+        Command::Lend(_) | Command::Return(_) => 64,
         _ => 1,
     }
 }
 
-/// What the engine hands back to the UI thread to free.
+/// What the engine hands back to the UI thread to free. Plugin instances
+/// come back stopped.
 #[derive(Debug)]
 pub enum Retired {
     Sample(Arc<Sample>),
+    /// An effect, with its plugin instance if it is a plugin insert.
     Insert(Box<Insert>),
+    /// A plugin instance the engine let go of.
+    Plugin(Box<Instance>),
+    /// A plugin instance lent out ([`Command::Lend`]).
+    Lent(Box<Instance>),
 }
 
-/// Capacity of the queue that returns released samples and effects to the
-/// UI thread. The engine holds at most 48 samples (32 tracks and 16 fading)
-/// and the 64 effects of a project for good; the rest of the room is for
+impl Retired {
+    /// How many of what the UI sent it hands back: an effect with an
+    /// instance in it is two.
+    pub fn count(&self) -> usize {
+        match self {
+            Retired::Insert(i) => 1 + usize::from(i.has_instance()),
+            _ => 1,
+        }
+    }
+}
+
+/// Capacity of the queue that returns released samples, effects and plugin
+/// instances to the UI thread. The engine holds at most 48 samples or
+/// instruments' instances (32 tracks and 16 fading) and the 64 effects of a
+/// project, each with an instance, for good; the rest of the room is for
 /// what is on its way back or out (replaced effects, removed tracks' and
 /// groups'), which a few seconds of playing let go.
 pub const RETIRE_QUEUE: usize = 256;
-/// The most samples and effects an engine playing a project holds for good.
-pub const HELD_FOR_GOOD: usize = MAX_TRACKS + MAX_FADING + crate::insert::MAX_INSERTS;
+/// The most samples, effects and instances an engine playing a project
+/// holds for good, counted as [`Retired::count`] does.
+pub const HELD_FOR_GOOD: usize = MAX_TRACKS + MAX_FADING + 2 * crate::insert::MAX_INSERTS;
 
 /// Hands a sample the engine no longer uses to the UI thread, so the audio
 /// thread never frees it. Without a queue (offline rendering) it is dropped
@@ -810,9 +855,27 @@ fn retire(queue: &mut Option<Producer<Retired>>, sample: Option<Arc<Sample>>) {
     }
 }
 
-/// [`retire`] for an effect.
-fn retire_insert(queue: &mut Option<Producer<Retired>>, insert: Box<Insert>) {
+/// [`retire`] for an effect; a plugin's instance stops processing first.
+fn retire_insert(queue: &mut Option<Producer<Retired>>, mut insert: Box<Insert>) {
+    if let Some(i) = insert.plugin_slot().and_then(PluginSlot::instance) {
+        i.stop();
+    }
     retire_any(queue, Retired::Insert(insert));
+}
+
+/// [`retire`] for what an instrument holds: its sample, or its plugin
+/// instance.
+fn retire_instrument(queue: &mut Option<Producer<Retired>>, instrument: &mut Instrument) {
+    retire(queue, instrument.set_sample(None));
+    if let Some(i) = instrument.plugin_slot().and_then(PluginSlot::take) {
+        retire_any(queue, Retired::Plugin(i));
+    }
+}
+
+/// Hands back an instance the engine does not keep, stopped.
+fn retire_instance(queue: &mut Option<Producer<Retired>>, mut instance: Box<Instance>) {
+    instance.stop();
+    retire_any(queue, Retired::Plugin(instance));
 }
 
 fn retire_any(queue: &mut Option<Producer<Retired>>, item: Retired) {
@@ -820,9 +883,10 @@ fn retire_any(queue: &mut Option<Producer<Retired>>, item: Retired) {
     if let Err(item) = q.push(item) {
         // Unreachable while the UI keeps at most `RETIRE_QUEUE` items in
         // flight, as `EngineLink` does. Leaking is the real-time-safe
-        // fallback if that bookkeeping is ever wrong.
-        debug_assert!(false, "retirement queue overflow");
+        // fallback if that bookkeeping is ever wrong; it goes first, so a
+        // debug build's assertion cannot drop the item here.
         std::mem::forget(item);
+        debug_assert!(false, "retirement queue overflow");
     }
 }
 
@@ -1031,6 +1095,61 @@ impl Lane {
         Self { target: None, ramp: false, points: [[f32::NAN; MAX_STEPS]; MAX_PATTERNS], segment: None, applied: None };
 }
 
+/// A track's channel strip: one channel, or two for a stereo instrument.
+// Inline either way, so the track's slot holds all of it.
+#[allow(clippy::large_enum_variant)]
+enum TrackStrip {
+    Mono(Strip),
+    Stereo(StereoStrip),
+}
+
+impl TrackStrip {
+    fn new(stereo: bool, sample_rate: f32) -> Self {
+        if stereo {
+            TrackStrip::Stereo(StereoStrip::new(sample_rate))
+        } else {
+            TrackStrip::Mono(Strip::new(sample_rate))
+        }
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        match self {
+            TrackStrip::Mono(s) => s.set_param(index, value),
+            TrackStrip::Stereo(s) => s.set_param(index, value),
+        }
+    }
+
+    #[cfg(test)]
+    fn param(&self, index: usize) -> Option<f32> {
+        match self {
+            TrackStrip::Mono(s) => s.param(index),
+            TrackStrip::Stereo(s) => s.param(index),
+        }
+    }
+
+    fn snap(&mut self) {
+        match self {
+            TrackStrip::Mono(s) => s.snap(),
+            TrackStrip::Stereo(s) => s.snap(),
+        }
+    }
+
+    fn gain_reduction_db(&self) -> f32 {
+        match self {
+            TrackStrip::Mono(s) => s.gain_reduction_db(),
+            TrackStrip::Stereo(s) => s.gain_reduction_db(),
+        }
+    }
+
+    /// Processes `buf`: one channel, or two interleaved.
+    fn process(&mut self, buf: &mut [f32], key: &[f32]) {
+        match self {
+            TrackStrip::Mono(s) => s.process(buf, key),
+            TrackStrip::Stereo(s) => s.process(buf, key),
+        }
+    }
+}
+
 struct Track {
     instrument: Instrument,
     steps: [[Option<Step>; MAX_STEPS]; MAX_PATTERNS],
@@ -1040,7 +1159,7 @@ struct Track {
     /// Parameter values set by edits; automation overrides them while a
     /// point is in force and returns to them afterwards.
     base: [f32; MAX_TRACK_PARAMS],
-    strip: Strip,
+    strip: TrackStrip,
     /// Its insert chain, after the strip.
     chain: Chain,
     /// The delay after its chain that lines it up with slower paths.
@@ -1095,7 +1214,7 @@ impl Track {
             parts: [Part::Follow; MAX_SONG],
             lanes: [Lane::EMPTY; MAX_LANES],
             base: base_params(kind),
-            strip: Strip::new(sample_rate),
+            strip: TrackStrip::new(kind.plugin().is_some(), sample_rate),
             chain: Chain::default(),
             align: Align::new(align::longest(sample_rate), sample_rate),
             gain_db: 0.0,
@@ -1130,9 +1249,13 @@ impl Track {
 
     /// Turns the slot into a fresh track of `kind` in place. A whole new
     /// `Track` would be built on the (audio thread's) stack first. Its
-    /// sample and effects must have been taken out already.
+    /// sample, plugin instance and effects must have been taken out already.
     fn reset(&mut self, kind: InstrumentKind, sample_rate: f32) {
         debug_assert!(self.chain.is_empty(), "effects freed on the audio thread");
+        debug_assert!(
+            !self.instrument.plugin_slot().is_some_and(|p| p.has_instance()),
+            "an instance dropped on the audio thread"
+        );
         self.align.reset();
         self.instrument = Instrument::new(kind, sample_rate);
         for p in &mut self.steps {
@@ -1141,7 +1264,7 @@ impl Track {
         self.parts.fill(Part::Follow);
         self.lanes.fill(Lane::EMPTY);
         self.base = base_params(kind);
-        self.strip = Strip::new(sample_rate);
+        self.strip = TrackStrip::new(kind.plugin().is_some(), sample_rate);
         self.gain_db = 0.0;
         self.pan = 0.0;
         self.auto_gain = None;
@@ -1424,6 +1547,8 @@ pub struct Engine {
     /// before any strip runs, so the key bus is complete when the
     /// compressors read it.
     track_bufs: Box<[[f32; BLOCK]]>,
+    /// The same for tracks with a stereo instrument, interleaved.
+    track_stereo: Box<[[f32; 2 * BLOCK]]>,
     /// Group buses: [`MAX_GROUPS`] slots, the first `group_count` in use.
     groups: Box<[Group]>,
     group_count: usize,
@@ -1534,6 +1659,7 @@ impl Engine {
             mix_l: [0.0; BLOCK],
             mix_r: [0.0; BLOCK],
             track_bufs: vec![[0.0; BLOCK]; MAX_TRACKS].into_boxed_slice(),
+            track_stereo: vec![[0.0; 2 * BLOCK]; MAX_TRACKS].into_boxed_slice(),
             groups: (0..2 * MAX_GROUPS).map(|_| Group::new(SMOOTHING_TIME, sample_rate)).collect(),
             group_count: 0,
             route_l: [0.0; BLOCK],
@@ -1710,8 +1836,10 @@ impl Engine {
         self.takes = Some(queue);
     }
 
-    /// Routes every sample and effect the engine releases from now on to
-    /// `queue`.
+    /// Routes every sample, effect and plugin instance the engine releases
+    /// from now on to `queue`. An engine given plugin instances needs one:
+    /// without it, what it lets go of is dropped where it is, which for an
+    /// instance on the audio thread locks and may allocate.
     pub fn attach_retirement(&mut self, queue: Producer<Retired>) {
         self.retired = Some(queue);
     }
@@ -1720,6 +1848,14 @@ impl Engine {
     /// effect it replaces, or `insert` for a chain that is not there, goes
     /// back through the retirement queue.
     fn place_slot(&mut self, id: ChainId, slot: u8, insert: Option<Box<Insert>>) {
+        let mut insert = insert;
+        let rate = f64::from(self.sample_rate);
+        // A plugin insert made for another sample rate would play out of
+        // tune: it goes back, and the slot stays as it was.
+        if let Some(b) = insert.take_if(|b| b.plugin_slot().is_some_and(|s| s.sample_rate() != rate)) {
+            retire_insert(&mut self.retired, b);
+            return;
+        }
         let tempo = self.tempo_now;
         let tracks = &self.tracks[..self.track_count];
         let insert = insert.map(|mut b| {
@@ -1767,6 +1903,71 @@ impl Engine {
         tracks[t].chain.clear(&mut |b| retire_insert(retired, b));
     }
 
+    /// Same as handling [`Command::SetPlugin`].
+    pub fn set_plugin(&mut self, track: usize, instance: Box<Instance>) {
+        debug_assert!(self.retired.is_some(), "an engine taking plugin instances needs a retirement queue");
+        let attached = match self.tracks[..self.track_count].get_mut(track) {
+            Some(t) => t.instrument.attach(instance),
+            None => Err(instance),
+        };
+        match attached {
+            Ok(old) => {
+                self.forget_voices(track);
+                if let Some(i) = old {
+                    retire_any(&mut self.retired, Retired::Plugin(i));
+                }
+            }
+            Err(i) => retire_instance(&mut self.retired, i),
+        }
+    }
+
+    /// Calls `f` on every plugin slot (instruments of the tracks and of
+    /// those fading out, then every chain's inserts, waiting ones too)
+    /// until it returns true. Returns the track whose instrument it
+    /// stopped at, as `Some(index)` for a track playing and `Some(usize::MAX)`
+    /// for anything else, or `None` if it never stopped.
+    fn find_slot(&mut self, mut f: impl FnMut(&mut PluginSlot) -> bool) -> Option<usize> {
+        let n = self.track_count;
+        for (i, t) in self.tracks[..n].iter_mut().enumerate() {
+            if t.instrument.plugin_slot().is_some_and(&mut f) {
+                return Some(i);
+            }
+        }
+        if self.fading.iter_mut().any(|x| x.track.instrument.plugin_slot().is_some_and(&mut f)) {
+            return Some(usize::MAX);
+        }
+        let chains = self.tracks[..n]
+            .iter_mut()
+            .map(|t| &mut t.chain)
+            .chain(self.fading.iter_mut().map(|x| &mut x.track.chain))
+            .chain(self.groups.iter_mut().map(|g| &mut g.chain))
+            .chain(std::iter::once(&mut self.master_chain));
+        for c in chains {
+            if c.each().any(|i| i.plugin_slot().is_some_and(&mut f)) {
+                return Some(usize::MAX);
+            }
+        }
+        None
+    }
+
+    /// Forgets the notes playing track `track`'s instrument held: its
+    /// instance went, and another's notes would answer to their ids. Its
+    /// notes on the MIDI output and the hits still to come are kept.
+    fn forget_voices(&mut self, track: usize) {
+        let Some(t) = self.tracks[..self.track_count].get_mut(track) else { return };
+        t.off_count = 0;
+        let mut k = 0;
+        while k < self.held_count {
+            let h = self.held[k];
+            if usize::from(h.track) == track && h.out.is_none() {
+                self.held.copy_within(k + 1..self.held_count, k);
+                self.held_count -= 1;
+            } else {
+                k += 1;
+            }
+        }
+    }
+
     /// Same as handling [`Command::SetSample`].
     pub fn set_sample(&mut self, track: usize, sample: Option<Arc<Sample>>) {
         let old = match self.tracks[..self.track_count].get_mut(track) {
@@ -1787,8 +1988,7 @@ impl Engine {
         }
         std::mem::swap(&mut f.track, &mut self.tracks[slot]);
         f.left = self.fade_frames;
-        let old = self.tracks[slot].instrument.set_sample(None);
-        retire(&mut self.retired, old);
+        retire_instrument(&mut self.retired, &mut self.tracks[slot].instrument);
         Self::free_chain(&mut self.tracks, slot, &mut self.retired);
     }
 
@@ -1922,6 +2122,35 @@ impl Engine {
             }
             Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
             Command::SetSlot { chain, slot, insert } => self.place_slot(chain, slot, insert),
+            Command::SetPlugin { track, instance } => self.set_plugin(usize::from(track), instance),
+            Command::Lend(token) => {
+                let mut lent = None;
+                if let Some(track) = self.find_slot(|s| {
+                    lent = s.lend(token);
+                    lent.is_some()
+                }) {
+                    self.forget_voices(track);
+                }
+                if let Some(i) = lent {
+                    retire_any(&mut self.retired, Retired::Lent(i));
+                }
+            }
+            Command::Return(instance) => {
+                let mut back = Some(instance);
+                let found = self.find_slot(|s| match back.take().map(|i| s.give_back(i)) {
+                    Some(Err(i)) => {
+                        back = Some(i);
+                        false
+                    }
+                    _ => true,
+                });
+                if let Some(track) = found {
+                    self.forget_voices(track);
+                }
+                if let Some(i) = back {
+                    retire_instance(&mut self.retired, i);
+                }
+            }
             Command::SetMidiClock(on) => {
                 self.midi_clock = on;
                 if !on && self.clock_pulse.take().is_some() && !std::mem::take(&mut self.clock_resume) {
@@ -2825,8 +3054,7 @@ impl Engine {
             Edit::InsertTrack { index, kind } => {
                 let i = usize::from(index);
                 if n < MAX_TRACKS && i <= n {
-                    let old = self.tracks[n].instrument.set_sample(None);
-                    retire(&mut self.retired, old);
+                    retire_instrument(&mut self.retired, &mut self.tracks[n].instrument);
                     Self::free_chain(&mut self.tracks, n, &mut self.retired);
                     self.tracks[n].reset(kind, self.sample_rate);
                     self.tracks[n].instrument.set_tempo(self.tempo_now);
@@ -2843,8 +3071,7 @@ impl Engine {
             }
             Edit::AddTrack(kind) => {
                 if n < MAX_TRACKS {
-                    let old = self.tracks[n].instrument.set_sample(None);
-                    retire(&mut self.retired, old);
+                    retire_instrument(&mut self.retired, &mut self.tracks[n].instrument);
                     Self::free_chain(&mut self.tracks, n, &mut self.retired);
                     self.tracks[n].reset(kind, self.sample_rate);
                     self.tracks[n].instrument.set_tempo(self.tempo_now);
@@ -3239,7 +3466,10 @@ impl Engine {
             }
             t.audible = audible;
             let g = if audible { fader_gain(t.auto_gain.unwrap_or(t.gain_db)) } else { 0.0 };
-            let (l, r) = pan_gains(t.auto_pan.unwrap_or(t.pan));
+            let pan = t.auto_pan.unwrap_or(t.pan);
+            // A stereo instrument is balanced, unity at the centre, as a
+            // group is; a mono one panned.
+            let (l, r) = if t.instrument.is_stereo() { group::balance_gains(pan) } else { pan_gains(pan) };
             t.gain_l.set_target(g * l);
             t.gain_r.set_target(g * r);
         }
@@ -3670,6 +3900,7 @@ impl Engine {
             tracks,
             track_count,
             track_bufs,
+            track_stereo,
             key,
             mix_l,
             mix_r,
@@ -3695,7 +3926,18 @@ impl Engine {
         }
         let key = &mut key[a..b];
         key.fill(0.0);
-        for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
+        for ((t, buf), st) in tracks.iter_mut().zip(track_bufs.iter_mut()).zip(track_stereo.iter_mut()) {
+            if t.instrument.is_stereo() {
+                let st = &mut st[2 * a..2 * b];
+                t.instrument.render_stereo(st);
+                let k = &mut t.sends[send::KEY];
+                if k.current() != 0.0 || k.target() != 0.0 {
+                    for (y, f) in key.iter_mut().zip(st.chunks_exact(2)) {
+                        *y += 0.5 * (f[0] + f[1]) * k.tick();
+                    }
+                }
+                continue;
+            }
             let buf = &mut buf[a..b];
             buf.fill(0.0);
             t.instrument.render(buf);
@@ -3717,7 +3959,17 @@ impl Engine {
             fade: *fade_frames,
             fed: [0; 2 * MAX_GROUPS],
         };
-        for (t, buf) in tracks.iter_mut().zip(track_bufs.iter_mut()) {
+        for ((t, buf), st) in tracks.iter_mut().zip(track_bufs.iter_mut()).zip(track_stereo.iter_mut()) {
+            if t.instrument.is_stereo() {
+                let st = &mut st[2 * a..2 * b];
+                t.strip.process(st, key);
+                if !t.chain.is_empty() || t.align.is_active() {
+                    t.chain.process(st, key, &mut |x| retire_insert(retired, x));
+                    t.align.process(st);
+                }
+                route.track(t, Signal::Stereo(st), b - a, mix);
+                continue;
+            }
             let buf = &mut buf[a..b];
             t.strip.process(buf, key);
             if t.chain.is_empty() && !t.align.is_active() {
@@ -3736,6 +3988,34 @@ impl Engine {
         }
         // A removed track feeds no one's key: its key send went with it.
         for f in fading.iter_mut().filter(|f| f.left > 0) {
+            if f.track.instrument.is_stereo() {
+                let n = b - a;
+                // Played no further than its fade, where its instance goes.
+                let sounding = n.min(f.left as usize);
+                let st = &mut stereo_buf[..2 * n];
+                let (live, rest) = st.split_at_mut(2 * sounding);
+                rest.fill(0.0);
+                f.track.instrument.render_stereo(live);
+                f.track.strip.process(live, key);
+                if !f.track.chain.is_empty() || f.track.align.is_active() {
+                    f.track.chain.process(live, key, &mut |x| retire_insert(retired, x));
+                    f.track.align.process(live);
+                }
+                let whole = *fade_frames as f32;
+                for s in st.chunks_exact_mut(2) {
+                    let g = f.left as f32 / whole;
+                    s[0] *= g;
+                    s[1] *= g;
+                    f.left = f.left.saturating_sub(1);
+                }
+                route.track(&mut f.track, Signal::Stereo(st), sounding, mix);
+                if f.left == 0 {
+                    *fading_count -= 1;
+                    retire_instrument(retired, &mut f.track.instrument);
+                    f.track.chain.clear(&mut |x| retire_insert(retired, x));
+                }
+                continue;
+            }
             let buf = &mut fade_buf[a..b];
             buf.fill(0.0);
             f.track.instrument.render(buf);
@@ -3751,8 +4031,11 @@ impl Engine {
             } else {
                 let st = &mut stereo_buf[..2 * buf.len()];
                 stereo(buf, st);
-                f.track.chain.process(st, key, &mut |x| retire_insert(retired, x));
-                f.track.align.process(st);
+                // Its inserts play no further than its fade, where they go.
+                let (live, rest) = st.split_at_mut(2 * sounding);
+                rest.fill(0.0);
+                f.track.chain.process(live, key, &mut |x| retire_insert(retired, x));
+                f.track.align.process(live);
                 for s in st.chunks_exact_mut(2) {
                     let g = f.left as f32 / whole;
                     s[0] *= g;
@@ -3763,7 +4046,7 @@ impl Engine {
             }
             if f.left == 0 {
                 *fading_count -= 1;
-                retire(retired, f.track.instrument.set_sample(None));
+                retire_instrument(retired, &mut f.track.instrument);
                 f.track.chain.clear(&mut |x| retire_insert(retired, x));
             }
         }
