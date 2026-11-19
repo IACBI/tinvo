@@ -257,6 +257,39 @@ pub struct ClapPluginNotePorts {
     >,
 }
 
+/// `CLAP_EVENT_MIDI`, and `clap_event_midi_t`.
+pub const CLAP_EVENT_MIDI: u16 = 10;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ClapEventMidi {
+    pub header: ClapEventHeader,
+    pub port_index: u16,
+    pub data: [u8; 3],
+}
+
+/// `CLAP_EXT_THREAD_CHECK`.
+pub const CLAP_EXT_THREAD_CHECK: &std::ffi::CStr = c"clap.thread-check";
+
+/// `clap_host_thread_check_t`.
+#[repr(C)]
+pub struct ClapHostThreadCheck {
+    pub is_main_thread: Option<unsafe extern "C" fn(host: *const ClapHost) -> bool>,
+    pub is_audio_thread: Option<unsafe extern "C" fn(host: *const ClapHost) -> bool>,
+}
+
+/// `CLAP_EXT_RENDER`, and the render modes.
+pub const CLAP_EXT_RENDER: &std::ffi::CStr = c"clap.render";
+pub const CLAP_RENDER_REALTIME: i32 = 0;
+pub const CLAP_RENDER_OFFLINE: i32 = 1;
+
+/// `clap_plugin_render_t`.
+#[repr(C)]
+pub struct ClapPluginRender {
+    pub has_hard_realtime_requirement: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> bool>,
+    pub set: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, mode: i32) -> bool>,
+}
+
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
@@ -291,6 +324,10 @@ mod tests {
         assert_eq!(offset_of!(ClapAudioPortInfo, port_type), 272);
         assert_eq!(size_of::<ClapPluginAudioPorts>(), 16);
         assert_eq!(size_of::<ClapNotePortInfo>(), 268);
+        assert_eq!(size_of::<ClapEventMidi>(), 24);
+        assert_eq!(offset_of!(ClapEventMidi, data), 18);
+        assert_eq!(size_of::<ClapHostThreadCheck>(), 16);
+        assert_eq!(size_of::<ClapPluginRender>(), 16);
         assert_eq!(size_of::<Option<unsafe extern "C" fn()>>(), 8, "a null pointer is None");
     }
 }
