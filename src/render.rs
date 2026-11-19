@@ -136,8 +136,15 @@ const CHUNK: usize = 4096;
 /// Makes the plugin instances a render plays, on the thread that renders.
 pub trait PluginSource {
     /// An instance of `plugin` as a `role`, made to render offline at
-    /// `sample_rate` in calls of at most [`BLOCK`] frames.
-    fn make(&mut self, plugin: PluginRef, role: Role, sample_rate: f64) -> Result<Instance, String>;
+    /// `sample_rate` in calls of at most [`BLOCK`] frames, loading `state`
+    /// first if given.
+    fn make(
+        &mut self,
+        plugin: PluginRef,
+        role: Role,
+        sample_rate: f64,
+        state: Option<&[u8]>,
+    ) -> Result<Instance, String>;
     /// What the instances made have asked for since the last call
     /// ([`PluginHost::poll`]).
     fn poll(&mut self) -> Vec<Request>;
@@ -149,7 +156,7 @@ pub trait PluginSource {
 pub struct NoPlugins;
 
 impl PluginSource for NoPlugins {
-    fn make(&mut self, _: PluginRef, _: Role, _: f64) -> Result<Instance, String> {
+    fn make(&mut self, _: PluginRef, _: Role, _: f64, _: Option<&[u8]>) -> Result<Instance, String> {
         Err("no plugin catalog was read".into())
     }
 
@@ -179,11 +186,17 @@ impl CatalogPlugins {
 }
 
 impl PluginSource for CatalogPlugins {
-    fn make(&mut self, plugin: PluginRef, role: Role, sample_rate: f64) -> Result<Instance, String> {
+    fn make(
+        &mut self,
+        plugin: PluginRef,
+        role: Role,
+        sample_rate: f64,
+        state: Option<&[u8]>,
+    ) -> Result<Instance, String> {
         let (file, _) = self.catalog.find(plugin.id()).ok_or("not found in the plugin catalog")?;
         // SAFETY: a file of the catalog, on the thread that made this, as
         // its maker promised.
-        unsafe { self.host.create(file, plugin.id(), role, Mode::Offline, sample_rate, BLOCK) }
+        unsafe { self.host.create_with_state(file, plugin.id(), role, Mode::Offline, sample_rate, BLOCK, state) }
     }
 
     fn poll(&mut self) -> Vec<Request> {
@@ -202,7 +215,8 @@ struct Playing {
 }
 
 impl Playing {
-    /// Puts an instance in every plugin place of `project`.
+    /// Puts an instance in every plugin place of `project`, each starting
+    /// from the state the project keeps for it.
     fn attach(
         engine: &mut Engine,
         project: &Project,
@@ -213,7 +227,8 @@ impl Playing {
         engine.attach_retirement(tx);
         let mut playing = Playing { tokens: Vec::new(), back };
         for (place, plugin) in project.plugin_places() {
-            let made = plugins.make(plugin, place.role(), f64::from(sample_rate));
+            let state = project.plugin_state(place).map(|s| &s[..]);
+            let made = plugins.make(plugin, place.role(), f64::from(sample_rate), state);
             let name = || plugins.name(plugin);
             let instance = made.map_err(|e| format!("{} cannot load: {e}", name()))?;
             playing.tokens.push((instance.token(), plugin));

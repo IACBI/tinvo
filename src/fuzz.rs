@@ -1238,7 +1238,7 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
                 _ => ChainId::Track(track),
             };
             let slot = s.below(MAX_SLOTS + 1) as u8;
-            let held = p.chain(chain).ok().and_then(|c| c.get(usize::from(slot)).copied().flatten());
+            let held = p.chain(chain).ok().and_then(|c| c.get(usize::from(slot)).cloned().flatten());
             let kind = EffectKind::ALL[s.below(EffectKind::ALL.len())];
             let index = s.below(MAX_INSERT_PARAMS + 1) as u8;
             match s.below(5) {

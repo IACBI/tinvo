@@ -161,15 +161,22 @@ impl Plugins {
     }
 
     /// An instance of `plugin` as a `role`, to play in real time at
-    /// `sample_rate`.
-    pub fn make(&mut self, plugin: PluginRef, role: Role, sample_rate: u32) -> Result<Instance, String> {
+    /// `sample_rate`, loading `state` first if given.
+    pub fn make(
+        &mut self,
+        plugin: PluginRef,
+        role: Role,
+        sample_rate: u32,
+        state: Option<&[u8]>,
+    ) -> Result<Instance, String> {
         let Some(catalog) = &self.catalog else { return Err(self.why_no_catalog()) };
         let (file, _) = catalog.find(plugin.id()).ok_or("not found in the plugin catalog")?;
         // SAFETY: a file of the catalog, which whoever gave it promised
         // could be trusted; on the thread this was made on, which they
         // promised plays CLAP's main thread.
+        let sr = f64::from(sample_rate);
         let instance =
-            unsafe { self.host.create(file, plugin.id(), role, Mode::Realtime, f64::from(sample_rate), BLOCK) }?;
+            unsafe { self.host.create_with_state(file, plugin.id(), role, Mode::Realtime, sr, BLOCK, state) }?;
         self.made.insert(instance.token(), plugin);
         Ok(instance)
     }
@@ -270,7 +277,7 @@ mod tests {
     fn without_a_catalog_nothing_is_made_and_the_list_says_why() {
         let mut p = Plugins::new();
         let r = PluginRef::new("org.tinvo.test.unit").unwrap();
-        assert_eq!(p.make(r, Role::Instrument, 48_000).err().as_deref(), Some("no plugin catalog was read"));
+        assert_eq!(p.make(r, Role::Instrument, 48_000, None).err().as_deref(), Some("no plugin catalog was read"));
         p.scan_error = Some("no".into());
         assert_eq!(p.why_no_catalog(), "the plugin scan failed (no)");
         let (_tx, rx) = mpsc::channel();

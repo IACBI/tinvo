@@ -8,7 +8,7 @@
 use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::autosave::{self, Autosave};
 use crate::clap::PluginRef;
-use crate::clap::host::{Instance, Request, Role as PluginRole};
+use crate::clap::host::{Instance, PluginHandle, Request, Role as PluginRole};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
@@ -282,12 +282,13 @@ struct TrackMeta {
 }
 
 /// What lives outside the [`Edit`] stream: each track's name and sample,
-/// each group's name, and the song's markers.
+/// each group's name, the song's markers and the plugins' states.
 #[derive(Clone, Debug, PartialEq)]
 struct Meta {
     tracks: Vec<TrackMeta>,
     groups: Vec<String>,
     markers: Vec<Marker>,
+    states: Vec<(PluginPlace, Arc<[u8]>)>,
 }
 
 /// One undoable user action.
@@ -833,6 +834,12 @@ pub struct App {
     /// An instance made before the edit that needs it, so a plugin that
     /// cannot load leaves the project as it was.
     ready: Option<(PluginRef, Instance)>,
+    /// The engine's instances by where they play, to save their states
+    /// into the project from; followed through every edit.
+    live: Vec<(PluginPlace, PluginHandle)>,
+    /// While undo or redo applies its edits: the plugin places they made,
+    /// given instances once the states they had are back.
+    created: Option<Vec<(PluginPlace, PluginRef)>>,
 }
 
 /// Something on screen the mouse can point at.
@@ -1004,6 +1011,8 @@ impl App {
             stroke_at: None,
             plugins: Plugins::new(),
             ready: None,
+            live: Vec::new(),
+            created: None,
         }
     }
 
@@ -1123,7 +1132,10 @@ impl App {
         self.group_reduction = [0.0; MAX_GROUPS];
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
-        // A new engine has no instances: the old ones went with the old.
+        // A new engine has no instances: the old ones went with the old,
+        // whose states the new start from.
+        self.sync_states();
+        self.live.clear();
         self.plugins.forget_made();
         self.attach_all();
     }
@@ -1473,6 +1485,7 @@ impl App {
                 return false;
             }
         };
+        self.sync_states_before(&[e]);
         let meta_before = self.meta();
         let Some(applied) = self.apply_raw(e) else { return false };
         if inverse == [applied] {
@@ -1506,6 +1519,7 @@ impl App {
     /// Applies several edits as one undo step. Invalid or no-op edits are
     /// skipped.
     fn edit_group(&mut self, edits: Vec<Edit>, what: &'static str) {
+        self.sync_states_before(&edits);
         let meta_before = self.meta();
         let (mut inverses, mut redo) = (Vec::new(), Vec::new());
         for e in edits {
@@ -1575,6 +1589,22 @@ impl App {
                 if let Some(r) = &mut self.note_rec {
                     r.take.edited(&applied);
                 }
+                self.live.retain_mut(|(place, _)| match project::follow_place(*place, &applied) {
+                    Some(p) => {
+                        *place = p;
+                        true
+                    }
+                    None => false,
+                });
+                if let Some(created) = &mut self.created {
+                    created.retain_mut(|(place, _)| match project::follow_place(*place, &applied) {
+                        Some(p) => {
+                            *place = p;
+                            true
+                        }
+                        None => false,
+                    });
+                }
                 if let Some(l) = &mut self.link {
                     l.send(engine_command(applied, self.sample_rate));
                 }
@@ -1598,6 +1628,53 @@ impl App {
                 .collect(),
             groups: self.project.groups.iter().map(|g| g.name.clone()).collect(),
             markers: self.project.markers.clone(),
+            states: self
+                .project
+                .plugin_places()
+                .into_iter()
+                .filter_map(|(place, _)| Some((place, self.project.plugin_state(place)?.clone())))
+                .collect(),
+        }
+    }
+
+    /// Saves every playing plugin's state into the project, for a save,
+    /// an export, a new engine or an edit that may remove it. A plugin
+    /// that cannot save keeps the state it had.
+    fn sync_states(&mut self) {
+        for (place, handle) in &self.live {
+            if let Ok(state) = handle.save_state() {
+                self.project.set_plugin_state(*place, state.map(Into::into));
+            }
+        }
+    }
+
+    /// [`App::sync_states`] if `edits` may remove a plugin, so its state
+    /// goes into the history.
+    fn sync_states_before(&mut self, edits: &[Edit]) {
+        let removes = |e: &Edit| matches!(e, Edit::RemoveTrack(_) | Edit::RemoveGroup(_) | Edit::SetSlot { .. });
+        if edits.iter().any(removes) {
+            self.sync_states();
+        }
+    }
+
+    /// Applies the edits of an undo or redo step, `edits`, and brings back
+    /// what `meta` kept; a plugin place they made gets an instance
+    /// starting from the state it had. `now` is the step's other side,
+    /// given the states of the plugins it may remove.
+    fn apply_history(&mut self, edits: &[Edit], meta: &Meta, now: &mut Meta) {
+        if edits.iter().any(|e| matches!(e, Edit::RemoveTrack(_) | Edit::RemoveGroup(_) | Edit::SetSlot { .. })) {
+            self.sync_states();
+            now.states = self.meta().states;
+        }
+        self.created = Some(Vec::new());
+        for &e in edits {
+            self.apply_raw(e);
+        }
+        self.restore_meta(meta);
+        for (place, plugin) in self.created.take().unwrap_or_default() {
+            let state = meta.states.iter().find(|(p, _)| *p == place).map(|(_, s)| Arc::clone(s));
+            self.project.set_plugin_state(place, state);
+            self.attach_place(place, plugin);
         }
     }
 
@@ -1708,10 +1785,8 @@ impl App {
             self.undo.push_back(c);
             return;
         }
-        for &e in &c.undo {
-            self.apply_raw(e);
-        }
-        self.restore_meta(&c.meta_before);
+        let mut c = c;
+        self.apply_history(&c.undo.clone(), &c.meta_before.clone(), &mut c.meta_after);
         self.after_history_move(&c, "Undid");
         self.redo.push(c);
     }
@@ -1726,10 +1801,8 @@ impl App {
             self.redo.push(c);
             return;
         }
-        for &e in &c.redo {
-            self.apply_raw(e);
-        }
-        self.restore_meta(&c.meta_after);
+        let mut c = c;
+        self.apply_history(&c.redo.clone(), &c.meta_after.clone(), &mut c.meta_before);
         self.after_history_move(&c, "Redid");
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
@@ -1944,6 +2017,7 @@ impl App {
     }
 
     fn write_autosave(&mut self, now: Instant) {
+        self.sync_states();
         match self.autosave.write(&self.project, self.revision, now) {
             Ok(()) => self.autosave_failed = false,
             Err(e) if !self.autosave_failed => {
@@ -1965,6 +2039,7 @@ impl App {
         let Some(path) = self.autosave.path().map(Path::to_path_buf) else {
             return "; the unsaved edits are lost: there is nowhere to autosave them".into();
         };
+        self.sync_states();
         match self.autosave.write(&self.project, self.revision, Instant::now()) {
             Ok(()) => format!("; the unsaved edits were autosaved to {}", path.display()),
             Err(e) => format!("; the unsaved edits could not be autosaved to {}: {e}", path.display()),
@@ -3263,8 +3338,9 @@ impl App {
     }
 
     /// Gives the engine an instance for the plugin `place` holds: the one
-    /// made ready for it, or a new one. Without an engine or a catalog
-    /// there is nothing to do yet.
+    /// made ready for it, or a new one starting from the state the project
+    /// keeps for it (at its defaults, said, if it cannot load that).
+    /// Without an engine or a catalog there is nothing to do yet.
     fn attach_place(&mut self, place: PluginPlace, plugin: PluginRef) {
         if self.link.is_none() {
             return;
@@ -3272,13 +3348,28 @@ impl App {
         let made = match self.ready.take() {
             Some((r, i)) if r == plugin => Ok(i),
             _ if self.plugins.catalog().is_none() => return,
-            _ => self.plugins.make(plugin, place.role(), self.sample_rate),
+            _ => {
+                let state = self.project.plugin_state(place).cloned();
+                let made = self.plugins.make(plugin, place.role(), self.sample_rate, state.as_deref());
+                match made {
+                    Err(e) if state.is_some() => {
+                        let (at, name) = (self.place_text(place), self.plugins.name(plugin));
+                        self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}"));
+                        self.plugins.make(plugin, place.role(), self.sample_rate, None)
+                    }
+                    made => made,
+                }
+            }
         };
         match made {
-            Ok(i) => self.send(match place {
-                PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
-                PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
-            }),
+            Ok(i) => {
+                self.live.retain(|(p, _)| *p != place);
+                self.live.push((place, i.handle()));
+                self.send(match place {
+                    PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
+                    PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
+                })
+            }
             Err(e) => {
                 let line = format!("{}: {} cannot load: {e}", self.place_text(place), self.plugins.name(plugin));
                 self.plugin_problem(line);
@@ -3297,7 +3388,10 @@ impl App {
             Edit::SetSlot { chain, slot, kind: Some(EffectKind::Plugin(r)) } => (PluginPlace::Slot(chain, slot), r),
             _ => return,
         };
-        self.attach_place(place, plugin);
+        match &mut self.created {
+            Some(created) => created.push((place, plugin)),
+            None => self.attach_place(place, plugin),
+        }
     }
 
     /// Gives a new engine, or the one playing when the catalog comes, an
@@ -3363,21 +3457,32 @@ impl App {
     }
 
     /// Serves what the instances asked for: one restart each, a failure
-    /// first, for the instances of the engine playing; and restarts the
-    /// instances the engine has lent out for it.
+    /// first, for the instances of the engine playing, and a changed state
+    /// marked unsaved; and restarts the instances the engine has lent out
+    /// for it.
     fn serve_plugins(&mut self, requests: Vec<Request>) {
         let Some(link) = &mut self.link else { return };
         for token in link.take_gone() {
             self.plugins.forget(token);
         }
         let mut tokens: Vec<(u64, bool)> = Vec::new();
+        let mut changed = false;
         for request in requests {
+            // A playing plugin's changed state is an unsaved change, saved
+            // with the project.
+            if let Request::StateDirty(token) = request {
+                changed |= self.live.iter().any(|(_, h)| h.token() == token);
+                continue;
+            }
             let (Request::Restart(token) | Request::Failed(token)) = request else { continue };
             let failed = matches!(request, Request::Failed(_));
             match tokens.iter_mut().find(|t| t.0 == token) {
                 Some(t) => t.1 |= failed,
                 None => tokens.push((token, failed)),
             }
+        }
+        if changed {
+            self.touch();
         }
         for (token, failed) in tokens {
             // Another engine's, or gone.
@@ -3470,16 +3575,26 @@ impl App {
         };
         let name = self.plugins.name(plugin);
         let kind = EffectKind::Plugin(plugin);
+        // Picked again: a fresh instance in place, the slot's settings and
+        // the plugin's state kept.
+        let again = match target {
+            PluginFor::Slot(chain, slot) if self.slot_data(chain, slot).map(|d| d.kind) == Some(kind) => {
+                Some(PluginPlace::Slot(chain, slot))
+            }
+            _ => None,
+        };
+        if again.is_some() {
+            self.sync_states();
+        }
+        let state = again.and_then(|place| self.project.plugin_state(place).cloned());
         // Made first, even with no engine to play it (at the rate the next
         // is likely to have), so one that cannot load changes nothing.
-        match self.plugins.make(plugin, target.role(), self.sample_rate) {
+        match self.plugins.make(plugin, target.role(), self.sample_rate, state.as_deref()) {
             Ok(i) => self.ready = Some((plugin, i)),
             Err(e) => return self.plugin_problem(format!("{name} cannot load: {e}")),
         }
         if let PluginFor::Slot(chain, slot) = target {
-            // Picked again: a fresh instance in place, the slot's settings
-            // kept.
-            if self.slot_data(chain, slot).map(|d| d.kind) == Some(kind) {
+            if again.is_some() {
                 self.attach_place(PluginPlace::Slot(chain, slot), plugin);
                 self.ready = None;
                 return self.set_status(format!("{} slot {}: {name}, loaded again", self.chain_name(chain), slot + 1));
@@ -4377,6 +4492,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
+        self.sync_states();
         // Saving to another file moves the session there, lock and all; a
         // file another session has open is refused.
         let moving = self.lock.as_ref().is_none_or(|l| !l.is_for(&path));
@@ -4432,6 +4548,7 @@ impl App {
     }
 
     pub fn export_to(&mut self, path: &Path) {
+        self.sync_states();
         if let Err(e) = render::check_destination(&self.project, self.path.as_deref(), path) {
             return self.set_status(format!("Not exported: {} {e}", path.display()));
         }
@@ -7490,7 +7607,7 @@ mod tests {
         assert!(sent().is_empty());
         // The effect keys go through the kinds; each reaches the engine built.
         keys(&mut a, &[Key::Char('.'), Key::Char('.')]);
-        assert_eq!(a.project.tracks[0].chain[0].map(|d| d.kind), Some(Compressor));
+        assert_eq!(a.project.tracks[0].chain[0].as_ref().map(|d| d.kind), Some(Compressor));
         let built: Vec<_> = sent()
             .into_iter()
             .filter_map(|c| match c {
@@ -7502,7 +7619,7 @@ mod tests {
         // Its settings follow its bypass on the page.
         assert_eq!(a.page_params().len(), MAX_SLOTS - 1 + Compressor.params().len());
         keys(&mut a, &[Key::Down, Key::Down, Key::Right]);
-        let ratio = a.project.tracks[0].chain[0].unwrap().params[2];
+        let ratio = a.project.tracks[0].chain[0].as_ref().unwrap().params[2];
         assert!(ratio > Compressor.params()[2].default);
         let edits: Vec<_> =
             sent().into_iter().filter_map(|c| if let Command::Edit(e) = c { Some(e) } else { None }).collect();
@@ -7539,7 +7656,7 @@ mod tests {
         assert!(a.project.tracks[0].chain[1].is_none());
         sent();
         keys(&mut a, &[Key::Char('u')]);
-        let back = a.project.tracks[0].chain[1].unwrap();
+        let back = a.project.tracks[0].chain[1].as_ref().unwrap();
         assert_eq!((back.kind, back.params[0], back.params[2]), (Compressor, 1.0, ratio));
         let undone = sent();
         assert!(
@@ -7551,7 +7668,7 @@ mod tests {
         assert_eq!(a.insert_chain(), ChainId::Master);
         // Back from none, the last kind.
         keys(&mut a, &[Key::Char(','), Key::Char(';')]);
-        assert_eq!(a.project.master_chain[0].map(|d| d.kind), EffectKind::ALL.last().copied());
+        assert_eq!(a.project.master_chain[0].as_ref().map(|d| d.kind), EffectKind::ALL.last().copied());
         assert_eq!(a.insert_chain(), ChainId::Track(0));
         // In a group, its chain comes between.
         a.edit(Edit::InsertGroup(0));
@@ -9452,6 +9569,29 @@ mod tests {
         assert_eq!(note_name(61), "C#4");
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+    }
+
+    #[test]
+    fn undo_brings_back_each_plugin_s_state_where_its_plugin_lands() {
+        use crate::clap::PluginRef;
+        let (one, two) = (PluginRef::new("com.example.one").unwrap(), PluginRef::new("com.example.two").unwrap());
+        let mut a = app();
+        let n = a.project.tracks.len() as u8;
+        a.edit(Edit::AddTrack(InstrumentKind::Plugin(one)));
+        a.edit(Edit::AddTrack(InstrumentKind::Plugin(two)));
+        let (first, second): (Arc<[u8]>, Arc<[u8]>) = (vec![1u8].into(), vec![2u8, 2].into());
+        assert!(a.project.set_plugin_state(PluginPlace::Track(n), Some(first.clone())));
+        assert!(a.project.set_plugin_state(PluginPlace::Track(n + 1), Some(second.clone())));
+        // Both gone in one step; undone, the second track comes back first,
+        // and moves as the first comes back before it.
+        a.edit_group(vec![Edit::RemoveTrack(n), Edit::RemoveTrack(n)], "delete tracks");
+        assert_eq!(a.project.tracks.len(), usize::from(n));
+        a.undo();
+        assert_eq!(a.project.plugin_state(PluginPlace::Track(n)), Some(&first));
+        assert_eq!(a.project.plugin_state(PluginPlace::Track(n + 1)), Some(&second));
+        a.redo();
+        a.undo();
+        assert_eq!(a.project.plugin_state(PluginPlace::Track(n + 1)), Some(&second));
     }
 
     #[test]

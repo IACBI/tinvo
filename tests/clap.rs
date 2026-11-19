@@ -2413,6 +2413,32 @@ fn an_export_lines_up_a_late_plugin_and_refuses_one_that_changes() {
 }
 
 #[test]
+fn an_export_starts_each_plugin_from_its_state() {
+    let dir = temp_dir("render-state");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert!(gain.set_param(10, 0.25, 1));
+    processed(&mut gain, 8);
+    let quarter: Arc<[u8]> = gain.save_state().unwrap().unwrap().into();
+    gain.stop();
+    drop(gain);
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) }).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let half = export(&p, &mut catalog_plugins(&dir.join("a"), "fixture")).unwrap();
+    assert!(p.set_plugin_state(PluginPlace::Slot(ChainId::Track(0), 0), Some(quarter)));
+    let out = export(&p, &mut catalog_plugins(&dir.join("b"), "fixture")).unwrap();
+    assert_eq!(out.len(), half.len());
+    assert!((factor(&out, &half) - 0.5).abs() < 1e-4, "at a quarter, not a half");
+    // One it cannot load fails the export, named.
+    let e = export(&p, &mut catalog_plugins(&dir.join("c"), "loadfail")).unwrap_err();
+    assert_eq!(e, "Test Gain cannot load: could not load its saved state");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_export_refuses_plugins_later_than_it_makes_up_for() {
     let dir = temp_dir("render-too-late");
     // Four late gains on one track: at 200 Hz, 1280 ms.
@@ -2505,14 +2531,17 @@ impl Editor {
     }
 
     /// A new engine for the project as it is, as a reopened device gets.
+    /// The old engine plays on until the editor has taken the new, as a
+    /// reopened device's does.
     fn reconnect(&mut self) {
         let shared = Arc::new(Shared::new());
-        self.engine = Engine::with_edits(RATE as f32, &self.app.project.to_edits(), shared.clone(), None);
+        let mut engine = Engine::with_edits(RATE as f32, &self.app.project.to_edits(), shared.clone(), None);
         let (tx, commands) = spsc::channel(1024);
         let (rtx, rrx) = spsc::channel(RETIRE_QUEUE);
-        self.engine.attach_retirement(rtx);
+        engine.attach_retirement(rtx);
         self.commands = commands;
         self.app.reconnect(EngineLink::new(tx, shared).with_retirement(rrx, 0), RATE as u32, "t".into());
+        self.engine = engine;
     }
 
     /// Hands the engine what the editor sent: the plugin commands, by name.
@@ -2594,7 +2623,7 @@ fn the_editor_s_plugin_list_picks_and_undo_brings_back() {
     ed.key(Key::Enter);
     assert_eq!(ed.app.status_text(), Some("Plugin slot 3: Test Gain, loaded again"));
     assert_eq!(ed.pump(), ["set_slot_plugin"]);
-    let slot = ed.app.project.chain(ChainId::Track(0)).unwrap()[2].unwrap();
+    let slot = ed.app.project.chain(ChainId::Track(0)).unwrap()[2].as_ref().unwrap();
     assert_eq!(slot.params[0], 1.0, "still bypassed");
     // Undone and redone, each place gets a fresh instance.
     ed.key(Key::Char('u'));
@@ -2741,6 +2770,137 @@ fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
         ed.app.plugin_problems(),
         ["Test Sine failed while playing; restarting it", "Test Sine failed again and stays silent"]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gain's level in `state`, as an instance loading it says.
+fn gain_in(host: &mut PluginHost, file: &Path, state: &[u8]) -> Option<f64> {
+    // SAFETY: the test plugin, loaded only through plugin hosts here.
+    let gain = unsafe { host.create_with_state(file, GAIN, Role::Effect, Mode::Realtime, RATE, 64, Some(state)) };
+    gain.unwrap().handle().value(10)
+}
+
+#[test]
+fn the_editor_keeps_each_plugin_s_state() {
+    let dir = temp_dir("editor-state");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    // The gain at a quarter, as an instance of its own saved it.
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert!(gain.set_param(10, 0.25, 1));
+    processed(&mut gain, 8);
+    let quarter: Arc<[u8]> = gain.save_state().unwrap().unwrap().into();
+    gain.stop();
+    drop(gain);
+    let slot = PluginPlace::Slot(ChainId::Track(0), 0);
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    assert!(p.set_plugin_state(slot, Some(quarter)));
+    let mut ed = Editor::new(&dir, "state", p.clone());
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    // What the instances keep goes with the project.
+    let file_path = dir.join("song.tvo");
+    let mut saved_at = |ed: &mut Editor, place| {
+        ed.app.save_to(file_path.clone());
+        let p = Project::load(&file_path).unwrap();
+        assert!(p.plugin_state(PluginPlace::Track(p.tracks.len() as u8 - 1)).is_some(), "the sine's");
+        gain_in(&mut host, &file, p.plugin_state(place).unwrap())
+    };
+    assert_eq!(saved_at(&mut ed, slot), Some(0.25), "started from it");
+    let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.75, serial: 1 };
+    ed.engine.handle(set);
+    render(&mut ed.engine, 256, 64);
+    assert!(!ed.app.dirty);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.75), "as it is now");
+    // Moved by a track put before it, it is saved where it is.
+    assert!(ed.app.edit(Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick }));
+    let moved = PluginPlace::Slot(ChainId::Track(1), 0);
+    let set = EngineCommand::SetPluginParam { place: moved, plugin: gain_ref(), id: 10, value: 0.5, serial: 2 };
+    ed.pump();
+    ed.engine.handle(set);
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(saved_at(&mut ed, moved), Some(0.5), "moved");
+    ed.key(Key::Char('u'));
+    assert!(ed.pump().is_empty());
+    // A track deleted comes back with its plugin as it was, the other
+    // followed to its new place; changed since the last save, it comes
+    // back as it was when it went.
+    let set_now = |ed: &mut Editor, value, serial| {
+        ed.engine.handle(EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value, serial });
+        render(&mut ed.engine, 256, 64);
+    };
+    set_now(&mut ed, 0.6, 10);
+    ed.app.track = 0;
+    ed.key(Key::Char('D'));
+    ed.key(Key::Char('y'));
+    assert_eq!(ed.app.project.tracks.len(), 1);
+    assert!(ed.pump().is_empty());
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.6), "brought back");
+    // Changed again, then deleted by a redo and brought back by an undo.
+    set_now(&mut ed, 0.65, 11);
+    ed.key(Key::Char('U'));
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.65));
+    // A new engine's instances, and one picked again, start from it too.
+    let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.3, serial: 3 };
+    ed.engine.handle(set);
+    render(&mut ed.engine, 256, 64);
+    ed.reconnect();
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.3), "a new engine");
+    set_now(&mut ed, 0.35, 12);
+    ed.app.mode = EditorMode::Plugins(PluginPicker { target: PluginFor::Slot(ChainId::Track(0), 0), cursor: 0 });
+    ed.key(Key::Enter);
+    assert!(ed.app.status_text().unwrap().ends_with("loaded again"));
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.35), "loaded again");
+    // An export, and an autosave, take what it keeps now.
+    let at_now = |ed: &mut Editor, value, serial| {
+        ed.engine.handle(EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value, serial });
+        render(&mut ed.engine, 256, 64);
+    };
+    at_now(&mut ed, 0.2, 4);
+    ed.app.export_loops = 1;
+    ed.app.export_to(&dir.join("song.wav"));
+    assert!(ed.app.status_text().unwrap().starts_with("Exported"));
+    assert_eq!(gain_in(&mut host, &file, ed.app.project.plugin_state(slot).unwrap()), Some(0.2), "exported");
+    at_now(&mut ed, 0.4, 5);
+    assert!(ed.app.edit(Edit::SetMute { track: 0, mute: true }));
+    assert!(ed.app.autosave_now().contains("autosaved"));
+    let autosaved = Project::load(&dir.join("song.tvo.autosave")).unwrap();
+    assert_eq!(gain_in(&mut host, &file, autosaved.plugin_state(slot).unwrap()), Some(0.4), "autosaved");
+    drop(ed);
+    // One that cannot load it plays at its defaults, and says so.
+    let mut ed = Editor::new(&dir, "loadfail", p);
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    let problems = ed.app.plugin_problems();
+    assert_eq!(problems.len(), 1);
+    assert!(
+        problems[0].ends_with("Test Gain plays at its defaults: it could not load its saved state"),
+        "{problems:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_s_changed_state_is_an_unsaved_change() {
+    let dir = temp_dir("editor-dirty");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "dirty", p);
+    ed.pump();
+    ed.app.tick();
+    assert!(!ed.app.dirty);
+    // The test plugin marks its state changed as it plays.
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert!(ed.app.dirty);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

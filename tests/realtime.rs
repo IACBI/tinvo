@@ -283,10 +283,10 @@ fn full_song() -> usize {
     assert_eq!(p.insert_count(), MAX_INSERTS);
     // Each track's first effect on a ramp, and the groups' second.
     for t in 0..8u8 {
-        let kind = p.tracks[usize::from(t)].chain[0].unwrap().kind;
+        let kind = p.tracks[usize::from(t)].chain[0].as_ref().unwrap().kind;
         let target = Some(LaneTarget::Slot { slot: 0, kind, index: 1 });
         ok(p.apply(Edit::SetLane { track: t, lane: 2, target, ramp: true }));
-        let g = p.groups[usize::from(t)].chain[1].unwrap().kind;
+        let g = p.groups[usize::from(t)].chain[1].as_ref().unwrap().kind;
         let target = Some(LaneTarget::GroupSlot { group: t, slot: 1, kind: g, index: 1 });
         ok(p.apply(Edit::SetLane { track: 8 + t, lane: 2, target, ramp: true }));
         for track in [t, 8 + t] {

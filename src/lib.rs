@@ -25,6 +25,7 @@ pub mod align;
 pub mod app;
 pub mod audio;
 pub mod autosave;
+pub mod base64;
 pub mod bench;
 pub mod clap;
 pub mod dsp;
