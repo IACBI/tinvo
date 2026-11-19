@@ -290,6 +290,142 @@ pub struct ClapPluginRender {
     pub set: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, mode: i32) -> bool>,
 }
 
+/// `CLAP_PATH_SIZE`.
+pub const CLAP_PATH_SIZE: usize = 1024;
+
+/// `CLAP_EVENT_IS_LIVE` and `CLAP_EVENT_DONT_RECORD`, event header flags.
+pub const CLAP_EVENT_IS_LIVE: u32 = 1;
+pub const CLAP_EVENT_DONT_RECORD: u32 = 1 << 1;
+
+/// `CLAP_EVENT_PARAM_VALUE`, and `clap_event_param_value_t`. `note_id`,
+/// `port_index`, `channel` and `key` are -1 for every note.
+pub const CLAP_EVENT_PARAM_VALUE: u16 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ClapEventParamValue {
+    pub header: ClapEventHeader,
+    pub param_id: ClapId,
+    pub cookie: *mut c_void,
+    pub note_id: i32,
+    pub port_index: i16,
+    pub channel: i16,
+    pub key: i16,
+    pub value: f64,
+}
+
+/// `CLAP_EXT_PARAMS`.
+pub const CLAP_EXT_PARAMS: &std::ffi::CStr = c"clap.params";
+
+/// `clap_param_info_flags`.
+pub const CLAP_PARAM_IS_STEPPED: u32 = 1;
+pub const CLAP_PARAM_IS_PERIODIC: u32 = 1 << 1;
+pub const CLAP_PARAM_IS_HIDDEN: u32 = 1 << 2;
+pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;
+pub const CLAP_PARAM_IS_BYPASS: u32 = 1 << 4;
+pub const CLAP_PARAM_IS_AUTOMATABLE: u32 = 1 << 5;
+pub const CLAP_PARAM_REQUIRES_PROCESS: u32 = 1 << 15;
+pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 16;
+
+/// `clap_param_info_t`.
+#[repr(C)]
+pub struct ClapParamInfo {
+    pub id: ClapId,
+    pub flags: u32,
+    pub cookie: *mut c_void,
+    pub name: [c_char; CLAP_NAME_SIZE],
+    pub module: [c_char; CLAP_PATH_SIZE],
+    pub min_value: f64,
+    pub max_value: f64,
+    pub default_value: f64,
+}
+
+/// `clap_plugin_params_t`.
+#[repr(C)]
+pub struct ClapPluginParams {
+    pub count: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> u32>,
+    pub get_info:
+        Option<unsafe extern "C" fn(plugin: *const ClapPlugin, param_index: u32, info: *mut ClapParamInfo) -> bool>,
+    pub get_value: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, param_id: ClapId, out: *mut f64) -> bool>,
+    pub value_to_text: Option<
+        unsafe extern "C" fn(
+            plugin: *const ClapPlugin,
+            param_id: ClapId,
+            value: f64,
+            out: *mut c_char,
+            capacity: u32,
+        ) -> bool,
+    >,
+    pub text_to_value: Option<
+        unsafe extern "C" fn(plugin: *const ClapPlugin, param_id: ClapId, text: *const c_char, out: *mut f64) -> bool,
+    >,
+    pub flush: Option<
+        unsafe extern "C" fn(plugin: *const ClapPlugin, input: *const ClapInputEvents, output: *const ClapOutputEvents),
+    >,
+}
+
+/// `clap_param_rescan_flags`.
+pub const CLAP_PARAM_RESCAN_VALUES: u32 = 1;
+pub const CLAP_PARAM_RESCAN_TEXT: u32 = 1 << 1;
+pub const CLAP_PARAM_RESCAN_INFO: u32 = 1 << 2;
+pub const CLAP_PARAM_RESCAN_ALL: u32 = 1 << 3;
+pub const CLAP_PARAM_CLEAR_ALL: u32 = 1;
+pub const CLAP_PARAM_CLEAR_AUTOMATIONS: u32 = 1 << 1;
+pub const CLAP_PARAM_CLEAR_MODULATIONS: u32 = 1 << 2;
+
+/// `clap_host_params_t`.
+#[repr(C)]
+pub struct ClapHostParams {
+    pub rescan: Option<unsafe extern "C" fn(host: *const ClapHost, flags: u32)>,
+    pub clear: Option<unsafe extern "C" fn(host: *const ClapHost, param_id: ClapId, flags: u32)>,
+    pub request_flush: Option<unsafe extern "C" fn(host: *const ClapHost)>,
+}
+
+/// `CLAP_EXT_LATENCY`.
+pub const CLAP_EXT_LATENCY: &std::ffi::CStr = c"clap.latency";
+
+/// `clap_plugin_latency_t`.
+#[repr(C)]
+pub struct ClapPluginLatency {
+    pub get: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> u32>,
+}
+
+/// `clap_host_latency_t`.
+#[repr(C)]
+pub struct ClapHostLatency {
+    pub changed: Option<unsafe extern "C" fn(host: *const ClapHost)>,
+}
+
+/// `CLAP_EXT_STATE`.
+pub const CLAP_EXT_STATE: &std::ffi::CStr = c"clap.state";
+
+/// `clap_istream_t`: `read` returns the bytes read, 0 at the end, or -1.
+#[repr(C)]
+pub struct ClapIStream {
+    pub ctx: *mut c_void,
+    pub read: Option<unsafe extern "C" fn(stream: *const ClapIStream, buffer: *mut c_void, size: u64) -> i64>,
+}
+
+/// `clap_ostream_t`: `write` returns the bytes written, or -1.
+#[repr(C)]
+pub struct ClapOStream {
+    pub ctx: *mut c_void,
+    pub write: Option<unsafe extern "C" fn(stream: *const ClapOStream, buffer: *const c_void, size: u64) -> i64>,
+}
+
+/// `clap_plugin_state_t`.
+#[repr(C)]
+pub struct ClapPluginState {
+    pub save: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, stream: *const ClapOStream) -> bool>,
+    pub load: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, stream: *const ClapIStream) -> bool>,
+}
+
+/// `clap_host_state_t`.
+#[repr(C)]
+pub struct ClapHostState {
+    pub mark_dirty: Option<unsafe extern "C" fn(host: *const ClapHost)>,
+}
+
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
@@ -328,6 +464,24 @@ mod tests {
         assert_eq!(offset_of!(ClapEventMidi, data), 18);
         assert_eq!(size_of::<ClapHostThreadCheck>(), 16);
         assert_eq!(size_of::<ClapPluginRender>(), 16);
+        assert_eq!(size_of::<ClapEventParamValue>(), 56);
+        assert_eq!(offset_of!(ClapEventParamValue, cookie), 24);
+        assert_eq!(offset_of!(ClapEventParamValue, key), 40);
+        assert_eq!(offset_of!(ClapEventParamValue, value), 48);
+        assert_eq!(size_of::<ClapParamInfo>(), 1320);
+        assert_eq!(offset_of!(ClapParamInfo, name), 16);
+        assert_eq!(offset_of!(ClapParamInfo, module), 272);
+        assert_eq!(offset_of!(ClapParamInfo, min_value), 1296);
+        assert_eq!(offset_of!(ClapParamInfo, default_value), 1312);
+        assert_eq!(size_of::<ClapPluginParams>(), 48);
+        assert_eq!(offset_of!(ClapPluginParams, flush), 40);
+        assert_eq!(size_of::<ClapHostParams>(), 24);
+        assert_eq!(size_of::<ClapPluginLatency>(), 8);
+        assert_eq!(size_of::<ClapHostLatency>(), 8);
+        assert_eq!(size_of::<ClapIStream>(), 16);
+        assert_eq!(size_of::<ClapOStream>(), 16);
+        assert_eq!(size_of::<ClapPluginState>(), 16);
+        assert_eq!(size_of::<ClapHostState>(), 8);
         assert_eq!(size_of::<Option<unsafe extern "C" fn()>>(), 8, "a null pointer is None");
     }
 }

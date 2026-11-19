@@ -35,6 +35,17 @@
 //! - `incomplete`: creates plugins without a `process`;
 //! - `initfail`: its plugins' `init` fails;
 //! - `nomain`: port 0 each way is not flagged main;
+//! - `latency`: the gain says its output comes 64 frames late, and it
+//!   does; 64 more at each activation after;
+//! - `meter`: the gain reports its read-only meter after every call, and
+//!   once, a change of its own to its mode, after which (in a main-thread
+//!   callback) it renames its gain "Volume", shows its hold and clears
+//!   what refers to the hold;
+//! - `dirty`: marks its state dirty in a callback it asks for in its
+//!   first process call;
+//! - `bigstate`: the state saved is 17 MiB, and the save says it worked
+//!   however much the host took; `savefail` / `loadfail`: saving / loading
+//!   the state fails;
 //! - `procerror`: `process` fails on its second call, before reading its
 //!   events; `procerrors`: on every call from the second, asking for a
 //!   restart each time, and from the main thread on every callback after;
@@ -42,6 +53,16 @@
 //!   `NAME.deinit` beside the file in `deinit`, with the times the file
 //!   was initialised, the instances alive then and the rules broken
 //!   overall.
+//!
+//! Their parameters (`clap.params`): the gain's gain (10, 0 to 1, 0.5 at
+//! first, the factor it plays at), mode (11, stepped 0 to 2), a hidden
+//! hold (12: set to 1, its next process call waits until a state is saved,
+//! with the meter at 1 meanwhile), a read-only meter (13) and an offset
+//! added to its output (14, -1 to 1, which CLAP's `REQUIRES_PROCESS` keeps
+//! out of a flush while it is active); the sine's level (20, 0 to 1, 0.25
+//! at first, each voice's). Their state (`clap.state`) is their
+//! parameters' values, read and written a few bytes at a time; loading it
+//! tells the host its values changed.
 //!
 //! Voices survive deactivation and activation; only `reset` (or a release)
 //! ends them, as CLAP allows.
@@ -78,6 +99,12 @@ enum Mode {
     Both,
     Tail,
     ProcessErrors,
+    Latency,
+    Meter,
+    BigState,
+    SaveFail,
+    LoadFail,
+    Dirty,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -85,9 +112,11 @@ static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 static ENTRY_INITS: AtomicU32 = AtomicU32::new(0);
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static BROKEN: AtomicU32 = AtomicU32::new(0);
+/// States saved, by any instance: a held process call waits for one.
+static SAVES: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 19] = [
+    const ALL: [Mode; 25] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -107,6 +136,12 @@ fn mode() -> Mode {
         Mode::Both,
         Mode::Tail,
         Mode::ProcessErrors,
+        Mode::Latency,
+        Mode::Meter,
+        Mode::BigState,
+        Mode::SaveFail,
+        Mode::LoadFail,
+        Mode::Dirty,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -166,6 +201,13 @@ pub struct Stats {
     pub frames: u32,
     /// Where the last process call left steady time (`u32::MAX` unknown).
     pub steady: u32,
+    /// Parameter changes taken, in process calls and flushes.
+    pub params_set: u32,
+    pub flushes: u32,
+    /// States saved while a process call was held.
+    pub overlaps: u32,
+    /// The gain as it was activated.
+    pub start_gain: f64,
 }
 
 #[repr(C)]
@@ -183,6 +225,69 @@ unsafe extern "C" fn probe(p: *const ClapPlugin) -> u32 {
     let me = unsafe { me(p) };
     u32::from(me.is_main()) | u32::from(me.is_audio()) << 1
 }
+
+/// One of the plugins' parameters.
+struct Param {
+    id: u32,
+    flags: u32,
+    name: &'static CStr,
+    module: &'static CStr,
+    min: f64,
+    max: f64,
+    default: f64,
+}
+
+const GAIN: u32 = 10;
+const KIND: u32 = 11;
+/// Set to 1, it holds the next process call until a state is saved.
+const HOLD: u32 = 12;
+const METER: u32 = 13;
+const OFFSET: u32 = 14;
+const LEVEL: u32 = 20;
+/// Frames the gain's output comes late in `latency`, at each activation:
+/// 64 at the first, 128 at the second, and so on.
+const LATENCY: u32 = 64;
+
+static GAIN_PARAMS: [Param; 5] = [
+    Param {
+        id: GAIN,
+        flags: CLAP_PARAM_IS_AUTOMATABLE,
+        name: c"Gain",
+        module: c"Main",
+        min: 0.0,
+        max: 1.0,
+        default: 0.5,
+    },
+    Param {
+        id: KIND,
+        flags: CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM | CLAP_PARAM_IS_AUTOMATABLE,
+        name: c"Mode",
+        module: c"Main",
+        min: 0.0,
+        max: 2.0,
+        default: 0.0,
+    },
+    Param { id: HOLD, flags: CLAP_PARAM_IS_HIDDEN, name: c"Hold", module: c"", min: 0.0, max: 1.0, default: 0.0 },
+    Param { id: METER, flags: CLAP_PARAM_IS_READONLY, name: c"Meter", module: c"", min: 0.0, max: 1.0, default: 0.0 },
+    Param {
+        id: OFFSET,
+        flags: CLAP_PARAM_REQUIRES_PROCESS | CLAP_PARAM_IS_AUTOMATABLE,
+        name: c"Offset",
+        module: c"",
+        min: -1.0,
+        max: 1.0,
+        default: 0.0,
+    },
+];
+static SINE_PARAMS: [Param; 1] = [Param {
+    id: LEVEL,
+    flags: CLAP_PARAM_IS_AUTOMATABLE,
+    name: c"Level",
+    module: c"",
+    min: 0.0,
+    max: 1.0,
+    default: 0.25,
+}];
 
 /// Enough for every note a host can hold at once.
 const VOICES: usize = 512;
@@ -203,6 +308,11 @@ struct Audio {
     next_steady: i64,
     voices: [Voice; VOICES],
     asked: bool,
+    /// The gain's output still to come, in `latency`.
+    delay: Vec<[f32; 2]>,
+    delay_at: usize,
+    /// The mode change it made itself, in `meter`.
+    told: bool,
 }
 
 /// One instance. `plugin` comes first: the host's `*const ClapPlugin` is
@@ -231,6 +341,16 @@ struct Instance {
     offline: AtomicU32,
     frames: AtomicU32,
     steady: AtomicU32,
+    /// Its parameters' values, as `f64` bits, in the order of its table.
+    values: [AtomicU64; 5],
+    params_set: AtomicU32,
+    flushes: AtomicU32,
+    overlaps: AtomicU32,
+    start_gain: AtomicU64,
+    /// Its latency since it was last activated, in `latency`.
+    latency: AtomicU32,
+    /// In `meter`, it renamed its gain and showed its hold.
+    renamed: AtomicBool,
 }
 
 /// # Safety
@@ -280,6 +400,60 @@ impl Instance {
         let check = self.check.load(Ordering::Relaxed);
         // SAFETY: as above.
         !check.is_null() && unsafe { (*check).is_audio_thread.is_some_and(|f| f(self.host)) }
+    }
+
+    fn params(&self) -> &'static [Param] {
+        if self.sine { &SINE_PARAMS } else { &GAIN_PARAMS }
+    }
+
+    fn value(&self, id: u32) -> Option<f64> {
+        let i = self.params().iter().position(|p| p.id == id)?;
+        Some(f64::from_bits(self.values[i].load(Ordering::Relaxed)))
+    }
+
+    fn set_value(&self, id: u32, v: f64) {
+        if let Some(i) = self.params().iter().position(|p| p.id == id) {
+            self.values[i].store(v.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// A parameter change from the host, checked: an id it has and may be
+    /// set, a value in range (whole for a stepped one), for every note.
+    fn take_param(&self, e: &ClapEventParamValue) {
+        let p = self.params().iter().find(|p| p.id == e.param_id);
+        let ok = p.is_some_and(|p| {
+            p.flags & CLAP_PARAM_IS_READONLY == 0
+                && (p.min..=p.max).contains(&e.value)
+                && (p.flags & CLAP_PARAM_IS_STEPPED == 0 || e.value.fract() == 0.0)
+        }) && e.cookie.is_null()
+            && (e.note_id, e.port_index, e.channel, e.key) == (-1, -1, -1, -1);
+        if !ok {
+            self.broke();
+            return;
+        }
+        self.set_value(e.param_id, e.value);
+        self.params_set.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn ask_callback(&self) {
+        // SAFETY: the host's thread-safe callback.
+        unsafe {
+            if let Some(f) = (*self.host).request_callback {
+                f(self.host);
+            }
+        }
+    }
+
+    /// The host's `clap.params`, on the main thread.
+    fn host_params(&self) -> Option<&ClapHostParams> {
+        // SAFETY: the host's own extension, valid while the plugin lives.
+        unsafe { self.host_extension(CLAP_EXT_PARAMS).cast::<ClapHostParams>().as_ref() }
+    }
+
+    /// The host's extension `id`, or null.
+    fn host_extension(&self, id: &CStr) -> *const c_void {
+        // SAFETY: the host given to create_plugin, usable from init on.
+        unsafe { (*self.host).get_extension.map_or(null(), |f| f(self.host, id.as_ptr())) }
     }
 
     /// A main-thread call: the host says so, and it is the OS thread the
@@ -347,9 +521,14 @@ unsafe extern "C" fn plugin_activate(p: *const ClapPlugin, sample_rate: f64, min
     audio.sample_rate = sample_rate;
     audio.max_frames = max;
     audio.next_steady = 0;
+    let n = me.activates.fetch_add(1, Ordering::Relaxed) + 1;
+    let latency = if mode() == Mode::Latency { LATENCY * n } else { 0 };
+    audio.delay = vec![[0.0; 2]; latency as usize];
+    audio.delay_at = 0;
+    me.latency.store(latency, Ordering::Relaxed);
+    me.start_gain.store(me.values[0].load(Ordering::Relaxed), Ordering::Relaxed);
     me.max_frames.store(max, Ordering::Relaxed);
     me.active.store(true, Ordering::Relaxed);
-    me.activates.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -484,8 +663,9 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             }
             let mut s = 0.0;
             let rate = audio.sample_rate;
+            let level = me.value(LEVEL).unwrap_or(0.25);
             for v in audio.voices.iter_mut().filter(|v| v.on) {
-                s += 0.25 * v.phase.cos();
+                s += level * v.phase.cos();
                 let hz = 440.0 * 2f64.powf((f64::from(v.key) - 69.0) / 12.0);
                 v.phase = (v.phase + std::f64::consts::TAU * hz / rate) % std::f64::consts::TAU;
             }
@@ -503,11 +683,91 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             outs[0].constant_mask = 0b11;
         }
     } else {
+        // SAFETY: the host's event list for this call.
+        let events = unsafe { &*pr.in_events };
+        let count = events.size.map_or(0, |f| unsafe { f(events) });
+        for n in 0..count {
+            // SAFETY: an index below the list's size.
+            let e = unsafe { events.get.map_or(null(), |f| f(events, n)) };
+            // SAFETY: the host's event, valid during this call.
+            if !e.is_null() && unsafe { (*e).kind } == CLAP_EVENT_PARAM_VALUE {
+                // SAFETY: as above.
+                me.require(unsafe { (*e).time } == 0);
+                // SAFETY: a parameter change, by its kind.
+                unsafe { me.event(audio, e) };
+            }
+        }
+        let gain = me.value(GAIN).unwrap_or(0.5) as f32;
+        let offset = me.value(OFFSET).unwrap_or(0.0) as f32;
         for c in 0..2 {
             // SAFETY: the main ports, stereo as checked.
             let (i, o) = unsafe { (channel(&ins[0], c, frames), channel(&outs[0], c, frames)) };
             for (o, i) in o.iter_mut().zip(i.iter()) {
-                *o = 0.5 * i;
+                *o = gain * i + offset;
+            }
+        }
+        if mode() == Mode::Latency {
+            // SAFETY: the main output, stereo as checked.
+            let (l, r) = unsafe { (channel(&outs[0], 0, frames), channel(&outs[0], 1, frames)) };
+            let n = audio.delay.len();
+            for i in 0..frames {
+                let late = audio.delay[audio.delay_at];
+                audio.delay[audio.delay_at] = [l[i], r[i]];
+                audio.delay_at = (audio.delay_at + 1) % n;
+                l[i] = late[0];
+                r[i] = late[1];
+            }
+        }
+        if mode() == Mode::Normal && me.value(HOLD) == Some(1.0) {
+            // Held until the main thread saves a state, with the meter at 1
+            // meanwhile; given up after a while, which the test sees.
+            let saves = SAVES.load(Ordering::Acquire);
+            me.set_value(METER, 1.0);
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(10) {
+                if SAVES.load(Ordering::Acquire) != saves {
+                    me.overlaps.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            me.set_value(METER, 0.0);
+            me.set_value(HOLD, 0.0);
+        }
+        if mode() == Mode::Dirty && !audio.told {
+            audio.told = true;
+            me.ask_callback();
+        }
+        if mode() == Mode::Meter {
+            // SAFETY: the host's output list for this call.
+            let out = unsafe { &*pr.out_events };
+            let tell = |id: u32, value: f64| {
+                let e = ClapEventParamValue {
+                    header: ClapEventHeader {
+                        size: size_of::<ClapEventParamValue>() as u32,
+                        time: 0,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        kind: CLAP_EVENT_PARAM_VALUE,
+                        flags: 0,
+                    },
+                    param_id: id,
+                    cookie: null_mut(),
+                    note_id: -1,
+                    port_index: -1,
+                    channel: -1,
+                    key: -1,
+                    value,
+                };
+                me.set_value(id, value);
+                // SAFETY: the host's list, given an event it may copy (the
+                // whole of it, which the pointer covers).
+                me.require(out.try_push.is_some_and(|f| unsafe { f(out, (&raw const e).cast()) }));
+            };
+            tell(METER, 0.5);
+            if !audio.told {
+                audio.told = true;
+                tell(KIND, 1.0);
+                me.ask_callback();
             }
         }
         if mode() == Mode::Sidechain {
@@ -530,6 +790,12 @@ impl Instance {
         let midi_only = mode() == Mode::Midi;
         // SAFETY: by the caller's promise.
         let h = unsafe { *e };
+        if (h.space_id, h.kind) == (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE) {
+            self.require(h.size as usize == size_of::<ClapEventParamValue>());
+            // SAFETY: a parameter change, by its kind.
+            self.take_param(unsafe { &*e.cast::<ClapEventParamValue>() });
+            return;
+        }
         let (on, id, key, velocity) = match (h.space_id, h.kind) {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF) => {
                 self.require(!midi_only && h.size as usize == size_of::<ClapEventNote>());
@@ -680,8 +946,210 @@ unsafe extern "C" fn get_stats(p: *const ClapPlugin, out: *mut Stats) {
         max_frames: n(&me.max_frames),
         frames: n(&me.frames),
         steady: n(&me.steady),
+        params_set: n(&me.params_set),
+        flushes: n(&me.flushes),
+        overlaps: n(&me.overlaps),
+        start_gain: f64::from_bits(me.start_gain.load(Ordering::Relaxed)),
     };
 }
+
+unsafe extern "C" fn params_count(p: *const ClapPlugin) -> u32 {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    me.params().len() as u32
+}
+
+/// `src` into the C string array `dst`, NUL-terminated.
+fn copy_text(dst: &mut [c_char], src: &CStr) {
+    let bytes = src.to_bytes_with_nul();
+    let n = bytes.len().min(dst.len());
+    for (d, &b) in dst.iter_mut().zip(&bytes[..n]) {
+        *d = b as c_char;
+    }
+    dst[dst.len() - 1] = 0;
+}
+
+unsafe extern "C" fn params_info(p: *const ClapPlugin, index: u32, info: *mut ClapParamInfo) -> bool {
+    // SAFETY: as above, and the host's room for one info.
+    let (me, info) = unsafe { (me(p), &mut *info) };
+    me.on_main();
+    let Some(param) = me.params().get(index as usize) else { return false };
+    let renamed = me.renamed.load(Ordering::Relaxed);
+    info.id = param.id;
+    info.flags = if renamed && param.id == HOLD { param.flags & !CLAP_PARAM_IS_HIDDEN } else { param.flags };
+    info.cookie = null_mut();
+    copy_text(&mut info.name, if renamed && param.id == GAIN { c"Volume" } else { param.name });
+    copy_text(&mut info.module, param.module);
+    info.min_value = param.min;
+    info.max_value = param.max;
+    info.default_value = param.default;
+    true
+}
+
+unsafe extern "C" fn params_value(p: *const ClapPlugin, id: ClapId, out: *mut f64) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    match me.value(id) {
+        // SAFETY: the host's room for the value.
+        Some(v) => unsafe { *out = v },
+        None => return false,
+    }
+    true
+}
+
+unsafe extern "C" fn params_to_text(p: *const ClapPlugin, id: ClapId, v: f64, out: *mut c_char, n: u32) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    let text = match id {
+        KIND => ["soft", "hard", "wild"].get(v as usize).map(|s| s.to_string()),
+        GAIN | LEVEL | METER | HOLD | OFFSET => Some(format!("{:.1} %", v * 100.0)),
+        _ => None,
+    };
+    let Some(text) = text else { return false };
+    let Ok(text) = std::ffi::CString::new(text) else { return false };
+    // SAFETY: the host's buffer of `n` chars.
+    copy_text(unsafe { std::slice::from_raw_parts_mut(out, n as usize) }, &text);
+    true
+}
+
+unsafe extern "C" fn params_from_text(p: *const ClapPlugin, id: ClapId, text: *const c_char, out: *mut f64) -> bool {
+    // SAFETY: as above, and a NUL-terminated text.
+    let (me, text) = unsafe { (me(p), CStr::from_ptr(text).to_string_lossy()) };
+    me.on_main();
+    let v = match id {
+        KIND => ["soft", "hard", "wild"].iter().position(|s| *s == text.trim()).map(|i| i as f64),
+        _ => text.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0),
+    };
+    match v {
+        // SAFETY: the host's room for the value.
+        Some(v) => unsafe { *out = v },
+        None => return false,
+    }
+    true
+}
+
+unsafe extern "C" fn params_flush(p: *const ClapPlugin, input: *const ClapInputEvents, _out: *const ClapOutputEvents) {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    // An active plugin flushes on the audio thread, not while it processes.
+    if me.active.load(Ordering::Relaxed) {
+        me.require(me.is_audio());
+    } else {
+        me.on_main();
+    }
+    me.flushes.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the host's list, valid during this call.
+    let events = unsafe { &*input };
+    let count = events.size.map_or(0, |f| unsafe { f(events) });
+    for n in 0..count {
+        // SAFETY: an index below the list's size.
+        let e = unsafe { events.get.map_or(null(), |f| f(events, n)) };
+        // SAFETY: the host's event, valid during this call.
+        let ok = !e.is_null() && unsafe { (*e).kind } == CLAP_EVENT_PARAM_VALUE;
+        me.require(ok);
+        if ok {
+            // SAFETY: a parameter change, by its kind.
+            let e = unsafe { &*e.cast::<ClapEventParamValue>() };
+            // One that needs processing never comes here while active.
+            let processed =
+                me.params().iter().any(|p| p.id == e.param_id && p.flags & CLAP_PARAM_REQUIRES_PROCESS != 0);
+            me.require(!(processed && me.active.load(Ordering::Relaxed)));
+            me.take_param(e);
+        }
+    }
+}
+
+static PARAMS: ClapPluginParams = ClapPluginParams {
+    count: Some(params_count),
+    get_info: Some(params_info),
+    get_value: Some(params_value),
+    value_to_text: Some(params_to_text),
+    text_to_value: Some(params_from_text),
+    flush: Some(params_flush),
+};
+
+unsafe extern "C" fn latency_get(p: *const ClapPlugin) -> u32 {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    me.require(me.active.load(Ordering::Relaxed));
+    me.latency.load(Ordering::Relaxed)
+}
+
+static LATENCY_EXT: ClapPluginLatency = ClapPluginLatency { get: Some(latency_get) };
+
+const STATE_MAGIC: &[u8; 4] = b"TVST";
+
+unsafe extern "C" fn state_save(p: *const ClapPlugin, stream: *const ClapOStream) -> bool {
+    // SAFETY: as above, and the host's stream.
+    let (me, stream) = unsafe { (me(p), &*stream) };
+    me.on_main();
+    let Some(write) = stream.write else { return false };
+    if mode() == Mode::SaveFail {
+        return false;
+    }
+    SAVES.fetch_add(1, Ordering::Release);
+    let mut bytes = STATE_MAGIC.to_vec();
+    if mode() == Mode::BigState {
+        bytes.resize(17 << 20, 7);
+    }
+    for v in &me.values[..me.params().len()] {
+        bytes.extend_from_slice(&v.load(Ordering::Relaxed).to_le_bytes());
+    }
+    // A few bytes at a time, each part as far as the host took it.
+    let mut at = 0;
+    while at < bytes.len() {
+        let part = &bytes[at..(at + 5).max(at + (1 << 20).min(bytes.len() / 4)).min(bytes.len())];
+        // SAFETY: the host's stream, given bytes it may copy.
+        let n = unsafe { write(stream, part.as_ptr().cast(), part.len() as u64) };
+        if n <= 0 {
+            // `bigstate` says it worked anyway.
+            return mode() == Mode::BigState;
+        }
+        at += n as usize;
+    }
+    true
+}
+
+unsafe extern "C" fn state_load(p: *const ClapPlugin, stream: *const ClapIStream) -> bool {
+    // SAFETY: as above, and the host's stream.
+    let (me, stream) = unsafe { (me(p), &*stream) };
+    me.on_main();
+    let Some(read) = stream.read else { return false };
+    if mode() == Mode::LoadFail {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let mut part = [0u8; 3];
+        // SAFETY: the host's stream, given room for three bytes.
+        let n = unsafe { read(stream, part.as_mut_ptr().cast(), 3) };
+        if !(0..=3).contains(&n) {
+            return false;
+        }
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&part[..n as usize]);
+    }
+    let values = me.params().len();
+    if bytes.len() != 4 + 8 * values || &bytes[..4] != STATE_MAGIC {
+        return false;
+    }
+    for (i, v) in bytes[4..].chunks_exact(8).enumerate() {
+        me.values[i].store(u64::from_le_bytes(v.try_into().unwrap()), Ordering::Relaxed);
+    }
+    // SAFETY: the host's own function, on the main thread.
+    if let Some(rescan) = me.host_params().and_then(|h| h.rescan) {
+        unsafe { rescan(me.host, CLAP_PARAM_RESCAN_VALUES) };
+    }
+    true
+}
+
+static STATE: ClapPluginState = ClapPluginState { save: Some(state_save), load: Some(state_load) };
 
 impl Instance {
     fn takes_notes(&self) -> bool {
@@ -698,6 +1166,12 @@ unsafe extern "C" fn plugin_extension(p: *const ClapPlugin, id: *const c_char) -
         (&raw const NOTE_PORTS).cast()
     } else if id == CLAP_EXT_RENDER {
         (&raw const RENDER).cast()
+    } else if id == CLAP_EXT_PARAMS {
+        (&raw const PARAMS).cast()
+    } else if id == CLAP_EXT_STATE {
+        (&raw const STATE).cast()
+    } else if id == CLAP_EXT_LATENCY && mode() == Mode::Latency && !me.sine {
+        (&raw const LATENCY_EXT).cast()
     } else if id == c"org.tinvo.test.stats" {
         (&raw const STATS_EXT).cast()
     } else {
@@ -712,6 +1186,30 @@ unsafe extern "C" fn plugin_on_main_thread(p: *const ClapPlugin) {
     me.callbacks.fetch_add(1, Ordering::Relaxed);
     if mode() == Mode::ProcessErrors {
         me.ask_restart_and_callback();
+    }
+    if mode() == Mode::Dirty {
+        let state = me.host_extension(CLAP_EXT_STATE).cast::<ClapHostState>();
+        // SAFETY: the host's own extension, on the main thread.
+        if let Some(dirty) = unsafe { state.as_ref() }.and_then(|h| h.mark_dirty) {
+            unsafe { dirty(me.host) };
+        }
+    }
+    if mode() == Mode::Meter && !me.renamed.swap(true, Ordering::Relaxed) {
+        // After changing its mode itself: a new name and its hold shown,
+        // which may change while it is active; and its hold no longer
+        // what it was, for automation.
+        if let Some(h) = me.host_params() {
+            // SAFETY: the host's own functions, on the main thread.
+            unsafe {
+                if let Some(rescan) = h.rescan {
+                    rescan(me.host, CLAP_PARAM_RESCAN_INFO);
+                }
+                if let Some(clear) = h.clear {
+                    clear(me.host, HOLD, CLAP_PARAM_CLEAR_ALL);
+                    clear(me.host, HOLD, CLAP_PARAM_CLEAR_AUTOMATIONS);
+                }
+            }
+        }
     }
 }
 
@@ -739,6 +1237,8 @@ unsafe extern "C" fn create_plugin(
         _ => return null(),
     };
     let desc = &DESCRIPTORS.0[usize::from(sine)];
+    let table: &[Param] = if sine { &SINE_PARAMS } else { &GAIN_PARAMS };
+    let values = std::array::from_fn(|i| AtomicU64::new(table.get(i).map_or(0.0, |p| p.default).to_bits()));
     let instance = Box::new(Instance {
         plugin: ClapPlugin {
             desc,
@@ -766,6 +1266,9 @@ unsafe extern "C" fn create_plugin(
             next_steady: 0,
             voices: [Voice::default(); VOICES],
             asked: false,
+            delay: Vec::new(),
+            delay_at: 0,
+            told: false,
         }),
         max_frames: AtomicU32::new(0),
         activates: AtomicU32::new(0),
@@ -780,6 +1283,13 @@ unsafe extern "C" fn create_plugin(
         offline: AtomicU32::new(0),
         frames: AtomicU32::new(0),
         steady: AtomicU32::new(0),
+        values,
+        params_set: AtomicU32::new(0),
+        flushes: AtomicU32::new(0),
+        overlaps: AtomicU32::new(0),
+        start_gain: AtomicU64::new(0),
+        latency: AtomicU32::new(0),
+        renamed: AtomicBool::new(false),
     });
     LIVE.fetch_add(1, Ordering::Relaxed);
     Box::into_raw(instance).cast_const().cast()
@@ -881,6 +1391,30 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "procerror" => {
             set(Mode::ProcessError);
+            true
+        }
+        "latency" => {
+            set(Mode::Latency);
+            true
+        }
+        "meter" => {
+            set(Mode::Meter);
+            true
+        }
+        "bigstate" => {
+            set(Mode::BigState);
+            true
+        }
+        "savefail" => {
+            set(Mode::SaveFail);
+            true
+        }
+        "loadfail" => {
+            set(Mode::LoadFail);
+            true
+        }
+        "dirty" => {
+            set(Mode::Dirty);
             true
         }
         "procerrors" => {

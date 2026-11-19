@@ -8,8 +8,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tinvo::app::{App, EngineLink, Mode as EditorMode, PluginFor, PluginPicker};
-use tinvo::clap::ffi::ClapPlugin;
-use tinvo::clap::host::{Instance, MAX_EVENTS, Mode, PluginHost, Request, Role};
+use tinvo::clap::ffi::{
+    CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS,
+    CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, ClapPlugin,
+};
+use tinvo::clap::host::{Instance, MAX_EVENTS, Mode, ParamInfo, PluginHost, Request, Role};
 use tinvo::clap::scan::{self, Catalog, Options};
 use tinvo::clap::{PluginRef, Roles};
 use tinvo::engine::{ChainId, Command as EngineCommand, Edit, Engine, RETIRE_QUEUE, Retired, Shared, Step};
@@ -357,7 +360,7 @@ fn tinvo_plugins_lists_what_clap_path_holds() {
 /// What the test plugin's `org.tinvo.test.stats` reports; the plugin has
 /// the same.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Stats {
     entry_inits: u32,
     live: u32,
@@ -374,6 +377,10 @@ struct Stats {
     max_frames: u32,
     frames: u32,
     steady: u32,
+    params_set: u32,
+    flushes: u32,
+    overlaps: u32,
+    start_gain: f64,
 }
 
 #[repr(C)]
@@ -842,6 +849,308 @@ fn an_instance_is_main_threaded_on_its_own_host_s_thread_only() {
         s.spawn(move || drop(b));
     });
     drop(a);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Parameters, state and latency.
+
+/// `ramp` times `gain`.
+fn scaled(frames: usize, gain: f32) -> Vec<f32> {
+    ramp(frames).iter().map(|x| x * gain).collect()
+}
+
+fn processed(i: &mut Instance, frames: usize) -> Vec<f32> {
+    let mut io = ramp(frames);
+    assert!(i.process(&mut io));
+    io
+}
+
+#[test]
+fn a_plugin_s_parameters_are_read_and_set_by_id() {
+    let dir = temp_dir("params");
+    let file = install(&dir, "params");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let handle = gain.handle();
+    let params = gain.params().clone();
+    let ids: Vec<u32> = params.iter().map(|p| p.id).collect();
+    assert_eq!(ids, [10, 11, 12, 13, 14]);
+    assert_eq!(handle.params(), params, "the handle sees what the instance read");
+    let (g, kind, hold, meter, offset) = (&params[0], &params[1], &params[2], &params[3], &params[4]);
+    assert_eq!((g.name.as_str(), g.module.as_str(), g.min, g.max, g.default), ("Gain", "Main", 0.0, 1.0, 0.5));
+    assert!(g.is_automatable() && !g.is_stepped() && !g.is_hidden() && !g.is_readonly());
+    assert!(kind.is_stepped() && hold.is_hidden() && meter.is_readonly());
+    assert_ne!(offset.flags & CLAP_PARAM_REQUIRES_PROCESS, 0);
+    assert_eq!(handle.value(10), Some(0.5));
+    assert_eq!(handle.text(10, 0.5).as_deref(), Some("50.0 %"));
+    assert_eq!(handle.text(11, 2.0).as_deref(), Some("wild"));
+    assert_eq!(handle.parse(11, "hard"), Some(1.0));
+    assert_eq!(handle.parse(10, "25 %"), Some(0.25));
+    assert_eq!(handle.value(99), None);
+
+    // A change reaches the plugin in the next call, and is acknowledged.
+    assert!(gain.set_param(10, 0.25, 1));
+    assert_eq!(handle.delivered(), 0, "not before the plugin has it");
+    assert_eq!(processed(&mut gain, 16), scaled(16, 0.25));
+    assert_eq!((handle.delivered(), handle.value(10)), (1, Some(0.25)));
+    // Two to one parameter before a call: the later one, once.
+    assert!(gain.set_param(10, 0.1, 2) && gain.set_param(10, 0.75, 3));
+    assert_eq!(gain.params_queued(), 1);
+    assert_eq!(processed(&mut gain, 16), scaled(16, 0.75));
+    assert_eq!((handle.delivered(), stats(&gain).params_set), (3, 2));
+    // Kept in range, a stepped one whole; refused, nothing queued.
+    assert!(gain.set_param(10, 5.0, 4) && gain.set_param(11, 1.7, 5));
+    for (id, value) in [(13, 0.5), (99, 0.5), (10, f64::NAN), (10, f64::INFINITY)] {
+        assert!(!gain.set_param(id, value, 6), "{id} {value}");
+    }
+    processed(&mut gain, 8);
+    assert_eq!((handle.value(10), handle.value(11), handle.delivered()), (Some(1.0), Some(1.0), 5));
+    gain.stop();
+    assert_eq!(stats(&gain).broken, 0, "every change in range, whole where stepped, for every note");
+    // A stepped one with bounds between whole numbers stays within them.
+    let stepped = ParamInfo { min: 0.5, max: 2.5, flags: CLAP_PARAM_IS_STEPPED, ..g.clone() };
+    let kept = [0.0, 0.7, 1.7, 9.0, -3.0].map(|v| stepped.clamp(v));
+    assert_eq!(kept, [Some(1.0), Some(1.0), Some(1.0), Some(2.0), Some(1.0)]);
+
+    // Parameter changes never take a note's room.
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let notes = |i: &mut Instance| (0..).take_while(|_| i.note_on(60, 0.5).is_some()).count();
+    let plain = notes(&mut sine);
+    sine.restart().unwrap();
+    assert!(sine.set_param(20, 0.5, 1));
+    assert_eq!(notes(&mut sine), plain);
+    sine.restart().unwrap();
+    assert_eq!(sine.params_queued(), 1, "kept through a restart");
+    sine.note_on(69, 0.8).unwrap();
+    let mut io = vec![0.0; 2 * 16];
+    assert!(sine.process(&mut io));
+    assert_eq!((io[0], io[1]), (0.5, 0.25), "each voice at the level set");
+    sine.stop();
+    assert_eq!(stats(&sine).broken, 0);
+    drop((gain, sine));
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_parameter_change_reaches_a_plugin_not_processed_through_a_flush() {
+    let dir = temp_dir("flush");
+    let file = install(&dir, "flush");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let handle = gain.handle();
+    let token = gain.token();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            processed(&mut gain, 8);
+            gain.skip(64);
+            assert_eq!(stats(&gain).flushes, 0, "nothing to flush");
+            // The offset needs processing, so it waits for a process call;
+            // the serial it waits with is its later change's.
+            assert!(gain.set_param(14, 0.2, 6) && gain.set_param(10, 0.25, 7) && gain.set_param(14, 0.5, 8));
+            gain.skip(64);
+            gain.skip(64);
+        });
+    });
+    let s = stats(&gain);
+    assert_eq!((s.flushes, s.params_set, s.broken), (1, 1, 0), "on the audio thread, once: {s:?}");
+    assert_eq!((gain.params_queued(), handle.delivered(), handle.value(10)), (1, 7, Some(0.25)));
+    assert_eq!(host.poll(), [Request::StateDirty(token)], "what the plugin would save changed");
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let offset: Vec<f32> = scaled(8, 0.25).iter().map(|x| x + 0.5).collect();
+            assert_eq!(processed(&mut gain, 8), offset);
+            gain.stop();
+        });
+    });
+    assert_eq!((gain.params_queued(), handle.delivered(), stats(&gain).broken), (0, 8, 0));
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_handle_works_on_its_host_s_thread_while_the_plugin_plays_elsewhere() {
+    let dir = temp_dir("handle");
+    let file = install(&dir, "handle");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let handle = gain.handle();
+    let token = gain.token();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let audio = s.spawn(|| {
+            for n in 0..2000u64 {
+                gain.set_param(10, (n % 100) as f64 / 100.0, n + 1);
+                processed(&mut gain, 32);
+            }
+            gain.stop();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut reads = 0;
+        while !done.load(std::sync::atomic::Ordering::Relaxed) || reads == 0 {
+            assert!(handle.value(10).is_some_and(|v| (0.0..=1.0).contains(&v)));
+            assert!(handle.text(10, 0.5).is_some());
+            assert!(handle.save_state().unwrap().is_some_and(|b| b.len() == 4 + 5 * 8));
+            reads += 1;
+        }
+        audio.join().unwrap();
+    });
+    assert_eq!(handle.delivered(), 2000);
+    // For certain while a process call is under way: the plugin holds the
+    // call until a state is saved.
+    assert!(gain.set_param(12, 1.0, 2001));
+    std::thread::scope(|s| {
+        let audio = s.spawn(|| {
+            processed(&mut gain, 32);
+            gain.stop();
+        });
+        let start = std::time::Instant::now();
+        while handle.value(13) != Some(1.0) {
+            assert!(start.elapsed() < Duration::from_secs(10), "the call is held");
+            std::thread::yield_now();
+        }
+        assert!(handle.save_state().unwrap().is_some());
+        assert_eq!(handle.value(10), Some(0.99));
+        audio.join().unwrap();
+    });
+    assert_eq!(stats(&gain).overlaps, 1, "saved during the call");
+    // Not `Send` nor `Sync`, it cannot reach another thread at all.
+    assert_eq!(stats(&gain).broken, 0, "every call on its thread");
+    // Its instance gone, it does nothing, and its host forgets it.
+    drop(gain);
+    assert!(!handle.is_alive());
+    assert_eq!((handle.value(10), handle.text(10, 0.5)), (None, None));
+    assert!(handle.save_state().is_err());
+    assert_eq!(handle.token(), token);
+    assert_eq!(host.poll(), [], "nothing it asked for outlives it");
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_saved_state_is_loaded_before_the_plugin_starts() {
+    let dir = temp_dir("state");
+    let file = install(&dir, "state");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    gain.set_param(10, 0.25, 1);
+    gain.set_param(11, 2.0, 2);
+    processed(&mut gain, 8);
+    gain.stop();
+    assert_eq!(host.poll(), [Request::StateDirty(gain.token())]);
+    let saved = gain.handle().save_state().unwrap().unwrap();
+    assert_eq!(gain.save_state().unwrap().as_deref(), Some(&saved[..]));
+    let make = |host: &mut PluginHost, state: &[u8]| unsafe {
+        host.create_with_state(&file, GAIN, Role::Effect, Mode::Realtime, RATE, 64, Some(state))
+    };
+    let mut again = make(&mut host, &saved).unwrap();
+    assert_eq!(stats(&again).start_gain, 0.25, "loaded before it was activated");
+    assert_eq!(processed(&mut again, 16), scaled(16, 0.25), "from its first call");
+    assert_eq!(again.handle().value(11), Some(2.0));
+    let rescan = CLAP_PARAM_RESCAN_VALUES;
+    assert_eq!(host.poll(), [Request::Params(again.token(), rescan)], "it said its values changed");
+    again.stop();
+    assert_eq!(stats(&again).broken, 0, "loaded on the main thread, while not active");
+    // A state it cannot read is refused, and the instance made comes to
+    // nothing.
+    assert_eq!(make(&mut host, b"nonsense").err().as_deref(), Some("could not load its saved state"));
+    let too_big = vec![0; tinvo::clap::host::MAX_STATE + 1];
+    assert_eq!(make(&mut host, &too_big).err().as_deref(), Some("has a saved state over 16 MiB"));
+    drop((gain, again));
+    for (stem, error) in
+        [("savefail", "could not save its state"), ("bigstate", "has a state over 16 MiB, too large to keep")]
+    {
+        let file = install(&dir, stem);
+        let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+        assert_eq!(gain.save_state().err().as_deref(), Some(error), "{stem}");
+        assert_eq!(gain.handle().save_state().err().as_deref(), Some(error), "{stem}");
+    }
+    let file = install(&dir, "loadfail");
+    let made = unsafe { host.create_with_state(&file, GAIN, Role::Effect, Mode::Realtime, RATE, 64, Some(&saved)) };
+    assert_eq!(made.err().as_deref(), Some("could not load its saved state"));
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_s_own_changes_and_a_dirty_state_are_reported() {
+    let dir = temp_dir("dirty");
+    let file = install(&dir, "plain");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let token = gain.token();
+    processed(&mut gain, 8);
+    assert_eq!(host.poll(), [], "nothing changed");
+    // A change the host made dirties the state, as CLAP says, though the
+    // plugin does not say so; processed or flushed.
+    gain.set_param(10, 0.3, 1);
+    processed(&mut gain, 8);
+    assert_eq!(host.poll(), [Request::StateDirty(token)]);
+    assert_eq!(host.poll(), []);
+    gain.set_param(10, 0.4, 2);
+    gain.skip(8);
+    assert_eq!(host.poll(), [Request::StateDirty(token)]);
+    gain.stop();
+    drop(gain);
+
+    // The plugin's own `mark_dirty`.
+    let file = install(&dir, "dirty");
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    processed(&mut gain, 8);
+    assert_eq!(host.poll(), [Request::StateDirty(gain.token())]);
+    gain.stop();
+    drop(gain);
+
+    let (values, info) = (CLAP_PARAM_RESCAN_VALUES, CLAP_PARAM_RESCAN_INFO);
+    let file = install(&dir, "meter");
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (token, handle) = (gain.token(), gain.handle());
+    // Its meter (read-only) and, once, its mode, changed by itself; then
+    // its names, what is hidden, and its hold cleared.
+    processed(&mut gain, 8);
+    let cleared = Request::Cleared { token, id: 12, flags: CLAP_PARAM_CLEAR_ALL | CLAP_PARAM_CLEAR_AUTOMATIONS };
+    assert_eq!(host.poll(), [Request::Params(token, values | info), cleared, Request::StateDirty(token)]);
+    assert_eq!(handle.value(11), Some(1.0));
+    let names: Vec<(String, bool)> = handle.params().iter().map(|p| (p.name.clone(), p.is_hidden())).collect();
+    assert_eq!((names[0].0.as_str(), names[2].1), ("Volume", false), "read again for the handle");
+    assert_eq!((gain.params()[0].name.as_str(), gain.params()[2].is_hidden()), ("Gain", true), "not by the instance");
+    processed(&mut gain, 8);
+    assert_eq!(host.poll(), [Request::Params(token, values)], "a meter's change dirties nothing");
+    // A change waiting for a parameter cleared goes at the restart, when
+    // its id may name another.
+    assert!(gain.set_param(12, 1.0, 5));
+    gain.restart().unwrap();
+    assert_eq!((gain.params_queued(), handle.delivered()), (0, 5), "dropped, so settled");
+    gain.stop();
+    assert_eq!(stats(&gain).broken, 0);
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_s_latency_is_read_each_time_it_is_activated() {
+    let dir = temp_dir("latency");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "fixture");
+    assert_eq!(create(&mut host, &file, GAIN, Role::Effect).unwrap().latency(), 0, "none said");
+    let file = install(&dir, "latency");
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert_eq!(gain.latency(), 64);
+    let out = processed(&mut gain, 128);
+    assert!(out[..128].iter().all(|&x| x == 0.0));
+    assert_eq!(&out[128..], &halved(64)[..], "64 frames late");
+    // Activated again, it says what it says then.
+    gain.restart().unwrap();
+    assert_eq!(gain.latency(), 128);
+    let out = processed(&mut gain, 256);
+    assert!(out[..256].iter().all(|&x| x == 0.0));
+    assert_eq!(&out[256..], &halved(128)[..], "128 frames late");
+    gain.stop();
+    assert_eq!(stats(&gain).broken, 0, "asked on the main thread, while active");
+    drop(gain);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
 }
