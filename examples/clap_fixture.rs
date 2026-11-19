@@ -228,6 +228,9 @@ unsafe fn me<'a>(p: *const ClapPlugin) -> &'a Instance {
     unsafe { &*p.cast::<Instance>() }
 }
 
+// `thread::current` registers a thread-exit destructor in this library's
+// own standard library, on whatever thread calls in, as real plugins do: a
+// host that unloaded the library would crash when such a thread exits.
 fn thread_hash() -> u64 {
     let mut h = DefaultHasher::new();
     std::thread::current().id().hash(&mut h);

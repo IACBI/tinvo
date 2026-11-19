@@ -5,8 +5,8 @@
 //! `.clap` files (on macOS, `.clap` bundles), without following links to
 //! folders, within limits of depth and size. Each file new or changed since
 //! the cache was written is read by a child process, `tinvo scan-clap FILE
-//! RESULT`: it loads the file, lists its factory's descriptors, unloads it
-//! and only then writes the result file. A child that crashes, hangs past
+//! RESULT`: it loads the file, lists its factory's descriptors, calls its
+//! `deinit` and only then writes the result file. A child that crashes, hangs past
 //! its time or writes no readable result marks the file as not loadable,
 //! with the reason, until the file changes or a rescan is asked for. Plugin
 //! code never runs in the process that asked.
@@ -304,8 +304,7 @@ pub unsafe fn worker(file: &Path, result: &Path) -> u8 {
     contain_children();
     // SAFETY: the caller's promise; this process exists for this file.
     let read = unsafe { super::library::Dso::open(file) }.and_then(|dso| dso.plugins());
-    // Written once the file is unloaded: a crash in its deinit is a failure
-    // too.
+    // Written after the file's deinit: a crash there is a failure too.
     let mut text = format!("{RESULT_HEADER}\n");
     match read {
         Ok(plugins) => {

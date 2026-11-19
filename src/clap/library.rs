@@ -1,7 +1,14 @@
 //! A CLAP plugin file loaded and initialised: the operating system's
 //! library handle, its `clap_entry`, and the `init` / `deinit` pair the
-//! spec asks for (every `init` that succeeded gets one `deinit`, before the
-//! library is closed).
+//! spec asks for (every `init` that succeeded gets one `deinit`).
+//!
+//! A library, once loaded, stays loaded until the process ends. A plugin
+//! can leave code behind that runs after its `deinit`: thread-exit
+//! destructors (Rust's standard library and C++ `thread_local` register
+//! them on threads that called into it) and threads of its own. Unloading
+//! the library would pull that code out from under them, and the next
+//! thread to exit would crash. CLAP lets a file be initialised again after
+//! its `deinit`, so loading it again later costs only that.
 
 use super::ffi::*;
 use super::{PluginInfo, Roles};
@@ -16,12 +23,11 @@ const MAX_FEATURES: usize = 64;
 /// At most this many bytes are read from one of a descriptor's strings.
 const MAX_STRING: usize = 1024;
 
-/// An initialised plugin file. Dropping it calls `deinit`, then closes the
-/// library.
+/// An initialised plugin file. Dropping it calls `deinit`; the library
+/// stays loaded.
 pub struct Dso {
     entry: *const ClapPluginEntry,
     deinit: unsafe extern "C" fn(),
-    // Dropped after `deinit` has run, in `Drop::drop`.
     library: sys::Library,
 }
 
@@ -76,8 +82,7 @@ impl Dso {
         let binary = sys::binary_of(&path)?;
         let library = sys::Library::open(&binary)?;
         // The system hands out one handle per loaded image, so a second
-        // load of the same one only counts it again; dropping `library`
-        // undoes that.
+        // load of the same one only counts it again.
         if let Some(d) = loaded.iter().find(|d| d.library.handle() == library.handle()) {
             return Ok(Opened::Loaded(d.clone()));
         }
@@ -141,7 +146,7 @@ impl Dso {
 impl Drop for Dso {
     fn drop(&mut self) {
         // SAFETY: init succeeded in `open`; this is its one deinit, and the
-        // library is closed only after it (when `library` drops).
+        // library stays loaded after it.
         unsafe { (self.deinit)() };
     }
 }
@@ -250,7 +255,6 @@ mod sys {
     unsafe extern "C" {
         fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-        fn dlclose(handle: *mut c_void) -> c_int;
         fn dlerror() -> *mut c_char;
     }
 
@@ -298,13 +302,6 @@ mod sys {
                 return Err("is not a CLAP plugin (its clap_entry comes from another library)".into());
             }
             Ok(p.cast())
-        }
-    }
-
-    impl Drop for Library {
-        fn drop(&mut self) {
-            // SAFETY: a handle from dlopen, closed once.
-            unsafe { dlclose(self.handle) };
         }
     }
 
@@ -415,7 +412,6 @@ mod sys {
     unsafe extern "system" {
         fn LoadLibraryExW(file: *const u16, reserved: *mut c_void, flags: u32) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
-        fn FreeLibrary(module: *mut c_void) -> i32;
     }
 
     pub struct Library {
@@ -456,13 +452,6 @@ mod sys {
                 return Err("is not a CLAP plugin (it has no clap_entry)".into());
             }
             Ok(p.cast())
-        }
-    }
-
-    impl Drop for Library {
-        fn drop(&mut self) {
-            // SAFETY: a module from LoadLibraryExW, freed once.
-            unsafe { FreeLibrary(self.handle) };
         }
     }
 
