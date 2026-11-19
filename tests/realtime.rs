@@ -4,10 +4,11 @@
 //! while armed, and arms it only around work that runs on a real-time
 //! thread: `Engine::process` (with whatever commands, samples and live
 //! notes are waiting for it), the capture side of recording, the MIDI
-//! byte parser and mailboxes the backend threads use, and a CLAP plugin
-//! instance's notes and processing (the test plugin allocates through its
-//! own copy of the standard library, so what is counted is TINVO's side). It runs without the
-//! test harness, one thread at a time, so nothing else allocates while armed.
+//! byte parser and mailboxes the backend threads use, and CLAP plugin
+//! instances' notes and processing, on their own and in the engine (the
+//! test plugin allocates through its own copy of the standard library, so
+//! what is counted is TINVO's side). It runs without the test harness, one
+//! thread at a time, so nothing else allocates while armed.
 //!
 //! On the first allocation while armed it prints a backtrace, so a failure
 //! names the code that allocated.
@@ -16,7 +17,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tinvo::clap::host::{Mode, PluginHost, Role, prepare_audio_thread};
+use tinvo::clap::PluginRef;
+use tinvo::clap::host::{Instance, Mode, PluginHost, Role, prepare_audio_thread};
 use tinvo::dsp::noise::Rng;
 use tinvo::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Retired, Shared, Step, Take};
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
@@ -663,11 +665,91 @@ fn plugins() -> usize {
     calls
 }
 
+/// Plugin tracks and a plugin insert in the engine, through its command
+/// queue: instances put in, replaced, lent out and returned to be
+/// restarted, a plugin track added and removed (its instance coming back
+/// when its fade ends), while a song plays at every buffer size.
+fn plugins_in_the_engine() -> usize {
+    let mut host = PluginHost::new();
+    let file = fixture();
+    let (sine, gain) = (PluginRef::new("org.tinvo.test.sine").unwrap(), PluginRef::new("org.tinvo.test.gain").unwrap());
+    // SAFETY: the test plugin, loaded only through this host.
+    let mut make = |id: PluginRef, role| {
+        Box::new(unsafe { host.create(&file, id.id(), role, Mode::Realtime, SR as f64, 64) }.unwrap())
+    };
+    let mut edits = vec![Edit::AddTrack(InstrumentKind::Plugin(sine)), Edit::AddTrack(InstrumentKind::Synth)];
+    for s in 0..16u8 {
+        edits.push(Edit::SetStep { track: 0, pattern: 0, step: s, value: Some(Step::new(48 + 3 * s, 100, 1 + s % 3)) });
+    }
+    let (mut commands, rx) = spsc::channel(4096);
+    let (tx, mut retired) = spsc::channel(256);
+    let mut engine = Engine::with_edits(SR, &edits, Arc::new(Shared::new()), Some(rx));
+    engine.attach_retirement(tx);
+    let mut send = |cmd| assert!(commands.push(cmd).is_ok(), "command queue full");
+    let first: Box<Instance> = make(sine, Role::Instrument);
+    let mut sine_token = first.token();
+    send(Command::SetPlugin { track: 0, instance: first });
+    let effect = make(gain, Role::Effect);
+    let gain_token = effect.token();
+    let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain), SR, 120.0));
+    assert!(insert.attach(effect).unwrap().is_none());
+    send(Command::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
+    send(Command::Play);
+    let mut buf = vec![0.0f32; 2 * 4096];
+    let (mut calls, mut heard, mut lent) = (0, false, 0);
+    // The instances removed and replaced, and those that came back.
+    let (mut expected, mut gone) = (Vec::new(), Vec::new());
+    for i in 0..3000 {
+        match i {
+            _ if i % 300 == 150 => send(Command::Lend(if i % 600 == 150 { sine_token } else { gain_token })),
+            1200 => {
+                send(Command::Edit(Edit::AddTrack(InstrumentKind::Plugin(sine))));
+                let added = make(sine, Role::Instrument);
+                expected.push(added.token());
+                send(Command::SetPlugin { track: 2, instance: added });
+                send(Command::Edit(Edit::SetStep { track: 2, pattern: 0, step: 3, value: Some(Step::new(70, 90, 2)) }));
+            }
+            2000 => send(Command::Edit(Edit::RemoveTrack(2))),
+            2500 => {
+                let next = make(sine, Role::Instrument);
+                expected.push(sine_token);
+                sine_token = next.token();
+                send(Command::SetPlugin { track: 0, instance: next });
+            }
+            _ => {}
+        }
+        let frames = SIZES[i % SIZES.len()];
+        let io = &mut buf[..2 * frames];
+        calls += armed(|| engine.process(io));
+        heard |= io.iter().any(|x| x.abs() > 1e-6);
+        // The UI thread's side: what is lent is restarted and sent back,
+        // the rest dropped.
+        while let Some(r) = retired.pop() {
+            match r {
+                Retired::Lent(mut i) => {
+                    i.restart().unwrap();
+                    lent += 1;
+                    send(Command::Return(i));
+                }
+                Retired::Plugin(i) => gone.push(i.token()),
+                _ => {}
+            }
+        }
+    }
+    drop(engine);
+    drop(make);
+    while retired.pop().is_some() {}
+    let _ = host.poll();
+    assert!(heard && lent == 10, "the plugins played ({heard}) and were lent out ten times ({lent})");
+    assert_eq!(gone, expected, "the removed instance came back, then the replaced one");
+    calls
+}
+
 /// A check: how often the allocator was called while armed.
 type Check = fn() -> usize;
 
 fn main() {
-    let checks: [(&str, Check); 10] = [
+    let checks: [(&str, Check); 11] = [
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
         ("as many tracks as a project holds, likewise", full_song),
@@ -678,6 +760,7 @@ fn main() {
         ("the capture side of recording", capture),
         ("MIDI parsing and mailboxes", midi),
         ("a CLAP instrument and effect playing", plugins),
+        ("CLAP plugins in the engine, put in, lent out, returned and removed", plugins_in_the_engine),
     ];
     let mut failed = 0;
     for (name, check) in checks {

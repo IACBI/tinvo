@@ -21,7 +21,18 @@
 //! sound it had, so bringing it back never replays stale echoes, and the
 //! strip's stages forget their state. Fades are counted in frames, so they
 //! end on the same frame at any buffer size.
+//!
+//! A plugin insert holds a CLAP instance, built on the UI thread and handed
+//! over in its box; its only parameter of TINVO's is the bypass. Bypassed
+//! all the way it is not called, and holds what it held until it is
+//! brought back. While its last call says it has a tail
+//! (`CLAP_PROCESS_TAIL`) it holds sound, as a delay does, so its group does
+//! not come to rest on it; a plugin that says nothing of its tail can be
+//! cut short there, or by an export's quiet ending.
 
+use crate::clap::PluginRef;
+use crate::clap::host::{Instance, Role};
+use crate::clap::slot::PluginSlot;
 use crate::dsp::chorus::Chorus;
 use crate::dsp::crusher::Crusher;
 use crate::dsp::echo::Echo;
@@ -114,6 +125,7 @@ static CRUSHER: [ParamSpec; 4] = [
     ParamSpec::linear("crusher_hold", "Downsample", 1.0, 32.0, 1.0, 1.0, Unit::None),
     FULL_MIX_SPEC,
 ];
+static PLUGIN: [ParamSpec; 1] = [BYPASS_SPEC];
 static GATE: [ParamSpec; 7] = [
     BYPASS_SPEC,
     ParamSpec::linear("gate_threshold", "Threshold", -80.0, 0.0, -40.0, 0.5, Unit::Decibels),
@@ -137,6 +149,9 @@ pub enum EffectKind {
     Phaser,
     Crusher,
     Gate,
+    /// A CLAP plugin, by its id. Not in [`EffectKind::ALL`], which is the
+    /// built-in kinds.
+    Plugin(PluginRef),
 }
 
 impl EffectKind {
@@ -153,9 +168,11 @@ impl EffectKind {
         EffectKind::Gate,
     ];
 
-    /// Stable identifier used in project files.
+    /// Stable identifier used in project files; `plugin` for every plugin,
+    /// whose own id goes with it.
     pub fn id(self) -> &'static str {
         match self {
+            EffectKind::Plugin(_) => "plugin",
             EffectKind::Eq => "eq",
             EffectKind::Compressor => "compressor",
             EffectKind::Drive => "drive",
@@ -185,6 +202,7 @@ impl EffectKind {
             EffectKind::Phaser => "Phaser",
             EffectKind::Crusher => "Bit crusher",
             EffectKind::Gate => "Gate",
+            EffectKind::Plugin(_) => "Plugin",
         }
     }
 
@@ -201,6 +219,15 @@ impl EffectKind {
             EffectKind::Phaser => &PHASER,
             EffectKind::Crusher => &CRUSHER,
             EffectKind::Gate => &GATE,
+            EffectKind::Plugin(_) => &PLUGIN,
+        }
+    }
+
+    /// The plugin it is, for a plugin.
+    pub fn plugin(self) -> Option<PluginRef> {
+        match self {
+            EffectKind::Plugin(r) => Some(r),
+            _ => None,
         }
     }
 
@@ -225,7 +252,7 @@ impl EffectKind {
 // An `Insert` is always boxed, so the size goes to the heap once; boxing
 // the strip as well would only add a pointer to follow every block.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum Effect {
     Strip(StereoStrip),
     Delay(Echo),
@@ -235,6 +262,7 @@ enum Effect {
     Phaser(Phaser),
     Crusher(Crusher),
     Gate { gate: Gate, keyed: bool },
+    Plugin(PluginSlot),
 }
 
 /// A stereo multimode filter whose cutoff glides.
@@ -311,7 +339,7 @@ impl Filter {
 }
 
 /// One effect in a slot, with its settings and its fade.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Insert {
     kind: EffectKind,
     /// Values set by edits.
@@ -356,6 +384,7 @@ impl Insert {
             EffectKind::Phaser => Effect::Phaser(Phaser::new(sample_rate)),
             EffectKind::Crusher => Effect::Crusher(Crusher::new()),
             EffectKind::Gate => Effect::Gate { gate: Gate::new(sample_rate, BLOCK), keyed: false },
+            EffectKind::Plugin(r) => Effect::Plugin(PluginSlot::new(r, Role::Effect, f64::from(sample_rate))),
         };
         let mut base = [0.0; MAX_INSERT_PARAMS];
         for (b, spec) in base.iter_mut().zip(kind.params()) {
@@ -384,6 +413,34 @@ impl Insert {
 
     pub fn kind(&self) -> EffectKind {
         self.kind
+    }
+
+    /// A plugin insert's slot.
+    pub fn plugin_slot(&mut self) -> Option<&mut PluginSlot> {
+        match &mut self.effect {
+            Effect::Plugin(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Whether it holds a plugin instance.
+    pub fn has_instance(&self) -> bool {
+        matches!(&self.effect, Effect::Plugin(p) if p.has_instance())
+    }
+
+    /// Puts `instance` in a plugin insert it fits: returns the one it
+    /// replaces, stopped; hands `instance` back from any other insert.
+    pub fn attach(&mut self, instance: Box<Instance>) -> Result<Option<Box<Instance>>, Box<Instance>> {
+        match &mut self.effect {
+            Effect::Plugin(p) => p.attach(instance),
+            _ => Err(instance),
+        }
+    }
+
+    /// Takes a plugin insert's instance out, stopped: before the insert
+    /// leaves the audio thread.
+    pub fn take_instance(&mut self) -> Option<Box<Instance>> {
+        self.plugin_slot().and_then(PluginSlot::take)
     }
 
     /// The value automation holds parameter `index` at, if any.
@@ -448,6 +505,7 @@ impl Insert {
         }
         let v = |i: usize| self.value(i);
         match &self.effect {
+            Effect::Plugin(_) => {}
             Effect::Strip(_) => {
                 let (i, x) = (self.kind.strip_offset() + index - 1, v(index));
                 if let Effect::Strip(s) = &mut self.effect {
@@ -525,7 +583,7 @@ impl Insert {
             Effect::Reverb(r) => r.snap(),
             Effect::Chorus(c) => c.snap(),
             Effect::Filter(f) => f.snap(),
-            Effect::Phaser(_) | Effect::Crusher(_) | Effect::Gate { .. } => {}
+            Effect::Phaser(_) | Effect::Crusher(_) | Effect::Gate { .. } | Effect::Plugin(_) => {}
         }
         let t = self.wet.target();
         self.wet.snap(t);
@@ -568,7 +626,7 @@ impl Insert {
             Effect::Phaser(p) => p.clear(),
             Effect::Crusher(c) => c.clear(),
             Effect::Gate { gate, .. } => gate.clear(),
-            Effect::Delay(_) | Effect::Reverb(_) | Effect::Chorus(_) => {}
+            Effect::Delay(_) | Effect::Reverb(_) | Effect::Chorus(_) | Effect::Plugin(_) => {}
         }
     }
 
@@ -579,6 +637,7 @@ impl Insert {
             Effect::Delay(e) => e.is_idle(),
             Effect::Reverb(r) => r.is_idle(),
             Effect::Chorus(c) => c.is_idle(),
+            Effect::Plugin(p) => !p.has_tail(),
             _ => true,
         }
     }
@@ -609,6 +668,12 @@ impl Insert {
             match &mut self.effect {
                 Effect::Strip(s) => return s.process(buf, key),
                 Effect::Filter(f) => return f.process(buf),
+                Effect::Plugin(p) => {
+                    if let Some(i) = p.instance() {
+                        i.process(buf);
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -621,6 +686,12 @@ impl Insert {
             Effect::Filter(f) => {
                 wet.copy_from_slice(buf);
                 f.process(wet);
+            }
+            Effect::Plugin(p) => {
+                wet.copy_from_slice(buf);
+                if let Some(i) = p.instance() {
+                    i.process(wet);
+                }
             }
             effect => {
                 match effect {
@@ -644,7 +715,7 @@ impl Insert {
                         wet.copy_from_slice(buf);
                         c.process(wet);
                     }
-                    Effect::Strip(_) | Effect::Filter(_) | Effect::Gate { .. } => {}
+                    Effect::Strip(_) | Effect::Filter(_) | Effect::Gate { .. } | Effect::Plugin(_) => {}
                 }
                 for (w, x) in wet.chunks_exact_mut(2).zip(buf.chunks_exact(2)) {
                     // All wet is the effect's output as it is.
@@ -718,8 +789,14 @@ impl Insert {
     }
 
     /// Feeds a faded-out effect `n` samples of silence, unless it holds no
-    /// more sound.
+    /// more sound. A plugin is not called: its time moves on.
     fn drain(&mut self, n: usize) {
+        if let Effect::Plugin(p) = &mut self.effect {
+            if let Some(i) = p.instance() {
+                i.skip(n / 2);
+            }
+            return;
+        }
         if self.is_idle() {
             return;
         }
@@ -760,7 +837,7 @@ impl Insert {
 /// effect on the frame the last of them is out; the inserts then in those
 /// slots fade in. Changes made meanwhile join the one waiting, so the chain
 /// ends as the edits left it. A slot no change touches plays on throughout.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Chain {
     slots: [Option<Box<Insert>>; MAX_SLOTS],
     /// The change waiting: slot `i` will hold what `new[i]` says if it says
@@ -770,7 +847,7 @@ pub struct Chain {
     latency: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Pending {
     order: [u8; MAX_SLOTS],
     new: [Option<Option<Box<Insert>>>; MAX_SLOTS],
@@ -806,7 +883,8 @@ impl Chain {
     }
 
     /// Every insert it holds or will hold.
-    fn each(&mut self) -> impl Iterator<Item = &mut Insert> {
+    /// Every insert it holds or waits to hold.
+    pub fn each(&mut self) -> impl Iterator<Item = &mut Insert> {
         let pending = self.pending.iter_mut().flat_map(|p| p.new.iter_mut().flatten().flatten());
         self.slots.iter_mut().flatten().chain(pending).map(|b| &mut **b)
     }
@@ -1071,7 +1149,7 @@ mod tests {
     fn bypass_crossfades_over_ten_milliseconds() {
         let input = noise(2000);
         let mut i = insert(EffectKind::Drive, &[(1, 18.0)]);
-        let mut wet = i.clone();
+        let mut wet = insert(EffectKind::Drive, &[(1, 18.0)]);
         let full = through(&mut wet, &input);
         let mut out = through(&mut i, &input[..2 * 500]);
         i.set_param(BYPASS, 1.0);
@@ -1279,7 +1357,7 @@ mod tests {
         let shut = [(1, 0.0), (2, -80.0), (4, 0.001), (5, 0.005)];
         let mut gate = insert(EffectKind::Gate, &shut);
         let l = gate.latency();
-        let gated = through(&mut gate.clone(), &input);
+        let gated = through(&mut insert(EffectKind::Gate, &shut), &input);
         let mut out = through(&mut gate, &input[..2 * 2000]);
         gate.set_param(BYPASS, 1.0);
         out.extend(through(&mut gate, &input[2 * 2000..]));

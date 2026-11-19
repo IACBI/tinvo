@@ -15,8 +15,9 @@
 //!   `on_main_thread`, the port queries) run only on the thread whose host
 //!   created the instance, which is what the host's `clap.thread-check`
 //!   reports as main for it: the host is not `Send`, [`Instance::restart`]
-//!   refuses another thread, and an instance dropped on another thread is
-//!   leaked rather than destroyed there;
+//!   refuses another thread, and an instance dropped on another thread
+//!   stops processing there and goes home to its host, whose next poll (or
+//!   drop) destroys it;
 //! - audio-thread functions (`start_processing`, `process`, `reset`,
 //!   `stop_processing`) run inside an [`AudioRole`], which is what
 //!   `clap.thread-check` reports as audio, on one thread at a time, since
@@ -32,6 +33,7 @@
 //! Processing never allocates: the buffers and event lists are sized when
 //! an instance is activated.
 
+use super::PluginRef;
 use super::ffi::*;
 use super::library::Dso;
 use std::cell::Cell;
@@ -62,6 +64,9 @@ thread_local! {
 }
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// The next instance's token: unique in the process, whichever host made it.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// A number for this thread, unique in the process (thread ids may be
 /// reused); given the first time it is asked for, without allocating.
@@ -173,10 +178,11 @@ struct HostData {
     restart: AtomicBool,
     process: AtomicBool,
     failed: AtomicBool,
-    /// Its instance was dropped off its host's thread and leaked: the host
-    /// stops serving it.
-    abandoned: AtomicBool,
 }
+
+/// Instances dropped off their host's thread, stopped there and waiting for
+/// their host to destroy them; `None` once the host is gone.
+type Inbox = Mutex<Option<Vec<Instance>>>;
 
 // SAFETY: the pointers in `clap` are to static strings and functions;
 // everything else is atomic or never written after construction.
@@ -245,7 +251,7 @@ unsafe extern "C" fn host_is_audio_thread(_host: *const ClapHost) -> bool {
 /// it, which becomes CLAP's main thread for them.
 pub struct PluginHost {
     live: Vec<Weak<HostData>>,
-    next_token: u64,
+    inbox: Arc<Inbox>,
     owner: u64,
     // Plugins' main-thread functions are called from here: never moved to
     // another thread.
@@ -255,7 +261,12 @@ pub struct PluginHost {
 impl PluginHost {
     #[allow(clippy::new_without_default)]
     pub fn new() -> PluginHost {
-        PluginHost { live: Vec::new(), next_token: 1, owner: thread_key(), _main: PhantomData }
+        PluginHost {
+            live: Vec::new(),
+            inbox: Arc::new(Mutex::new(Some(Vec::new()))),
+            owner: thread_key(),
+            _main: PhantomData,
+        }
     }
 
     /// Creates, initialises and activates the plugin `id` from the file at
@@ -301,6 +312,7 @@ impl PluginHost {
         if !(sample_rate.is_finite() && sample_rate > 0.0) {
             return Err(format!("cannot run at {sample_rate} Hz"));
         }
+        let plugin_ref = PluginRef::new(id).ok_or("has an id no plugin can have")?;
         let c_id = CString::new(id).map_err(|_| "has an id with a NUL in it".to_string())?;
         let dso = {
             let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
@@ -317,8 +329,7 @@ impl PluginHost {
         let Some(create_plugin) = (unsafe { (*factory).create_plugin }) else {
             return Err("has an incomplete plugin factory".into());
         };
-        let token = self.next_token;
-        self.next_token += 1;
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let host = Arc::new(HostData {
             clap: ClapHost {
                 clap_version: CLAP_VERSION,
@@ -339,7 +350,6 @@ impl PluginHost {
             restart: AtomicBool::new(false),
             process: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            abandoned: AtomicBool::new(false),
         });
         // SAFETY: the factory's own function, given a host that lives until
         // after `destroy` (the instance holds it) and a NUL-terminated id.
@@ -387,6 +397,9 @@ impl PluginHost {
             activated: false,
             started: false,
             failed: false,
+            tail: false,
+            plugin_ref,
+            inbox: Some(self.inbox.clone()),
             host: ManuallyDrop::new(host),
             dso: ManuallyDrop::new(dso),
         };
@@ -397,14 +410,19 @@ impl PluginHost {
         Ok(instance)
     }
 
-    /// Services what plugins asked for since the last call: calls
-    /// `on_main_thread` for those that asked, and returns what their owners
-    /// have to do. Lets go of plugin files no instance uses. Called often
-    /// (CLAP suggests within about 30 ms of a request).
+    /// Destroys the instances dropped off this thread since the last call,
+    /// then services what plugins asked for: calls `on_main_thread` for
+    /// those that asked, and returns what their owners have to do. Lets go
+    /// of plugin files no instance uses. Called often (CLAP suggests within
+    /// about 30 ms of a request).
     pub fn poll(&mut self) -> Vec<Request> {
+        // Taken out under the lock and destroyed after it, so the lock is
+        // never held over a plugin's code or the files' lock.
+        let home = self.inbox.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(std::mem::take);
+        drop(home);
         let mut requests = Vec::new();
         self.live.retain(|w| {
-            let Some(h) = w.upgrade().filter(|h| !h.abandoned.load(Ordering::Acquire)) else { return false };
+            let Some(h) = w.upgrade() else { return false };
             // Taken before the call, so a request made during it is kept for
             // the next poll.
             if h.callback.swap(false, Ordering::AcqRel) {
@@ -433,6 +451,10 @@ impl PluginHost {
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
+        // Closed, so an instance dropped off this thread from now on is
+        // leaked with its file: nothing is left to destroy it.
+        let home = self.inbox.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(home);
         let_go_of_unused_files();
     }
 }
@@ -505,6 +527,18 @@ struct Held {
 /// A note played on an instance, for releasing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoteId(i32);
+
+impl NoteId {
+    /// The note's CLAP note id: 0 to `i32::MAX`.
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// The note with CLAP note id `id`, if it can be one.
+    pub fn from_id(id: i32) -> Option<NoteId> {
+        (id >= 0).then_some(NoteId(id))
+    }
+}
 
 /// An instance's audio buffers: one plane of `max_frames` per channel of
 /// every port, inputs first; reached only through `planes` once made, as
@@ -585,9 +619,27 @@ pub struct Instance {
     /// It could not start processing, or its processing failed: it is not
     /// called again until restarted.
     failed: bool,
+    /// Its last process call said it has a tail still to play.
+    tail: bool,
+    plugin_ref: PluginRef,
+    /// Where it goes if it is dropped off its host's thread.
+    inbox: Option<Arc<Inbox>>,
     // Both outlive the plugin: let go of in `drop` after `destroy`.
     host: ManuallyDrop<Arc<HostData>>,
     dso: ManuallyDrop<Arc<Dso>>,
+}
+
+impl std::fmt::Debug for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Instance({} {:?})", self.plugin_ref.id(), self.token())
+    }
+}
+
+/// Two instances are equal when they are the same instance.
+impl PartialEq for Instance {
+    fn eq(&self, other: &Self) -> bool {
+        self.token() == other.token()
+    }
 }
 
 // SAFETY: an instance is used by one thread at a time (`&mut self` for
@@ -604,6 +656,16 @@ impl Instance {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Which plugin it is.
+    pub fn plugin(&self) -> PluginRef {
+        self.plugin_ref
+    }
+
+    /// The sample rate it is activated for.
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
     }
 
     pub fn layout(&self) -> &Layout {
@@ -790,10 +852,10 @@ impl Instance {
 
     /// Plays note `key` (0 to 127) at `velocity` (0 to 1), from the start
     /// of the next process call; `None` if its event list has no room left
-    /// for the note and its release.
+    /// for the note and its release, or it is not playing.
     pub fn note_on(&mut self, key: u8, velocity: f32) -> Option<NoteId> {
         let (_, clap) = self.layout.notes?;
-        if !velocity.is_finite() {
+        if !velocity.is_finite() || !self.is_playing() {
             return None;
         }
         let key = key.min(127);
@@ -983,6 +1045,7 @@ impl Instance {
         // SAFETY: audio thread, processing; every pointer in `process` is
         // valid until it returns, and its counts are the plugin's own.
         let status = unsafe { (self.fns.process)(self.plugin, &process) };
+        self.tail = status == CLAP_PROCESS_TAIL;
         if status == CLAP_PROCESS_ERROR {
             // Its events stay queued for whatever follows: a restart clears
             // them, with the notes they belong to.
@@ -1015,7 +1078,16 @@ impl Instance {
     /// Moves its steady time on by `frames` not processed (CLAP's steady
     /// time counts every frame since it started).
     pub fn skip(&mut self, frames: usize) {
+        self.tail = false;
         self.advance(frames);
+    }
+
+    /// Whether its last process call said it has a tail still to play
+    /// (`CLAP_PROCESS_TAIL`): until it says otherwise, silent input may
+    /// still bring out sound. Not called since (stopped or skipped), it
+    /// has none.
+    pub fn has_tail(&self) -> bool {
+        self.tail
     }
 
     /// Steady time, `frames` on; past what it can count, unknown (-1) for
@@ -1040,18 +1112,47 @@ impl Instance {
             unsafe { (self.fns.stop_processing)(self.plugin) };
             self.started = false;
         }
+        self.tail = false;
     }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         if !self.on_host_thread() {
-            // Destroying it here would break CLAP's threading rules, and
-            // letting go of its file could deinitialise the file under it:
-            // both are leaked instead, and its host stops serving it (a
-            // poll already under way may serve it once more, which the
-            // leak keeps safe).
-            self.host.abandoned.store(true, Ordering::Release);
+            // Destroying it here would break CLAP's threading rules. It
+            // stops processing on this thread, which played its audio
+            // thread, and goes home whole, for its host to destroy (a poll
+            // may serve it meanwhile, which CLAP allows of a live instance).
+            // Off the audio callback: this locks, and may allocate.
+            self.stop();
+            let Some(inbox) = self.inbox.take() else { return };
+            let home = Instance {
+                plugin: self.plugin,
+                fns: self.fns,
+                role: self.role,
+                layout: std::mem::take(&mut self.layout),
+                buffers: std::mem::take(&mut self.buffers),
+                events: std::mem::take(&mut self.events),
+                held: std::mem::take(&mut self.held),
+                next_note: self.next_note,
+                steady: self.steady,
+                sample_rate: self.sample_rate,
+                max_frames: self.max_frames,
+                activated: self.activated,
+                started: false,
+                failed: self.failed,
+                tail: false,
+                plugin_ref: self.plugin_ref,
+                inbox: None,
+                // SAFETY: moved out once; this drop touches neither again.
+                host: ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.host) }),
+                dso: ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.dso) }),
+            };
+            match inbox.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                Some(list) => list.push(home),
+                // Its host is gone: leaked, with its file.
+                None => std::mem::forget(home),
+            }
             return;
         }
         // An instance the audio thread left processing (its stream ended

@@ -50,7 +50,7 @@ pub fn balance_gains(pan: f32) -> (f32, f32) {
 }
 
 /// One group bus on the audio thread.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Group {
     strip: StereoStrip,
     /// Its insert chain, after the strip. The engine changes it, and frees

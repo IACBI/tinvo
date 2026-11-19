@@ -254,6 +254,7 @@ fn inserts() -> Setup {
             EffectKind::Filter => &[("filter_mode", 1.0), ("filter_cutoff", 2000.0), ("filter_resonance", 0.4)],
             EffectKind::Crusher => &[("crusher_bits", 6.0), ("crusher_hold", 2.5), ("mix", 0.5)],
             EffectKind::Gate => &[("gate_threshold", -50.0), ("gate_range", -30.0)],
+            EffectKind::Plugin(_) => &[],
         };
         for &(id, value) in busy {
             let index = kind.params().iter().position(|s| s.id == id).unwrap_or_else(|| panic!("no parameter {id}"));

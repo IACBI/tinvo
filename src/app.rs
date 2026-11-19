@@ -7,6 +7,7 @@
 
 use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::autosave::{self, Autosave};
+use crate::clap::host::Instance;
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
@@ -86,20 +87,28 @@ const COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
 /// UI-side end of the command queue. Commands that do not fit are kept in
 /// order and retried, so the engine never misses an edit. It also receives
-/// the samples the engine has released and frees them here, on the UI thread.
+/// the samples, effects and plugin instances the engine has released and
+/// frees them here, on the UI thread, and keeps the instances lent out to
+/// be restarted for their owner ([`EngineLink::take_lent`]).
 ///
-/// Every sample or effect the engine holds or releases arrived in a
-/// `SetSample` or `SetSlot` command (or was built with the engine) and is
-/// released at most once, so the retirement queue never holds more than
-/// those sent and not yet received back. Keeping that count at most
-/// the queue's capacity means the engine's push into the queue cannot fail; a
-/// command carrying one waits in the backlog until there is room.
+/// Every sample, effect or instance the engine holds or releases arrived in
+/// a `SetSample`, `SetSlot`, `SetPlugin` or `Return` command (or was built
+/// with the engine) and is released at most once, so the retirement queue
+/// never holds more than those sent and not yet received back (an effect
+/// with an instance in it counts as two, as they can come back apart).
+/// Keeping that count at most the queue's capacity means the engine's push
+/// into the queue cannot fail; a command carrying one waits in the backlog
+/// until there is room.
 pub struct EngineLink {
     tx: Producer<Command>,
     backlog: VecDeque<Command>,
     shared: Arc<Shared>,
     retired: Option<Consumer<Retired>>,
     in_flight: usize,
+    /// Instances the engine lent out, waiting for their owner.
+    // Boxed as the engine holds and returns them, so none is moved.
+    #[allow(clippy::vec_box)]
+    lent: Vec<Box<Instance>>,
     takes: Option<Consumer<TakeEvent>>,
     /// [`Command::RecordNotes`] commands sent, to compare with the count
     /// the engine has handled.
@@ -108,7 +117,16 @@ pub struct EngineLink {
 
 impl EngineLink {
     pub fn new(tx: Producer<Command>, shared: Arc<Shared>) -> Self {
-        Self { tx, backlog: VecDeque::new(), shared, retired: None, in_flight: 0, takes: None, record_sent: 0 }
+        Self {
+            tx,
+            backlog: VecDeque::new(),
+            shared,
+            retired: None,
+            in_flight: 0,
+            lent: Vec::new(),
+            takes: None,
+            record_sent: 0,
+        }
     }
 
     /// Takes over the receiving end of the engine's take queue.
@@ -157,8 +175,11 @@ impl EngineLink {
 
     pub fn flush(&mut self) {
         if let Some(rx) = &mut self.retired {
-            while rx.pop().is_some() {
-                self.in_flight = self.in_flight.saturating_sub(1);
+            while let Some(r) = rx.pop() {
+                self.in_flight = self.in_flight.saturating_sub(r.count());
+                if let Retired::Lent(i) = r {
+                    self.lent.push(i);
+                }
             }
         }
         while let Some(cmd) = self.backlog.pop_front() {
@@ -169,14 +190,25 @@ impl EngineLink {
         }
     }
 
+    /// The instances the engine has lent out since the last call, stopped,
+    /// for their owner to restart and send back ([`Command::Return`]).
+    pub fn take_lent(&mut self) -> Vec<Box<Instance>> {
+        self.flush();
+        std::mem::take(&mut self.lent)
+    }
+
     fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
-        let carries = self.retired.is_some()
-            && matches!(&cmd, Command::SetSample { sample: Some(_), .. } | Command::SetSlot { insert: Some(_), .. });
-        if carries && self.in_flight >= self.retired.as_ref().map_or(0, Consumer::capacity) {
+        let carries = match &cmd {
+            _ if self.retired.is_none() => 0,
+            Command::SetSample { sample: Some(_), .. } | Command::SetPlugin { .. } | Command::Return(_) => 1,
+            Command::SetSlot { insert: Some(i), .. } => 1 + usize::from(i.has_instance()),
+            _ => 0,
+        };
+        if carries > 0 && self.in_flight + carries > self.retired.as_ref().map_or(0, Consumer::capacity) {
             return Err(cmd);
         }
         self.tx.push(cmd)?;
-        self.in_flight += usize::from(carries);
+        self.in_flight += carries;
         Ok(())
     }
 }

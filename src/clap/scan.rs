@@ -285,7 +285,7 @@ fn parse_plugin(fields: &[&str]) -> Option<PluginInfo> {
     let mut next = || text.next().flatten();
     let (id, name, vendor, version, description) = (next()?, next()?, next()?, next()?, next()?);
     let features: Vec<String> = fields[5..].iter().map(|f| unescape(f)).collect::<Option<_>>()?;
-    if id.is_empty() || name.is_empty() {
+    if !super::is_valid_id(&id) || name.is_empty() {
         return None;
     }
     let roles = Roles::from_features(&features);

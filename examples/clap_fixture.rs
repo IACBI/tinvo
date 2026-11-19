@@ -23,6 +23,8 @@
 //! `org.tinvo.test.stats` reads the counts. Names that change them:
 //!
 //! - `midi`: the sine takes MIDI 1 only;
+//! - `both`: the gain takes notes too, so it can be made as an instrument;
+//! - `tail`: the gain says it has a tail to play after every call;
 //! - `sidechain`: the gain has a second stereo input and a second mono
 //!   output, and checks the input is silent;
 //! - `noactivate` / `nostart`: `activate` / `start_processing` fail;
@@ -72,6 +74,8 @@ enum Mode {
     NoMain,
     ProcessError,
     Leak,
+    Both,
+    Tail,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -81,7 +85,7 @@ static LIVE: AtomicU32 = AtomicU32::new(0);
 static BROKEN: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 16] = [
+    const ALL: [Mode; 18] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -98,6 +102,8 @@ fn mode() -> Mode {
         Mode::NoMain,
         Mode::ProcessError,
         Mode::Leak,
+        Mode::Both,
+        Mode::Tail,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -155,6 +161,8 @@ pub struct Stats {
     pub offline: u32,
     pub max_frames: u32,
     pub frames: u32,
+    /// Where the last process call left steady time (`u32::MAX` unknown).
+    pub steady: u32,
 }
 
 #[repr(C)]
@@ -219,6 +227,7 @@ struct Instance {
     notes_off: AtomicU32,
     offline: AtomicU32,
     frames: AtomicU32,
+    steady: AtomicU32,
 }
 
 /// # Safety
@@ -393,6 +402,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
         -1 => -1,
         t => t.checked_add(i64::from(pr.frames_count)).unwrap_or(-1),
     };
+    me.steady.store(u32::try_from(audio.next_steady).unwrap_or(u32::MAX), Ordering::Relaxed);
     me.processes.fetch_add(1, Ordering::Relaxed);
     me.frames.fetch_add(pr.frames_count, Ordering::Relaxed);
     if matches!(mode(), Mode::Restart | Mode::Leak) && !audio.asked {
@@ -491,7 +501,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             unsafe { channel(&outs[1], 0, frames) }.fill(1.0);
         }
     }
-    CLAP_PROCESS_CONTINUE
+    if mode() == Mode::Tail { CLAP_PROCESS_TAIL } else { CLAP_PROCESS_CONTINUE }
 }
 
 impl Instance {
@@ -585,14 +595,14 @@ unsafe extern "C" fn note_count(p: *const ClapPlugin, is_input: bool) -> u32 {
     // SAFETY: as above.
     let me = unsafe { me(p) };
     me.on_main();
-    u32::from(is_input && me.sine)
+    u32::from(is_input && me.takes_notes())
 }
 
 unsafe extern "C" fn note_get(p: *const ClapPlugin, index: u32, is_input: bool, info: *mut ClapNotePortInfo) -> bool {
     // SAFETY: as above.
     let me = unsafe { me(p) };
     me.on_main();
-    if !(me.sine && is_input && index == 0) {
+    if !(me.takes_notes() && is_input && index == 0) {
         me.broke();
         return false;
     }
@@ -650,7 +660,14 @@ unsafe extern "C" fn get_stats(p: *const ClapPlugin, out: *mut Stats) {
         offline: n(&me.offline),
         max_frames: n(&me.max_frames),
         frames: n(&me.frames),
+        steady: n(&me.steady),
     };
+}
+
+impl Instance {
+    fn takes_notes(&self) -> bool {
+        self.sine || mode() == Mode::Both
+    }
 }
 
 unsafe extern "C" fn plugin_extension(p: *const ClapPlugin, id: *const c_char) -> *const c_void {
@@ -658,7 +675,7 @@ unsafe extern "C" fn plugin_extension(p: *const ClapPlugin, id: *const c_char) -
     let (me, id) = unsafe { (me(p), CStr::from_ptr(id)) };
     if id == CLAP_EXT_AUDIO_PORTS {
         (&raw const AUDIO_PORTS).cast()
-    } else if id == CLAP_EXT_NOTE_PORTS && me.sine {
+    } else if id == CLAP_EXT_NOTE_PORTS && me.takes_notes() {
         (&raw const NOTE_PORTS).cast()
     } else if id == CLAP_EXT_RENDER {
         (&raw const RENDER).cast()
@@ -740,6 +757,7 @@ unsafe extern "C" fn create_plugin(
         notes_off: AtomicU32::new(0),
         offline: AtomicU32::new(0),
         frames: AtomicU32::new(0),
+        steady: AtomicU32::new(0),
     });
     LIVE.fetch_add(1, Ordering::Relaxed);
     Box::into_raw(instance).cast_const().cast()
@@ -841,6 +859,14 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "procerror" => {
             set(Mode::ProcessError);
+            true
+        }
+        "both" => {
+            set(Mode::Both);
+            true
+        }
+        "tail" => {
+            set(Mode::Tail);
             true
         }
         "leak" => {
