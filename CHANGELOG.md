@@ -7,6 +7,8 @@ Author: 𝓐.𝓒.𝓑
 ## [Unreleased]
 
 ### Added
+- Project format 16: CLAP plugins by id, as a track's instrument (`track plugin <id>`) and in insert slots (`insert 0 plugin <id>`). A plugin that is not installed is kept as written. Format 15 files still load.
+- `tinvo render` plays the CLAP plugins a project names, each made for offline rendering. A plugin that is not installed, cannot load or fails while rendering stops the render with its name and the reason, and no file is written; with `--stems`, the mix and the stems are put in place only once all of them rendered.
 - `tinvo plugins` lists the CLAP plugins in CLAP's standard folders and in `CLAP_PATH`: name, version, vendor, what each is for, its id and file. Each new or changed file is read in a child process of its own with a time limit (10 s a file, 2 minutes a scan; files left over are read next time), so a plugin that crashes, hangs or refuses to start is listed as not loaded with the reason, and processes a plugin starts end with the scan where the system allows it. What was read is cached in the state directory (`plugins.txt`) until the file changes (its size and modification time); `--rescan` reads every file again, within the same time limits.
 
 ## [0.25.0] - 2026-11-19

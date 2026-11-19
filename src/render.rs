@@ -2,10 +2,21 @@
 //!
 //! Rendering drives the very same [`Engine`] the audio thread uses, so an
 //! export is bit-for-bit what the engine plays.
+//!
+//! The plugins a project names play through instances of the render's own,
+//! made for offline rendering ([`PluginSource`]) before anything is
+//! rendered: one that cannot load fails the render, named, and so does one
+//! whose processing fails during it. The render runs on the thread that
+//! made them, which plays CLAP's audio thread for them too, and serves
+//! their requests between chunks.
 
+use crate::clap::PluginRef;
+use crate::clap::host::{Instance, Mode, PluginHost, Request, Role};
+use crate::clap::scan::Catalog;
 use crate::engine::transport::Transport;
-use crate::engine::{Command, Edit, Engine, MAX_PATTERNS, Shared};
-use crate::project::{Project, TrackData};
+use crate::engine::{BLOCK, Command, Edit, Engine, MAX_PATTERNS, RETIRE_QUEUE, Retired, Shared};
+use crate::project::{PluginPlace, Project, TrackData};
+use crate::rt::spsc::{self, Consumer};
 use crate::sample::Sample;
 use std::path::Path;
 use std::sync::Arc;
@@ -122,15 +133,136 @@ pub fn main_frames(project: &Project, opts: &RenderOptions) -> u64 {
 /// Frames the engine renders per call while exporting.
 const CHUNK: usize = 4096;
 
+/// Makes the plugin instances a render plays, on the thread that renders.
+pub trait PluginSource {
+    /// An instance of `plugin` as a `role`, made to render offline at
+    /// `sample_rate` in calls of at most [`BLOCK`] frames.
+    fn make(&mut self, plugin: PluginRef, role: Role, sample_rate: f64) -> Result<Instance, String>;
+    /// What the instances made have asked for since the last call
+    /// ([`PluginHost::poll`]).
+    fn poll(&mut self) -> Vec<Request>;
+    /// The plugin's name, for messages.
+    fn name(&self, plugin: PluginRef) -> String;
+}
+
+/// Makes no instances: for projects without plugins.
+pub struct NoPlugins;
+
+impl PluginSource for NoPlugins {
+    fn make(&mut self, _: PluginRef, _: Role, _: f64) -> Result<Instance, String> {
+        Err("no plugin catalog was read".into())
+    }
+
+    fn poll(&mut self) -> Vec<Request> {
+        Vec::new()
+    }
+
+    fn name(&self, plugin: PluginRef) -> String {
+        plugin.id().to_string()
+    }
+}
+
+/// The plugins a scan found, through a host of its own on this thread.
+pub struct CatalogPlugins {
+    host: PluginHost,
+    catalog: Catalog,
+}
+
+impl CatalogPlugins {
+    /// # Safety
+    /// As [`PluginHost::create`], for every file in `catalog`: their code
+    /// runs in this process, trusted, and this is made (and, not being
+    /// `Send`, used) on the thread CLAP calls main.
+    pub unsafe fn new(catalog: Catalog) -> Self {
+        Self { host: PluginHost::new(), catalog }
+    }
+}
+
+impl PluginSource for CatalogPlugins {
+    fn make(&mut self, plugin: PluginRef, role: Role, sample_rate: f64) -> Result<Instance, String> {
+        let (file, _) = self.catalog.find(plugin.id()).ok_or("not found in the plugin catalog")?;
+        // SAFETY: a file of the catalog, on the thread that made this, as
+        // its maker promised.
+        unsafe { self.host.create(file, plugin.id(), role, Mode::Offline, sample_rate, BLOCK) }
+    }
+
+    fn poll(&mut self) -> Vec<Request> {
+        self.host.poll()
+    }
+
+    fn name(&self, plugin: PluginRef) -> String {
+        self.catalog.find(plugin.id()).map_or_else(|| plugin.id().to_string(), |(_, p)| p.name.clone())
+    }
+}
+
+/// The instances a render plays, by token, for its messages.
+struct Playing {
+    tokens: Vec<(u64, PluginRef)>,
+    back: Consumer<Retired>,
+}
+
+impl Playing {
+    /// Puts an instance in every plugin place of `project`.
+    fn attach(
+        engine: &mut Engine,
+        project: &Project,
+        sample_rate: u32,
+        plugins: &mut dyn PluginSource,
+    ) -> Result<Playing, String> {
+        let (tx, back) = spsc::channel(RETIRE_QUEUE);
+        engine.attach_retirement(tx);
+        let mut playing = Playing { tokens: Vec::new(), back };
+        for (place, plugin) in project.plugin_places() {
+            let made = plugins.make(plugin, place.role(), f64::from(sample_rate));
+            let name = || plugins.name(plugin);
+            let instance = made.map_err(|e| format!("{} cannot load: {e}", name()))?;
+            playing.tokens.push((instance.token(), plugin));
+            let instance = Box::new(instance);
+            match place {
+                PluginPlace::Track(t) => engine.set_plugin(usize::from(t), instance),
+                PluginPlace::Slot(chain, slot) => engine.set_slot_plugin(chain, slot, instance),
+            }
+            if std::iter::from_fn(|| playing.back.pop()).any(|r| matches!(r, Retired::Plugin(_))) {
+                return Err(format!("{} cannot play there", name()));
+            }
+        }
+        Ok(playing)
+    }
+
+    /// Serves what the instances asked for since the last call: a restart
+    /// is done in place; a failure fails the render.
+    fn serve(&mut self, engine: &mut Engine, plugins: &mut dyn PluginSource) -> Result<(), String> {
+        for request in plugins.poll() {
+            let (Request::Restart(token) | Request::Failed(token)) = request;
+            let name = self.tokens.iter().find(|t| t.0 == token).map_or_else(String::new, |t| plugins.name(t.1));
+            if let Request::Failed(_) = request {
+                return Err(format!("{name} failed while rendering"));
+            }
+            engine.handle(Command::Lend(token));
+            while let Some(r) = self.back.pop() {
+                if let Retired::Lent(mut i) = r {
+                    i.restart().map_err(|e| format!("{name} could not restart: {e}"))?;
+                    engine.handle(Command::Return(i));
+                }
+            }
+        }
+        while self.back.pop().is_some() {}
+        Ok(())
+    }
+}
+
 /// Renders the project as interleaved stereo, handing it to `sink` block by
 /// block, and returns the number of frames rendered. Memory use does not
 /// depend on the length of the render. `samples` holds each track's sample
-/// (see [`Project::load_samples`]); missing entries play silence. A `sink`
-/// error stops the render and is returned.
+/// (see [`Project::load_samples`]); missing entries play silence. Every
+/// plugin place gets an instance from `plugins` before anything is
+/// rendered. A `sink` error, or a plugin that cannot load or fails, stops
+/// the render and is returned.
 pub fn render_into(
     project: &Project,
     samples: &[Option<Arc<Sample>>],
     opts: &RenderOptions,
+    plugins: &mut dyn PluginSource,
     sink: &mut dyn FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<u64, String> {
     let sr = opts.sample_rate;
@@ -138,6 +270,7 @@ pub fn render_into(
     for (track, sample) in samples.iter().enumerate() {
         engine.set_sample(track, sample.clone());
     }
+    let mut playing = Playing::attach(&mut engine, project, sr, plugins)?;
     match resolve(project, opts.source) {
         Source::Song => {
             engine.apply(Edit::SetLoop(None));
@@ -164,6 +297,7 @@ pub fn render_into(
     while skip > 0 {
         let n = skip.min(CHUNK as u64) as usize;
         engine.process(&mut buf[..n * 2]);
+        playing.serve(&mut engine, plugins)?;
         skip -= n as u64;
     }
     let stop_at = main.saturating_sub(latency);
@@ -177,6 +311,7 @@ pub fn render_into(
         let limit = if stopped { main } else { stop_at };
         let n = (limit - done).min(CHUNK as u64) as usize;
         engine.process(&mut buf[..n * 2]);
+        playing.serve(&mut engine, plugins)?;
         sink(&buf[..n * 2])?;
         done += n as u64;
     }
@@ -196,6 +331,7 @@ pub fn render_into(
         let n = 512.min(max_tail - tail);
         let b = &mut buf[..n * 2];
         engine.process(b);
+        playing.serve(&mut engine, plugins)?;
         tail += n;
         if b.iter().all(|x| x.abs() < TAIL_THRESHOLD) {
             held.extend_from_slice(b);
@@ -212,14 +348,15 @@ pub fn render_into(
     Ok(done)
 }
 
-/// [`render_into`] collected in memory.
+/// [`render_into`] collected in memory, for a project without plugins.
+#[cfg(test)]
 pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<f32> {
     let mut out = Vec::new();
     let mut sink = |b: &[f32]| {
         out.extend_from_slice(b);
         Ok(())
     };
-    render_into(project, samples, opts, &mut sink).expect("collecting cannot fail");
+    render_into(project, samples, opts, &mut NoPlugins, &mut sink).expect("collecting cannot fail");
     out
 }
 
@@ -280,6 +417,15 @@ pub fn stem_project(project: &Project, stem: Stem) -> Project {
             Stem::Group(g) => t.group != Some(g) || !heard.contains(&j),
         };
         t.solo = false;
+    }
+    // A group none of the stem's tracks feed is still played, its inserts
+    // too, and a plugin among them can sound from silence.
+    for (g, group) in solo.groups.iter_mut().enumerate() {
+        let kept = match stem {
+            Stem::Track(i) => project.tracks[i].group == Some(g as u8),
+            Stem::Group(s) => usize::from(s) == g,
+        };
+        group.mute |= !kept;
     }
     solo.mix[crate::mix::mp::LIMITER] = 0.0;
     solo.master_chain = Default::default();
@@ -670,6 +816,11 @@ mod tests {
         assert_eq!(super::stems(&p), [Stem::Group(1)]);
         let held = stem_project(&p, Stem::Group(1));
         assert_eq!(held.tracks.iter().map(|t| t.mute).collect::<Vec<_>>(), [true, false, true, true, true, true]);
+        // Only the stem's own group plays: another's inserts could sound
+        // with none of its tracks heard.
+        assert_eq!(held.groups.iter().map(|g| g.mute).collect::<Vec<_>>(), [true, false, true]);
+        let alone = stem_project(&p, Stem::Track(5));
+        assert_eq!(alone.groups.iter().map(|g| g.mute).collect::<Vec<_>>(), [true, true, true]);
     }
 
     #[test]

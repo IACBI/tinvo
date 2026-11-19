@@ -3,7 +3,7 @@
 //! A project file is UTF-8 text, line based and versioned:
 //!
 //! ```text
-//! tinvo 15
+//! tinvo 16
 //! tempo 92
 //! swing 50
 //! pattern_length B 32        # only patterns that are not 16 steps long
@@ -26,6 +26,11 @@
 //! mute false
 //! param comp_ratio 2         # its strip and sends; only values off their default
 //! insert 1 compressor        # its insert chain, as a track's
+//! end
+//!
+//! track plugin com.example.synth  # a CLAP plugin as the instrument, by its id
+//! name Pad
+//! insert 0 plugin com.example.chorus  # a CLAP plugin as an effect
 //! end
 //!
 //! track kick
@@ -66,10 +71,13 @@
 //! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers),
 //! 10 (every track plays the entry's pattern), 11 (16th-note steps, up
 //! to 4 ratchets), 12 (no MIDI channels, bend ranges or mod wheel), 13
-//! (no MIDI output) and 14 (no groups, up to 16 tracks) are still read.
+//! (no MIDI output), 14 (no groups, up to 16 tracks) and 15 (no plugins)
+//! are still read. A plugin is kept by its id whether or not it is
+//! installed, so a project that names one missing saves as it was read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
 
+use crate::clap::PluginRef;
 use crate::engine::ChainId;
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
@@ -83,7 +91,7 @@ use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 16;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -121,6 +129,23 @@ pub struct TrackData {
     pub parts: Box<[Part; MAX_SONG]>,
     /// Its insert chain.
     pub chain: ChainData,
+}
+
+/// Where a plugin plays: a track's instrument, or an insert slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginPlace {
+    Track(u8),
+    Slot(ChainId, u8),
+}
+
+impl PluginPlace {
+    /// What it is asked to be there.
+    pub fn role(self) -> crate::clap::host::Role {
+        match self {
+            PluginPlace::Track(_) => crate::clap::host::Role::Instrument,
+            PluginPlace::Slot(..) => crate::clap::host::Role::Effect,
+        }
+    }
 }
 
 /// An effect in an insert slot and its settings.
@@ -784,6 +809,27 @@ impl Project {
         chains.chain([&self.master_chain]).flatten().filter(|s| s.is_some()).count()
     }
 
+    /// Every place a plugin plays in the project, with the plugin: each
+    /// plugin track, then the plugin inserts of the tracks, the groups and
+    /// the master.
+    pub fn plugin_places(&self) -> Vec<(PluginPlace, PluginRef)> {
+        let tracks = self.tracks.iter().enumerate();
+        let mut out: Vec<(PluginPlace, PluginRef)> =
+            tracks.clone().filter_map(|(i, t)| Some((PluginPlace::Track(i as u8), t.kind.plugin()?))).collect();
+        let chains = tracks
+            .map(|(i, t)| (ChainId::Track(i as u8), &t.chain))
+            .chain(self.groups.iter().enumerate().map(|(g, x)| (ChainId::Group(g as u8), &x.chain)))
+            .chain([(ChainId::Master, &self.master_chain)]);
+        for (chain, c) in chains {
+            for (slot, d) in c.iter().enumerate() {
+                if let Some(r) = d.as_ref().and_then(|d| d.kind.plugin()) {
+                    out.push((PluginPlace::Slot(chain, slot as u8), r));
+                }
+            }
+        }
+        out
+    }
+
     /// Whether a lane automates the effect in slot `slot` of chain `c`.
     pub fn slot_automated(&self, c: ChainId, slot: u8) -> bool {
         self.tracks.iter().enumerate().any(|(i, t)| {
@@ -1357,7 +1403,7 @@ impl Project {
             let _ = writeln!(s, "end");
         }
         for t in &self.tracks {
-            let _ = writeln!(s, "\ntrack {}", t.kind.id());
+            let _ = writeln!(s, "\ntrack {}", instrument_text(t.kind));
             let _ = writeln!(s, "name {}", sanitize_name(&t.name));
             if let Some(path) = &t.sample {
                 let _ = writeln!(s, "sample {}", crate::sample::relativize(path, dir));
@@ -1485,7 +1531,7 @@ impl Project {
                         g.params[i] = parse_in(value.trim(), spec).map_err(err)?;
                     }
                     "insert" | "insert_param" => {
-                        parse_insert_line(&mut g.chain, &mut inserts, key == "insert_param", rest).map_err(err)?;
+                        parse_insert_line(&mut g.chain, &mut inserts, key == "insert_param", rest, ver).map_err(err)?;
                     }
                     "end" => p.groups.push(current_group.take().expect("inside a group block")),
                     _ => return Err(err(format!("unknown group key '{key}'"))),
@@ -1533,7 +1579,7 @@ impl Project {
                         if t.lanes.iter().any(|l| l.target.is_some()) {
                             return Err(err("inserts come before lanes".into()));
                         }
-                        parse_insert_line(&mut t.chain, &mut inserts, key == "insert_param", rest).map_err(err)?;
+                        parse_insert_line(&mut t.chain, &mut inserts, key == "insert_param", rest, ver).map_err(err)?;
                     }
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
@@ -1777,7 +1823,7 @@ impl Project {
                         return Err(err("the master's inserts come before groups and tracks".into()));
                     }
                     let param = key == "master_insert_param";
-                    parse_insert_line(&mut p.master_chain, &mut inserts, param, rest).map_err(err)?;
+                    parse_insert_line(&mut p.master_chain, &mut inserts, param, rest, ver).map_err(err)?;
                 }
                 "mix" if ver >= 8 => {
                     let (id, value) = rest
@@ -1791,8 +1837,12 @@ impl Project {
                     p.mix[i] = parse_in(value.trim(), &MIX_PARAMS[i]).map_err(err)?;
                 }
                 "track" => {
-                    let kind =
-                        InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?;
+                    let kind = match plugin_id(rest, ver) {
+                        Some(id) => InstrumentKind::Plugin(plugin_ref(id).map_err(err)?),
+                        None => {
+                            InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?
+                        }
+                    };
                     current = Some(TrackData::new(kind));
                     pattern = 0;
                 }
@@ -1919,7 +1969,13 @@ fn slot_targets<'a>(
 
 /// Reads an `insert` or `insert_param` line's fields into `chain`, counting
 /// effects in `count`.
-fn parse_insert_line(chain: &mut ChainData, count: &mut usize, param: bool, rest: &str) -> Result<(), String> {
+fn parse_insert_line(
+    chain: &mut ChainData,
+    count: &mut usize,
+    param: bool,
+    rest: &str,
+    ver: u32,
+) -> Result<(), String> {
     let (slot, rest) = rest.split_once(char::is_whitespace).ok_or("expected an insert slot and more")?;
     let slot: usize = parse_num(slot)?;
     let d = chain.get_mut(slot).ok_or_else(|| format!("insert slot {slot} out of range (0..{MAX_SLOTS})"))?;
@@ -1931,7 +1987,10 @@ fn parse_insert_line(chain: &mut ChainData, count: &mut usize, param: bool, rest
         if *count >= MAX_INSERTS {
             return Err(format!("more than {MAX_INSERTS} inserts"));
         }
-        let kind = EffectKind::from_id(rest).ok_or_else(|| format!("unknown effect '{rest}'"))?;
+        let kind = match plugin_id(rest, ver) {
+            Some(id) => EffectKind::Plugin(plugin_ref(id)?),
+            None => EffectKind::from_id(rest).ok_or_else(|| format!("unknown effect '{rest}'"))?,
+        };
         *d = Some(SlotData::new(kind));
         *count += 1;
         return Ok(());
@@ -1949,13 +2008,43 @@ fn parse_insert_line(chain: &mut ChainData, count: &mut usize, param: bool, rest
     Ok(())
 }
 
+/// The id of the plugin a `track` or `insert` line names (`plugin <id>`,
+/// from version 16).
+fn plugin_id(rest: &str, ver: u32) -> Option<&str> {
+    let (key, id) = rest.split_once(char::is_whitespace)?;
+    (key == "plugin" && ver >= 16).then(|| id.trim())
+}
+
+fn plugin_ref(id: &str) -> Result<PluginRef, String> {
+    if !crate::clap::is_valid_id(id) {
+        return Err(format!("'{id}' is not a plugin id"));
+    }
+    PluginRef::new(id).ok_or_else(|| format!("too many plugin ids in this run (at most {})", crate::clap::MAX_REFS))
+}
+
+/// How a `track` line names its instrument.
+fn instrument_text(kind: InstrumentKind) -> String {
+    match kind.plugin() {
+        Some(r) => format!("plugin {}", r.id()),
+        None => kind.id().to_string(),
+    }
+}
+
+/// How an `insert` line names its effect.
+fn effect_text(kind: EffectKind) -> String {
+    match kind.plugin() {
+        Some(r) => format!("plugin {}", r.id()),
+        None => kind.id().to_string(),
+    }
+}
+
 /// Writes chain `c` as `<key> <slot> <effect>` lines, each followed by
 /// `<key>_param <slot> <id> <value>` lines for its settings off their
 /// default.
 fn write_chain(s: &mut String, key: &str, c: &ChainData) {
     for (slot, d) in c.iter().enumerate() {
         let Some(d) = d else { continue };
-        let _ = writeln!(s, "{key} {slot} {}", d.kind.id());
+        let _ = writeln!(s, "{key} {slot} {}", effect_text(d.kind));
         for (spec, &v) in d.kind.params().iter().zip(&d.params) {
             if v != spec.default {
                 let _ = writeln!(s, "{key}_param {slot} {} {v}", spec.id);
@@ -2465,7 +2554,7 @@ mod tests {
         p.tracks[4].parts[4] = Part::Pattern(0);
         p.tracks[2].midi_out = true;
         let text = p.to_text();
-        assert!(text.starts_with("tinvo 15\n"));
+        assert!(text.starts_with(&format!("tinvo {FORMAT_VERSION}\n")));
         assert!(text.contains("\nsolo false\nparts . - . P\n"), "{text}");
         assert!(text.contains("\nparts . . . . A\n"), "{text}");
         assert_eq!(text.matches("\nparts ").count(), 2, "only tracks with parts of their own");
@@ -3323,6 +3412,43 @@ pattern_division A 1/8
         assert_eq!(p.apply(full), Err(EditError::TooManyTracks));
         p.apply(Edit::RemoveTrack(last)).unwrap();
         assert_eq!(p.apply(Edit::RemoveTrack(last)), Err(EditError::NoSuchTrack(last)));
+    }
+
+    #[test]
+    fn plugins_round_trip_by_id_from_format_16() {
+        use crate::clap::PluginRef;
+        let synth = PluginRef::new("com.example.synth").unwrap();
+        let chorus = PluginRef::new("com.example.my chorus").unwrap();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Plugin(synth))).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 2, kind: Some(EffectKind::Plugin(chorus)) }).unwrap();
+        p.apply(Edit::SetSlotParam { chain: ChainId::Track(0), slot: 2, index: 0, value: 1.0 }).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Plugin(chorus)) }).unwrap();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Group(0), slot: 7, kind: Some(EffectKind::Plugin(synth)) }).unwrap();
+        // A plugin track has the strip and sends any track has.
+        let strip = track_param(InstrumentKind::Plugin(synth), 0).unwrap();
+        p.apply(Edit::SetParam { track: 0, index: 0, value: strip.max }).unwrap();
+        let text = p.to_text();
+        assert!(text.contains(&format!("\nparam {} {}\n", strip.id, strip.max)), "{text}");
+        assert!(text.contains("\ninsert 7 plugin com.example.synth\n"), "{text}");
+        assert!(text.contains("\ntrack plugin com.example.synth\n"), "{text}");
+        assert!(text.contains("\ninsert 2 plugin com.example.my chorus\ninsert_param 2 bypass 1\n"), "{text}");
+        assert!(text.contains("\nmaster_insert 0 plugin com.example.my chorus\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        // Older formats know no plugins, and an id must be one.
+        for (text, line, what) in [
+            ("tinvo 15\ntrack plugin a.b\nend", 2, "unknown instrument"),
+            ("tinvo 15\ntrack kick\ninsert 0 plugin a.b\nend", 3, "unknown effect"),
+            ("tinvo 15\nmaster_insert 0 plugin a.b", 2, "unknown effect"),
+            ("tinvo 15\ngroup G\ninsert 0 plugin a.b\nend", 3, "unknown effect"),
+            ("tinvo 16\ntrack plugin\nend", 2, "unknown instrument"),
+            ("tinvo 16\ntrack kick\ninsert 0 plugin a\u{7}b\nend", 3, "not a plugin id"),
+            ("tinvo 16\ntrack kick\ninsert 0 plugin a.b\ninsert_param 0 mix 1\nend", 4, "unknown parameter"),
+        ] {
+            let e = Project::from_text(text).unwrap_err();
+            assert!(e.line == line && e.message.contains(what), "{text}: {e:?}");
+        }
     }
 
     #[test]

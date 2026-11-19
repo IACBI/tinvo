@@ -722,6 +722,12 @@ impl Catalog {
         out
     }
 
+    /// The plugin with `id`, with the file that offers it (the first, if
+    /// more than one does).
+    pub fn find(&self, id: &str) -> Option<(&Path, &PluginInfo)> {
+        self.entries.iter().find_map(|e| Some((e.path.as_path(), e.result.as_ref().ok()?.iter().find(|p| p.id == id)?)))
+    }
+
     /// The files that could not be read, with why.
     pub fn failures(&self) -> Vec<(&Path, &str)> {
         self.entries.iter().filter_map(|e| e.result.as_ref().err().map(|w| (e.path.as_path(), w.as_str()))).collect()
@@ -1016,5 +1022,7 @@ mod tests {
         assert_eq!(ids, [("a.clap", "x"), ("a.clap", "y")]);
         assert_eq!(catalog.duplicates(), [("y", Path::new("a.clap"), Path::new("b.clap"))]);
         assert_eq!(catalog.failures(), [(Path::new("c.clap"), "no")]);
+        let found = |id| catalog.find(id).map(|(p, i)| (p.to_str().unwrap(), i.id.as_str()));
+        assert_eq!((found("y"), found("x"), found("z")), (Some(("a.clap", "y")), Some(("a.clap", "x")), None));
     }
 }

@@ -200,7 +200,10 @@ impl EngineLink {
     fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
         let carries = match &cmd {
             _ if self.retired.is_none() => 0,
-            Command::SetSample { sample: Some(_), .. } | Command::SetPlugin { .. } | Command::Return(_) => 1,
+            Command::SetSample { sample: Some(_), .. }
+            | Command::SetPlugin { .. }
+            | Command::SetSlotPlugin { .. }
+            | Command::Return(_) => 1,
             Command::SetSlot { insert: Some(i), .. } => 1 + usize::from(i.has_instance()),
             _ => 0,
         };
@@ -4087,7 +4090,7 @@ impl App {
         let samples = self.track_samples();
         let mut meter = ExportMeter::new(self.sample_rate);
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
-            let frames = render::render_into(&self.project, &samples, &opts, &mut |b| {
+            let frames = render::render_into(&self.project, &samples, &opts, &mut render::NoPlugins, &mut |b| {
                 meter.push(b);
                 file.write(b)
             })?;
