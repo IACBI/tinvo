@@ -40,6 +40,8 @@
 //!   asking for a restart in its first process call as `restart` does;
 //!   `latefail`: the same, failing its second process call as `procerror`
 //!   does;
+//! - `many`: the gain has 300 more parameters (ids 100 to 399, none doing
+//!   anything), more than a host queues for one call;
 //! - `meter`: the gain reports its read-only meter after every call, and
 //!   once, a change of its own to its mode, after which (in a main-thread
 //!   callback) it renames its gain "Volume", shows its hold and clears
@@ -110,6 +112,7 @@ enum Mode {
     Dirty,
     Relatency,
     LateFail,
+    Many,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -121,7 +124,7 @@ static BROKEN: AtomicU32 = AtomicU32::new(0);
 static SAVES: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 27] = [
+    const ALL: [Mode; 28] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -149,6 +152,7 @@ fn mode() -> Mode {
         Mode::Dirty,
         Mode::Relatency,
         Mode::LateFail,
+        Mode::Many,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -239,6 +243,7 @@ unsafe extern "C" fn probe(p: *const ClapPlugin) -> u32 {
 }
 
 /// One of the plugins' parameters.
+#[derive(Clone, Copy)]
 struct Param {
     id: u32,
     flags: u32,
@@ -260,7 +265,32 @@ const LEVEL: u32 = 20;
 /// 64 at the first, 128 at the second, and so on.
 const LATENCY: u32 = 64;
 
-static GAIN_PARAMS: [Param; 5] = [
+/// The gain's own parameters, before the ones it has in `many`.
+const OWN: usize = 5;
+const EXTRA: usize = 300;
+static GAIN_PARAMS: [Param; OWN + EXTRA] = {
+    let extra = Param {
+        id: 0,
+        flags: CLAP_PARAM_IS_AUTOMATABLE,
+        name: c"Extra",
+        module: c"More",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+    };
+    let (own, mut all) = (OWN_PARAMS, [extra; OWN + EXTRA]);
+    let mut i = 0;
+    while i < OWN + EXTRA {
+        if i < OWN {
+            all[i] = own[i];
+        } else {
+            all[i].id = 100 + (i - OWN) as u32;
+        }
+        i += 1;
+    }
+    all
+};
+const OWN_PARAMS: [Param; OWN] = [
     Param {
         id: GAIN,
         flags: CLAP_PARAM_IS_AUTOMATABLE,
@@ -354,7 +384,7 @@ struct Instance {
     frames: AtomicU32,
     steady: AtomicU32,
     /// Its parameters' values, as `f64` bits, in the order of its table.
-    values: [AtomicU64; 5],
+    values: [AtomicU64; OWN + EXTRA],
     params_set: AtomicU32,
     flushes: AtomicU32,
     overlaps: AtomicU32,
@@ -415,7 +445,11 @@ impl Instance {
     }
 
     fn params(&self) -> &'static [Param] {
-        if self.sine { &SINE_PARAMS } else { &GAIN_PARAMS }
+        match () {
+            _ if self.sine => &SINE_PARAMS,
+            _ if mode() == Mode::Many => &GAIN_PARAMS,
+            _ => &GAIN_PARAMS[..OWN],
+        }
     }
 
     fn value(&self, id: u32) -> Option<f64> {
@@ -1421,6 +1455,10 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "latefail" => {
             set(Mode::LateFail);
+            true
+        }
+        "many" => {
+            set(Mode::Many);
             true
         }
         "meter" => {

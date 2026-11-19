@@ -367,6 +367,9 @@ pub struct Insert {
     scratch: [f32; 2 * BLOCK],
     /// A plugin's input, as late as its output.
     dry: [f32; 2 * BLOCK],
+    /// Frames a plugin brought back after being skipped still plays its
+    /// input for: its output comes late, from before it was skipped.
+    prime: usize,
     sample_rate: f32,
 }
 
@@ -409,6 +412,7 @@ impl Insert {
             held_out: false,
             scratch: [0.0; 2 * BLOCK],
             dry: [0.0; 2 * BLOCK],
+            prime: 0,
             sample_rate,
         };
         for i in 1..kind.params().len() {
@@ -798,7 +802,8 @@ impl Insert {
     /// late as the output (`dry`) as it is bypassed and brought back, and
     /// the whole over the input as it arrives as it is taken out or put in.
     /// Bypassed all the way, or out of the chain, it is not called: its
-    /// time moves on.
+    /// time moves on. Brought back, a late one plays its input until what
+    /// it is given comes out.
     fn process_plugin(&mut self, buf: &mut [f32]) {
         let (on, present) = (!self.bypassed(), !self.held_out);
         // Faded out before the block ends: from then on it is not called,
@@ -811,7 +816,7 @@ impl Insert {
             self.process_plugin(tail);
             return;
         }
-        let Self { effect, scratch, dry, fade, bypass_fade, fade_frames, .. } = self;
+        let Self { effect, scratch, dry, fade, bypass_fade, fade_frames, prime, .. } = self;
         let Effect::Plugin(p) = effect else { return };
         let (whole, top) = (*fade_frames as f32, *fade_frames);
         let x = &mut scratch[..buf.len()];
@@ -823,21 +828,34 @@ impl Insert {
             let heard = (present || *fade > 0) && (on || *bypass_fade > 0);
             if !heard {
                 i.skip(buf.len() / 2);
+                *prime = i.latency() as usize;
             } else if !i.process(buf) {
                 // One that failed stands in for itself with its input, in
                 // time.
                 buf.copy_from_slice(dry);
             }
         }
-        if present && on && *fade == top && *bypass_fade == top {
+        if present && on && *fade == top && *bypass_fade == top && *prime == 0 {
             return;
         }
+        let heard = (present || *fade > 0) && (on || *bypass_fade > 0);
         for (i, f) in buf.chunks_exact_mut(2).enumerate() {
-            *bypass_fade = if on { (*bypass_fade + 1).min(top) } else { bypass_fade.saturating_sub(1) };
+            let caught_up = *prime == 0;
+            if heard && !caught_up {
+                *prime -= 1;
+            }
+            *bypass_fade = if !on {
+                bypass_fade.saturating_sub(1)
+            } else if caught_up {
+                (*bypass_fade + 1).min(top)
+            } else {
+                *bypass_fade
+            };
             *fade = if present { (*fade + 1).min(top) } else { fade.saturating_sub(1) };
             for c in 0..2 {
                 let (input, d, w) = (x[2 * i + c], dry[2 * i + c], f[c]);
                 let y = match *bypass_fade {
+                    _ if !caught_up => d,
                     b if b == top => w,
                     0 => d,
                     b => d + b as f32 / whole * (w - d),

@@ -2107,11 +2107,11 @@ impl Engine {
                         b.automate(usize::from(index), l.applied);
                     }
                 }
-                // And a plugin's parameter its lane's value, or base.
+                // And a plugin's parameter the value its lane holds.
                 for l in &t.lanes {
                     let Some((place, plugin, pid)) = l.target.and_then(|x| x.plugin_param(i as u8)) else { continue };
                     if place == PluginPlace::Slot(id, slot) {
-                        deliver(b.plugin_slot().filter(|p| p.plugin() == plugin), pid, l.applied, l.base);
+                        deliver(b.plugin_slot().filter(|p| p.plugin() == plugin), pid, l.applied, f32::NAN);
                     }
                 }
             }
@@ -2196,8 +2196,8 @@ impl Engine {
         }
     }
 
-    /// Has every lane on a plugin parameter send its value again, as to an
-    /// instance just come.
+    /// Has every lane on a plugin parameter holding it send its value
+    /// again, as to an instance just come.
     fn replay_plugin_lanes(&mut self) {
         for l in self.tracks[..self.track_count].iter_mut().flat_map(|t| t.lanes.iter_mut()) {
             if let Some(LaneTarget::Plugin { .. }) = l.target {
@@ -4036,7 +4036,9 @@ impl Engine {
                 if let Some((place, plugin, id)) = l.target.and_then(|x| x.plugin_param(ti as u8)) {
                     let want = l.segment.map(|g| g.value_at(Curve::Plain, frame));
                     if l.fresh || want != l.applied {
-                        let base = l.base;
+                        // A base goes out only as the lane lets go: an
+                        // instance that comes keeps what it was given since.
+                        let base = if want.is_none() && l.applied.is_some() { l.base } else { f32::NAN };
                         let sent = deliver(plugin_slot_at(tracks, groups, master_chain, place, plugin), id, want, base);
                         // Not taken, it is tried again next time.
                         if sent {

@@ -768,7 +768,7 @@ impl Project {
                 for (i, t) in self.tracks.iter_mut().enumerate() {
                     for l in &mut t.lanes {
                         let Some(x) = l.target else { continue };
-                        if x.slot(i as u8).is_some_and(|(c, ..)| c == chain) {
+                        if x.chain_slot(i as u8).is_some_and(|(c, _)| c == chain) {
                             l.target = Some(x.with_slot(swap));
                         }
                     }
@@ -3121,6 +3121,16 @@ mod tests {
         p.apply(Edit::InsertGroup(0)).unwrap();
         assert_eq!(p.tracks[0].lanes[2].target, on(PluginAt::GroupSlot { group: 1, slot: 0 }, gain));
         assert_eq!(p.apply(Edit::RemoveGroup(1)), Err(EditError::GroupInUse(1)));
+        // Slots swapped take theirs along, and are rebuilt so.
+        p.apply(Edit::SwapSlots { chain: ChainId::Track(1), a: 2, b: 5 }).unwrap();
+        p.apply(Edit::SwapSlots { chain: ChainId::Master, a: 0, b: 1 }).unwrap();
+        assert_eq!(p.tracks[1].lanes[0].target, on(PluginAt::Slot(5), gain));
+        assert_eq!(p.tracks[1].lanes[1].target, on(PluginAt::MasterSlot(0), gain));
+        let mut q = Project::new();
+        for e in p.to_edits() {
+            q.apply(e).unwrap();
+        }
+        assert_eq!(q.tracks[1].lanes, p.tracks[1].lanes);
     }
 
     #[test]

@@ -742,27 +742,15 @@ fn plugins_in_the_engine() -> usize {
     send(Command::SetSlot { chain: ChainId::Track(0), slot: 1, insert: Some(late_insert) });
     send(Command::Play);
     let mut buf = vec![0.0f32; 2 * 4096];
-    let (mut calls, mut heard, mut lent) = (0, false, 0);
+    let (mut calls, mut heard, mut lent, mut added_token) = (0, false, 0, None);
     // The instances removed and replaced, and those that came back.
     let (mut expected, mut gone) = (Vec::new(), Vec::new());
     for i in 0..3000 {
         match i {
-            _ if i % 300 == 150 => send(Command::Lend(if i % 600 == 150 { sine_token } else { gain_token })),
-            _ if i % 500 == 400 => send(Command::Lend(late_token)),
-            _ if i % 7 == 3 => send(Command::SetPluginParam {
-                place: PluginPlace::Slot(ChainId::Track(0), 1),
-                plugin: gain,
-                id: 10,
-                value: (i % 10) as f64 / 10.0,
-                serial: i as u64,
-            }),
-            _ if i % 400 == 50 => {
-                let value = (i % 3 == 0).then_some(0.3);
-                send(Command::Edit(Edit::SetLaneBase { track: 0, lane: 2, value }));
-            }
             1200 => {
                 send(Command::Edit(Edit::AddTrack(InstrumentKind::Plugin(sine))));
                 let added = make(sine, Role::Instrument);
+                added_token = Some(added.token());
                 expected.push(added.token());
                 send(Command::SetPlugin { track: 2, instance: added });
                 send(Command::Edit(Edit::SetStep { track: 2, pattern: 0, step: 3, value: Some(Step::new(70, 90, 2)) }));
@@ -780,6 +768,19 @@ fn plugins_in_the_engine() -> usize {
                 sine_token = next.token();
                 send(Command::SetPlugin { track: 0, instance: next });
             }
+            _ if i % 300 == 150 => send(Command::Lend(if i % 600 == 150 { sine_token } else { gain_token })),
+            _ if i % 500 == 400 => send(Command::Lend(late_token)),
+            _ if i % 7 == 3 => send(Command::SetPluginParam {
+                place: PluginPlace::Slot(ChainId::Track(0), 1),
+                plugin: gain,
+                id: 10,
+                value: (i % 10) as f64 / 10.0,
+                serial: i as u64,
+            }),
+            _ if i % 400 == 50 => {
+                let value = (i % 3 == 0).then_some(0.3);
+                send(Command::Edit(Edit::SetLaneBase { track: 0, lane: 2, value }));
+            }
             _ => {}
         }
         let frames = SIZES[i % SIZES.len()];
@@ -795,7 +796,11 @@ fn plugins_in_the_engine() -> usize {
                     lent += 1;
                     send(Command::Return(i));
                 }
-                Retired::Plugin(i) => gone.push(i.token()),
+                Retired::Plugin(p) => {
+                    // The added track's, only once the track is gone.
+                    assert!(Some(p.token()) != added_token || i >= 2000, "track 2 played");
+                    gone.push(p.token());
+                }
                 _ => {}
             }
         }
