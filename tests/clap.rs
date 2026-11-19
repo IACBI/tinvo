@@ -176,6 +176,32 @@ fn a_file_the_scan_s_time_cuts_short_is_left_for_next_time() {
 }
 
 #[test]
+fn a_scan_called_off_ends_its_child_and_leaves_the_file_for_next_time() {
+    let dir = temp_dir("called-off");
+    let cache = dir.join("plugins.txt");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    install(&plugins, "hang");
+    // A file the scan would come to next.
+    let next = dir.join("next");
+    std::fs::create_dir_all(&next).unwrap();
+    install(&next, "fixture");
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let caller = cancel.clone();
+    let off = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        caller.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let started = std::time::Instant::now();
+    let catalog = scan::scan_until(&[plugins, next], Some(&cache), &options(Duration::from_secs(30)), &cancel);
+    off.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "the child was not waited for");
+    assert_eq!((catalog.entries.len(), catalog.left), (0, 2), "not taken for a hang, none read after: {catalog:?}");
+    assert!(scan::read_cache(&cache).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_cache_is_used_until_a_file_changes() {
     let dir = temp_dir("cache");
     let plugins = dir.join("plugins");
@@ -1187,16 +1213,16 @@ fn the_link_counts_an_insert_with_an_instance_as_two() {
     let dir = temp_dir("engine-link");
     let file = install(&dir, "link");
     let mut host = PluginHost::new();
-    let (tx, mut commands) = spsc::channel(128);
-    let (mut back, retired) = spsc::channel(256);
+    let (tx, mut commands) = spsc::channel(RETIRE_QUEUE);
+    let (mut back, retired) = spsc::channel(RETIRE_QUEUE);
     let mut link = EngineLink::new(tx, Arc::new(Shared::new())).with_retirement(retired, tinvo::engine::HELD_FOR_GOOD);
-    // Samples on their way, till two of the queue's 256 places are left.
+    // Samples on their way, till two of the queue's places are left.
     let sample = Arc::new(tinvo::sample::Sample::from_mono(&[0.5; 16], 48_000).unwrap());
-    for _ in tinvo::engine::HELD_FOR_GOOD..254 {
+    for _ in tinvo::engine::HELD_FOR_GOOD..RETIRE_QUEUE - 2 {
         link.send(EngineCommand::SetSample { track: 0, sample: Some(sample.clone()) });
     }
     let sent = |c: &mut Consumer<EngineCommand>| std::iter::from_fn(|| c.pop()).collect::<Vec<_>>();
-    assert_eq!(sent(&mut commands).len(), 254 - tinvo::engine::HELD_FOR_GOOD);
+    assert_eq!(sent(&mut commands).len(), RETIRE_QUEUE - 2 - tinvo::engine::HELD_FOR_GOOD);
     let insert = |host: &mut PluginHost| {
         let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
         insert.attach(Box::new(create(host, &file, GAIN, Role::Effect).unwrap())).unwrap();
@@ -1725,10 +1751,16 @@ fn the_editor_s_plugin_list_picks_and_undo_brings_back() {
     ed.key(Key::Enter);
     assert_eq!(ed.app.status_text(), Some("Plugin slot 3: Test Gain"));
     assert_eq!(ed.pump(), ["set_slot_plugin"]);
-    // Picked again, the same plugin changes nothing.
+    // Picked again, the same plugin is loaded again in place, the slot's
+    // settings kept.
+    let bypass = Edit::SetSlotParam { chain: ChainId::Track(0), slot: 2, index: 0, value: 1.0 };
+    ed.app.project.apply(bypass).unwrap();
     ed.app.mode = EditorMode::Plugins(PluginPicker { target: PluginFor::Slot(ChainId::Track(0), 2), cursor: 0 });
     ed.key(Key::Enter);
-    assert!(ed.pump().is_empty());
+    assert_eq!(ed.app.status_text(), Some("Plugin slot 3: Test Gain, loaded again"));
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    let slot = ed.app.project.chain(ChainId::Track(0)).unwrap()[2].unwrap();
+    assert_eq!(slot.params[0], 1.0, "still bypassed");
     // Undone and redone, each place gets a fresh instance.
     ed.key(Key::Char('u'));
     ed.key(Key::Char('u'));
@@ -1768,6 +1800,52 @@ fn a_picked_plugin_that_cannot_load_changes_nothing() {
 }
 
 #[test]
+fn without_an_engine_a_picked_plugin_is_still_made_first() {
+    let dir = temp_dir("editor-offline");
+    let folder = dir.join("noactivate");
+    std::fs::create_dir_all(&folder).unwrap();
+    install(&folder, "noactivate");
+    let catalog = scan::scan(&[folder], None, &options(Duration::from_secs(30)));
+    // SAFETY: as in `Editor::new`.
+    let mut app = unsafe { App::new(Project::new(), None, None, RATE as u32, "t".into()).with_plugin_catalog(catalog) };
+    for k in [Key::Char('a'), Key::Char('8'), Key::Enter] {
+        app.handle_key(k);
+    }
+    assert!(app.project.tracks.is_empty());
+    let [problem] = app.plugin_problems() else { panic!("{:?}", app.plugin_problems()) };
+    assert!(problem.starts_with("Test Sine cannot load: "), "kept for the list: {problem}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_editor_lets_go_of_the_instances_that_came_back() {
+    let dir = temp_dir("editor-gone");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    let mut ed = Editor::new(&dir, "gone", p);
+    assert_eq!(ed.pump(), ["set_plugin"]);
+    assert!(ed.app.plugins_playing());
+    ed.key(Key::Char('D'));
+    ed.key(Key::Char('y'));
+    assert!(ed.app.project.tracks.is_empty());
+    ed.pump();
+    render(&mut ed.engine, 8192, 256);
+    ed.app.tick();
+    assert!(!ed.app.plugins_playing(), "no plugin left to keep the editor busy");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_plugin_list_s_cursor_stays_on_its_rows() {
+    let dir = temp_dir("editor-cursor");
+    let mut ed = Editor::new(&dir, "cursor", Project::new());
+    ed.app.mode = EditorMode::Plugins(PluginPicker { target: PluginFor::Track, cursor: 50 });
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.project.tracks[0].kind, InstrumentKind::Plugin(sine_ref()), "the last row picked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
     let dir = temp_dir("editor-restart");
     let mut p = Project::new();
@@ -1793,12 +1871,41 @@ fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
     assert_eq!(ed.pump(), ["lend"]);
     ed.app.tick();
     assert_eq!(ed.pump(), ["return"]);
-    assert_eq!(ed.app.plugin_problems(), ["Test Sine failed while playing; restarted"]);
+    assert_eq!(ed.app.plugin_problems(), ["Test Sine failed while playing; restarting it"]);
     // Restarted, it plays on.
     render(&mut ed.engine, 128, 64);
     ed.app.tick();
     assert!(ed.pump().is_empty());
     assert_eq!(ed.app.plugin_problems().len(), 1);
+
+    // One that fails, asking for a restart, every time and from the main
+    // thread after: restarted once, its failure and its requests served as
+    // one, then left silent however often it asks.
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    let mut ed = Editor::new(&dir, "procerrors", p);
+    assert_eq!(ed.pump(), ["set_plugin"]);
+    render(&mut ed.engine, 128, 64);
+    ed.app.tick();
+    assert_eq!(ed.pump(), ["lend"]);
+    ed.app.tick();
+    assert_eq!(ed.pump(), ["return"]);
+    assert_eq!(ed.app.plugin_problems(), ["Test Sine failed while playing; restarting it"]);
+    // Asked again once back, restarted again: lent once more, and what it
+    // asks while lent is answered by that restart.
+    ed.app.tick();
+    assert_eq!(ed.pump(), ["lend"]);
+    ed.app.tick();
+    assert_eq!(ed.pump(), ["return"]);
+    for _ in 0..3 {
+        render(&mut ed.engine, 128, 64);
+        ed.app.tick();
+        assert!(ed.pump().is_empty(), "not lent again");
+    }
+    assert_eq!(
+        ed.app.plugin_problems(),
+        ["Test Sine failed while playing; restarting it", "Test Sine failed again and stays silent"]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1827,7 +1934,7 @@ fn the_editor_exports_through_plugins_of_its_own() {
 }
 
 #[test]
-fn without_an_engine_the_editor_names_the_plugins_not_installed() {
+fn without_an_engine_the_editor_names_the_plugins_not_in_its_catalog() {
     let dir = temp_dir("editor-missing");
     let folder = dir.join("missing");
     std::fs::create_dir_all(&folder).unwrap();
@@ -1838,7 +1945,7 @@ fn without_an_engine_the_editor_names_the_plugins_not_installed() {
     p.apply(Edit::AddTrack(InstrumentKind::Plugin(PluginRef::new("org.tinvo.test.gone").unwrap()))).unwrap();
     // SAFETY: as in `Editor::new`.
     let app = unsafe { App::new(p, None, None, RATE as u32, "t".into()).with_plugin_catalog(catalog) };
-    assert_eq!(app.plugin_problems(), ["Plugin: org.tinvo.test.gone is not installed"]);
+    assert_eq!(app.plugin_problems(), ["Plugin: org.tinvo.test.gone is not in the plugin catalog"]);
     assert!(app.status_text().unwrap().contains("(& lists plugins)"), "{:?}", app.status_text());
     let _ = std::fs::remove_dir_all(&dir);
 }

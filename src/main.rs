@@ -448,14 +448,15 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
     let (midi_start, rest) = midi_option(rest)?;
     let (midi_out, rest) = midi_out_option(rest)?;
     let (input, rest) = input_option(rest)?;
-    match &rest[..] {
-        [] => tinvo::app::run(None, config, midi_start, midi_out, input, settings, settings_path),
-        [s] if s.starts_with('-') => Err(format!("unknown option '{}'{SEE_HELP}", shown(s))),
-        [path] => {
-            tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, midi_out, input, settings, settings_path)
-        }
-        _ => Err(format!("too many arguments{SEE_HELP}")),
-    }
+    let path = match &rest[..] {
+        [] => None,
+        [s] if s.starts_with('-') => return Err(format!("unknown option '{}'{SEE_HELP}", shown(s))),
+        [path] => Some(PathBuf::from(path)),
+        _ => return Err(format!("too many arguments{SEE_HELP}")),
+    };
+    // SAFETY: the program's main thread; the plugins are the ones installed
+    // where CLAP says to look, which the project or the user asks to play.
+    unsafe { tinvo::app::run(path, config, midi_start, midi_out, input, settings, settings_path) }
 }
 
 /// Checks the settings file and prints every setting it gives.
@@ -562,7 +563,7 @@ fn plugin_source(project: &Project) -> Result<Box<dyn render::PluginSource>, Str
     if project.plugin_places().is_empty() {
         return Ok(Box::new(render::NoPlugins));
     }
-    let catalog = tinvo::clap::scan::installed(false)?.0;
+    let catalog = tinvo::clap::scan::installed(false, &std::sync::atomic::AtomicBool::new(false))?.0;
     // SAFETY: the program's main thread; the plugins installed where CLAP
     // says to look, which the project asks to run.
     Ok(Box::new(unsafe { render::CatalogPlugins::new(catalog) }))
@@ -574,7 +575,7 @@ fn cmd_plugins(args: &[String]) -> Result<(), String> {
         [a] if a == "--rescan" => true,
         [a, ..] => return Err(format!("plugins takes only --rescan, not '{}'{SEE_HELP}", shown(a))),
     };
-    let (catalog, roots) = tinvo::clap::scan::installed(rescan)?;
+    let (catalog, roots) = tinvo::clap::scan::installed(rescan, &std::sync::atomic::AtomicBool::new(false))?;
     let path = |p: &std::path::Path| shown(&p.display().to_string());
     let plugins = catalog.plugins();
     for (file, p) in &plugins {

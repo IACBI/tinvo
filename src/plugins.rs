@@ -7,7 +7,10 @@ use crate::clap::scan::{self, Catalog};
 use crate::clap::{PluginInfo, PluginRef, Roles};
 use crate::engine::BLOCK;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::JoinHandle;
 
 /// The editor's plugins. Not `Send`: it lives on the thread its host was
 /// made on, which plays CLAP's main thread.
@@ -15,6 +18,10 @@ pub struct Plugins {
     host: PluginHost,
     catalog: Option<Catalog>,
     scanning: Option<Receiver<Result<Catalog, String>>>,
+    /// The scan's thread, joined when this is dropped, and what calls it
+    /// off: a plugin file hanging its scanner must not outlive the editor.
+    scan_thread: Option<JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
     /// Why the last scan could not be read.
     scan_error: Option<String>,
     /// The plugin of each instance made, by token.
@@ -22,6 +29,11 @@ pub struct Plugins {
     /// Instances restarted once after failing: one that fails again is
     /// left silent.
     restarted: HashSet<u64>,
+    /// Instances that failed twice, whose requests are no longer served.
+    given_up: HashSet<u64>,
+    /// Instances asked of the engine to restart and not yet back: what they
+    /// ask meanwhile the restart under way answers.
+    lending: HashSet<u64>,
     /// What could not play, as lines for the plugin list.
     problems: Vec<String>,
 }
@@ -39,9 +51,13 @@ impl Plugins {
             host: PluginHost::new(),
             catalog: None,
             scanning: None,
+            scan_thread: None,
+            cancel: Arc::new(AtomicBool::new(false)),
             scan_error: None,
             made: HashMap::new(),
             restarted: HashSet::new(),
+            given_up: HashSet::new(),
+            lending: HashSet::new(),
             problems: Vec::new(),
         }
     }
@@ -55,11 +71,15 @@ impl Plugins {
     /// CLAP calls main.
     pub unsafe fn start_scan(&mut self) {
         let (tx, rx) = mpsc::channel();
+        let cancel = self.cancel.clone();
         let spawned = std::thread::Builder::new().name("plugin scan".into()).spawn(move || {
-            let _ = tx.send(scan::installed(false).map(|(c, _)| c));
+            let _ = tx.send(scan::installed(false, &cancel).map(|(c, _)| c));
         });
         match spawned {
-            Ok(_) => self.scanning = Some(rx),
+            Ok(thread) => {
+                self.scanning = Some(rx);
+                self.scan_thread = Some(thread);
+            }
             Err(e) => self.scan_error = Some(format!("cannot start the plugin scan: {e}")),
         }
     }
@@ -160,9 +180,34 @@ impl Plugins {
         self.host.poll()
     }
 
-    /// The plugin of the instance with `token`, if it was made here.
+    /// The plugin of the instance with `token`, if it was made here for
+    /// the engine now playing and is still alive.
     pub fn plugin_of(&self, token: u64) -> Option<PluginRef> {
         self.made.get(&token).copied()
+    }
+
+    /// Forgets the instance with `token`, destroyed.
+    pub fn forget(&mut self, token: u64) {
+        self.made.remove(&token);
+        self.restarted.remove(&token);
+        self.given_up.remove(&token);
+        self.lending.remove(&token);
+    }
+
+    /// Whether the instance with `token` should be asked of the engine to
+    /// restart: not while it is already.
+    pub fn lend(&mut self, token: u64) -> bool {
+        self.lending.insert(token)
+    }
+
+    /// The instance with `token` is back from the engine, to restart.
+    pub fn lent_back(&mut self, token: u64) {
+        self.lending.remove(&token);
+    }
+
+    /// Whether the instance with `token` failed twice and is left be.
+    pub fn given_up(&self, token: u64) -> bool {
+        self.given_up.contains(&token)
     }
 
     /// Whether any instance has been made for the engine now playing.
@@ -174,12 +219,19 @@ impl Plugins {
     pub fn forget_made(&mut self) {
         self.made.clear();
         self.restarted.clear();
+        self.given_up.clear();
+        self.lending.clear();
     }
 
     /// Whether the instance with `token` should be restarted after failing:
-    /// once, so one that keeps failing is not restarted forever.
+    /// once, so one that keeps failing is not restarted forever. One that
+    /// is not is given up on.
     pub fn restart_after_failure(&mut self, token: u64) -> bool {
-        self.restarted.insert(token)
+        let first = self.restarted.insert(token);
+        if !first {
+            self.given_up.insert(token);
+        }
+        first
     }
 
     pub fn problems(&self) -> &[String] {
@@ -197,6 +249,16 @@ impl Plugins {
             self.problems.remove(0);
         }
         self.problems.push(problem);
+    }
+}
+
+impl Drop for Plugins {
+    fn drop(&mut self) {
+        // The scanner ends its child, so none is left running.
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.scan_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -222,9 +284,15 @@ mod tests {
     #[test]
     fn a_failed_instance_is_restarted_once_and_problems_are_capped() {
         let mut p = Plugins::new();
-        assert!(p.restart_after_failure(7) && !p.restart_after_failure(7) && p.restart_after_failure(8));
+        assert!(p.restart_after_failure(7) && !p.given_up(7));
+        assert!(!p.restart_after_failure(7) && p.given_up(7) && p.restart_after_failure(8));
+        p.forget(8);
+        assert!(p.restart_after_failure(8), "forgotten");
+        assert!(p.lend(8) && !p.lend(8), "once till it is back");
+        p.lent_back(8);
+        assert!(p.lend(8));
         p.forget_made();
-        assert!(p.restart_after_failure(7), "a new engine's instances start afresh");
+        assert!(p.restart_after_failure(7) && !p.given_up(7), "a new engine's instances start afresh");
         for i in 0..250 {
             p.add_problem(format!("{i}"));
         }

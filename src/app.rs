@@ -114,6 +114,8 @@ pub struct EngineLink {
     // Boxed as the engine holds and returns them, so none is moved.
     #[allow(clippy::vec_box)]
     lent: Vec<Box<Instance>>,
+    /// The tokens of the instances that came back and were destroyed.
+    gone: Vec<u64>,
     takes: Option<Consumer<TakeEvent>>,
     /// [`Command::RecordNotes`] commands sent, to compare with the count
     /// the engine has handled.
@@ -129,6 +131,7 @@ impl EngineLink {
             retired: None,
             in_flight: 0,
             lent: Vec::new(),
+            gone: Vec::new(),
             takes: None,
             record_sent: 0,
         }
@@ -182,8 +185,13 @@ impl EngineLink {
         if let Some(rx) = &mut self.retired {
             while let Some(r) = rx.pop() {
                 self.in_flight = self.in_flight.saturating_sub(r.count());
-                if let Retired::Lent(i) = r {
-                    self.lent.push(i);
+                match r {
+                    Retired::Lent(i) => self.lent.push(i),
+                    Retired::Plugin(i) => self.gone.push(i.token()),
+                    Retired::Insert(mut i) => {
+                        self.gone.extend(i.plugin_slot().and_then(|s| s.instance()).map(|i| i.token()))
+                    }
+                    Retired::Sample(_) => {}
                 }
             }
         }
@@ -200,6 +208,13 @@ impl EngineLink {
     pub fn take_lent(&mut self) -> Vec<Box<Instance>> {
         self.flush();
         std::mem::take(&mut self.lent)
+    }
+
+    /// The tokens of the instances that came back since the last call, all
+    /// destroyed by now.
+    pub fn take_gone(&mut self) -> Vec<u64> {
+        self.flush();
+        std::mem::take(&mut self.gone)
     }
 
     fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
@@ -3296,17 +3311,22 @@ impl App {
     }
 
     /// With the catalog come: instances for the engine playing, or without
-    /// one, the plugins not installed named.
+    /// one, the plugins it lacks named.
     fn catalog_arrived(&mut self) {
         if self.link.is_some() { self.attach_all() } else { self.report_missing() }
     }
 
-    /// Without an engine to play them: names the plugins not installed.
+    /// Without an engine to play them: names the plugins the catalog lacks.
     fn report_missing(&mut self) {
         self.plugins.clear_problems();
+        let left = self.plugins.catalog().map_or(0, |c| c.left);
+        let more = match left {
+            0 => String::new(),
+            n => format!(" (the scan left {n} files for next time)"),
+        };
         for (place, plugin) in self.project.plugin_places() {
             if self.plugins.info(plugin).is_none() {
-                let line = format!("{}: {} is not installed", self.place_text(place), plugin.id());
+                let line = format!("{}: {} is not in the plugin catalog{more}", self.place_text(place), plugin.id());
                 self.plugins.add_problem(line);
             }
         }
@@ -3335,17 +3355,42 @@ impl App {
             }
             _ => {}
         }
-        for request in self.plugins.poll() {
+        let requests = self.plugins.poll();
+        self.serve_plugins(requests);
+    }
+
+    /// Serves what the instances asked for: one restart each, a failure
+    /// first, for the instances of the engine playing; and restarts the
+    /// instances the engine has lent out for it.
+    fn serve_plugins(&mut self, requests: Vec<Request>) {
+        let Some(link) = &mut self.link else { return };
+        for token in link.take_gone() {
+            self.plugins.forget(token);
+        }
+        let mut tokens: Vec<(u64, bool)> = Vec::new();
+        for request in requests {
             let (Request::Restart(token) | Request::Failed(token)) = request;
-            let name = self.plugins.plugin_of(token).map_or_else(|| "A plugin".to_string(), |r| self.plugins.name(r));
-            if let Request::Failed(_) = request {
+            let failed = matches!(request, Request::Failed(_));
+            match tokens.iter_mut().find(|t| t.0 == token) {
+                Some(t) => t.1 |= failed,
+                None => tokens.push((token, failed)),
+            }
+        }
+        for (token, failed) in tokens {
+            // Another engine's, or gone.
+            let Some(plugin) = self.plugins.plugin_of(token) else { continue };
+            if self.plugins.given_up(token) {
+                continue;
+            }
+            let name = self.plugins.name(plugin);
+            if failed {
                 if !self.plugins.restart_after_failure(token) {
                     self.plugin_problem(format!("{name} failed again and stays silent"));
                     continue;
                 }
-                self.plugin_problem(format!("{name} failed while playing; restarted"));
+                self.plugin_problem(format!("{name} failed while playing; restarting it"));
             }
-            if self.link.is_some() {
+            if self.plugins.lend(token) {
                 self.send(Command::Lend(token));
             }
         }
@@ -3354,13 +3399,16 @@ impl App {
             None => return,
         };
         for mut instance in lent {
+            self.plugins.lent_back(instance.token());
             match instance.restart() {
                 Ok(()) => self.send(Command::Return(instance)),
                 Err(e) => {
-                    let name = self
-                        .plugins
-                        .plugin_of(instance.token())
-                        .map_or_else(|| "A plugin".to_string(), |r| self.plugins.name(r));
+                    let token = instance.token();
+                    let name =
+                        self.plugins.plugin_of(token).map_or_else(|| "A plugin".to_string(), |r| self.plugins.name(r));
+                    // Destroyed here, with its slot left empty.
+                    drop(instance);
+                    self.plugins.forget(token);
                     self.plugin_problem(format!("{name} could not restart and stays silent: {e}"));
                 }
             }
@@ -3391,6 +3439,8 @@ impl App {
 
     fn plugins_action(&mut self, mut p: PluginPicker, a: Option<Action>) {
         let (ids, rows) = self.plugin_rows(p.target);
+        // The list can shrink while it is open, as a new engine tries again.
+        p.cursor = p.cursor.min(rows.saturating_sub(1));
         match a {
             Some(Action::Up) => p.cursor = p.cursor.saturating_sub(1),
             Some(Action::Down) => p.cursor = (p.cursor + 1).min(rows.saturating_sub(1)),
@@ -3417,15 +3467,19 @@ impl App {
         };
         let name = self.plugins.name(plugin);
         let kind = EffectKind::Plugin(plugin);
-        if let PluginFor::Slot(chain, slot) = target {
-            if self.slot_data(chain, slot).map(|d| d.kind) == Some(kind) {
-                return self.set_status(format!("{} slot {} already plays {name}", self.chain_name(chain), slot + 1));
-            }
+        // Made first, even with no engine to play it (at the rate the next
+        // is likely to have), so one that cannot load changes nothing.
+        match self.plugins.make(plugin, target.role(), self.sample_rate) {
+            Ok(i) => self.ready = Some((plugin, i)),
+            Err(e) => return self.plugin_problem(format!("{name} cannot load: {e}")),
         }
-        if self.link.is_some() {
-            match self.plugins.make(plugin, target.role(), self.sample_rate) {
-                Ok(i) => self.ready = Some((plugin, i)),
-                Err(e) => return self.set_status(format!("{name} cannot load: {e}")),
+        if let PluginFor::Slot(chain, slot) = target {
+            // Picked again: a fresh instance in place, the slot's settings
+            // kept.
+            if self.slot_data(chain, slot).map(|d| d.kind) == Some(kind) {
+                self.attach_place(PluginPlace::Slot(chain, slot), plugin);
+                self.ready = None;
+                return self.set_status(format!("{} slot {}: {name}, loaded again", self.chain_name(chain), slot + 1));
             }
         }
         match target {
@@ -4423,13 +4477,18 @@ impl App {
         let started = Instant::now();
         let samples = self.track_samples();
         let mut meter = ExportMeter::new(self.sample_rate);
+        // The plugins playing live are served while it renders: what they
+        // ask of the main thread cannot wait for the whole export.
+        let (live, mut asked) = (&mut self.plugins, Vec::new());
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
             let frames = render::render_into(&self.project, &samples, &opts, &mut *plugins, &mut |b| {
+                asked.extend(live.poll());
                 meter.push(b);
                 file.write(b)
             })?;
             Ok((frames, file.finish()?))
         });
+        self.serve_plugins(asked);
         match result {
             Ok((frames, stats)) => {
                 let secs = frames as f32 / self.sample_rate as f32;
@@ -6095,7 +6154,11 @@ impl MidiOutSession {
 }
 
 /// Runs the interactive session until the user quits.
-pub fn run(
+/// # Safety
+/// On the thread CLAP calls main (the program's main thread on Windows and
+/// macOS), trusting the CLAP plugins installed, whose code it runs in this
+/// process ([`crate::clap::host::PluginHost::create`]).
+pub unsafe fn run(
     path: Option<PathBuf>,
     config: StreamConfig,
     midi_start: MidiStart,
@@ -6215,8 +6278,7 @@ pub fn run(
     };
     app.lock = lock;
     app.input_device = input;
-    // SAFETY: the program's main thread; the plugins installed where CLAP
-    // says to look, which the project or the user asks to play.
+    // SAFETY: by the caller's promise.
     unsafe { app.scan_plugins() };
     let mut midi = MidiSession::new();
     let mut midi_out = MidiOutSession::new();
