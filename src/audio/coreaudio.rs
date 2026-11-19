@@ -853,12 +853,15 @@ where
         }
         let cleanup = |queue: AudioQueueRef| {
             // SAFETY: stopping synchronously guarantees no callback runs
-            // after AudioQueueStop returns, so `state` can be freed.
+            // after AudioQueueStop returns, so `state` can be freed. If the
+            // stop or dispose fails, a callback may still run: the state is
+            // leaked on purpose rather than freed under it.
             unsafe {
                 (*state).stopping.store(true, Ordering::Release);
-                AudioQueueStop(queue, 1);
-                AudioQueueDispose(queue, 1);
-                drop(Box::from_raw(state));
+                let stopped = AudioQueueStop(queue, 1) == 0;
+                if AudioQueueDispose(queue, 1) == 0 && stopped {
+                    drop(Box::from_raw(state));
+                }
             }
         };
         if let Some(uid) = &device {

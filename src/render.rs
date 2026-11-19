@@ -7,7 +7,38 @@ use crate::engine::transport::Transport;
 use crate::engine::{Command, Edit, Engine, MAX_PATTERNS, Shared};
 use crate::project::{Project, TrackData};
 use crate::sample::Sample;
+use std::path::Path;
 use std::sync::Arc;
+
+/// Checks that an export may write `out`: a `.wav`, `.mid` or `.midi` file
+/// that is neither the project at `project_path` nor a sample `project`
+/// plays, which writing it would destroy. The error follows the path, as
+/// in "song.tvo is the project itself".
+pub fn check_destination(project: &Project, project_path: Option<&Path>, out: &Path) -> Result<(), String> {
+    let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !["wav", "mid", "midi"].iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+        return Err("is not a .wav or .mid file".into());
+    }
+    let out = match std::fs::canonicalize(out) {
+        Ok(p) => p,
+        // Nothing at the name: a new file.
+        Err(_) if std::fs::symlink_metadata(out).is_err() => return Ok(()),
+        // Something that does not resolve, such as a link to a file gone,
+        // may still stand for a sample the editor holds.
+        Err(e) => return Err(format!("cannot be followed ({e}); choose another name")),
+    };
+    if out.is_dir() {
+        return Err("is a folder; choose a file name".into());
+    }
+    let same = |p: &Path| std::fs::canonicalize(p).is_ok_and(|p| p == out);
+    if project_path.is_some_and(same) {
+        return Err("is the project itself".into());
+    }
+    if project.tracks.iter().filter_map(|t| t.sample.as_deref()).any(|s| same(Path::new(s))) {
+        return Err("is a sample the project plays".into());
+    }
+    Ok(())
+}
 
 /// What a render plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +315,44 @@ mod tests {
     use super::*;
     use crate::engine::{Division, Step};
     use crate::instrument::InstrumentKind;
+
+    #[test]
+    fn an_export_writes_only_a_new_or_exported_file() {
+        let dir = std::env::temp_dir().join(format!("tinvo-dest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let song = dir.join("song.tvo");
+        let kick = dir.join("kick.wav");
+        let old = dir.join("old.wav");
+        for f in [&song, &kick, &old] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        p.tracks[0].sample = Some(kick.display().to_string());
+        let check = |out: &Path| check_destination(&p, Some(&song), out);
+        assert_eq!(check(&song), Err("is not a .wav or .mid file".into()));
+        assert_eq!(check(&dir.join("notes.txt")), Err("is not a .wav or .mid file".into()));
+        assert_eq!(check(&dir.join("x")), Err("is not a .wav or .mid file".into()));
+        assert_eq!(check(&dir.join("sub").join("..").join("kick.wav")), Err("is a sample the project plays".into()));
+        assert_eq!(check(&old), Ok(()), "an earlier export is written over");
+        assert_eq!(check(&dir.join("new.MID")), Ok(()));
+        assert_eq!(check(&dir.join("new.WAV")), Ok(()));
+        assert_eq!(check(&dir.join("new.midi")), Ok(()));
+        std::fs::create_dir(dir.join("folder.wav")).unwrap();
+        assert_eq!(check(&dir.join("folder.wav")), Err("is a folder; choose a file name".into()));
+        // A link to a file that is gone is not taken for a new file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.wav");
+            std::os::unix::fs::symlink(dir.join("gone.wav"), &link).unwrap();
+            assert!(check(&link).is_err_and(|e| e.starts_with("cannot be followed")));
+        }
+        // A project named like a WAV file is still the project.
+        let odd = dir.join("odd.wav");
+        std::fs::write(&odd, "x").unwrap();
+        assert_eq!(check_destination(&p, Some(&odd), &odd), Err("is the project itself".into()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn demo_renders_deterministically() {

@@ -1847,9 +1847,15 @@ impl Project {
     /// Loads every track's sample file. Returns one entry per track (`None`
     /// for tracks without a sample or whose file failed) and the errors.
     pub fn load_samples(&self) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
+        self.load_samples_within(crate::sample::PROJECT_FRAMES)
+    }
+
+    /// [`Project::load_samples`], holding at most `budget` frames together.
+    fn load_samples_within(&self, budget: usize) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
         let mut errors = Vec::new();
         // Tracks playing one file share it, read once.
         let mut loaded = std::collections::HashMap::new();
+        let mut left = budget;
         let samples = self
             .tracks
             .iter()
@@ -1858,7 +1864,10 @@ impl Project {
                 loaded
                     .entry(path)
                     .or_insert_with(|| {
-                        crate::sample::load(Path::new(path)).map(std::sync::Arc::new).map_err(|e| errors.push(e)).ok()
+                        let s = crate::sample::load_within(Path::new(path), left.min(crate::sample::MAX_FRAMES));
+                        let s = s.map_err(|e| errors.push(e)).ok()?;
+                        left -= s.frames();
+                        Some(std::sync::Arc::new(s))
                     })
                     .clone()
             })
@@ -3396,6 +3405,14 @@ pattern_division A 1/8
         assert!(std::sync::Arc::ptr_eq(a, b));
         assert!(samples[1].is_none() && samples[3].is_none());
         assert_eq!(errors.len(), 1, "a missing file is reported once: {errors:?}");
+        // A file shared counts once against the project's budget; one more
+        // that does not fit in what is left is refused.
+        let other = dir.join("other.wav");
+        crate::wav::write_file(&other, &[0.5; 64], 1, 48_000, crate::wav::SampleFormat::Float32).unwrap();
+        let text = format!("tinvo 4\n{}{}{}", track(&wav), track(&wav), track(&other));
+        let (samples, errors) = Project::from_text(&text).unwrap().load_samples_within(100);
+        assert!(samples[0].is_some() && samples[1].is_some() && samples[2].is_none());
+        assert!(errors[0].contains("other.wav") && errors[0].contains("36 frames left"), "{errors:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

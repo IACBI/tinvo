@@ -46,52 +46,52 @@ use Color::{
 };
 
 roles! {
-        Text "text" [Style::DEFAULT] [Style::DEFAULT] "ordinary text";
-        Dim "dim" [fg(Gray)] [fg(Gray)] "separators, column heads, empty steps";
-        Beat "beat" [fg(White)] [fg(Black)] "empty steps on a beat, beat numbers, information lines";
-        Title "title" [fg(BrightWhite).bold()] [fg(Black).bold()] "the title of a view";
+    Text "text" [Style::DEFAULT] [Style::DEFAULT] "ordinary text";
+    Dim "dim" [fg(Gray)] [fg(Gray)] "separators, column heads, empty steps";
+    Beat "beat" [fg(White)] [fg(Black)] "empty steps on a beat, beat numbers, information lines";
+    Title "title" [fg(BrightWhite).bold()] [fg(Black).bold()] "the title of a view";
     Header "header" [fg(BrightWhite).on(Blue)] [fg(Black).on(White)] "the top bar";
     HeaderPlay "header_play" [fg(BrightGreen).on(Blue).bold()] [fg(Blue).on(White).bold()] "PLAY in the top bar";
     Playhead "playhead" [fg(BrightGreen)] [fg(Blue)] "the marker above the playing step";
     PlayColumn "play_column" [bg(Blue)] [bg(BrightCyan)] "the playing step (background only)";
-        Cursor "cursor" [fg(Black).on(BrightWhite)] [fg(BrightWhite).on(Black)] "the cursor";
-        CursorIdle "cursor_idle" [fg(Black).on(Gray)] [fg(BrightWhite).on(Gray)] "the grid cursor while the panel has the keys";
+    Cursor "cursor" [fg(Black).on(BrightWhite)] [fg(BrightWhite).on(Black)] "the cursor";
+    CursorIdle "cursor_idle" [fg(Black).on(Gray)] [fg(BrightWhite).on(Gray)] "the grid cursor while the panel has the keys";
     CursorColumn "cursor_column" [bg(Black)] [bg(White)] "the cursor's step in the piano roll (background only)";
-        Selected "selected" [fg(BrightYellow)] [fg(Blue)] "the marker of the selected track or lane";
-        SelectedName "selected_name" [fg(BrightWhite).bold()] [fg(Black).bold()] "the name of the selected track or lane";
-        ParamSelected "param_selected" [fg(BrightWhite)] [fg(Blue).bold()] "the selected parameter while the grid has the keys";
-        Note "note" [fg(BrightMagenta)] [fg(Magenta)] "a step with one note";
+    Selected "selected" [fg(BrightYellow)] [fg(Blue)] "the marker of the selected track or lane";
+    SelectedName "selected_name" [fg(BrightWhite).bold()] [fg(Black).bold()] "the name of the selected track or lane";
+    ParamSelected "param_selected" [fg(BrightWhite)] [fg(Blue).bold()] "the selected parameter while the grid has the keys";
+    Note "note" [fg(BrightMagenta)] [fg(Magenta)] "a step with one note";
     Chord "chord" [fg(BrightGreen)] [fg(Red)] "a step with a chord";
     Drum "drum" [fg(BrightCyan)] [fg(Blue)] "a drum hit";
-    Chance "chance" [fg(Yellow)] [fg(Black)] "a step that plays by chance";
-        Held "held" [fg(Magenta)] [fg(BrightMagenta)] "a note still sounding, in the piano roll";
-        Muted "muted" [fg(Gray)] [fg(Gray)] "the steps of a muted track (foreground only)";
-        BlackKey "black_key" [fg(Black)] [fg(White)] "empty cells on black-key rows of the piano roll";
-        PitchCursor "pitch_cursor" [fg(BrightYellow).bold()] [fg(Blue).bold()] "the cursor's pitch in the piano roll";
-        PitchC "pitch_c" [fg(BrightWhite)] [fg(Black).bold()] "the C of each octave in the piano roll";
-        Point "point" [fg(BrightYellow).bold()] [fg(Blue).bold()] "an automation point";
-    Value "value" [fg(Yellow)] [fg(Gray)] "an automated value between points";
-    Entry "entry" [fg(BrightCyan)] [fg(Black)] "a song entry";
+    Chance "chance" [fg(Yellow)] [fg(Green)] "a step that plays by chance";
+    Held "held" [fg(Magenta)] [fg(BrightMagenta)] "a note still sounding, in the piano roll";
+    Muted "muted" [fg(Gray)] [fg(Gray)] "the steps of a muted track (foreground only)";
+    BlackKey "black_key" [fg(Black)] [fg(White)] "empty cells on black-key rows of the piano roll";
+    PitchCursor "pitch_cursor" [fg(BrightYellow).bold()] [fg(Blue).bold()] "the cursor's pitch in the piano roll";
+    PitchC "pitch_c" [fg(BrightWhite)] [fg(Black).bold()] "the C of each octave in the piano roll";
+    Point "point" [fg(BrightYellow).bold()] [fg(Blue).bold()] "an automation point";
+    Value "value" [fg(Yellow)] [fg(Green)] "an automated value between points";
+    Entry "entry" [fg(BrightCyan)] [fg(Green)] "a song entry";
     EntryLoop "entry_loop" [fg(BrightGreen)] [fg(Blue).bold()] "a song entry in the loop region";
     Marker "marker" [fg(BrightMagenta).bold()] [fg(Magenta).bold()] "a song marker and its name";
-        Warning "warning" [fg(Yellow)] [fg(Red)] "what to do when a view is empty";
-        Mute "mute" [fg(Black).on(Red)] [fg(BrightWhite).on(Red)] "M of a muted track";
-        Solo "solo" [fg(Black).on(Yellow)] [fg(Black).on(Yellow)] "S of a soloed track";
-        PanelFocus "panel_focus" [fg(BrightYellow).bold()] [fg(Blue).bold()] "the panel's title while it has the keys";
-        Panel "panel" [fg(White)] [fg(Black)] "the panel's title otherwise";
-        StatusBar "status_bar" [bg(Black)] [bg(White)] "the bottom line (background only)";
-        Prompt "prompt" [fg(BrightWhite).on(Black).bold()] [fg(Black).on(White).bold()] "a question or prompt on the bottom line";
-        Input "input" [fg(BrightWhite).on(Black)] [fg(Black).on(White)] "text being typed";
-        Message "message" [fg(BrightYellow).on(Black)] [fg(Blue).on(White).bold()] "news on the bottom line";
-        Hint "hint" [fg(Gray).on(Black)] [fg(Black).on(White)] "the key hints on the bottom line";
-        ListCursor "list_cursor" [fg(Black).on(BrightCyan)] [fg(Black).on(BrightCyan)] "the cursor in a list";
-        TabOn "tab_on" [fg(Black).on(BrightWhite).bold()] [fg(BrightWhite).on(Black).bold()] "the open page of the device list";
-        HelpKey "help_key" [fg(BrightYellow).bold()] [fg(Blue).bold()] "keys on the help screen";
-        AnswerKey "answer_key" [fg(BrightCyan).bold()] [fg(Blue).bold()] "the answers on the recovery screen";
+    Warning "warning" [fg(Yellow)] [fg(Red)] "what to do when a view is empty";
+    Mute "mute" [fg(Black).on(Red)] [fg(BrightWhite).on(Red)] "M of a muted track";
+    Solo "solo" [fg(Black).on(Yellow)] [fg(Black).on(Yellow)] "S of a soloed track";
+    PanelFocus "panel_focus" [fg(BrightYellow).bold()] [fg(Blue).bold()] "the panel's title while it has the keys";
+    Panel "panel" [fg(White)] [fg(Black)] "the panel's title otherwise";
+    StatusBar "status_bar" [bg(Black)] [bg(White)] "the bottom line (background only)";
+    Prompt "prompt" [fg(BrightWhite).on(Black).bold()] [fg(Black).on(White).bold()] "a question or prompt on the bottom line";
+    Input "input" [fg(BrightWhite).on(Black)] [fg(Black).on(White)] "text being typed";
+    Message "message" [fg(BrightYellow).on(Black)] [fg(Blue).on(White).bold()] "news on the bottom line";
+    Hint "hint" [fg(Gray).on(Black)] [fg(Black).on(White)] "the key hints on the bottom line";
+    ListCursor "list_cursor" [fg(Black).on(BrightCyan)] [fg(Black).on(BrightCyan)] "the cursor in a list";
+    TabOn "tab_on" [fg(Black).on(BrightWhite).bold()] [fg(BrightWhite).on(Black).bold()] "the open page of the device list";
+    HelpKey "help_key" [fg(BrightYellow).bold()] [fg(Blue).bold()] "keys on the help screen";
+    AnswerKey "answer_key" [fg(BrightCyan).bold()] [fg(Blue).bold()] "the answers on the recovery screen";
     MeterLow "meter_low" [fg(BrightGreen)] [fg(Blue)] "a level meter below -6 dBFS (foreground only)";
     MeterHigh "meter_high" [fg(BrightYellow)] [fg(Magenta)] "a level meter from -6 dBFS (foreground only)";
     MeterClip "meter_clip" [fg(BrightRed)] [fg(Red)] "a level meter at full scale (foreground only)";
-        MeterEmpty "meter_empty" [fg(Gray)] [fg(Gray)] "the empty part of a level meter (foreground only)";
+    MeterEmpty "meter_empty" [fg(Gray)] [fg(Gray)] "the empty part of a level meter (foreground only)";
 }
 
 impl Role {
@@ -231,6 +231,26 @@ pub fn style_name(s: Style) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roles_seen_side_by_side_differ_in_both_themes() {
+        // Each group is drawn in one view, where its roles must tell apart.
+        let groups: [&[Role]; 3] = [
+            &[Role::Dim, Role::Beat, Role::Note, Role::Chord, Role::Drum, Role::Chance],
+            &[Role::Dim, Role::Beat, Role::Point, Role::Value],
+            &[Role::Dim, Role::Entry, Role::EntryLoop, Role::Marker],
+        ];
+        for name in BUILT_IN {
+            let theme = Theme::built_in(name).unwrap();
+            for group in groups {
+                for (i, &a) in group.iter().enumerate() {
+                    for &b in &group[i + 1..] {
+                        assert_ne!(theme.get(a), theme.get(b), "{name}: {} and {}", a.id(), b.id());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn roles_are_named_once_and_themes_cover_them() {

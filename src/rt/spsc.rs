@@ -81,6 +81,13 @@ impl<T> Producer<T> {
     pub fn capacity(&self) -> usize {
         self.ring.mask + 1
     }
+
+    /// Places free now; the consumer may free more at any time.
+    pub fn free(&self) -> usize {
+        let r = &*self.ring;
+        let used = r.tail.0.load(Ordering::Relaxed).wrapping_sub(r.head.0.load(Ordering::Acquire));
+        self.capacity() - used
+    }
 }
 
 impl<T> Consumer<T> {

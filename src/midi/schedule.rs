@@ -34,7 +34,8 @@ pub enum OutEvent {
 }
 
 impl OutEvent {
-    /// A message of one to three bytes due on `frame`.
+    /// A message of one to three bytes due on `frame` that is not a note:
+    /// a note and its release go with their tag ([`OutEvent::tagged`]).
     pub fn message(frame: u64, msg: &[u8]) -> Self {
         Self::tagged(frame, msg, 0)
     }
@@ -99,10 +100,11 @@ pub struct Scheduler {
     /// How many times each key on each channel was started and not yet
     /// released: two tracks can play one key, and each release counts.
     sounding: Keys,
-    /// Starts dropped (late or refused) whose releases are still to come,
-    /// as (channel, key, tag): each skips its own release, so another note
-    /// on the key goes on sounding until its own.
-    skipped: Vec<(u8, u8, u32)>,
+    /// Starts sent and not yet released, as (channel, key, tag). A tagged
+    /// release goes only with one of them: the release of a start that was
+    /// dropped (late or refused), or that a reset already let go, is not
+    /// sent, so another note on the key goes on sounding until its own.
+    live: Vec<(u8, u8, u32)>,
     /// Releases (and a Stop) the output refused for longer than
     /// [`GIVE_UP`], or while everything was let go: tried again until it
     /// takes them, holding back the engine's messages for [`GIVE_UP`] after
@@ -123,7 +125,7 @@ impl Scheduler {
             timing: None,
             delay,
             sounding: [[0; 128]; 16],
-            skipped: Vec::new(),
+            live: Vec::new(),
             owed: [[0; 128]; 16],
             owe_stop: false,
             owed_since: None,
@@ -203,9 +205,8 @@ impl Scheduler {
             }
             let late = now.saturating_duration_since(due);
             if len == 0 {
-                // Releases of starts dropped before it are not coming: they
-                // may have been what was lost.
-                self.skipped.clear();
+                // Every note is let go: no release before it is sent.
+                self.live.clear();
                 // A reset the output refused part of stays first in line.
                 if !self.let_go(bytes[0] != 0, &mut send) {
                     if late <= GIVE_UP {
@@ -225,18 +226,20 @@ impl Scheduler {
                     if late <= LATE && send(msg) {
                         let n = &mut self.sounding[channel][key];
                         *n = n.saturating_add(1);
-                    } else {
-                        self.skipped.push((channel as u8, key as u8, tag));
+                        if tag != 0 {
+                            self.live.push((channel as u8, key as u8, tag));
+                        }
                     }
                     true
                 }
-                // A release of a note never sent is not sent either.
-                0x80 | 0x90 if self.skip(channel as u8, key as u8, tag) => true,
+                // A release of a note not sounding is not sent.
+                0x80 | 0x90 if tag != 0 && self.live_at(channel, key, tag).is_none() => true,
                 0x80 | 0x90 if self.sounding[channel][key] == 0 => true,
                 0x80 | 0x90 => {
                     let ok = send(msg);
                     if ok {
                         self.sounding[channel][key] -= 1;
+                        self.forget(channel, key, tag);
                     }
                     ok
                 }
@@ -263,6 +266,7 @@ impl Scheduler {
                 match status & 0xF0 {
                     0x80 | 0x90 => {
                         self.sounding[channel][key] -= 1;
+                        self.forget(channel, key, tag);
                         self.owed[channel][key] = self.owed[channel][key].saturating_add(1);
                         self.owed_since.get_or_insert(now);
                     }
@@ -279,11 +283,16 @@ impl Scheduler {
         self.pending.drain(..taken);
     }
 
-    /// Whether the release of `tag` on `channel` and `key` goes with a start
-    /// that was dropped: then it is forgotten, and skipped.
-    fn skip(&mut self, channel: u8, key: u8, tag: u32) -> bool {
-        let found = self.skipped.iter().position(|&s| s == (channel, key, tag));
-        found.map(|i| self.skipped.swap_remove(i)).is_some()
+    /// Where the start that `tag` releases on `channel` and `key` is among
+    /// those sounding.
+    fn live_at(&self, channel: usize, key: usize, tag: u32) -> Option<usize> {
+        self.live.iter().position(|&l| l == (channel as u8, key as u8, tag))
+    }
+
+    fn forget(&mut self, channel: usize, key: usize, tag: u32) {
+        if let Some(i) = self.live_at(channel, key, tag) {
+            self.live.swap_remove(i);
+        }
     }
 
     /// Sends a release for every note still sounding and, while the clock
@@ -314,7 +323,6 @@ impl Scheduler {
     pub fn release_all(&mut self, now: Instant, mut send: impl FnMut(&[u8]) -> bool) {
         let running = self.running;
         self.owe(now, running);
-        self.skipped.clear();
         self.pending.clear();
         self.timing = None;
         self.settle(now, &mut send);
@@ -327,6 +335,7 @@ impl Scheduler {
             *owed = owed.saturating_add(*sounding);
         }
         self.sounding = [[0; 128]; 16];
+        self.live.clear();
         if stop {
             self.owe_stop = true;
             self.running = false;
@@ -527,7 +536,26 @@ mod tests {
         s.push(OutEvent::tagged(4800, &[0x80, 60, 0], 2));
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(100)), [vec![0x80, 60, 0]], "A ends on time");
         assert!(sent(&mut s, t0 + Duration::from_millis(200)).is_empty(), "B never started");
-        assert!(s.skipped.is_empty());
+        assert!(s.live.is_empty());
+    }
+
+    #[test]
+    fn a_release_after_a_reset_does_not_end_a_newer_note_on_its_key() {
+        let mut s = Scheduler::new(Duration::ZERO);
+        let t0 = s.t0;
+        s.push(anchor(t0, 0, 0));
+        s.push(OutEvent::tagged(0, &[0x90, 60, 100], 1));
+        s.push(OutEvent::Reset { frame: 480, running: false });
+        s.push(OutEvent::tagged(960, &[0x90, 60, 90], 2));
+        s.push(OutEvent::tagged(1440, &[0x80, 60, 0], 1));
+        s.push(OutEvent::tagged(4800, &[0x80, 60, 0], 2));
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(sent(&mut s, at(11)), [vec![0x90, 60, 100]]);
+        assert_eq!(sent(&mut s, at(21)), [vec![0x80, 60, 0]], "the reset lets A go");
+        assert_eq!(sent(&mut s, at(31)), [vec![0x90, 60, 90]]);
+        assert!(sent(&mut s, at(41)).is_empty(), "A's own release would end B");
+        assert_eq!(sent(&mut s, at(111)), [vec![0x80, 60, 0]], "B ends on its own release");
+        assert!(s.live.is_empty());
     }
 
     #[test]
@@ -679,13 +707,13 @@ mod tests {
         let mut s = Scheduler::new(Duration::ZERO);
         let t0 = s.t0;
         s.push(anchor(t0, 0, 0));
-        s.push(OutEvent::message(0, &[0x90, 60, 100]));
+        s.push(OutEvent::tagged(0, &[0x90, 60, 100], 1));
         sent(&mut s, t0 + Duration::from_millis(11));
         // A second C4, dropped as late, and its release.
-        s.push(OutEvent::message(480, &[0x90, 60, 90]));
-        s.push(OutEvent::message(480, &[0x80, 60, 0]));
+        s.push(OutEvent::tagged(480, &[0x90, 60, 90], 2));
+        s.push(OutEvent::tagged(480, &[0x80, 60, 0], 2));
         assert!(sent(&mut s, t0 + Duration::from_millis(100)).is_empty());
-        s.push(OutEvent::message(4800, &[0x80, 60, 0]));
+        s.push(OutEvent::tagged(4800, &[0x80, 60, 0], 1));
         assert_eq!(sent(&mut s, t0 + Duration::from_millis(111)), [vec![0x80, 60, 0]], "the first ends on its own");
     }
 

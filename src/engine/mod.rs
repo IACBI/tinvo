@@ -658,6 +658,9 @@ pub enum Command {
 
 /// Capacity of the queue that hands recorded notes to the UI thread.
 pub const TAKE_QUEUE: usize = 1024;
+/// The share of the take queue's places (one in this many) only layout
+/// reports may take: 64 of [`TAKE_QUEUE`].
+const LAYOUT_SHARE: usize = 16;
 
 /// What the engine reports while it records ([`Command::RecordNotes`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -906,6 +909,9 @@ pub struct Shared {
     pub count_in: AtomicU32,
     /// Take events lost to a full take queue.
     pub takes_lost: AtomicU32,
+    /// Of those, reports that the tracks were inserted or removed: without
+    /// them the take cannot tell which track a later note is on.
+    pub layouts_lost: AtomicU32,
     /// [`Command::RecordNotes`] commands handled. Every take event the
     /// engine pushed before handling one is in the queue once this counts
     /// it, so the UI knows when a take is complete.
@@ -934,6 +940,7 @@ impl Shared {
             load: AtomicF32::new(0.0),
             count_in: AtomicU32::new(0),
             takes_lost: AtomicU32::new(0),
+            layouts_lost: AtomicU32::new(0),
             record_commands: AtomicU32::new(0),
         }
     }
@@ -1669,18 +1676,15 @@ impl Engine {
         self.compensation = total;
     }
 
-    /// Frames until the paths' delays may change next: a chain change
-    /// falling due, or, while there is a delay to change, a group with no
-    /// track resting.
+    /// Frames until the paths may change next: a chain change falling due,
+    /// or a group with no track resting (its delay, and what it feeds the
+    /// buses, stop on that frame at any buffer size).
     fn next_chain_change(&self) -> Option<usize> {
         let gn = self.group_count;
         let tracks = self.tracks[..self.track_count].iter().map(|t| &t.chain);
         let groups = self.groups.iter().enumerate().filter(|&(i, g)| i < gn || (i >= MAX_GROUPS && g.is_live()));
         let all = tracks.chain(groups.map(|(_, g)| &g.chain)).chain(std::iter::once(&self.master_chain));
         let change = all.filter_map(Chain::frames_to_change).filter(|&k| k > 0).min();
-        if self.compensation == 0 {
-            return change;
-        }
         let rest = self.groups.iter().filter(|g| !g.tracked).filter_map(Group::frames_to_rest).min();
         change.into_iter().chain(rest).min()
     }
@@ -2040,8 +2044,15 @@ impl Engine {
 
     fn push_take(&mut self, take: Take) {
         if let Some(q) = self.takes.as_mut() {
-            if q.push(take).is_err() {
+            // A lost layout report would move every later note of the take
+            // to another track, so the last places are kept for them.
+            let layout = matches!(take, Take::Layout);
+            let room = layout || q.free() > q.capacity() / LAYOUT_SHARE;
+            if !room || q.push(take).is_err() {
                 self.shared.takes_lost.fetch_add(1, Ordering::Relaxed);
+                if layout {
+                    self.shared.layouts_lost.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -2730,11 +2741,7 @@ impl Engine {
                 } else {
                     let pending = self.pending_position();
                     self.transport.set_tempo(self.tempo, self.sample_rate, self.now, pending);
-                    self.tempo_now = self.tempo;
-                    self.mix.set_tempo(self.tempo);
-                    for t in &mut self.tracks {
-                        t.instrument.set_tempo(self.tempo);
-                    }
+                    self.set_tempo_now(self.tempo);
                 }
             }
             Edit::SetPatternLength { pattern, len } => {
@@ -4236,6 +4243,72 @@ mod tests {
             }
             assert_eq!(got, reference, "buffer size {size}");
         }
+    }
+
+    #[test]
+    fn a_tempo_edit_reaches_every_chain_s_delay() {
+        let mut e = engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::InsertGroup(0),
+            set_slot(ChainId::Track(0), 0, EffectKind::Delay),
+            set_slot(ChainId::Group(0), 0, EffectKind::Delay),
+            set_slot(ChainId::Master, 0, EffectKind::Delay),
+        ]);
+        e.apply(Edit::SetTempo(90.0));
+        let t = |c: &mut Chain| c.slot_mut(0).unwrap().tempo();
+        assert_eq!([t(&mut e.tracks[0].chain), t(&mut e.groups[0].chain), t(&mut e.master_chain)], [90.0; 3]);
+    }
+
+    #[test]
+    fn a_group_resting_stops_feeding_its_buses_on_the_same_frame_at_any_buffer_size() {
+        let edits = [
+            Edit::AddTrack(InstrumentKind::Snare),
+            Edit::SetStep { track: 0, pattern: 0, step: 0, value: step(60) },
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+            Edit::SetGroupParam { group: 0, index: group_index("send_chorus"), value: 0.0 },
+        ];
+        let go = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = run_in(&mut e, 4800, size);
+            e.apply(Edit::SetTrackGroup { track: 0, group: None });
+            out.extend(run_in(&mut e, 120_000, size));
+            assert!(!e.groups[0].is_live());
+            // Back in the group: the chorus goes on from where it rested.
+            e.apply(Edit::SetTrackGroup { track: 0, group: Some(0) });
+            out.extend(run_in(&mut e, 96_000, size));
+            out
+        };
+        let one = go(1);
+        for size in [64, 4096] {
+            let got = go(size);
+            let first = got.iter().zip(&one).position(|(a, b)| a != b);
+            assert!(first.is_none(), "buffer size {size}: first differs at frame {:?}", first.map(|i| i / 2));
+        }
+    }
+
+    #[test]
+    fn layout_reports_keep_their_room_in_a_full_take_queue() {
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        let (tx, mut rx) = spsc::channel(128);
+        e.attach_takes(tx);
+        for _ in 0..200 {
+            e.push_take(Take::Passed { track: 0, pattern: 0, step: 0 });
+        }
+        e.push_take(Take::Layout);
+        let mut got = Vec::new();
+        while let Some(t) = rx.pop() {
+            got.push(t);
+        }
+        assert_eq!(got.len(), 128 - 128 / LAYOUT_SHARE + 1);
+        assert!(matches!(got.last(), Some(Take::Layout)));
+        assert_eq!(e.shared.layouts_lost.load(Ordering::Relaxed), 0);
+        // Only a full queue loses one (here the 72 past its 128), and says so.
+        for _ in 0..200 {
+            e.push_take(Take::Layout);
+        }
+        assert_eq!(e.shared.layouts_lost.load(Ordering::Relaxed), 200 - 128);
     }
 
     #[test]

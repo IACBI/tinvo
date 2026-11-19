@@ -159,14 +159,14 @@ actions! {
     PitchUp "pitch_up" Step [c('.')] "pitch up a semitone";
     OctaveDown "octave_down" Step [c('<')] "pitch down an octave";
     OctaveUp "octave_up" Step [c('>')] "pitch up an octave";
-    Chord "chord" Step [c('c')] "cycle the chord: maj, min, 7, m7, maj7, sus4 (green in the grid)";
+    Chord "chord" Step [c('c')] "cycle the chord: maj, min, 7, m7, maj7, sus4 (a colour of its own in the grid)";
     Earlier "earlier" Step [c('(')] "move the step earlier (1/24 step, up to half a step)";
     Later "later" Step [c(')')] "move the step later";
     VelocityDown "velocity_down" Step [c('[')] "velocity down";
     VelocityUp "velocity_up" Step [c(']')] "velocity up";
     Shorter "shorter" Step [c('{')] "length down";
     Longer "longer" Step [c('}')] "length up";
-    ChanceDown "chance_down" Step [c('-')] "chance down (yellow: below 100 %)";
+    ChanceDown "chance_down" Step [c('-')] "chance down (below 100 %, a colour of its own in the grid)";
     ChanceUp "chance_up" Step [c('=')] "chance up";
     Ratchet "ratchet" Step [c('/')] "ratchet: 1-8 hits per step";
     RollOctaveUp "roll_octave_up" Roll [PageUp] "cursor pitch up an octave";

@@ -57,6 +57,10 @@ pub enum Decoded {
     Key(Key, usize),
     /// A mouse event, and how many bytes it used.
     Mouse(Mouse, usize),
+    /// The start of a bracketed paste, and how many bytes the marker used.
+    PasteStart(usize),
+    /// The end of a bracketed paste, and how many bytes the marker used.
+    PasteEnd(usize),
     /// The buffer holds the beginning of a sequence; more bytes are needed.
     Incomplete,
     /// Unrecognised bytes to discard.
@@ -70,7 +74,10 @@ pub fn decode(b: &[u8]) -> Decoded {
             None => Decoded::Incomplete,
             Some(b'[') => csi(b),
             Some(b'O') => ss3(b),
-            // ESC followed by something else: a lone Escape press.
+            // ESC before a character is Alt with it, which TINVO does not
+            // use: dropped whole, so the character is not taken as a key.
+            Some(0x20..=0x7e | 0x80..) => Decoded::Skip(2),
+            // ESC before another control: a lone Escape press.
             Some(_) => Decoded::Key(Key::Esc, 1),
         },
         b'\r' | b'\n' => Decoded::Key(Key::Enter, 1),
@@ -150,6 +157,15 @@ fn csi(b: &[u8]) -> Decoded {
             None => Decoded::Skip(6),
         };
     }
+    // The Linux console's F1 to F5: ESC [ [ and A to E. The second `[`
+    // would otherwise end the sequence and leave the letter as a key.
+    if b.get(2) == Some(&b'[') {
+        return match b.get(3) {
+            None => Decoded::Incomplete,
+            Some(&c @ b'A'..=b'E') => Decoded::Key(Key::F(c - b'A' + 1), 4),
+            Some(_) => Decoded::Skip(4),
+        };
+    }
     // ESC [ params final, where final is in 0x40..=0x7e.
     let Some(end) = b.iter().skip(2).position(|c| (0x40..=0x7e).contains(c)).map(|p| p + 2) else {
         return if b.len() >= MAX_SEQ { Decoded::Skip(b.len()) } else { Decoded::Incomplete };
@@ -157,9 +173,9 @@ fn csi(b: &[u8]) -> Decoded {
     let params = std::str::from_utf8(&b[2..end]).unwrap_or("");
     // SGR mouse encoding: ESC [ < button ; column ; row, then M or m.
     if let (Some(sgr), b'M' | b'm') = (params.strip_prefix('<'), b[end]) {
-        let n: Vec<u32> = sgr.split(';').map_while(|p| p.parse().ok()).collect();
-        return match n[..] {
-            [cb, x, y] => match mouse(cb, x, y, b[end] == b'm') {
+        let n: Option<Vec<u32>> = sgr.split(';').map(|p| p.parse().ok()).collect();
+        return match n.as_deref().unwrap_or_default() {
+            &[cb, x, y] => match mouse(cb, x, y, b[end] == b'm') {
                 Some(m) => Decoded::Mouse(m, end + 1),
                 None => Decoded::Skip(end + 1),
             },
@@ -167,6 +183,11 @@ fn csi(b: &[u8]) -> Decoded {
         };
     }
     let first: u32 = params.split(';').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    match (b[end], first) {
+        (b'~', 200) => return Decoded::PasteStart(end + 1),
+        (b'~', 201) => return Decoded::PasteEnd(end + 1),
+        _ => {}
+    }
     let key = match b[end] {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
@@ -248,6 +269,18 @@ mod tests {
         assert_eq!(key(b"\x1b[15~"), Key::F(5));
         assert_eq!(key(b"\x1b[24~"), Key::F(12));
         assert_eq!(key(b"\x1b[1;5C"), Key::Right);
+        // The Linux console's function keys.
+        assert_eq!(key(b"\x1b[[A"), Key::F(1));
+        assert_eq!(key(b"\x1b[[E"), Key::F(5));
+        assert_eq!(decode(b"\x1b[["), Decoded::Incomplete);
+        assert_eq!(decode(b"\x1b[[Zq"), Decoded::Skip(4));
+    }
+
+    #[test]
+    fn paste_markers() {
+        assert_eq!(decode(b"\x1b[200~ab"), Decoded::PasteStart(6));
+        assert_eq!(decode(b"\x1b[201~"), Decoded::PasteEnd(6));
+        assert_eq!(decode(b"\x1b[202~"), Decoded::Skip(6));
     }
 
     fn mouse_event(b: &[u8]) -> Mouse {
@@ -280,7 +313,15 @@ mod tests {
         assert_eq!(decode(b"\x1b[<0;2;3Mq"), Decoded::Mouse(at(Press(Button::Left), 1, 2), 9));
         assert_eq!(decode(b"\x1b[<0;2"), Decoded::Incomplete);
         // Motion without a button, extra buttons, and malformed reports are dropped.
-        for bad in [&b"\x1b[<35;2;2M"[..], b"\x1b[<128;2;2M", b"\x1b[<0;0;2M", b"\x1b[<0;2M", b"\x1b[<0;2;2;2M"] {
+        for bad in [
+            &b"\x1b[<35;2;2M"[..],
+            b"\x1b[<128;2;2M",
+            b"\x1b[<0;0;2M",
+            b"\x1b[<0;2M",
+            b"\x1b[<0;2;2;2M",
+            b"\x1b[<0;2;2;M",
+            b"\x1b[<0;2;-2M",
+        ] {
             assert_eq!(decode(bad), Decoded::Skip(bad.len()), "{bad:?}");
         }
     }
@@ -304,7 +345,11 @@ mod tests {
         assert_eq!(decode(b"\x1b["), Decoded::Incomplete);
         assert_eq!(decode(b"\x1b[1;5"), Decoded::Incomplete);
         assert_eq!(decode(&"é".as_bytes()[..1]), Decoded::Incomplete);
-        assert_eq!(decode(b"\x1bx"), Decoded::Key(Key::Esc, 1));
+        // Alt with a key, as ESC before it, is dropped whole.
+        assert_eq!(decode(b"\x1bx"), Decoded::Skip(2));
+        assert_eq!(decode("\x1bü".as_bytes()), Decoded::Skip(2));
+        assert_eq!(decode(b"\x1b\x1b"), Decoded::Key(Key::Esc, 1));
+        assert_eq!(decode(b"\x1b\r"), Decoded::Key(Key::Esc, 1));
         assert_eq!(decode(b"\x1b[99~"), Decoded::Skip(5));
         assert_eq!(decode(b"\xff"), Decoded::Skip(1));
         assert_eq!(decode(b"\x1d"), Decoded::Skip(1));

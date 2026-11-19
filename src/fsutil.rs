@@ -72,12 +72,78 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Reads at most `max` bytes from `path`. A longer file is an error once
-/// `max + 1` bytes are read, so a huge file, or one that never ends (a
-/// FIFO, a device), cannot take all memory.
+/// The `O_NONBLOCK` flag of each platform's <fcntl.h>, where it is known;
+/// elsewhere a named pipe opens waiting for a writer.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+const NONBLOCK: Option<i32> = Some(0x0004);
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    )
+))]
+const NONBLOCK: Option<i32> = Some(0o4000);
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
+        )
+    )
+)))]
+#[cfg_attr(not(unix), allow(dead_code))]
+const NONBLOCK: Option<i32> = None;
+
+/// Whether [`open_without_waiting`] opens a named pipe without waiting on
+/// this platform.
+#[cfg(test)]
+pub const OPENS_WITHOUT_WAITING: bool = NONBLOCK.is_some();
+
+/// Opens `path` for reading without waiting for a writer, were it a named
+/// pipe (`O_NONBLOCK`, which reading a plain file ignores). Callers check
+/// what was opened, since the name may have changed since they last looked.
+pub fn open_without_waiting(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    if let Some(flag) = NONBLOCK {
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, flag);
+    }
+    options.open(path)
+}
+
+/// Reads at most `max` bytes from the plain file `path`. A longer file is
+/// an error once `max + 1` bytes are read, so a huge file cannot take all
+/// memory; anything else (a folder, a FIFO, a device) is refused, opened
+/// without waiting for it where the platform allows.
 pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut file = open_without_waiting(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
     let mut bytes = Vec::new();
-    File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    Read::by_ref(&mut file).take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         let size = if max >= 1 << 20 { format!("{} MiB", max >> 20) } else { format!("{max} bytes") };
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("larger than {size}")));
@@ -85,9 +151,8 @@ pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Reads `path` as UTF-8 text of at most `max` bytes. A longer file is an
-/// error once `max + 1` bytes are read, so a huge file, or one that never
-/// ends (a FIFO, a device), cannot take all memory.
+/// Reads the plain file `path` as UTF-8 text of at most `max` bytes, as
+/// [`read_bytes`] does.
 pub fn read_text(path: &Path, max: u64) -> io::Result<String> {
     String::from_utf8(read_bytes(path, max)?).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8 text"))
 }
@@ -108,6 +173,21 @@ mod tests {
         std::fs::write(&path, [0xff, b'a']).unwrap();
         assert_eq!(read_text(&path, 4).unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(read_text(&dir.join("none"), 4).unwrap_err().kind(), io::ErrorKind::NotFound);
+        // Only a plain file is read; a pipe opens without waiting for a
+        // writer, where the platform allows. (Windows refuses to open a
+        // folder at all.)
+        assert!(read_text(&dir, 4).is_err());
+        #[cfg(unix)]
+        assert_eq!(read_text(&dir, 4).unwrap_err().to_string(), "not a file");
+        #[cfg(windows)]
+        assert!(read_text(Path::new("NUL"), 4).is_err(), "a device");
+        #[cfg(unix)]
+        if OPENS_WITHOUT_WAITING {
+            let fifo = dir.join("pipe");
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            assert!(!open_without_waiting(&fifo).unwrap().metadata().unwrap().is_file());
+            assert_eq!(read_text(&fifo, 4).unwrap_err().to_string(), "not a file");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

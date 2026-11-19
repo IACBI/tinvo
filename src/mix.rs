@@ -133,7 +133,10 @@ pub struct Mix {
     returns: [Smoother; send::BUSES],
     /// Interleaved stereo send sums for the current block, per bus.
     inputs: [Vec<f32>; send::BUSES],
+    /// The buses fed in the current segment.
     fed: [bool; send::BUSES],
+    /// The buses fed anywhere in the current block, whose sums need clearing.
+    dirty: [bool; send::BUSES],
     wet: Vec<f32>,
     sample_rate: f32,
 }
@@ -151,6 +154,7 @@ impl Mix {
             returns: [Smoother::new(0.0, LEVEL_SMOOTHING, sample_rate); send::BUSES],
             inputs: std::array::from_fn(|_| vec![0.0; 2 * frames]),
             fed: [false; send::BUSES],
+            dirty: [false; send::BUSES],
             wet: vec![0.0; 2 * frames],
             sample_rate,
         };
@@ -215,58 +219,80 @@ impl Mix {
     /// Clears the send sums before a block. A fed sum is cleared whole, not
     /// just this block's length: a longer block later reads past it.
     pub fn begin(&mut self) {
-        for (input, fed) in self.inputs.iter_mut().zip(&mut self.fed) {
-            if *fed {
+        for (input, dirty) in self.inputs.iter_mut().zip(&mut self.dirty) {
+            if std::mem::take(dirty) {
                 input.fill(0.0);
-                *fed = false;
             }
         }
+        self.fed = [false; send::BUSES];
     }
 
     /// The send sum of `bus` for the current block, to add a track's send
     /// into. Taking it marks the bus as fed.
     pub fn input(&mut self, bus: usize) -> &mut [f32] {
         self.fed[bus] = true;
+        self.dirty[bus] = true;
         &mut self.inputs[bus]
     }
 
     /// All send sums at once; the buses flagged in `used` are marked fed.
     pub fn inputs(&mut self, used: [bool; send::BUSES]) -> [&mut [f32]; send::BUSES] {
-        for (fed, u) in self.fed.iter_mut().zip(used) {
+        for ((fed, dirty), u) in self.fed.iter_mut().zip(&mut self.dirty).zip(used) {
             *fed |= u;
+            *dirty |= u;
         }
         let [delay, reverb, chorus] = &mut self.inputs;
         [delay.as_mut_slice(), reverb.as_mut_slice(), chorus.as_mut_slice()]
     }
 
     /// Adds the returns to the mix for the frames of the block from frame
-    /// `from`, as many as `mix_l` holds.
+    /// `from`, as many as `mix_l` holds, and ends the segment: a bus fed
+    /// only before it is unfed after it.
+    ///
+    /// Fed or not decides whether a bus runs past idle, which moves the
+    /// chorus's LFO, so it is kept per segment to be the same at any buffer
+    /// size.
     pub fn add_returns(&mut self, mix_l: &mut [f32], mix_r: &mut [f32], from: usize) {
         let frames = mix_l.len();
         for bus in 0..send::BUSES {
-            let idle = match bus {
-                send::DELAY => self.echo.is_idle(),
-                send::REVERB => self.reverb.is_idle(),
-                _ => self.chorus.is_idle(),
-            };
-            if !self.fed[bus] && idle {
-                continue;
-            }
-            let input = &self.inputs[bus][2 * from..2 * (from + frames)];
-            let wet = &mut self.wet[..2 * frames];
-            wet.fill(0.0);
-            match bus {
-                send::DELAY => self.echo.process(input, wet),
-                send::REVERB => self.reverb.process(input, wet),
-                _ => self.chorus.process(input, wet),
-            }
-            let ret = &mut self.returns[bus];
-            for (i, f) in wet.chunks_exact(2).enumerate() {
-                let g = ret.tick();
-                mix_l[i] += f[0] * g;
-                mix_r[i] += f[1] * g;
+            let mut done = 0;
+            while done < frames {
+                // Unfed, a bus runs until it is idle, to the frame, so it
+                // stops on the same frame however the block is split. A
+                // repeat fed back on the way puts that frame further off,
+                // so it is asked again after each run.
+                let n = if self.fed[bus] {
+                    frames - done
+                } else {
+                    let left = match bus {
+                        send::DELAY => self.echo.frames_to_idle(),
+                        send::REVERB => self.reverb.frames_to_idle(),
+                        _ => self.chorus.frames_to_idle(),
+                    };
+                    if left == 0 {
+                        break;
+                    }
+                    left.min(frames - done)
+                };
+                let at = from + done;
+                let input = &self.inputs[bus][2 * at..2 * (at + n)];
+                let wet = &mut self.wet[..2 * n];
+                wet.fill(0.0);
+                match bus {
+                    send::DELAY => self.echo.process(input, wet),
+                    send::REVERB => self.reverb.process(input, wet),
+                    _ => self.chorus.process(input, wet),
+                }
+                let ret = &mut self.returns[bus];
+                for (i, f) in wet.chunks_exact(2).enumerate() {
+                    let g = ret.tick();
+                    mix_l[done + i] += f[0] * g;
+                    mix_r[done + i] += f[1] * g;
+                }
+                done += n;
             }
         }
+        self.fed = [false; send::BUSES];
     }
 
     /// Whether the delay, reverb and chorus hold nothing more to play.
@@ -342,6 +368,73 @@ mod tests {
             m.begin();
             m.add_returns(&mut l[..n], &mut r[..n], 0);
             assert!(m.inputs[send::DELAY].iter().all(|&v| v == 0.0), "after a block of {n}");
+        }
+    }
+
+    #[test]
+    fn an_unfed_chorus_stops_on_the_frame_it_goes_idle() {
+        // Fed for 1000 frames (sound for the first 500), unfed for 3000, then
+        // fed again: the chorus goes idle inside an unfed block, and its sweep
+        // must stop there for the last part to sound the same at any size.
+        let sound = |i: usize| ((i * 7919) % 101) as f32 / 101.0 - 0.5;
+        let go = |n: usize| {
+            let mut m = Mix::new(48_000.0, 120.0, 1000);
+            m.set_param(mp::CHORUS_RETURN, 0.0);
+            m.set_param(mp::CHORUS_DEPTH, 0.004);
+            m.snap();
+            let mut out = vec![0.0f32; 2 * 6000];
+            for start in (0..6000).step_by(n) {
+                m.begin();
+                if !(1000..4000).contains(&start) {
+                    let input = m.input(send::CHORUS);
+                    for f in 0..n {
+                        let v = if start + f < 500 || start + f >= 4000 { sound(start + f) } else { 0.0 };
+                        input[2 * f..2 * f + 2].fill(v);
+                    }
+                }
+                let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+                m.add_returns(&mut l, &mut r, 0);
+                for f in 0..n {
+                    out[2 * (start + f)..2 * (start + f) + 2].copy_from_slice(&[l[f], r[f]]);
+                }
+            }
+            out
+        };
+        let one = go(1);
+        assert!(one[2 * 4000..].iter().any(|&v| v != 0.0));
+        for n in [8, 1000] {
+            assert!(go(n) == one, "blocks of {n}");
+        }
+    }
+
+    #[test]
+    fn an_unfed_delay_plays_every_repeat_at_any_size() {
+        // The longest delay, a half note at the slowest tempo, fills the
+        // delay's memory: each repeat comes back two frames before the delay
+        // would be idle, inside a block, and must keep it running from there.
+        let go = |n: usize| {
+            let mut m = Mix::new(16_000.0, crate::engine::MIN_TEMPO, 256);
+            m.set_param(mp::DELAY_TIME, 10.0);
+            m.set_param(mp::DELAY_RETURN, 0.0);
+            m.set_param(mp::DELAY_FEEDBACK, 0.7);
+            m.snap();
+            let mut out = Vec::new();
+            for start in (0..3 * 96_000 + 1024).step_by(n) {
+                m.begin();
+                if start == 0 {
+                    m.input(send::DELAY)[..2].fill(1.0);
+                }
+                let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+                m.add_returns(&mut l, &mut r, 0);
+                out.extend(l.iter().zip(&r).flat_map(|(a, b)| [*a, *b]));
+            }
+            out
+        };
+        let one = go(1);
+        let heard = one.chunks(2).filter(|f| f[0].abs() > 1e-3).count();
+        assert!(heard >= 3, "{heard} frames of repeats");
+        for n in [64, 256] {
+            assert!(go(n) == one, "blocks of {n}");
         }
     }
 }

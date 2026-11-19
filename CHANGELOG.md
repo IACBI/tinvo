@@ -26,6 +26,67 @@ Author: 𝓐.𝓒.𝓑
 - An insert's mix at 100 % gives the effect's output exactly.
 - The chorus, delay and reverb step through their delay lines without a division per sample, so they cost less, with the same output to the bit.
 - A reverb that has gone quiet forgets its tail without clearing its memory, so many going quiet together cost nothing.
+- Prompts edit at a cursor: `←` `→` (outside the export prompt), Home, End and Delete; they take up to 4096 bytes, as long as a sample's path, and say so at the limit. `Ctrl+C` leaves a prompt as `Esc` does.
+- On Linux and macOS, pasted text arrives in one piece (bracketed paste): it goes into an open prompt without its line breaks and other control characters, and does nothing elsewhere, so a paste never submits a prompt or runs keys. A prompt that is full says so on its line, and a paste cut at 8192 bytes says so too.
+- The parameter panel takes at most half the screen below the top bar and pages through its parameters, so the grid, the song and the automation lanes keep their rows on a small screen. The automation view scrolls to the selected lane.
+- The top bar's audio, loudness and CPU readouts shorten, then go, when the controls need the room; they never cover a control.
+- The bottom line shows whole key hints, always ending with the key list's.
+- The key list wraps its descriptions, and the settings page shows the selected entry's in full below its list.
+- Names are cut and padded by the columns they take, so a name in wide characters keeps the grid's columns; an accent written as its own character stays on its letter.
+- In the light theme, chance steps, song entries and automated values have colours of their own; the key list no longer names the default theme's colours.
+- Command-line usage errors are one line; `tinvo devices`, `midi`, `inputs` and `probe` refuse arguments they do not take, and `render` refuses two of `--song`, `--region` and `--pattern`.
+- Once neither input nor the screen has changed for two seconds, the editor draws every 50 ms instead of every 16 ms.
+- The chorus pulls its sweep back to full size every 256 frames rather than once per audio block, so the sweep is the same at any buffer size.
+- In the prompts, the cursor steps over a letter together with an accent written after it, and `Del` takes both.
+- An undo or redo that would bring back more sample audio than a project may hold, after a file was loaded again longer, is refused.
+
+### Fixed
+- An export could write over the project itself (`song.tvo` typed as the file) or over a sample the project plays; it now writes only `.wav`, `.mid` and `.midi` files and refuses those two, and a folder.
+- The editor exported a WAV file with a sampler track silent when its sample was missing; it now says which sample to load again. A MIDI file is still written.
+- In the export prompt, choosing the loop region with no loop set showed pattern A and then stuck there; only the sources there are can be chosen.
+- In step entry, a chord whose keys were pressed on two steps (the cursor moved between them) was undone as one change that left the second step changed.
+- A recording that stopped by itself while a prompt was open moved the selection, so the prompt changed another track.
+- A partial escape sequence that came too slowly ran its last bytes as keys (`ESC [` made `[` lower a velocity); it is dropped whole. Alt with a key, sent as ESC and the key, no longer runs the key, and the Linux console's F1 to F5 are read.
+- A click in the same batch of input as a key or a resize acted on what the screen showed before them; it is dropped.
+- A project file that could not be read hid its autosave; the recovery question now comes first, and quitting keeps both.
+- On Linux and macOS, SIGTERM and SIGHUP end the session cleanly: the unsaved edits are autosaved and the terminal is given back.
+- A sample path naming a named pipe or a device kept the editor waiting forever; only a file is opened.
+- Two sessions closing the settings page at once could lose one's change; a save now holds the settings file's lock. A settings file that would grow past what TINVO reads is not written, a MIDI clock another session turned on is taken up here too, from the next Play, and lines that did not change stay as they were written, with their line ends.
+- `tinvo settings` printed the settings file's path unescaped.
+- On Windows, a key repeated by the console counted once, and characters outside the Basic Multilingual Plane (most emoji) were lost.
+- A busy stream of input no longer holds up the audio recovery, MIDI and drawing.
+- A group that came to rest stopped feeding the delay, reverb and chorus at the end of an audio block, not on its own frame, so a chorus it fed sounded different at another buffer size.
+- In a song with no tempo points or tempo lane, a change of the tempo did not reach the delay inserts of tracks, groups and the master.
+- A take queue filled by passed-step reports could drop the report that its layout had changed; that report keeps room of its own.
+- A MIDI release after a reset could end a newer note on the same key.
+- In one-shot mode a key let go kept its loop when the mode turned back; it now ends.
+- The samples of a project together are limited to 2^27 frames, checked as each loads.
+- A file of another program at a project's lock name is no longer emptied; the lock is refused.
+- On macOS, a failed stop of the audio input no longer frees what its callback may still use.
+- A delay no longer fed could skip part of its own repeats when one came back near the end of its memory, inside an audio block, so the longest delays sounded different at another buffer size.
+- A paste whose text ended in the start of an escape sequence stayed open and took in the keys after it.
+- A sequence whose bytes came slowly could hold up the editor; it has 25 ms in all.
+- A click that waited behind a batch of input that ran out of time acted on what the screen showed before that batch.
+- The settings were saved without the lock when a file of another program sat at the lock's name, and a lock file was recognised by its first word only; both are refused.
+- SIGTERM or SIGHUP during the recovery question went unheeded, and the message on a signal said the edits were autosaved even when that failed.
+- A project file that was a link to nothing counted as a new project, so `n` at the recovery question deleted its autosave.
+- An export could write over a sample whose name is a link to a file since gone; a name that cannot be followed is refused.
+- A take that lost a report of tracks being added or removed could put notes on the wrong tracks; it is not written.
+- A pipe put at a sample's name just after it was checked could still keep the editor waiting.
+- In one-shot mode a key let go made its note the first to give way to a new one.
+- A settings file with mixed line ends had every line rewritten with one kind, and one with no line end at its end gained one.
+- `tinvo render --stems` replaced the mix before finding that a stem's name was a folder, the project or a sample it plays.
+- Some usage errors printed what was typed unescaped, over more than one line.
+- On Windows, a key record repeating 65 times or more gave one key too many, and half of a surrogate pair stuck to a character after another key.
+- In the key list, a wrapped description ran past the screen's edge.
+- Writing over the second half of a wide letter left its accent behind.
+- A second session that read a lock file while its holder was still writing it took the file for another program's and opened the project unlocked; the file is now read through the lock, so the project is reported as held.
+- On Windows, a file of another program put at a lock's name just as a session checked it was emptied and deleted; the file is checked through the handle that holds the lock, and a lock file is deleted only by the session holding it, as it lets go.
+- A take recorded into a sampler track that could not load it (its samples over the project's limit) said it was recorded into the track; it now says why it was not loaded.
+- In pasted text, an ESC took the character after it with it.
+- A project, settings or MIDI file name that was a named pipe could keep TINVO waiting; only a plain file is read, and a pipe is opened without waiting for a writer.
+- On Linux and macOS, a session letting go of its lock could delete a lock file another session had put at the name since.
+- Two usage errors (`--from` and `--to` naming a marker the song lacks, `bench --count` naming no scenario) printed what was typed unescaped.
 
 ## [0.24.1] - 2026-11-16
 
