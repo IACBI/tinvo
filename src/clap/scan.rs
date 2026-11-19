@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// How deep below a root the search goes.
@@ -528,7 +529,14 @@ fn end_group(child: &Child, pinned: bool) {
 /// Reads the plugin file at `path` in a child process (`worker scan-clap`),
 /// its result going to a file in `dir`. The child gets `per_file`, or less
 /// if the scan must end at `scan_end` before.
-fn scan_file(worker: &Path, path: &Path, dir: &Path, per_file: Duration, scan_end: Instant) -> Outcome {
+fn scan_file(
+    worker: &Path,
+    path: &Path,
+    dir: &Path,
+    per_file: Duration,
+    scan_end: Instant,
+    cancel: &AtomicBool,
+) -> Outcome {
     let (file, result) = match fsutil::create_temp_beside(&dir.join("result")) {
         Ok(r) => r,
         Err(e) => return Outcome::Retry(format!("no room for a scan's result: {e}")),
@@ -558,7 +566,9 @@ fn scan_file(worker: &Path, path: &Path, dir: &Path, per_file: Duration, scan_en
                 end_group(&child, GROUP_PINNED);
                 break child.wait().map_err(|e| Some(e.to_string()));
             }
-            Ok(false) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(false) if Instant::now() < deadline && !cancel.load(Ordering::Relaxed) => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
             Ok(false) => {
                 end_group(&child, true);
                 let _ = child.kill();
@@ -584,7 +594,7 @@ fn scan_file(worker: &Path, path: &Path, dir: &Path, per_file: Duration, scan_en
     };
     let _ = std::fs::remove_file(&result);
     match status {
-        Err(None) => Outcome::TimedOut { by_budget: scan_end < own_deadline },
+        Err(None) => Outcome::TimedOut { by_budget: scan_end < own_deadline || cancel.load(Ordering::Relaxed) },
         Err(Some(e)) => Outcome::Retry(format!("the scanner lost track of its child: {e}")),
         Ok(s) if s.code() == Some(i32::from(RESULT_UNWRITTEN)) => {
             Outcome::Retry("the scanner could not write a result".into())
@@ -695,7 +705,7 @@ pub struct Options {
 }
 
 /// What a scan knows.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Catalog {
     /// Each plugin file, in the order found, then those kept from the cache
     /// under folders that could not be searched to the end.
@@ -753,9 +763,26 @@ impl Catalog {
     }
 }
 
+/// Scans CLAP's folders ([`default_roots`]) with TINVO's own program as
+/// the scanner and the cache in TINVO's state folder: the catalog and the
+/// folders searched.
+/// Setting `cancel` ends it soon, leaving what is left for the next scan.
+pub fn installed(rescan: bool, cancel: &AtomicBool) -> Result<(Catalog, Vec<PathBuf>), String> {
+    let worker = std::env::current_exe().map_err(|e| format!("cannot find TINVO's own program to scan with: {e}"))?;
+    let cache = crate::autosave::state_dir().map(|d| d.join("plugins.txt"));
+    let roots = default_roots();
+    let options = Options { worker, per_file: PER_FILE, budget: BUDGET, rescan };
+    Ok((scan_until(&roots, cache.as_deref(), &options, cancel), roots))
+}
+
 /// Searches `roots` and reads each plugin file new or changed since the
 /// cache at `cache` (if any) was written, then writes the cache again.
 pub fn scan(roots: &[PathBuf], cache: Option<&Path>, options: &Options) -> Catalog {
+    scan_until(roots, cache, options, &AtomicBool::new(false))
+}
+
+/// [`scan`], ended soon once `cancel` is set, as when its budget runs out.
+pub fn scan_until(roots: &[PathBuf], cache: Option<&Path>, options: &Options, cancel: &AtomicBool) -> Catalog {
     let start = Instant::now();
     let scan_end = start.checked_add(options.budget).unwrap_or(start + Duration::from_secs(365 * 86_400));
     let found = find(roots);
@@ -772,7 +799,7 @@ pub fn scan(roots: &[PathBuf], cache: Option<&Path>, options: &Options) -> Catal
             catalog.entries.push(e.clone());
             continue;
         }
-        if Instant::now() >= scan_end {
+        if Instant::now() >= scan_end || cancel.load(Ordering::Relaxed) {
             catalog.left += 1;
             continue;
         }
@@ -787,7 +814,7 @@ pub fn scan(roots: &[PathBuf], cache: Option<&Path>, options: &Options) -> Catal
             }
         }
         let dir = dir.as_deref().unwrap_or(Path::new("."));
-        let result = match scan_file(&options.worker, path, dir, options.per_file, scan_end) {
+        let result = match scan_file(&options.worker, path, dir, options.per_file, scan_end, cancel) {
             Outcome::Read(result) => result,
             Outcome::TimedOut { by_budget: false } => {
                 Err(format!("did not finish loading within {} s", options.per_file.as_secs()))

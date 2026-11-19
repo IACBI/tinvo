@@ -647,6 +647,9 @@ fn project_seeds() -> Vec<Vec<u8>> {
             "tinvo 8\ntempo 120\nmix reverb_decay 2.4\n\ntrack clap\nparam send_reverb -12\nend\n",
             "tinvo 10\nmarker 0 a\nmarker 2 b c\nsong A B C\n",
             "tinvo 11\nsong A B A\npattern_length C 3\n\ntrack kick\nparts . C -\nstep 1 36 100 1 100 1 0 -\nend\n",
+            // Plugins by a few ids, so a long run keeps finding ids it has
+            // seen: the ids a run takes are never given back.
+            "tinvo 16\nmaster_insert 0 plugin org.tinvo.fuzz.fx\n\ngroup G\ninsert 7 plugin org.tinvo.fuzz.fx\nend\n\ntrack plugin org.tinvo.fuzz.synth\ngroup 1\nparam send_reverb -12\ninsert 1 plugin org.tinvo.fuzz.fx\ninsert_param 1 bypass 1\nstep 0 60 100 1 100 1 0 -\nend\n",
         ]
         .map(String::from),
     );

@@ -36,7 +36,8 @@
 //! - `initfail`: its plugins' `init` fails;
 //! - `nomain`: port 0 each way is not flagged main;
 //! - `procerror`: `process` fails on its second call, before reading its
-//!   events;
+//!   events; `procerrors`: on every call from the second, asking for a
+//!   restart each time, and from the main thread on every callback after;
 //! - `lifecycle`, `leak`, and the five above but `restart`: write
 //!   `NAME.deinit` beside the file in `deinit`, with the times the file
 //!   was initialised, the instances alive then and the rules broken
@@ -76,6 +77,7 @@ enum Mode {
     Leak,
     Both,
     Tail,
+    ProcessErrors,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -85,7 +87,7 @@ static LIVE: AtomicU32 = AtomicU32::new(0);
 static BROKEN: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 18] = [
+    const ALL: [Mode; 19] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -104,6 +106,7 @@ fn mode() -> Mode {
         Mode::Leak,
         Mode::Both,
         Mode::Tail,
+        Mode::ProcessErrors,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -287,6 +290,18 @@ impl Instance {
         let first = self.main_thread.compare_exchange(0, here, Ordering::Relaxed, Ordering::Relaxed);
         self.require(first.is_ok() || first == Err(here));
     }
+
+    fn ask_restart_and_callback(&self) {
+        // SAFETY: the host's thread-safe callbacks.
+        unsafe {
+            if let Some(f) = (*self.host).request_restart {
+                f(self.host);
+            }
+            if let Some(f) = (*self.host).request_callback {
+                f(self.host);
+            }
+        }
+    }
 }
 
 unsafe extern "C" fn plugin_init(p: *const ClapPlugin) -> bool {
@@ -418,6 +433,10 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
         }
     }
     if mode() == Mode::ProcessError && me.processes.load(Ordering::Relaxed) == 2 {
+        return CLAP_PROCESS_ERROR;
+    }
+    if mode() == Mode::ProcessErrors && me.processes.load(Ordering::Relaxed) >= 2 {
+        me.ask_restart_and_callback();
         return CLAP_PROCESS_ERROR;
     }
     let (inputs, outputs) = ports(me.sine);
@@ -691,6 +710,9 @@ unsafe extern "C" fn plugin_on_main_thread(p: *const ClapPlugin) {
     let me = unsafe { me(p) };
     me.on_main();
     me.callbacks.fetch_add(1, Ordering::Relaxed);
+    if mode() == Mode::ProcessErrors {
+        me.ask_restart_and_callback();
+    }
 }
 
 unsafe extern "C" fn plugin_count(_: *const ClapPluginFactory) -> u32 {
@@ -859,6 +881,10 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "procerror" => {
             set(Mode::ProcessError);
+            true
+        }
+        "procerrors" => {
+            set(Mode::ProcessErrors);
             true
         }
         "both" => {

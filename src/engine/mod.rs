@@ -846,14 +846,17 @@ impl Retired {
 
 /// Capacity of the queue that returns released samples, effects and plugin
 /// instances to the UI thread. The engine holds at most 48 samples or
-/// instruments' instances (32 tracks and 16 fading) and the 64 effects of a
-/// project, each with an instance, for good; the rest of the room is for
-/// what is on its way back or out (replaced effects, removed tracks' and
-/// groups'), which a few seconds of playing let go.
-pub const RETIRE_QUEUE: usize = 256;
+/// instruments' instances (32 tracks and 16 fading), the 64 effects of a
+/// project and the 64 of the 8 removed groups still playing out (which a
+/// plugin's tail can keep playing for as long as it lasts), each with an
+/// instance, for good; the rest of the room is for what is on its way back
+/// or out (replaced effects, removed tracks'), which a few seconds of
+/// playing let go.
+pub const RETIRE_QUEUE: usize = 512;
 /// The most samples, effects and instances an engine playing a project
 /// holds for good, counted as [`Retired::count`] does.
-pub const HELD_FOR_GOOD: usize = MAX_TRACKS + MAX_FADING + 2 * crate::insert::MAX_INSERTS;
+pub const HELD_FOR_GOOD: usize =
+    MAX_TRACKS + MAX_FADING + 2 * crate::insert::MAX_INSERTS + 2 * crate::group::MAX_GROUPS * crate::insert::MAX_SLOTS;
 
 /// Hands a sample the engine no longer uses to the UI thread, so the audio
 /// thread never frees it. Without a queue (offline rendering) it is dropped
