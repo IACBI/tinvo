@@ -226,11 +226,15 @@ impl Playing {
                 return Err(format!("{} cannot play there", name()));
             }
         }
+        // Every path in time from the first frame.
+        engine.settle_latency();
         Ok(playing)
     }
 
     /// Serves what the instances asked for since the last call: a restart
-    /// is done in place; a failure fails the render.
+    /// is done in place; a failure fails the render, and so does a restart
+    /// that makes it come later or sooner, which the frames already
+    /// rendered could not be lined up with.
     fn serve(&mut self, engine: &mut Engine, plugins: &mut dyn PluginSource) -> Result<(), String> {
         for request in plugins.poll() {
             // What its parameters and state did is no render's concern.
@@ -242,7 +246,11 @@ impl Playing {
             engine.handle(Command::Lend(token));
             while let Some(r) = self.back.pop() {
                 if let Retired::Lent(mut i) = r {
+                    let latency = i.latency();
                     i.restart().map_err(|e| format!("{name} could not restart: {e}"))?;
+                    if i.latency() != latency {
+                        return Err(format!("{name} changed its latency while rendering"));
+                    }
                     engine.handle(Command::Return(i));
                 }
             }
@@ -434,7 +442,13 @@ pub fn stem_project(project: &Project, stem: Stem) -> Project {
     // effect no longer there.
     let limiter = crate::engine::LaneTarget::Mix(crate::mix::mp::LIMITER as u8);
     for lane in solo.tracks.iter_mut().flat_map(|t| t.lanes.iter_mut()) {
-        let master = matches!(lane.target, Some(crate::engine::LaneTarget::MasterSlot { .. }));
+        let master = matches!(
+            lane.target,
+            Some(
+                crate::engine::LaneTarget::MasterSlot { .. }
+                    | crate::engine::LaneTarget::Plugin { at: crate::engine::PluginAt::MasterSlot(_), .. }
+            )
+        );
         if lane.target == Some(limiter) || master {
             *lane = crate::project::LaneData::new(None, false);
         }

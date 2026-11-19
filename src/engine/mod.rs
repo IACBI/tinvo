@@ -20,7 +20,8 @@
 pub mod transport;
 
 use crate::align::{self, Align};
-use crate::clap::host::Instance;
+use crate::clap::PluginRef;
+use crate::clap::host::{Instance, Role};
 use crate::clap::slot::PluginSlot;
 use crate::dsp::loudness::LiveLoudness;
 use crate::dsp::noise::Rng;
@@ -85,10 +86,91 @@ pub enum LaneTarget {
     GroupSlot { group: u8, slot: u8, kind: EffectKind, index: u8 },
     /// The same of a slot of the master's chain.
     MasterSlot { slot: u8, kind: EffectKind, index: u8 },
+    /// Parameter `id` (its stable id in `clap.params`) of plugin `plugin`
+    /// where `at` says. One on a group's or the master's chain can be on any
+    /// one track. Its points are the parameter's own values, kept to its
+    /// range as they are sent; while the plugin is not there, or has no
+    /// such parameter, it does nothing.
+    Plugin { at: PluginAt, plugin: PluginRef, id: u32 },
+}
+
+/// Where a plugin a lane automates plays, from the lane's track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PluginAt {
+    /// The track's instrument.
+    Instrument,
+    /// Slot `0` of the track's chain.
+    Slot(u8),
+    GroupSlot {
+        group: u8,
+        slot: u8,
+    },
+    MasterSlot(u8),
+}
+
+impl PluginAt {
+    /// Where that is in the project, from track `track`.
+    pub fn place(self, track: u8) -> PluginPlace {
+        match self {
+            PluginAt::Instrument => PluginPlace::Track(track),
+            PluginAt::Slot(slot) => PluginPlace::Slot(ChainId::Track(track), slot),
+            PluginAt::GroupSlot { group, slot } => PluginPlace::Slot(ChainId::Group(group), slot),
+            PluginAt::MasterSlot(slot) => PluginPlace::Slot(ChainId::Master, slot),
+        }
+    }
+}
+
+/// Where a plugin plays: a plugin track's instrument, or a plugin insert in
+/// a slot of a chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PluginPlace {
+    Track(u8),
+    Slot(ChainId, u8),
+}
+
+impl PluginPlace {
+    /// What it is asked to be there.
+    pub fn role(self) -> Role {
+        match self {
+            PluginPlace::Track(_) => Role::Instrument,
+            PluginPlace::Slot(..) => Role::Effect,
+        }
+    }
+}
+
+/// How a lane's values run from point to point.
+#[derive(Clone, Copy)]
+enum Curve {
+    /// In the parameter's [`ParamSpec::to_unit`] terms, in its range.
+    Spec(&'static ParamSpec),
+    /// In a straight line, as the points are: a plugin's, whose curve and
+    /// range TINVO does not know.
+    Plain,
+}
+
+impl Curve {
+    fn clamp(self, v: f32) -> f32 {
+        match self {
+            Curve::Spec(s) => s.clamp(v),
+            Curve::Plain => v,
+        }
+    }
+
+    /// From `v0` to `v1`, `t` (0 to 1) of the way.
+    fn between(self, v0: f32, v1: f32, t: f32) -> f32 {
+        match self {
+            Curve::Spec(s) => {
+                let (u0, u1) = (s.to_unit(v0), s.to_unit(v1));
+                s.from_unit(u0 + (u1 - u0) * t)
+            }
+            Curve::Plain => v0 + (v1 - v0) * t,
+        }
+    }
 }
 
 impl LaneTarget {
-    /// The parameter it names on a track of `kind`, if there is one.
+    /// The parameter it names on a track of `kind`, if there is one; a
+    /// plugin's is TINVO's to know only while the plugin plays.
     pub fn spec(self, kind: InstrumentKind) -> Option<&'static ParamSpec> {
         match self {
             LaneTarget::Track(0) => Some(&VOLUME),
@@ -101,6 +183,69 @@ impl LaneTarget {
             LaneTarget::Slot { kind, index, .. }
             | LaneTarget::GroupSlot { kind, index, .. }
             | LaneTarget::MasterSlot { kind, index, .. } => kind.params().get(usize::from(index)),
+            LaneTarget::Plugin { .. } => None,
+        }
+    }
+
+    /// How its values run on a track of `kind`, if it names a parameter.
+    fn curve(self, kind: InstrumentKind) -> Option<Curve> {
+        match self {
+            LaneTarget::Plugin { .. } => Some(Curve::Plain),
+            x => x.spec(kind).map(Curve::Spec),
+        }
+    }
+
+    /// The insert slot it names, an effect's parameter or a plugin's, of
+    /// the chain on lane track `track`.
+    pub fn chain_slot(self, track: u8) -> Option<(ChainId, u8)> {
+        match self {
+            LaneTarget::Plugin { at, .. } => match at.place(track) {
+                PluginPlace::Slot(chain, slot) => Some((chain, slot)),
+                PluginPlace::Track(_) => None,
+            },
+            x => x.slot(track).map(|(chain, slot, ..)| (chain, slot)),
+        }
+    }
+
+    /// The plugin parameter it names from lane track `track`: where the
+    /// plugin plays, which, and the parameter's id.
+    pub fn plugin_param(self, track: u8) -> Option<(PluginPlace, PluginRef, u32)> {
+        match self {
+            LaneTarget::Plugin { at, plugin, id } => Some((at.place(track), plugin, id)),
+            _ => None,
+        }
+    }
+
+    /// The same target on the slot `to` gives for its own, for an insert's.
+    pub fn with_slot(self, to: impl Fn(u8) -> u8) -> LaneTarget {
+        match self {
+            LaneTarget::Slot { slot, kind, index } => LaneTarget::Slot { slot: to(slot), kind, index },
+            LaneTarget::GroupSlot { group, slot, kind, index } => {
+                LaneTarget::GroupSlot { group, slot: to(slot), kind, index }
+            }
+            LaneTarget::MasterSlot { slot, kind, index } => LaneTarget::MasterSlot { slot: to(slot), kind, index },
+            LaneTarget::Plugin { at, plugin, id } => {
+                let at = match at {
+                    PluginAt::Instrument => PluginAt::Instrument,
+                    PluginAt::Slot(slot) => PluginAt::Slot(to(slot)),
+                    PluginAt::GroupSlot { group, slot } => PluginAt::GroupSlot { group, slot: to(slot) },
+                    PluginAt::MasterSlot(slot) => PluginAt::MasterSlot(to(slot)),
+                };
+                LaneTarget::Plugin { at, plugin, id }
+            }
+            other => other,
+        }
+    }
+
+    /// The same target on group `group`, for a group's.
+    pub fn with_group(self, group: u8) -> LaneTarget {
+        match self {
+            LaneTarget::Group { index, .. } => LaneTarget::Group { group, index },
+            LaneTarget::GroupSlot { slot, kind, index, .. } => LaneTarget::GroupSlot { group, slot, kind, index },
+            LaneTarget::Plugin { at: PluginAt::GroupSlot { slot, .. }, plugin, id } => {
+                LaneTarget::Plugin { at: PluginAt::GroupSlot { group, slot }, plugin, id }
+            }
+            other => other,
         }
     }
 
@@ -123,13 +268,16 @@ impl LaneTarget {
                 | LaneTarget::Group { .. }
                 | LaneTarget::GroupSlot { .. }
                 | LaneTarget::MasterSlot { .. }
+                | LaneTarget::Plugin { at: PluginAt::GroupSlot { .. } | PluginAt::MasterSlot(_), .. }
         )
     }
 
     /// The group it is a setting of.
     pub fn group(self) -> Option<u8> {
         match self {
-            LaneTarget::Group { group, .. } | LaneTarget::GroupSlot { group, .. } => Some(group),
+            LaneTarget::Group { group, .. }
+            | LaneTarget::GroupSlot { group, .. }
+            | LaneTarget::Plugin { at: PluginAt::GroupSlot { group, .. }, .. } => Some(group),
             _ => None,
         }
     }
@@ -146,6 +294,15 @@ impl fmt::Display for LaneTarget {
                 write!(f, "group {group} slot {slot} {} {index}", kind.id())
             }
             LaneTarget::MasterSlot { slot, kind, index } => write!(f, "master slot {slot} {} {index}", kind.id()),
+            LaneTarget::Plugin { at, plugin, id } => {
+                match at {
+                    PluginAt::Instrument => {}
+                    PluginAt::Slot(slot) => write!(f, "slot {slot} ")?,
+                    PluginAt::GroupSlot { group, slot } => write!(f, "group {group} slot {slot} ")?,
+                    PluginAt::MasterSlot(slot) => write!(f, "master slot {slot} ")?,
+                }
+                write!(f, "plugin {} {id}", plugin.id())
+            }
         }
     }
 }
@@ -500,6 +657,15 @@ pub enum Edit {
         target: Option<LaneTarget>,
         ramp: bool,
     },
+    /// The value a lane on a plugin's parameter leaves it at while no
+    /// point of the lane is in force (`None`: as the lane last left it):
+    /// what the parameter is without the lane, which plugins keep in their
+    /// state, as automated or not.
+    SetLaneBase {
+        track: u8,
+        lane: u8,
+        value: Option<f32>,
+    },
     /// An automation point: the lane's value from this step on.
     SetPoint {
         track: u8,
@@ -669,6 +835,17 @@ pub enum Command {
     /// none (its track or slot went, or another instance took it) it goes
     /// back as [`Retired::Plugin`].
     Return(Box<Instance>),
+    /// Sets parameter `id` of plugin `plugin` where `place` says
+    /// ([`Instance::set_param`]), unless a lane holds it there; `serial` is
+    /// acknowledged once the plugin has it. One lent out to restart gets
+    /// it when it is back; with none there it is dropped.
+    SetPluginParam {
+        place: PluginPlace,
+        plugin: PluginRef,
+        id: u32,
+        value: f64,
+        serial: u64,
+    },
     /// The track live notes play on from now on.
     SetLiveTrack(u8),
     /// Hands the live notes and the steps the live track passes to the
@@ -816,6 +993,8 @@ fn command_cost(cmd: &Command) -> u32 {
         Command::Edit(Edit::AddTrack(_) | Edit::InsertTrack { .. } | Edit::RemoveTrack(_)) => 512,
         // A search of every track and chain.
         Command::Lend(_) | Command::Return(_) => 64,
+        // A search of every lane.
+        Command::SetPluginParam { .. } => 4,
         _ => 1,
     }
 }
@@ -992,6 +1171,10 @@ pub struct Shared {
     /// engine pushed before handling one is in the queue once this counts
     /// it, so the UI knows when a take is complete.
     pub record_commands: AtomicU32,
+    /// The plugins on some path make it later than the engine makes up for
+    /// ([`MAX_LATENCY_SECONDS`] together, besides the gates): that path is
+    /// heard early.
+    pub latency_over: AtomicBool,
 }
 
 impl Default for Shared {
@@ -1018,6 +1201,7 @@ impl Shared {
             takes_lost: AtomicU32::new(0),
             layouts_lost: AtomicU32::new(0),
             record_commands: AtomicU32::new(0),
+            latency_over: AtomicBool::new(false),
         }
     }
 }
@@ -1076,7 +1260,7 @@ struct Segment {
 impl Segment {
     /// The value at `frame`: exactly the points' values at and beyond the
     /// ends, and in between a straight line in [`ParamSpec::to_unit`] terms.
-    fn value_at(&self, spec: &ParamSpec, frame: u64) -> f32 {
+    fn value_at(&self, curve: Curve, frame: u64) -> f32 {
         if self.f1 <= self.f0 || frame <= self.f0 {
             return self.v0;
         }
@@ -1084,8 +1268,7 @@ impl Segment {
             return self.v1;
         }
         let t = ((frame - self.f0) as f64 / (self.f1 - self.f0) as f64) as f32;
-        let (u0, u1) = (spec.to_unit(self.v0), spec.to_unit(self.v1));
-        spec.from_unit(u0 + (u1 - u0) * t)
+        curve.between(self.v0, self.v1, t)
     }
 }
 
@@ -1100,11 +1283,24 @@ struct Lane {
     segment: Option<Segment>,
     /// The value last written to the target (`None`: the base value).
     applied: Option<f32>,
+    /// A plugin parameter's value while no point is in force
+    /// ([`Edit::SetLaneBase`]); NaN for none, which leaves it as it was.
+    base: f32,
+    /// The plugin instance there has not had the lane's value: it came
+    /// since, or did not take it.
+    fresh: bool,
 }
 
 impl Lane {
-    const EMPTY: Self =
-        Self { target: None, ramp: false, points: [[f32::NAN; MAX_STEPS]; MAX_PATTERNS], segment: None, applied: None };
+    const EMPTY: Self = Self {
+        target: None,
+        ramp: false,
+        points: [[f32::NAN; MAX_STEPS]; MAX_PATTERNS],
+        segment: None,
+        applied: None,
+        base: f32::NAN,
+        fresh: false,
+    };
 }
 
 /// A track's channel strip: one channel, or two for a stereo instrument.
@@ -1342,6 +1538,12 @@ impl Track {
         } else if let Some(spec) = mix::SEND_PARAMS.get(i - n - strip::sp::COUNT) {
             self.sends[i - n - strip::sp::COUNT].set_target(mix::level_gain(spec.clamp(value)));
         }
+    }
+
+    /// The frames its path is late by before its aligner: its plugin
+    /// instrument's latency and its chain's.
+    fn latency(&self) -> usize {
+        self.instrument.latency() + self.chain.latency()
     }
 
     /// Whether a lane currently overrides `target`.
@@ -1590,6 +1792,9 @@ pub struct Engine {
     /// How late the slowest path through look-ahead effects reaches the
     /// master, in frames; the others are delayed to match.
     compensation: usize,
+    /// Whether some path is later than its aligner makes up for
+    /// ([`Shared::latency_over`]).
+    latency_over: bool,
     /// The count-in's click, delayed as the tracks are.
     click_align: Align,
     /// A track's signal in stereo, for its insert chain.
@@ -1690,6 +1895,7 @@ impl Engine {
             retired: None,
             master_chain: Chain::default(),
             compensation: 0,
+            latency_over: false,
             click_align: Align::new(align::longest(sample_rate), sample_rate),
             stereo_buf: [0.0; 2 * BLOCK],
             loudness: LiveLoudness::new(sample_rate),
@@ -1774,7 +1980,7 @@ impl Engine {
         let mut total = 0;
         let group_of = |t: &Track| t.group.map(usize::from).filter(|&g| g < gn);
         for t in &self.tracks[..n] {
-            let own = t.chain.latency();
+            let own = t.latency();
             match group_of(t) {
                 Some(g) => (slowest[g], fed[g]) = (slowest[g].max(own), true),
                 None => total = total.max(own),
@@ -1802,7 +2008,7 @@ impl Engine {
         }
         for t in &mut self.tracks[..n] {
             let ahead = group_of(t).map_or(total, |g| slowest[g]);
-            t.align.set(ahead - t.chain.latency());
+            t.align.set(ahead - t.latency());
         }
         for (g, group) in self.groups[..gn].iter_mut().enumerate() {
             group.align.set(if fed[g] { total - slowest[g] - group.chain.latency() } else { 0 });
@@ -1810,8 +2016,29 @@ impl Engine {
         for group in self.groups[MAX_GROUPS..].iter_mut().filter(|g| g.is_live()) {
             group.align.set(total - group.input_latency - group.chain.latency());
         }
+        // Every aligner is as long as the click's and delays a path by no
+        // more than the slowest is late: that one late past it plays early.
+        let over = total > self.click_align.longest();
         self.click_align.set(total);
         self.compensation = total;
+        if over != self.latency_over {
+            self.latency_over = over;
+            self.shared.latency_over.store(over, Ordering::Relaxed);
+        }
+    }
+
+    /// Lines every path up at once, without crossfading: for a render, once
+    /// every plugin instance is in place, before its first frame.
+    pub fn settle_latency(&mut self) {
+        self.plan_latency();
+        for t in &mut self.tracks[..] {
+            t.align.snap();
+        }
+        for g in &mut self.groups[..] {
+            g.align.snap();
+        }
+        self.click_align.snap();
+        self.midi.latency = self.latency() as u64;
     }
 
     /// Frames until the paths may change next: a chain change falling due,
@@ -1880,6 +2107,13 @@ impl Engine {
                         b.automate(usize::from(index), l.applied);
                     }
                 }
+                // And a plugin's parameter its lane's value, or base.
+                for l in &t.lanes {
+                    let Some((place, plugin, pid)) = l.target.and_then(|x| x.plugin_param(i as u8)) else { continue };
+                    if place == PluginPlace::Slot(id, slot) {
+                        deliver(b.plugin_slot().filter(|p| p.plugin() == plugin), pid, l.applied, l.base);
+                    }
+                }
             }
             b.snap();
             b
@@ -1928,6 +2162,7 @@ impl Engine {
                 if let Some(i) = old {
                     retire_any(&mut self.retired, Retired::Plugin(i));
                 }
+                self.replay_plugin_lanes();
             }
             Err(i) => retire_instance(&mut self.retired, i),
         }
@@ -1941,14 +2176,80 @@ impl Engine {
             ChainId::Group(g) => self.groups[..self.group_count].get_mut(usize::from(g)).map(|g| &mut g.chain),
             ChainId::Master => Some(&mut self.master_chain),
         };
-        let attached = match chain.and_then(|c| c.slot_mut(usize::from(slot))) {
-            Some(insert) => insert.attach(instance),
+        let attached = match chain {
+            Some(c) => match c.slot_mut(usize::from(slot)) {
+                Some(insert) => {
+                    let attached = insert.attach(instance);
+                    c.recount();
+                    attached
+                }
+                None => Err(instance),
+            },
             None => Err(instance),
         };
         match attached {
-            Ok(old) => old.into_iter().for_each(|i| retire_any(&mut self.retired, Retired::Plugin(i))),
+            Ok(old) => {
+                old.into_iter().for_each(|i| retire_any(&mut self.retired, Retired::Plugin(i)));
+                self.replay_plugin_lanes();
+            }
             Err(i) => retire_instance(&mut self.retired, i),
         }
+    }
+
+    /// Has every lane on a plugin parameter send its value again, as to an
+    /// instance just come.
+    fn replay_plugin_lanes(&mut self) {
+        for l in self.tracks[..self.track_count].iter_mut().flat_map(|t| t.lanes.iter_mut()) {
+            if let Some(LaneTarget::Plugin { .. }) = l.target {
+                l.fresh = true;
+            }
+        }
+        self.automate(self.now);
+    }
+
+    /// Counts every chain's latency again, after an instance went or came
+    /// back somewhere in them.
+    fn recount_chains(&mut self) {
+        let fading = self.fading.iter_mut().map(|f| &mut f.track);
+        for t in self.tracks.iter_mut().chain(fading) {
+            t.chain.recount();
+        }
+        for g in &mut self.groups {
+            g.chain.recount();
+        }
+        self.master_chain.recount();
+    }
+
+    /// Same as handling [`Command::SetPluginParam`].
+    pub fn set_plugin_param(&mut self, place: PluginPlace, plugin: PluginRef, id: u32, value: f64, serial: u64) {
+        let n = self.track_count;
+        // A lane holding it wins, as over an instrument's own settings.
+        let named = |(i, t): (usize, &Track)| {
+            t.lanes.iter().any(|l| {
+                l.applied.is_some() && l.target.and_then(|x| x.plugin_param(i as u8)) == Some((place, plugin, id))
+            })
+        };
+        if self.tracks[..n].iter().enumerate().any(named) {
+            return;
+        }
+        let Self { tracks, groups, group_count, master_chain, .. } = self;
+        if let Some(s) = plugin_slot_at(&mut tracks[..n], &mut groups[..*group_count], master_chain, place, plugin) {
+            s.set_param(id, value, serial);
+        }
+    }
+
+    /// Leaves the plugin parameter a lane on track `track` let go of at the
+    /// lane's base, if it has one.
+    fn release_plugin(&mut self, track: u8, target: LaneTarget, base: f32) {
+        let Some((place, plugin, id)) = target.plugin_param(track) else { return };
+        let n = self.track_count;
+        let Self { tracks, groups, group_count, master_chain, .. } = self;
+        deliver(
+            plugin_slot_at(&mut tracks[..n], &mut groups[..*group_count], master_chain, place, plugin),
+            id,
+            None,
+            base,
+        );
     }
 
     /// Calls `f` on every plugin slot (instruments of the tracks and of
@@ -2067,14 +2368,7 @@ impl Engine {
         }
         self.master_chain.settle(&mut give_back);
         self.mix.snap();
-        self.plan_latency();
-        for t in &mut self.tracks[..] {
-            t.align.snap();
-        }
-        for g in &mut self.groups[..] {
-            g.align.snap();
-        }
-        self.click_align.snap();
+        self.settle_latency();
     }
 
     /// Handles one command immediately.
@@ -2154,6 +2448,9 @@ impl Engine {
             Command::SetSlot { chain, slot, insert } => self.place_slot(chain, slot, insert),
             Command::SetPlugin { track, instance } => self.set_plugin(usize::from(track), instance),
             Command::SetSlotPlugin { chain, slot, instance } => self.set_slot_plugin(chain, slot, instance),
+            Command::SetPluginParam { place, plugin, id, value, serial } => {
+                self.set_plugin_param(place, plugin, id, value, serial)
+            }
             Command::Lend(token) => {
                 let mut lent = None;
                 if let Some(track) = self.find_slot(|s| {
@@ -2164,6 +2461,7 @@ impl Engine {
                 }
                 if let Some(i) = lent {
                     retire_any(&mut self.retired, Retired::Lent(i));
+                    self.recount_chains();
                 }
             }
             Command::Return(instance) => {
@@ -2178,8 +2476,13 @@ impl Engine {
                 if let Some(track) = found {
                     self.forget_voices(track);
                 }
-                if let Some(i) = back {
-                    retire_instance(&mut self.retired, i);
+                match back {
+                    Some(i) => retire_instance(&mut self.retired, i),
+                    None => {
+                        // Restarted, it may come late by more or less.
+                        self.recount_chains();
+                        self.replay_plugin_lanes();
+                    }
                 }
             }
             Command::SetMidiClock(on) => {
@@ -3116,12 +3419,14 @@ impl Engine {
             Edit::RemoveTrack(i) => {
                 let i = usize::from(i);
                 if i < n {
-                    let held: [Option<LaneTarget>; MAX_LANES] = std::array::from_fn(|k| {
+                    let held: [Option<(LaneTarget, f32)>; MAX_LANES] = std::array::from_fn(|k| {
                         let l = &self.tracks[i].lanes[k];
-                        l.target.filter(|_| l.applied.is_some())
+                        l.target.filter(|_| l.applied.is_some()).map(|x| (x, l.base))
                     });
-                    for target in held.into_iter().flatten() {
+                    // What the track holds itself goes with it.
+                    for (target, base) in held.into_iter().flatten().filter(|(x, _)| x.is_global()) {
                         self.release_global(target);
+                        self.release_plugin(i as u8, target, base);
                     }
                     self.tracks[i..n].rotate_left(1);
                     self.fade_out(n - 1);
@@ -3153,9 +3458,9 @@ impl Engine {
                 let kind = t.instrument.kind();
                 let groups = self.group_count;
                 let valid = |x: LaneTarget| {
-                    x.spec(kind).is_some()
+                    x.curve(kind).is_some()
                         && x.group().is_none_or(|g| usize::from(g) < groups)
-                        && x.slot(track).is_none_or(|(_, s, _, _)| usize::from(s) < MAX_SLOTS)
+                        && x.chain_slot(track).is_none_or(|(_, s)| usize::from(s) < MAX_SLOTS)
                 };
                 if usize::from(lane) >= MAX_LANES || target.is_some_and(|x| !valid(x)) {
                     return;
@@ -3171,6 +3476,7 @@ impl Engine {
                             let c = &mut self.tracks[usize::from(track)].chain;
                             automate_slot(c, slot, kind, index, None);
                         }
+                        (Some(x @ LaneTarget::Plugin { .. }), Some(_)) => self.release_plugin(track, x, old.base),
                         (Some(x), Some(_)) => self.release_global(x),
                         _ => {}
                     }
@@ -3182,9 +3488,22 @@ impl Engine {
                 let Some(t) = self.tracks[..n].get_mut(usize::from(track)) else { return };
                 let kind = t.instrument.kind();
                 let Some(l) = t.lanes.get_mut(usize::from(lane)) else { return };
-                let Some(spec) = l.target.and_then(|x| x.spec(kind)) else { return };
+                let Some(curve) = l.target.and_then(|x| x.curve(kind)) else { return };
                 if let Some(slot) = l.points.get_mut(usize::from(pattern)).and_then(|p| p.get_mut(usize::from(step))) {
-                    *slot = value.map_or(f32::NAN, |v| spec.clamp(v));
+                    *slot = value.filter(|v| v.is_finite()).map_or(f32::NAN, |v| curve.clamp(v));
+                }
+            }
+            Edit::SetLaneBase { track, lane, value } => {
+                let Some(l) =
+                    self.tracks[..n].get_mut(usize::from(track)).and_then(|t| t.lanes.get_mut(usize::from(lane)))
+                else {
+                    return;
+                };
+                let Some(x @ LaneTarget::Plugin { .. }) = l.target else { return };
+                l.base = value.filter(|v| v.is_finite()).unwrap_or(f32::NAN);
+                if l.applied.is_none() {
+                    let base = l.base;
+                    self.release_plugin(track, x, base);
                 }
             }
             Edit::SetGain { track, db } => {
@@ -3345,19 +3664,8 @@ impl Engine {
                 for (i, t) in tracks[..track_count].iter_mut().enumerate() {
                     for l in &mut t.lanes {
                         let Some(target) = l.target else { continue };
-                        if target.slot(i as u8).is_some_and(|(c, ..)| c == chain) {
-                            l.target = Some(match target {
-                                LaneTarget::Slot { slot, kind, index } => {
-                                    LaneTarget::Slot { slot: swap(slot), kind, index }
-                                }
-                                LaneTarget::GroupSlot { group, slot, kind, index } => {
-                                    LaneTarget::GroupSlot { group, slot: swap(slot), kind, index }
-                                }
-                                LaneTarget::MasterSlot { slot, kind, index } => {
-                                    LaneTarget::MasterSlot { slot: swap(slot), kind, index }
-                                }
-                                other => other,
-                            });
+                        if target.chain_slot(i as u8).is_some_and(|(c, _)| c == chain) {
+                            l.target = Some(target.with_slot(swap));
                         }
                     }
                 }
@@ -3419,7 +3727,8 @@ impl Engine {
             LaneTarget::MasterSlot { slot, kind, index } => {
                 automate_slot(&mut self.master_chain, slot, kind, index, None);
             }
-            LaneTarget::Track(_) | LaneTarget::Slot { .. } => {}
+            // With its base: `release_plugin`.
+            LaneTarget::Track(_) | LaneTarget::Slot { .. } | LaneTarget::Plugin { .. } => {}
         }
     }
 
@@ -3461,16 +3770,11 @@ impl Engine {
             t.group = t.group.and_then(to);
             t.prev_group = t.prev_group.and_then(to);
             for l in &mut t.lanes {
-                match l.target {
-                    Some(LaneTarget::Group { group, index }) => match to(group) {
-                        Some(g) => l.target = Some(LaneTarget::Group { group: g, index }),
-                        None => *l = Lane::EMPTY,
-                    },
-                    Some(LaneTarget::GroupSlot { group, slot, kind, index }) => match to(group) {
-                        Some(g) => l.target = Some(LaneTarget::GroupSlot { group: g, slot, kind, index }),
-                        None => *l = Lane::EMPTY,
-                    },
-                    _ => {}
+                let Some(x) = l.target else { continue };
+                match x.group().map(to) {
+                    Some(Some(g)) => l.target = Some(x.with_group(g)),
+                    Some(None) => *l = Lane::EMPTY,
+                    None => {}
                 }
             }
         }
@@ -3693,7 +3997,7 @@ impl Engine {
         let kind = track.instrument.kind();
         let mut ramping = false;
         for l in &mut track.lanes {
-            let Some(spec) = l.target.and_then(|x| x.spec(kind)) else { continue };
+            let Some(curve) = l.target.and_then(|x| x.curve(kind)) else { continue };
             let Some(pattern) = k.pattern.map(usize::from) else {
                 l.segment = None;
                 continue;
@@ -3701,13 +4005,13 @@ impl Engine {
             let stop = usize::from(lens[pattern]).min(s + left);
             let pts = &l.points[pattern];
             l.segment = (0..=s).rev().find(|&i| !pts[i].is_nan()).map(|i| {
-                let v0 = spec.clamp(pts[i]);
+                let v0 = curve.clamp(pts[i]);
                 match (s + 1..stop).find(|&j| !pts[j].is_nan()).filter(|_| l.ramp) {
                     Some(j) => Segment {
                         f0: transport.step_frame(k.pulse.saturating_sub((s - i) as u64 * div), k.division),
                         v0,
                         f1: transport.step_frame(k.pulse + (j - s) as u64 * div, k.division),
-                        v1: spec.clamp(pts[j]),
+                        v1: curve.clamp(pts[j]),
                     },
                     None => Segment { f0: 0, v0, f1: 0, v1: v0 },
                 }
@@ -3724,12 +4028,29 @@ impl Engine {
         let mut gains = false;
         let Self { tracks, track_count, mix, groups, group_count, master_chain, retired, .. } = self;
         let groups = &mut groups[..*group_count];
-        for t in &mut tracks[..*track_count] {
-            let kind = t.instrument.kind();
+        let tracks = &mut tracks[..*track_count];
+        for ti in 0..tracks.len() {
             for k in 0..MAX_LANES {
+                let l = &tracks[ti].lanes[k];
+                // A plugin's parameter, sent to wherever the plugin plays.
+                if let Some((place, plugin, id)) = l.target.and_then(|x| x.plugin_param(ti as u8)) {
+                    let want = l.segment.map(|g| g.value_at(Curve::Plain, frame));
+                    if l.fresh || want != l.applied {
+                        let base = l.base;
+                        let sent = deliver(plugin_slot_at(tracks, groups, master_chain, place, plugin), id, want, base);
+                        // Not taken, it is tried again next time.
+                        if sent {
+                            let l = &mut tracks[ti].lanes[k];
+                            (l.applied, l.fresh) = (want, false);
+                        }
+                    }
+                    continue;
+                }
+                let t = &mut tracks[ti];
+                let kind = t.instrument.kind();
                 let l = t.lanes[k];
                 let Some((target, spec)) = l.target.and_then(|x| Some((x, x.spec(kind)?))) else { continue };
-                let want = l.segment.map(|g| g.value_at(spec, frame));
+                let want = l.segment.map(|g| g.value_at(Curve::Spec(spec), frame));
                 if want != l.applied {
                     t.lanes[k].applied = want;
                     match target {
@@ -3753,6 +4074,7 @@ impl Engine {
                         LaneTarget::MasterSlot { slot, kind, index } => {
                             automate_slot(master_chain, slot, kind, index, want);
                         }
+                        LaneTarget::Plugin { .. } => {}
                     }
                 }
             }
@@ -4209,6 +4531,38 @@ fn stereo(mono: &[f32], out: &mut [f32]) {
         f[0] = x;
         f[1] = x;
     }
+}
+
+/// The slot where `place` says (in the project's `tracks` and `groups`, or
+/// the master's chain), if it is one for plugin `plugin`.
+fn plugin_slot_at<'a>(
+    tracks: &'a mut [Track],
+    groups: &'a mut [Group],
+    master: &'a mut Chain,
+    place: PluginPlace,
+    plugin: PluginRef,
+) -> Option<&'a mut PluginSlot> {
+    let slot = match place {
+        PluginPlace::Track(t) => tracks.get_mut(usize::from(t))?.instrument.plugin_slot()?,
+        PluginPlace::Slot(chain, s) => {
+            let chain = match chain {
+                ChainId::Track(t) => &mut tracks.get_mut(usize::from(t))?.chain,
+                ChainId::Group(g) => &mut groups.get_mut(usize::from(g))?.chain,
+                ChainId::Master => master,
+            };
+            chain.slot_mut(usize::from(s))?.plugin_slot()?
+        }
+    };
+    (slot.plugin() == plugin).then_some(slot)
+}
+
+/// Sends a lane's value to plugin parameter `id` in `slot`, or with none in
+/// force (`want`) its base, if it has one (NaN: none). Whether that is done:
+/// with nothing to send it is; without a slot, or an instance there taking
+/// it (lent out it waits for it), it is not.
+fn deliver(slot: Option<&mut PluginSlot>, id: u32, want: Option<f32>, base: f32) -> bool {
+    let Some(value) = want.or((!base.is_nan()).then_some(base)) else { return true };
+    slot.is_some_and(|s| s.set_param(id, f64::from(value), 0))
 }
 
 /// Writes an automation value to parameter `index` of the effect in slot

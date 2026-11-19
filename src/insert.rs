@@ -11,8 +11,9 @@
 //!
 //! The gate looks ahead, so it delays the signal by [`Insert::latency`]
 //! frames, bypassed or not, and the engine delays the other paths to
-//! match. Taken out of or put into a chain, it crossfades with its input as
-//! it arrives, so the change of latency makes no jump.
+//! match; so does a plugin whose output comes late (`clap.latency`). Taken
+//! out of or put into a chain, either crossfades with its input as it
+//! arrives, so the change of latency makes no jump.
 //!
 //! A slot fades between its input and its effect's output over 10 ms
 //! whenever it is bypassed or brought back, or taken out of or put into
@@ -25,7 +26,10 @@
 //! A plugin insert holds a CLAP instance, built on the UI thread and handed
 //! over in its box; its only parameter of TINVO's is the bypass. Bypassed
 //! all the way it is not called, and holds what it held until it is
-//! brought back. While its last call says it has a tail
+//! brought back; its input comes out as late as its output did, so a
+//! bypass moves no path in time. Without an instance (none yet, or one
+//! lent out to restart) it passes its input, as late as that is. While
+//! its last call says it has a tail
 //! (`CLAP_PROCESS_TAIL`) it holds sound, as a delay does, so its group does
 //! not come to rest on it; a plugin that says nothing of its tail can be
 //! cut short there, or by an export's quiet ending.
@@ -361,6 +365,8 @@ pub struct Insert {
     /// holds.
     held_out: bool,
     scratch: [f32; 2 * BLOCK],
+    /// A plugin's input, as late as its output.
+    dry: [f32; 2 * BLOCK],
     sample_rate: f32,
 }
 
@@ -402,6 +408,7 @@ impl Insert {
             fade_frames: ((FADE_SECONDS * sample_rate) as u32).max(1),
             held_out: false,
             scratch: [0.0; 2 * BLOCK],
+            dry: [0.0; 2 * BLOCK],
             sample_rate,
         };
         for i in 1..kind.params().len() {
@@ -570,6 +577,7 @@ impl Insert {
     pub fn latency(&self) -> usize {
         match &self.effect {
             Effect::Gate { gate, .. } => gate.latency(),
+            Effect::Plugin(p) => p.latency(),
             _ => 0,
         }
     }
@@ -596,9 +604,15 @@ impl Insert {
     }
 
     /// Whether it should be heard: neither bypassed nor held out. A gate
-    /// bypassed is still heard, as its delayed input.
+    /// or a plugin bypassed is still heard, as its delayed input.
     fn wants_in(&self) -> bool {
-        !self.held_out && (self.kind == EffectKind::Gate || !self.bypassed())
+        !self.held_out && (self.delays_bypassed() || !self.bypassed())
+    }
+
+    /// Whether bypassing it passes its input as late as its output: a
+    /// gate's, and a plugin's (which may say it has none).
+    fn delays_bypassed(&self) -> bool {
+        matches!(self.kind, EffectKind::Gate | EffectKind::Plugin(_))
     }
 
     /// Holds it out of the chain (fading to its input) or lets it back.
@@ -649,6 +663,10 @@ impl Insert {
             self.process_gate(buf, key);
             return;
         }
+        if let EffectKind::Plugin(_) = self.kind {
+            self.process_plugin(buf);
+            return;
+        }
         let want = self.wants_in();
         if !want && self.fade == 0 {
             self.drain(buf.len());
@@ -668,12 +686,6 @@ impl Insert {
             match &mut self.effect {
                 Effect::Strip(s) => return s.process(buf, key),
                 Effect::Filter(f) => return f.process(buf),
-                Effect::Plugin(p) => {
-                    if let Some(i) = p.instance() {
-                        i.process(buf);
-                    }
-                    return;
-                }
                 _ => {}
             }
         }
@@ -686,12 +698,6 @@ impl Insert {
             Effect::Filter(f) => {
                 wet.copy_from_slice(buf);
                 f.process(wet);
-            }
-            Effect::Plugin(p) => {
-                wet.copy_from_slice(buf);
-                if let Some(i) = p.instance() {
-                    i.process(wet);
-                }
             }
             effect => {
                 match effect {
@@ -788,15 +794,66 @@ impl Insert {
         }
     }
 
-    /// Feeds a faded-out effect `n` samples of silence, unless it holds no
-    /// more sound. A plugin is not called: its time moves on.
-    fn drain(&mut self, n: usize) {
-        if let Effect::Plugin(p) = &mut self.effect {
-            if let Some(i) = p.instance() {
-                i.skip(n / 2);
-            }
+    /// [`Insert::process`] for a plugin: its output fades over its input as
+    /// late as the output (`dry`) as it is bypassed and brought back, and
+    /// the whole over the input as it arrives as it is taken out or put in.
+    /// Bypassed all the way, or out of the chain, it is not called: its
+    /// time moves on.
+    fn process_plugin(&mut self, buf: &mut [f32]) {
+        let (on, present) = (!self.bypassed(), !self.held_out);
+        // Faded out before the block ends: from then on it is not called,
+        // as in blocks of one frame.
+        let ending = |going: bool, f: u32| (going && f > 0).then_some(f as usize);
+        let k = ending(!on, self.bypass_fade).into_iter().chain(ending(!present, self.fade)).min();
+        if let Some(k) = k.filter(|&k| k < buf.len() / 2) {
+            let (head, tail) = buf.split_at_mut(2 * k);
+            self.process_plugin(head);
+            self.process_plugin(tail);
             return;
         }
+        let Self { effect, scratch, dry, fade, bypass_fade, fade_frames, .. } = self;
+        let Effect::Plugin(p) = effect else { return };
+        let (whole, top) = (*fade_frames as f32, *fade_frames);
+        let x = &mut scratch[..buf.len()];
+        let dry = &mut dry[..buf.len()];
+        x.copy_from_slice(buf);
+        dry.copy_from_slice(buf);
+        if let Some(i) = p.instance() {
+            i.delay_dry(dry);
+            let heard = (present || *fade > 0) && (on || *bypass_fade > 0);
+            if !heard {
+                i.skip(buf.len() / 2);
+            } else if !i.process(buf) {
+                // One that failed stands in for itself with its input, in
+                // time.
+                buf.copy_from_slice(dry);
+            }
+        }
+        if present && on && *fade == top && *bypass_fade == top {
+            return;
+        }
+        for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            *bypass_fade = if on { (*bypass_fade + 1).min(top) } else { bypass_fade.saturating_sub(1) };
+            *fade = if present { (*fade + 1).min(top) } else { fade.saturating_sub(1) };
+            for c in 0..2 {
+                let (input, d, w) = (x[2 * i + c], dry[2 * i + c], f[c]);
+                let y = match *bypass_fade {
+                    b if b == top => w,
+                    0 => d,
+                    b => d + b as f32 / whole * (w - d),
+                };
+                f[c] = match *fade {
+                    q if q == top => y,
+                    0 => input,
+                    q => input + q as f32 / whole * (y - input),
+                };
+            }
+        }
+    }
+
+    /// Feeds a faded-out effect `n` samples of silence, unless it holds no
+    /// more sound.
+    fn drain(&mut self, n: usize) {
         if self.is_idle() {
             return;
         }
@@ -927,6 +984,12 @@ impl Chain {
                 s.hold_out(p.touches(i));
             }
         }
+        self.count_latency();
+    }
+
+    /// Counts its latency again, after a plugin instance came, went or
+    /// restarted in one of its inserts.
+    pub fn recount(&mut self) {
         self.count_latency();
     }
 

@@ -15,9 +15,12 @@ use crate::dsp::{ring_back, ring_next};
 const FADE_SECONDS: f32 = 0.01;
 
 /// The longest delay a path can need at `sample_rate`: every slot of a
-/// track's chain and of its group's holding a gate.
+/// track's chain and of its group's holding a gate, and the plugins on it
+/// coming as late as is made up for
+/// ([`MAX_LATENCY_SECONDS`](crate::clap::host::MAX_LATENCY_SECONDS)).
 pub fn longest(sample_rate: f32) -> usize {
     2 * crate::insert::MAX_SLOTS * crate::dsp::gate::lookahead_frames(sample_rate)
+        + crate::clap::host::max_latency(f64::from(sample_rate))
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,11 @@ impl Align {
             fade: ((FADE_SECONDS * sample_rate) as u32).max(1),
             next: None,
         }
+    }
+
+    /// The longest delay it makes, in frames.
+    pub fn longest(&self) -> usize {
+        self.len - 1
     }
 
     /// The delay it is set to, in frames.

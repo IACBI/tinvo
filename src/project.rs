@@ -131,22 +131,7 @@ pub struct TrackData {
     pub chain: ChainData,
 }
 
-/// Where a plugin plays: a track's instrument, or an insert slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PluginPlace {
-    Track(u8),
-    Slot(ChainId, u8),
-}
-
-impl PluginPlace {
-    /// What it is asked to be there.
-    pub fn role(self) -> crate::clap::host::Role {
-        match self {
-            PluginPlace::Track(_) => crate::clap::host::Role::Instrument,
-            PluginPlace::Slot(..) => crate::clap::host::Role::Effect,
-        }
-    }
-}
+pub use crate::engine::PluginPlace;
 
 /// An effect in an insert slot and its settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,11 +163,14 @@ pub struct LaneData {
     pub ramp: bool,
     /// `points[pattern][step]`.
     pub points: Box<[[Option<f32>; MAX_STEPS]; MAX_PATTERNS]>,
+    /// A plugin parameter's value while no point is in force
+    /// ([`Edit::SetLaneBase`]).
+    pub base: Option<f32>,
 }
 
 impl LaneData {
     pub fn new(target: Option<LaneTarget>, ramp: bool) -> Self {
-        Self { target, ramp, points: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]) }
+        Self { target, ramp, points: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]), base: None }
     }
 
     /// The value in force at the start of `step` in `pattern` (of length
@@ -343,6 +331,8 @@ pub enum EditError {
     TooManyInserts,
     /// A lane automates the effect in the slot, so it cannot change kind.
     SlotAutomated(u8),
+    /// The lane is not on a plugin's parameter.
+    NotPluginLane(u8),
 }
 
 impl fmt::Display for EditError {
@@ -371,6 +361,7 @@ impl fmt::Display for EditError {
             EditError::SlotAutomated(s) => {
                 write!(f, "a lane automates the effect in insert slot {}", u32::from(*s) + 1)
             }
+            EditError::NotPluginLane(l) => write!(f, "lane {} is not on a plugin parameter", u32::from(*l) + 1),
         }
     }
 }
@@ -665,9 +656,19 @@ impl Project {
             }
             Edit::SetPoint { track, lane, pattern, step, value } => {
                 let spec = self.point_spec(track, lane, pattern, step)?;
-                let value = value.map(|v| spec.clamp(v));
+                // A plugin's range is the plugin's to keep to.
+                let value = match spec {
+                    Some(spec) => value.map(|v| spec.clamp(v)),
+                    None => value.filter(|v| v.is_finite()),
+                };
                 self.track_mut(track)?.lanes[usize::from(lane)].points[usize::from(pattern)][usize::from(step)] = value;
                 Edit::SetPoint { track, lane, pattern, step, value }
+            }
+            Edit::SetLaneBase { track, lane, value } => {
+                self.plugin_lane(track, lane)?;
+                let value = value.filter(|v| v.is_finite());
+                self.track_mut(track)?.lanes[usize::from(lane)].base = value;
+                Edit::SetLaneBase { track, lane, value }
             }
             Edit::SetMixParam { index, value } => {
                 let spec = MIX_PARAMS.get(usize::from(index)).ok_or(EditError::NoSuchParam(index))?;
@@ -768,7 +769,7 @@ impl Project {
                     for l in &mut t.lanes {
                         let Some(x) = l.target else { continue };
                         if x.slot(i as u8).is_some_and(|(c, ..)| c == chain) {
-                            l.target = Some(with_slot(x, swap));
+                            l.target = Some(x.with_slot(swap));
                         }
                     }
                 }
@@ -834,7 +835,7 @@ impl Project {
     pub fn slot_automated(&self, c: ChainId, slot: u8) -> bool {
         self.tracks.iter().enumerate().any(|(i, t)| {
             let targets = t.lanes.iter().filter_map(|l| l.target);
-            targets.filter_map(|x| x.slot(i as u8)).any(|(chain, s, ..)| chain == c && s == slot)
+            targets.filter_map(|x| x.chain_slot(i as u8)).any(|(chain, s)| chain == c && s == slot)
         })
     }
 
@@ -909,14 +910,10 @@ impl Project {
         for t in &mut self.tracks {
             t.group = t.group.map(&to);
             for l in &mut t.lanes {
-                match l.target {
-                    Some(LaneTarget::Group { group, index }) => {
-                        l.target = Some(LaneTarget::Group { group: to(group), index });
+                if let Some(x) = l.target {
+                    if let Some(g) = x.group() {
+                        l.target = Some(x.with_group(to(g)));
                     }
-                    Some(LaneTarget::GroupSlot { group, slot, kind, index }) => {
-                        l.target = Some(LaneTarget::GroupSlot { group: to(group), slot, kind, index });
-                    }
-                    _ => {}
                 }
             }
         }
@@ -945,9 +942,24 @@ impl Project {
             return Err(EditError::NoSuchLane(lane));
         }
         if let Some(x) = target {
-            x.spec(t.kind).ok_or(EditError::NoSuchTarget(x))?;
+            if x.plugin_param(track).is_none() {
+                x.spec(t.kind).ok_or(EditError::NoSuchTarget(x))?;
+            }
             if x.group().is_some_and(|g| usize::from(g) >= self.groups.len()) {
                 return Err(EditError::NoSuchTarget(x));
+            }
+            // A plugin's parameter while that plugin plays there; which
+            // parameters it has is the plugin's to say.
+            if let Some((place, plugin, _)) = x.plugin_param(track) {
+                let there = match place {
+                    PluginPlace::Track(_) => t.kind.plugin(),
+                    PluginPlace::Slot(c, slot) => {
+                        self.check_slot(c, slot).ok().and_then(|d| d.and_then(|d| d.kind.plugin()))
+                    }
+                };
+                if there != Some(plugin) {
+                    return Err(EditError::NoSuchTarget(x));
+                }
             }
             // An insert's parameter while the slot holds that effect.
             if let Some((c, slot, kind, _)) = x.slot(track) {
@@ -968,17 +980,30 @@ impl Project {
         Ok(())
     }
 
-    /// The parameter a point on (`track`, `lane`) sets, after validating
-    /// the point's position.
-    fn point_spec(&self, track: u8, lane: u8, pattern: u8, step: u8) -> Result<&'static ParamSpec, EditError> {
+    /// The parameter a point on (`track`, `lane`) sets (`None`: a plugin's),
+    /// after validating the point's position.
+    fn point_spec(&self, track: u8, lane: u8, pattern: u8, step: u8) -> Result<Option<&'static ParamSpec>, EditError> {
         let t = self.track(track)?;
         let l = t.lanes.get(usize::from(lane)).ok_or(EditError::NoSuchLane(lane))?;
-        let spec = l.target.and_then(|x| x.spec(t.kind)).ok_or(EditError::LaneUnassigned(lane))?;
+        let x = l.target.ok_or(EditError::LaneUnassigned(lane))?;
+        let spec = match x.plugin_param(track) {
+            Some(_) => None,
+            None => Some(x.spec(t.kind).ok_or(EditError::LaneUnassigned(lane))?),
+        };
         check_pattern(pattern)?;
         if usize::from(step) >= MAX_STEPS {
             return Err(EditError::NoSuchStep(step));
         }
         Ok(spec)
+    }
+
+    /// Validates that lane `lane` of `track` is on a plugin's parameter.
+    fn plugin_lane(&self, track: u8, lane: u8) -> Result<(), EditError> {
+        let l = self.track(track)?.lanes.get(usize::from(lane)).ok_or(EditError::NoSuchLane(lane))?;
+        match l.target.and_then(|x| x.plugin_param(track)) {
+            Some(_) => Ok(()),
+            None => Err(EditError::NotPluginLane(lane)),
+        }
     }
 
     fn entry(&self, index: u16) -> Result<u8, EditError> {
@@ -1276,8 +1301,13 @@ impl Project {
                 let mut v = vec![Edit::SetLane { track, lane, target: old.target, ramp: old.ramp }];
                 if old.target != target {
                     push_points(&mut v, track, lane, old);
+                    push_base(&mut v, track, lane, old);
                 }
                 v
+            }
+            Edit::SetLaneBase { track, lane, .. } => {
+                self.plugin_lane(track, lane)?;
+                vec![Edit::SetLaneBase { track, lane, value: self.track(track)?.lanes[usize::from(lane)].base }]
             }
             Edit::SetPoint { track, lane, pattern, step, .. } => {
                 self.point_spec(track, lane, pattern, step)?;
@@ -1951,6 +1981,8 @@ fn lane_id(target: LaneTarget, kind: InstrumentKind) -> Option<String> {
         LaneTarget::GroupSlot { group: g, slot, .. } => format!("group{}.insert{slot}.{id}", group(g)),
         LaneTarget::MasterSlot { slot, .. } => format!("master.insert{slot}.{id}"),
         LaneTarget::Track(_) | LaneTarget::Mix(_) => id.to_string(),
+        // Named by the plugin's own id, not a spec's.
+        LaneTarget::Plugin { .. } => return None,
     })
 }
 
@@ -2158,6 +2190,7 @@ fn push_track_state(e: &mut Vec<Edit>, track: u8, t: &TrackData) {
         if l.target.is_some() {
             e.push(Edit::SetLane { track, lane: k as u8, target: l.target, ramp: l.ramp });
             push_points(e, track, k as u8, l);
+            push_base(e, track, k as u8, l);
         }
     }
 }
@@ -2197,15 +2230,10 @@ fn push_slot(e: &mut Vec<Edit>, chain: ChainId, slot: u8, d: Option<SlotData>) {
     }
 }
 
-/// `x`, an insert's lane target, on the slot `to` gives for its own.
-fn with_slot(x: LaneTarget, to: impl Fn(u8) -> u8) -> LaneTarget {
-    match x {
-        LaneTarget::Slot { slot, kind, index } => LaneTarget::Slot { slot: to(slot), kind, index },
-        LaneTarget::GroupSlot { group, slot, kind, index } => {
-            LaneTarget::GroupSlot { group, slot: to(slot), kind, index }
-        }
-        LaneTarget::MasterSlot { slot, kind, index } => LaneTarget::MasterSlot { slot: to(slot), kind, index },
-        other => other,
+/// Appends a `SetLaneBase` for lane `lane`'s base, if it has one.
+fn push_base(e: &mut Vec<Edit>, track: u8, lane: u8, l: &LaneData) {
+    if l.base.is_some() {
+        e.push(Edit::SetLaneBase { track, lane, value: l.base });
     }
 }
 
@@ -3020,6 +3048,79 @@ mod tests {
         assert_eq!(p.apply(point(0, 64)), Err(EditError::NoSuchStep(64)));
         assert_eq!(p.inverse(&point(2, 0)), Err(EditError::LaneUnassigned(2)));
         assert!(p.apply(point(0, 63)).is_ok());
+    }
+
+    #[test]
+    fn a_plugin_lane_needs_its_plugin_there_and_keeps_a_base() {
+        use crate::clap::PluginRef;
+        use crate::engine::PluginAt;
+        let (synth, gain) = (PluginRef::new("com.example.synth").unwrap(), PluginRef::new("com.example.gain").unwrap());
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Plugin(synth))).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        let on = |at, plugin| Some(LaneTarget::Plugin { at, plugin, id: 7 });
+        let lane = |track, lane, target| Edit::SetLane { track, lane, target, ramp: false };
+        p.apply(lane(0, 0, on(PluginAt::Instrument, synth))).unwrap();
+        // Only where that plugin plays.
+        for (track, target) in [
+            (1, on(PluginAt::Instrument, synth)),
+            (0, on(PluginAt::Instrument, gain)),
+            (1, on(PluginAt::Slot(2), gain)),
+            (1, on(PluginAt::GroupSlot { group: 0, slot: 0 }, gain)),
+            (1, on(PluginAt::GroupSlot { group: 1, slot: 0 }, gain)),
+            (1, on(PluginAt::MasterSlot(9), gain)),
+        ] {
+            let t = target.unwrap();
+            assert_eq!(p.apply(lane(track, 1, target)), Err(EditError::NoSuchTarget(t)), "{t}");
+        }
+        p.apply(Edit::SetSlot { chain: ChainId::Track(1), slot: 2, kind: Some(EffectKind::Plugin(gain)) }).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 1, kind: Some(EffectKind::Plugin(gain)) }).unwrap();
+        p.apply(lane(1, 0, on(PluginAt::Slot(2), gain))).unwrap();
+        p.apply(lane(1, 1, on(PluginAt::MasterSlot(1), gain))).unwrap();
+        // One lane in the project for a master plugin's parameter.
+        assert_eq!(p.apply(lane(0, 1, on(PluginAt::MasterSlot(1), gain))), Err(EditError::DuplicateLane));
+        // Automated, the slot keeps its plugin.
+        let clear = Edit::SetSlot { chain: ChainId::Track(1), slot: 2, kind: None };
+        assert_eq!(p.apply(clear), Err(EditError::SlotAutomated(2)));
+        // Its points are the plugin's values, whatever the range.
+        let point = |value| Edit::SetPoint { track: 1, lane: 0, pattern: 0, step: 3, value };
+        assert_eq!(p.apply(point(Some(1234.5))), Ok(point(Some(1234.5))));
+        assert_eq!(p.apply(point(Some(f32::NAN))), Ok(point(None)));
+        // A base, on a plugin lane only.
+        let base = |track, lane, value| Edit::SetLaneBase { track, lane, value };
+        assert_eq!(p.apply(base(1, 2, Some(0.5))), Err(EditError::NotPluginLane(2)));
+        p.apply(lane(1, 2, Some(LaneTarget::Track(0)))).unwrap();
+        assert_eq!(p.apply(base(1, 2, Some(0.5))), Err(EditError::NotPluginLane(2)));
+        assert_eq!(p.inverse(&base(1, 2, None)), Err(EditError::NotPluginLane(2)));
+        assert_eq!(p.apply(base(1, 0, Some(f32::INFINITY))), Ok(base(1, 0, None)));
+        assert_eq!(p.apply(base(1, 0, Some(-3.0))), Ok(base(1, 0, Some(-3.0))));
+        assert_eq!(p.tracks[1].lanes[0].base, Some(-3.0));
+        // Undone, and rebuilt, with the rest.
+        for e in [base(1, 0, Some(9.0)), base(1, 0, None), lane(1, 0, None), lane(1, 0, Some(LaneTarget::Track(1)))] {
+            let mut q = p.clone();
+            let inv = q.inverse(&e).unwrap();
+            q.apply(e).unwrap();
+            assert_ne!(q, p, "{e:?} changed nothing");
+            for i in inv {
+                q.apply(i).unwrap();
+            }
+            assert_eq!(q, p, "{e:?}");
+        }
+        let mut q = Project::new();
+        for e in p.to_edits() {
+            q.apply(e).unwrap();
+        }
+        for (a, b) in q.tracks.iter_mut().zip(&p.tracks) {
+            a.name = b.name.clone();
+        }
+        assert_eq!(q, p);
+        // Groups renumbered take their plugin lanes along.
+        p.apply(Edit::SetSlot { chain: ChainId::Group(0), slot: 0, kind: Some(EffectKind::Plugin(gain)) }).unwrap();
+        p.apply(lane(0, 2, on(PluginAt::GroupSlot { group: 0, slot: 0 }, gain))).unwrap();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        assert_eq!(p.tracks[0].lanes[2].target, on(PluginAt::GroupSlot { group: 1, slot: 0 }, gain));
+        assert_eq!(p.apply(Edit::RemoveGroup(1)), Err(EditError::GroupInUse(1)));
     }
 
     #[test]
