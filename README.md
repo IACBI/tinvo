@@ -93,6 +93,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo --midi-out "synth" song.tvo  # send MIDI-out tracks and the clock there
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
+tinvo plugins             # list the CLAP plugins installed (--rescan reads every file again)
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
@@ -105,6 +106,8 @@ The editor stays on the system default unless told otherwise, follows it when it
 `Z` chooses a MIDI output, and `V` sends the selected track there instead of sounding it: on its MIDI channel, or channel 1, and drums as General MIDI notes on channel 10. Notes leave when their audio would be heard, and muting the track ends them. With `midi_clock = on` the output also gets MIDI clock, Start, Stop and Continue with the song position, so a drum machine or another sequencer follows TINVO's tempo; turned on while playing, the clock starts with the next Play. `midi_delay` sends everything a little later (up to 50 ms) when the output sounds before TINVO's audio does.
 
 A MIDI file (format 0 or 1) opens as a new, unsaved project: each MIDI track and channel becomes a synth track, and the General MIDI drums on channel 10 become kick, snare, clap and hat tracks. Notes land on the nearest 16th-note step with their timing kept as micro-timing, a step holds a chord of up to four notes, and the file is cut into patterns of whole bars that the song plays in order, a repeated stretch reusing its pattern. The tempo comes from the file, and later tempo changes become tempo points from the bar line they fall on, or the next one. Export (`e` with a file name ending in `.mid`, or `tinvo render` to a `.mid` file) writes each heard track's notes where TINVO plays them, with swing, micro-timing, ratchets and each song entry's tempo; drums go to channel 10, and tracks without a MIDI channel of their own take the free ones in turn.
+
+`tinvo plugins` lists the CLAP plugins in CLAP's standard folders and in the folders `CLAP_PATH` names: each one's name, version, vendor, what it is (instrument, effect…), id and file. Each file is read in a short-lived process of its own, so a plugin that crashes or hangs while it starts is listed as not loaded, with the reason, and TINVO carries on. What was read is kept in a cache until the file changes. Playing plugins in a project comes in the next releases.
 
 The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
@@ -268,6 +271,7 @@ tinvo --midi keystation song.tvo   # play from that MIDI keyboard
 tinvo --midi-out "synth" song.tvo  # send MIDI-out tracks and the clock there
 tinvo inputs              # list the audio input devices
 tinvo record take.wav 10  # record 10 seconds from the default input
+tinvo plugins             # list the CLAP plugins installed (--rescan reads every file again)
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
@@ -280,6 +284,8 @@ Başka bir cihaz seçilmedikçe editör sistemin varsayılan çıkışını kull
 `Z` bir MIDI çıkışı seçer, `V` de seçili kanalı kendi sesi yerine oraya gönderir: kendi MIDI kanalından ya da 1. kanaldan; davullar 10. kanalda General MIDI notaları olarak gider. Notalar, sesleri duyulacağı anda çıkar; kanal mute edilince notaları da biter. `midi_clock = on` ile çıkışa MIDI clock, Start, Stop ve şarkı konumuyla Continue da gider, böylece bir davul makinesi ya da başka bir sequencer TINVO'nun temposunu takip eder; çalarken açılırsa clock bir sonraki Play ile başlar. Çıkış TINVO'nun sesinden önce duyuluyorsa `midi_delay` her şeyi biraz geciktirir (en fazla 50 ms).
 
 Bir MIDI dosyası (format 0 ya da 1) kaydedilmemiş yeni bir proje olarak açılır: her MIDI track'i ve kanalı bir synth kanalı olur, 10. kanaldaki General MIDI davulları da kick, snare, clap ve hat kanallarına dönüşür. Notalar en yakın 16'lık adıma düşer, zamanlamaları micro-timing olarak korunur; bir adımda en fazla dört notalık akor olur. Dosya tam ölçülerden oluşan pattern'lere bölünür, şarkı bunları sırayla çalar; tekrar eden bir bölüm aynı pattern'i kullanır. Tempo dosyadan gelir; sonraki tempo değişiklikleri denk geldikleri ölçü çizgisinden, ölçü ortasındaysa bir sonrakinden başlayan tempo noktaları olur. Dışa aktarma (`e` ile `.mid` uzantılı bir dosya adı ya da `.mid` dosyasına `tinvo render`), duyulan her kanalın notalarını TINVO'nun çaldığı yere yazar: swing, micro-timing, ratchet ve her şarkı girişinin temposuyla. Davullar 10. kanala gider; kendi MIDI kanalı olmayan kanallar boştaki MIDI kanallarını sırayla alır.
+
+`tinvo plugins`, CLAP'in standart klasörlerinde ve `CLAP_PATH` ile verilen klasörlerde kurulu CLAP eklentilerini listeler: her birinin adını, sürümünü, üreticisini, ne olduğunu (instrument, effect…), id'sini ve dosyasını. Her dosya kısa ömürlü, ayrı bir süreçte okunur; açılırken çöken ya da takılan bir eklenti nedeniyle birlikte "yüklenemedi" diye listelenir, TINVO işine devam eder. Okunanlar, dosya değişene kadar önbellekte kalır. Eklentileri bir projede çalmak sonraki sürümlerle geliyor.
 
 Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 

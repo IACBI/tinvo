@@ -70,6 +70,7 @@ jobs:
           cargo run --release -- devices
           cargo run --release -- inputs
           cargo run --release -- midi
+          cargo run --release -- plugins
       - name: Probe JACK, then PipeWire's JACK
         if: runner.os == 'Linux'
         run: |

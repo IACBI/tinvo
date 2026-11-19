@@ -21,6 +21,11 @@ name = "realtime"
 # Its own allocator counts calls on one thread; the harness adds threads.
 harness = false
 
+[[example]]
+name = "clap_fixture"
+# A CLAP plugin file the tests in tests/clap.rs load.
+crate-type = ["cdylib"]
+
 [profile.dev]
 # Tests render seconds of audio; unoptimised DSP makes them needlessly slow.
 opt-level = 1

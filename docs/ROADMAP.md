@@ -523,9 +523,34 @@ For professional instruments and effects: sampled pianos and orchestral librarie
 - The plugin's own window (`clap.gui`) opens as a floating window, since a terminal has no window to place it in.
 - The spec's thread rules: main-thread calls from the UI thread, processing on the audio thread, and the host's callbacks honoured.
 - Export runs plugins through the same engine. A plugin whose output depends on timing or block size can make export differ from playback; TINVO says so instead of hiding it.
-- A plugin runs inside TINVO's process, so a plugin that crashes ends the session (the autosave keeps the project). Running plugins in a separate process is not planned.
+- A plugin plays inside TINVO's process, so a plugin that crashes while playing ends the session (the autosave keeps the project); only the scan reads each file in a child process. Running plugins in a separate process is not planned.
 - A new project format: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
 - Tests: two small CLAP plugins built in the repository (a gain and a sine instrument) for scanning, loading, parameters, state, latency and the thread rules, and the allocation test with a plugin playing.
+
+It comes in four parts, each merged on its own.
+
+#### 12a: Finding plugins ✅
+
+- `tinvo plugins [--rescan]`. The folders CLAP's `entry.h` names for the system (`%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\Programs\Common\CLAP`; `~/.clap` and `/usr/lib/clap`; `/Library/Audio/Plug-Ins/CLAP` and `~/Library/Audio/Plug-Ins/CLAP`), then those in `CLAP_PATH`, are searched for `.clap` files (bundles on macOS) without following links to folders, at most 16 deep, through 100,000 entries and up to 10,000 files.
+- Each new or changed file is read by a child process, `tinvo scan-clap`, with its standard streams closed. It loads the file (`LoadLibraryExW` searching the plugin's own folder for its libraries; `dlopen` with `RTLD_NOW | RTLD_LOCAL`; on macOS the bundle's executable as CoreFoundation finds it), calls `init` and `deinit` once each, reads the factory's descriptors (strings read to at most 1 KiB, at most 256 descriptors of at most 64 features, an id and a name required, 1 MiB in all) and writes its result, into a folder of the scan's own in the user's temporary folder (readable by the user alone on Unix), only once the file is unloaded. A child that crashes, runs past 10 s or leaves no whole result marks the file as not loaded, with the reason. Processes a plugin starts end with its child where the system allows it: on Windows the child puts itself in a job that ends them when it ends (unless a job it is already in forbids that), on Unix the child leads a process group that is ended after it, before it is reaped (on Linux and macOS, where an ended child can be seen without reaping it; elsewhere only a child that runs out of time has its group ended), so the group's id cannot have been reused; a helper that leaves the group survives. A scan's 2 minutes count from before the search, which its own limits bound, and are checked before each child: a child started near the end gets only the time left, and the files it does not finish are read by the next scan, as are those whose child could not start or write its result, or that changed while they were read.
+- The cache, `plugins.txt` in the state directory, keeps each file's size and modification time (on Unix its inode and change time too; on macOS those of the bundle's `Info.plist`, of the executable CoreFoundation finds and of the first 64 files in `Contents/MacOS`), names the system and processor it was made on and is written atomically. Only what the search reached is pruned: entries under a folder that could not be read, that was too deep or that a limit cut off stay. A file replaced by one of the same size and times goes unnoticed until `--rescan`.
+- A plugin id two files offer is listed once, from the first, and the other file is named.
+- The C types the next parts need (plugin, host, process, events, audio and note ports), checked against the headers' sizes and offsets on 64-bit systems.
+- Tests: a CLAP plugin built in the repository (`examples/clap_fixture.rs`) loaded under names that make it crash in `init` or `deinit`, hang, refuse, write megabytes to its output, offer no factory or start a helper process; its descriptors and roles, a nameless descriptor passed over, a file that is not a library, the cache reused, read again after a change and pruned only where the search reached, the time budget (also cutting a child short without blaming the plugin), the helper ended with its scan, duplicate ids, `tinvo plugins` through `CLAP_PATH`, the search's order, limits and links, and the cache's and the result's formats (a result with anything after its end refused).
+
+Known limits: a cache that would be over 16 MiB is not written, so such an installation is read again by each scan; cached entries under a folder one root could not search to the end are kept even when another root searches that folder fully; and a process a plugin starts outside its child's process group or job outlives the scan.
+
+#### 12b: Playing plugins
+
+- A plugin as a track's instrument or in an insert slot: activated on the UI thread at the engine's sample rate and largest block, processing on the audio thread with planar buffers and note events, deactivated and destroyed after leaving through the release queue. The host's callbacks (`request_restart`, `request_process`, `request_callback`) and `clap.thread-check`. Export says so through `clap.render`. The allocation test with a plugin playing.
+
+#### 12c: Parameters, latency and state
+
+- `clap.params` in the panel and on automation lanes, by stable id; `clap.latency` in the latency compensation; `clap.state` in project format 16; an instance of its own for export. A missing plugin: an insert passes its input through and an instrument stays silent; both keep their state and are named when the project opens.
+
+#### 12d: The plugin's window
+
+- `clap.gui` as a floating window, its platform's event loop running alongside the terminal's.
 
 ### Phase 13: Sampled instruments (medium)
 
