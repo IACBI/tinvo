@@ -32,7 +32,7 @@ use crate::sample::{self as sample_mod, Sample};
 use crate::settings::{self as settings_mod, MidiOut, OPTIONS, Recording, Settings};
 use crate::strip::{self, track_param};
 use crate::theme::{self as theme_mod, Role, Theme};
-use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal};
+use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal, screen, term};
 use crate::wav::{self, SampleFormat};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -55,6 +55,17 @@ const SONG_LINE_ROWS: u16 = 8;
 const PARAM_COL: u16 = 28;
 /// Columns a text prompt keeps for what is typed.
 const MIN_INPUT: usize = 24;
+/// The column the key list's descriptions start in.
+const HELP_TEXT: u16 = 20;
+/// The most bytes a prompt takes, as many as a sample's path may have.
+const MAX_PROMPT: usize = 4096;
+/// Why an undo or redo is refused when its samples would not fit.
+const TOO_MUCH_SAMPLE: &str = "Not done: the samples it brings back, as loaded now, hold more than a project's samples may; load shorter ones first";
+/// How often the editor draws while something on the screen moves.
+const FRAME: Duration = Duration::from_millis(16);
+/// How often it draws when nothing has moved for [`IDLE_AFTER`].
+const IDLE_FRAME: Duration = Duration::from_millis(50);
+const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// Rows the grid keeps however many parameters the panel has.
 const MIN_GRID_ROWS: u16 = 3;
 const MIN_W: u16 = 64;
@@ -574,6 +585,8 @@ struct NoteRecording {
     restart: bool,
     /// [`Shared::takes_lost`] when the recording started.
     lost: u32,
+    /// [`Shared::layouts_lost`] when the recording started.
+    layouts_lost: u32,
 }
 
 /// A recording into a sampler track.
@@ -624,6 +637,11 @@ pub struct App {
     pub inserts_of: InsertsOf,
     pub export_format: SampleFormat,
     pub export_loops: u32,
+    /// The prompt's cursor, as the characters after it.
+    prompt_back: usize,
+    /// Whether the last paste into the prompt was cut, until the next key:
+    /// the prompt says so, as the status line is not shown under it.
+    paste_cut: bool,
     /// What export plays; `Pattern` means the pattern being edited.
     pub export_source: Source,
     pub quit: bool,
@@ -713,6 +731,8 @@ pub struct App {
     /// How many lines of the key list the last frame showed, so scrolling
     /// stops where the end is in view.
     help_rows: Cell<usize>,
+    /// The columns the key list was last drawn in, which its lines wrap to.
+    help_width: Cell<u16>,
     /// What the last frame drew where, for the mouse.
     hits: RefCell<Vec<Hit>>,
     /// The highest pitch the piano roll showed; it scrolls only when the
@@ -834,6 +854,8 @@ impl App {
             inserts_of: InsertsOf::Track,
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
+            prompt_back: 0,
+            paste_cut: false,
             export_source: Source::Auto,
             quit: false,
             brushes,
@@ -885,6 +907,7 @@ impl App {
             settings_changed: false,
             settings_saved: Settings::default(),
             help_rows: Cell::new(1),
+            help_width: Cell::new(MIN_W),
             hits: RefCell::new(Vec::new()),
             roll_top: Cell::new(None),
             stroke: None,
@@ -1035,9 +1058,14 @@ impl App {
         let file = rec.path.display().to_string();
         match take.track {
             Some(t) if load && self.project.tracks.get(t).is_some_and(|t| t.kind == InstrumentKind::Sampler) => {
-                self.track = t;
-                self.load_sample(&file);
-                self.set_status(format!("{why}Recorded {:.1} s into {file}{lost}", rec.seconds()));
+                // A prompt or question open now is about the track selected.
+                if self.mode == Mode::Normal {
+                    self.track = t;
+                }
+                match self.load_sample(t, &file) {
+                    Ok(()) => self.set_status(format!("{why}Recorded {:.1} s into {file}{lost}", rec.seconds())),
+                    Err(e) => self.set_status(format!("{why}Recorded {:.1} s to {file}{lost}. {e}", rec.seconds())),
+                }
             }
             _ => {
                 let load = self.k(Action::LoadSample);
@@ -1212,9 +1240,13 @@ impl App {
         let s = s.sanitized();
         let (track, pattern, step) = (self.track as u8, self.pattern as u8, self.step as u8);
         let e = Edit::SetStep { track, pattern, step, value: Some(s) };
+        // A chord goes on in its undo step while it stays on its step; the
+        // step's inverse is that of the cell it began on.
         let ours = self.entry_notes.len() > 1
             && self.entry_change.is_some_and(|(at, last)| {
-                self.redo.is_empty() && self.undo.back().is_some_and(|c| c.at == at && c.redo == [last])
+                let here = matches!(last, Edit::SetStep { track: t, pattern: p, step: st, .. }
+                    if (t, p, st) == (track, pattern, step));
+                here && self.redo.is_empty() && self.undo.back().is_some_and(|c| c.at == at && c.redo == [last])
             });
         let written = if ours {
             // Same step, so the undo step's inverse (the step before the
@@ -1486,34 +1518,37 @@ impl App {
         self
     }
 
-    /// Loads a WAV file into the selected sampler track, as one undo step.
-    fn load_sample(&mut self, text: &str) {
+    /// Loads a WAV file into sampler track `track`, as one undo step.
+    fn load_sample(&mut self, track: usize, text: &str) -> Result<(), String> {
         let path = sample_mod::absolute(text);
         let key = path.to_string_lossy().into_owned();
         if let Some(why) = sample_mod::unstorable(&key) {
-            self.set_status(why);
-            return;
+            return Err(why.into());
         }
-        let loaded = match sample_mod::load(&path) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                self.set_status(format!("Cannot load sample: {e}"));
-                return;
-            }
-        };
+        // The project's other samples count against its budget, each once.
+        let mut others: Vec<&str> = (0..self.track_count())
+            .filter(|&i| i != track)
+            .filter_map(|i| self.project.tracks[i].sample.as_deref())
+            .filter(|&k| k != key)
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
+        let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load sample: {e}"))?);
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
         let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
         self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
         let reloaded = self.bank.insert(key.clone(), loaded).is_some();
         let meta_before = self.meta();
-        self.project.tracks[self.track].sample = Some(key.clone());
-        self.send_sample(self.track);
+        self.project.tracks[track].sample = Some(key.clone());
+        self.send_sample(track);
         // The file as loaded now is what every track using it plays, as an
         // export and the saved project would have it.
         if reloaded {
             let others: Vec<usize> = (0..self.track_count())
-                .filter(|&i| i != self.track && self.project.tracks[i].sample.as_deref() == Some(key.as_str()))
+                .filter(|&i| i != track && self.project.tracks[i].sample.as_deref() == Some(key.as_str()))
                 .collect();
             for &i in &others {
                 self.send_sample(i);
@@ -1531,6 +1566,7 @@ impl App {
             key: None,
             at: Instant::now(),
         });
+        Ok(())
     }
 
     pub fn undo(&mut self) {
@@ -1538,6 +1574,11 @@ impl App {
             self.set_status("Nothing to undo");
             return;
         };
+        if !self.samples_fit(&c.meta_before, sample_mod::PROJECT_FRAMES) {
+            self.set_status(TOO_MUCH_SAMPLE);
+            self.undo.push_back(c);
+            return;
+        }
         for &e in &c.undo {
             self.apply_raw(e);
         }
@@ -1551,6 +1592,11 @@ impl App {
             self.set_status("Nothing to redo");
             return;
         };
+        if !self.samples_fit(&c.meta_after, sample_mod::PROJECT_FRAMES) {
+            self.set_status(TOO_MUCH_SAMPLE);
+            self.redo.push(c);
+            return;
+        }
         for &e in &c.redo {
             self.apply_raw(e);
         }
@@ -1558,6 +1604,16 @@ impl App {
         self.after_history_move(&c, "Redid");
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
+    }
+
+    /// Whether the samples the tracks of `meta` play, as loaded now, hold
+    /// at most `budget` frames together, each file once. The history keeps
+    /// paths, and a file loaded again since may have grown.
+    fn samples_fit(&self, meta: &Meta, budget: usize) -> bool {
+        let mut keys: Vec<&str> = meta.tracks.iter().filter_map(|t| t.sample.as_deref()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() <= budget
     }
 
     fn after_history_move(&mut self, c: &Change, verb: &str) {
@@ -1771,10 +1827,18 @@ impl App {
     }
 
     /// Writes unsaved edits to the autosave now, whatever the interval; for
-    /// when the session is about to end abnormally.
-    pub fn autosave_now(&mut self) {
-        if self.dirty {
-            self.write_autosave(Instant::now());
+    /// when the session is about to end abnormally. Says what became of
+    /// them, to follow the reason the session ends (empty with none).
+    pub fn autosave_now(&mut self) -> String {
+        if !self.dirty {
+            return String::new();
+        }
+        let Some(path) = self.autosave.path().map(Path::to_path_buf) else {
+            return "; the unsaved edits are lost: there is nowhere to autosave them".into();
+        };
+        match self.autosave.write(&self.project, self.revision, Instant::now()) {
+            Ok(()) => format!("; the unsaved edits were autosaved to {}", path.display()),
+            Err(e) => format!("; the unsaved edits could not be autosaved to {}: {e}", path.display()),
         }
     }
 
@@ -1850,9 +1914,16 @@ impl App {
         self.finish_note_recording();
         let Some(link) = &mut self.link else { return };
         let lost = link.shared.takes_lost.load(Ordering::Relaxed);
+        let layouts_lost = link.shared.layouts_lost.load(Ordering::Relaxed);
         link.record_notes(true);
-        self.note_rec =
-            Some(NoteRecording { take: NoteTake::new(), started: false, closing: false, restart: false, lost });
+        self.note_rec = Some(NoteRecording {
+            take: NoteTake::new(),
+            started: false,
+            closing: false,
+            restart: false,
+            lost,
+            layouts_lost,
+        });
         if !self.playing {
             self.send(Command::Cue(self.pattern as u8));
             let meter = self.project.meters[self.pattern];
@@ -1925,6 +1996,7 @@ impl App {
     fn finish_note_recording(&mut self) {
         let Some(mut r) = self.note_rec.take() else { return };
         let mut lost = 0;
+        let mut layouts_lost = 0;
         if let Some(link) = &mut self.link {
             while let Some(e) = link.next_take() {
                 r.take.push(e);
@@ -1933,6 +2005,14 @@ impl App {
                 link.record_notes(false);
             }
             lost = link.shared.takes_lost.load(Ordering::Relaxed).wrapping_sub(r.lost);
+            layouts_lost = link.shared.layouts_lost.load(Ordering::Relaxed).wrapping_sub(r.layouts_lost);
+        }
+        if layouts_lost > 0 {
+            // Later notes may be on any track: none is written.
+            self.set_status(
+                "Recording stopped and not written: the editor fell behind while tracks were added or removed",
+            );
+            return;
         }
         r.take.settle();
         let edits = r.take.edits(&self.project, &self.brushes, self.recording);
@@ -2142,6 +2222,12 @@ impl App {
         // it ends the drag; the release that follows does nothing.
         self.stroke = None;
         self.stroke_at = None;
+        // A prompt this key opens starts with its cursor at the end, however
+        // the last one was closed.
+        if !matches!(self.mode, Mode::Prompt(..)) {
+            self.prompt_back = 0;
+        }
+        self.paste_cut = false;
         match self.mode.clone() {
             Mode::Help(top) => self.key_help(top, key),
             Mode::AddTrack => self.key_add_track(key),
@@ -2542,13 +2628,17 @@ impl App {
     fn key_prompt(&mut self, kind: PromptKind, mut text: String, key: Key) {
         // A colour is asked for on the settings page, which it returns to.
         let after = if let PromptKind::Style(_) = kind { Mode::Settings } else { Mode::Normal };
+        let back = self.prompt_back.min(text.chars().count());
+        let at = cursor_byte(&text, back);
         match key {
-            Key::Esc => {
+            Key::Esc | Key::Ctrl('c') => {
                 self.mode = after;
+                self.prompt_back = 0;
                 return;
             }
             Key::Enter => {
                 self.mode = after;
+                self.prompt_back = 0;
                 let text = text.trim().to_string();
                 // An empty marker name removes the marker.
                 if text.is_empty() && !matches!(kind, PromptKind::Marker | PromptKind::Channel) {
@@ -2558,7 +2648,11 @@ impl App {
                     PromptKind::SaveAs => self.save_to(with_extension(&text, FILE_EXTENSION)),
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
-                    PromptKind::LoadSample => self.load_sample(&text),
+                    PromptKind::LoadSample => {
+                        if let Err(e) = self.load_sample(self.track, &text) {
+                            self.set_status(e);
+                        }
+                    }
                     PromptKind::Marker => self.set_marker(&text),
                     PromptKind::Style(role) => self.set_style(role, &text),
                     PromptKind::Channel => self.set_channel(&text),
@@ -2567,28 +2661,79 @@ impl App {
                 return;
             }
             Key::Backspace => {
-                text.pop();
+                if let Some((i, _)) = text[..at].char_indices().next_back() {
+                    text.remove(i);
+                }
+            }
+            // The character with the marks on it goes as one.
+            Key::Delete if back > 0 => {
+                let gone = 1 + text[at..].chars().skip(1).take_while(|&c| screen::char_width(c) == 0).count();
+                let end = cursor_byte(&text, back - gone);
+                text.replace_range(at..end, "");
+                self.prompt_back = back - gone;
+            }
+            Key::Home => self.prompt_back = text.chars().count(),
+            Key::End => self.prompt_back = 0,
+            // The cursor steps over a letter with its marks, never onto one.
+            Key::Left if kind != PromptKind::Export => {
+                let marks = text[..at].chars().rev().take_while(|&c| screen::char_width(c) == 0).count();
+                self.prompt_back = (back + marks + 1).min(text.chars().count());
+            }
+            Key::Right if kind != PromptKind::Export => {
+                let marks = text[at..].chars().skip(1).take_while(|&c| screen::char_width(c) == 0).count();
+                self.prompt_back = back.saturating_sub(1 + marks);
             }
             Key::Tab if kind == PromptKind::Export => {
                 let i = SampleFormat::ALL.iter().position(|f| *f == self.export_format).unwrap_or(0);
                 self.export_format = SampleFormat::ALL[(i + 1) % SampleFormat::ALL.len()];
             }
             Key::Left | Key::Right if kind == PromptKind::Export => {
-                let order = [Source::Song, Source::Pattern(0), Source::Region];
-                let current = match render::resolve(&self.project, self.export_source) {
-                    Source::Pattern(_) => 1,
-                    Source::Region => 2,
-                    _ => 0,
+                // Only the sources there are: an empty song or a missing
+                // loop would play pattern A, as the Pattern choice does.
+                let order: Vec<Source> = [Source::Song, Source::Pattern(0), Source::Region]
+                    .into_iter()
+                    .filter(|&s| render::resolve(&self.project, s) == s)
+                    .collect();
+                let resolved = match render::resolve(&self.project, self.export_source) {
+                    Source::Pattern(_) => Source::Pattern(0),
+                    s => s,
                 };
+                let current = order.iter().position(|&s| s == resolved).unwrap_or(0);
                 let d = if key == Key::Right { 1 } else { order.len() - 1 };
                 self.export_source = order[(current + d) % order.len()];
             }
             Key::Up if kind == PromptKind::Export => self.export_loops = (self.export_loops + 1).min(64),
             Key::Down if kind == PromptKind::Export => self.export_loops = (self.export_loops - 1).max(1),
-            Key::Char(c) if text.chars().count() < 200 => text.push(c),
+            Key::Char(c) if text.len() + c.len_utf8() <= MAX_PROMPT => text.insert(at, c),
+            Key::Char(_) => self.set_status(format!("A prompt takes at most {MAX_PROMPT} bytes")),
             _ => {}
         }
         self.mode = Mode::Prompt(kind, text);
+    }
+
+    /// Text pasted in one piece goes into an open prompt at its cursor,
+    /// without its line breaks; elsewhere it does nothing, so pasted text
+    /// never runs as keys.
+    pub fn paste(&mut self, pasted: &str, cut_before: bool) {
+        let Mode::Prompt(_, text) = &mut self.mode else {
+            self.set_status("Pasting works in a text prompt only");
+            return;
+        };
+        let at = cursor_byte(text, self.prompt_back);
+        let mut add: String = pasted.chars().filter(|c| !c.is_control()).collect();
+        let room = MAX_PROMPT - text.len().min(MAX_PROMPT);
+        let cut = add.len() > room;
+        if cut {
+            let end = (0..=room).rev().find(|&i| add.is_char_boundary(i)).unwrap_or(0);
+            add.truncate(end);
+        }
+        text.insert_str(at, &add);
+        self.paste_cut = cut || cut_before;
+        if cut {
+            self.set_status(format!("Pasted text cut: a prompt takes at most {MAX_PROMPT} bytes"));
+        } else if cut_before {
+            self.set_status(format!("Pasted text cut: a paste is read up to {} bytes", term::MAX_PASTE));
+        }
     }
 
     /// How many rows the settings page's current tab has.
@@ -2854,6 +2999,10 @@ impl App {
         let Some(path) = self.settings_path.clone() else {
             return Ok("Settings apply until TINVO quits: there is no settings folder (no APPDATA or HOME)".into());
         };
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let _lock = lock_settings(&path)?;
         let old = match crate::fsutil::read_text(&path, settings_mod::MAX_FILE_BYTES) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -2861,21 +3010,23 @@ impl App {
         };
         let theirs = settings_mod::parse(&old)
             .map_err(|e| format!("the settings file has a mistake ({e}); it was not changed"))?;
+        // Held from the reading above to the writing below: unchecked, a save
+        // another session made in between would be lost.
         let ours = self.settings();
         let merged = settings_mod::merge(&self.settings_saved, &ours, &theirs);
         merged.keys.check().map_err(|e| format!("another session changed the settings file, and with it {e}"))?;
         let text = settings_mod::update_text(&old, &merged)?;
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
         crate::fsutil::write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         let also = if merged == ours { "" } else { ", with what another session saved there" };
         if merged.mouse != self.mouse {
             self.mouse_request = Some(merged.mouse);
         }
+        if merged.midi_out.clock != self.midi_out.clock {
+            self.send(Command::SetMidiClock(merged.midi_out.clock));
+        }
         self.settings_saved = merged.clone();
         (self.keys, self.theme, self.theme_base, self.mouse) = (merged.keys, merged.theme, merged.base, merged.mouse);
-        self.recording = merged.recording;
+        (self.recording, self.midi_out) = (merged.recording, merged.midi_out);
         Ok(format!("Settings saved to {}{also}", path.display()))
     }
 
@@ -3867,6 +4018,9 @@ impl App {
     }
 
     pub fn export_to(&mut self, path: &Path) {
+        if let Err(e) = render::check_destination(&self.project, self.path.as_deref(), path) {
+            return self.set_status(format!("Not exported: {} {e}", path.display()));
+        }
         if crate::smf::is_midi_path(path) {
             let loops = self.export_loops;
             if loops > crate::smf::MAX_LOOPS {
@@ -3890,6 +4044,13 @@ impl App {
             source: self.export_render_source(),
             ..Default::default()
         };
+        // A track whose sample did not load would be silent in the file.
+        let missing =
+            self.project.tracks.iter().find_map(|t| t.sample.as_ref().filter(|p| !self.bank.contains_key(*p)));
+        if let Some(p) = missing {
+            let load = self.k(Action::LoadSample);
+            return self.set_status(format!("Not exported: the sample {p} is missing; {load} loads it again"));
+        }
         let started = Instant::now();
         let samples = self.track_samples();
         let mut meter = ExportMeter::new(self.sample_rate);
@@ -4007,12 +4168,15 @@ impl App {
             (format!(" · {} steps", self.pattern_len()), Target::Length),
             (format!(" of {}", self.project.divisions[self.pattern].name()), Target::Division),
             (format!(" in {}  ", self.project.meters[self.pattern].name()), Target::Meter),
-            (format!("{playing}{file}{dirty} "), Target::Inert),
         ] {
             let n = s.put(x, 0, &text, bar);
             self.hit(x, 0, n, target);
             x += n;
         }
+        // What is right of the controls is for the news below; it may cover
+        // the file's name, never a control.
+        let controls = x;
+        s.put(x, 0, &format!("{playing}{file}{dirty} "), bar);
         let short_term = self.loudness[1];
         let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
         let rec = match (&self.take, self.count_in, &self.note_rec) {
@@ -4031,13 +4195,30 @@ impl App {
             (Some(_), Some(t)) if t.elapsed() < Duration::from_millis(150) => "MIDI●  ",
             (Some(_), _) => "MIDI○  ",
         };
-        let right = format!(" {rec}{midi}{lufs}{}  CPU {:4.1}%  ", self.audio_label, self.cpu * 100.0);
+        let cpu = format!("CPU {:4.1}%  ", self.cpu * 100.0);
         let meter_w = 10u16;
-        let rx = w.saturating_sub(right.chars().count() as u16 + meter_w + 1);
-        s.put(rx, 0, &right, bar);
-        self.hit(rx, 0, w - rx, Target::Inert);
-        let peak = self.master_meter[0].max(self.master_meter[1]);
-        self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
+        let room = w.saturating_sub(controls);
+        let meter = room > meter_w;
+        let end = if meter { w - meter_w - 1 } else { w };
+        // The longest that fits: recording comes first, then the CPU, the
+        // loudness and the device.
+        let right = [
+            format!(" {rec}{midi}{lufs}{}  {cpu}", self.audio_label),
+            format!(" {rec}{midi}{lufs}{cpu}"),
+            format!(" {rec}{midi}{cpu}"),
+            format!(" {rec}{midi}"),
+        ]
+        .into_iter()
+        .find(|r| screen::text_width(r) <= usize::from(end.saturating_sub(controls)));
+        if let Some(right) = right.filter(|r| !r.trim().is_empty()) {
+            let rx = end - screen::text_width(&right) as u16;
+            s.put(rx, 0, &right, bar);
+        }
+        self.hit(controls, 0, w - controls, Target::Inert);
+        if meter {
+            let peak = self.master_meter[0].max(self.master_meter[1]);
+            self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
+        }
     }
 
     /// The tempo in the top bar: the set tempo, and while the song's tempo
@@ -4175,13 +4356,16 @@ impl App {
         s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
-        for (k, l) in t.lanes.iter().enumerate().take(usize::from(rows)) {
-            let y = 2 + k as u16;
+        // The lanes that fit, scrolled to keep the selected one in view.
+        let fit = usize::from(rows).max(1);
+        let top = self.lane.saturating_sub(fit - 1);
+        for (k, l) in t.lanes.iter().enumerate().skip(top).take(fit) {
+            let y = 2 + (k - top) as u16;
             let selected = k == self.lane;
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
             let spec = l.target.and_then(|x| x.spec(t.kind));
             let label = match spec {
-                Some(sp) => format!("{} {:<16.16} {}", k + 1, sp.label, if l.ramp { "ramp" } else { "hold" }),
+                Some(sp) => format!("{} {} {}", k + 1, screen::pad(sp.label, 16), if l.ramp { "ramp" } else { "hold" }),
                 None => format!("{} (free)", k + 1),
             };
             s.put(1, y, &label, self.style(if selected { Role::SelectedName } else { Role::Text }));
@@ -4325,7 +4509,8 @@ impl App {
             k.label(Action::Play),
             k.label(Action::SongView),
         );
-        if rows > 2 {
+        // On its own row, below the Tempo row.
+        if rows > 3 {
             s.put(1, 1 + rows, &keys, self.style(Role::Dim));
         }
         if p.song.is_empty() {
@@ -4381,7 +4566,7 @@ impl App {
         for (k, t) in (top..self.track_count().min(top + visible)).enumerate() {
             let y = 5 + k as u16;
             s.put(0, y, if row == t + 1 { "▸" } else { " " }, self.style(Role::Selected));
-            s.put(1, y, &format!("{:>2} {:<10.10}", t + 1, p.tracks[t].name), self.style(label(t + 1)));
+            s.put(1, y, &format!("{:>2} {}", t + 1, screen::pad(&p.tracks[t].name, 10)), self.style(label(t + 1)));
             for (col, i) in (first..last).enumerate() {
                 let x = SONG_LEFT + col as u16 * 4;
                 let (text, mut st) = match p.part(t, i) {
@@ -4460,7 +4645,9 @@ impl App {
                 Some(g) => format!("G{} {}", u32::from(g) + 1, t.name),
                 None => t.name.clone(),
             };
-            s.put(1, y, &format!("{:>2} {:<12.12} {:<8.8}", ti + 1, name, kind), name_style);
+            // Cut and padded by columns: a wide name must not push the
+            // mute and solo marks out of their columns.
+            s.put(1, y, &format!("{:>2} {} {}", ti + 1, screen::pad(&name, 12), screen::pad(&kind, 8)), name_style);
             s.put(26, y, "M", if t.mute { self.style(Role::Mute) } else { dim });
             s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
             self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
@@ -4511,8 +4698,11 @@ impl App {
     fn params_rows(&self, w: u16, h: u16) -> u16 {
         let cols = (w / PARAM_COL).max(1) as usize;
         let needed = self.page_params().len().div_ceil(cols) as u16 + 1;
-        // header, ruler, the grid's rows, a blank line, the status line
-        needed.min(h.saturating_sub(2 + MIN_GRID_ROWS + 2).max(2))
+        // header, ruler, the grid's rows, a blank line, the status line; and
+        // at most half of what is left, so the view above keeps its rows
+        // (the panel shows a page of parameters at a time).
+        let half = h.saturating_sub(4) / 2;
+        needed.min(h.saturating_sub(2 + MIN_GRID_ROWS + 2).max(2)).min(half.max(2))
     }
 
     fn draw_params(&self, s: &mut Screen, w: u16, y: u16) {
@@ -4602,7 +4792,7 @@ impl App {
                 Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
                 None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
             };
-            s.put(w.saturating_sub(brush.chars().count() as u16 + 2), y, &brush, dim);
+            s.put(w.saturating_sub(screen::text_width(&brush) as u16 + 2), y, &brush, dim);
         }
         for (slot, i) in params.into_iter().enumerate() {
             let (row, col) = (slot / cols, slot % cols);
@@ -4626,61 +4816,74 @@ impl App {
     }
 
     /// The key hints for the bottom line.
-    fn hints(&self) -> String {
+    /// The bottom line's key hints for what has the keys, most useful
+    /// first; the key list's hint is not among them (see [`App::hint_line`]).
+    fn hints(&self) -> Vec<String> {
         let k = &self.keys;
+        let one = |a: Action, what: &str| format!("{} {what}", k.label(a));
+        let two = |a: &[Action], what: &str| format!("{} {what}", k.labels(a));
         match self.focus {
-            Focus::Grid if self.auto_view => format!(
-                "{} step  {} lane  {} point  {} value  {} coarse  {} hold-ramp  {} remove lane  {} grid  {} undo",
-                k.labels(&[Action::Left, Action::Right]),
-                k.labels(&[Action::Up, Action::Down]),
-                k.label(Action::Enter),
-                k.labels(&[Action::PointDown, Action::PointUp]),
-                k.labels(&[Action::PointCoarseDown, Action::PointCoarseUp]),
-                k.label(Action::Ramp),
-                k.label(Action::RemoveLane),
-                k.label(Action::Automate),
-                k.label(Action::Undo),
-            ),
-            Focus::Grid => format!(
-                "{} move  {} step  {} pitch  {} vel  {} len  {} chance  {} ratchet  {} undo  {} play  {} help",
-                k.labels(&[Action::Left, Action::Right, Action::Up, Action::Down]),
-                k.label(Action::Enter),
-                k.labels(&[Action::PitchDown, Action::PitchUp]),
-                k.labels(&[Action::VelocityDown, Action::VelocityUp]),
-                k.labels(&[Action::Shorter, Action::Longer]),
-                k.labels(&[Action::ChanceDown, Action::ChanceUp]),
-                k.label(Action::Ratchet),
-                k.label(Action::Undo),
-                k.label(Action::Play),
-                k.label(Action::Help),
-            ),
-            Focus::Params if self.page == Page::Inserts => format!(
-                "{} select  {} adjust  {} effect  {} move  {} remove  {} chain  {} default  {} page  {} automate  {} grid",
-                k.labels(&[Action::Up, Action::Down]),
-                k.labels(&[Action::Left, Action::Right]),
-                k.labels(&[Action::PrevEffect, Action::NextEffect]),
-                k.labels(&[Action::EffectEarlier, Action::EffectLater]),
-                k.label(Action::RemoveEffect),
-                k.label(Action::InsertChain),
-                k.label(Action::Default),
-                k.label(Action::Page),
-                k.label(Action::Automate),
-                k.label(Action::Focus),
-            ),
-            Focus::Params => format!(
-                "{} select  {} adjust  {} coarse  {} default  {} page  {} automate  {} mute  {} solo  {} grid  {} help",
-                k.labels(&[Action::Up, Action::Down]),
-                k.labels(&[Action::Left, Action::Right]),
-                k.labels(&[Action::CoarseUp, Action::CoarseDown]),
-                k.label(Action::Default),
-                k.label(Action::Page),
-                k.label(Action::Automate),
-                k.label(Action::Mute),
-                k.label(Action::Solo),
-                k.label(Action::Focus),
-                k.label(Action::Help),
-            ),
+            Focus::Grid if self.auto_view => vec![
+                two(&[Action::Left, Action::Right], "step"),
+                two(&[Action::Up, Action::Down], "lane"),
+                one(Action::Enter, "point"),
+                two(&[Action::PointDown, Action::PointUp], "value"),
+                two(&[Action::PointCoarseDown, Action::PointCoarseUp], "coarse"),
+                one(Action::Ramp, "hold-ramp"),
+                one(Action::RemoveLane, "remove lane"),
+                one(Action::Automate, "grid"),
+                one(Action::Undo, "undo"),
+            ],
+            Focus::Grid => vec![
+                two(&[Action::Left, Action::Right, Action::Up, Action::Down], "move"),
+                one(Action::Enter, "step"),
+                two(&[Action::PitchDown, Action::PitchUp], "pitch"),
+                two(&[Action::VelocityDown, Action::VelocityUp], "vel"),
+                two(&[Action::Shorter, Action::Longer], "len"),
+                two(&[Action::ChanceDown, Action::ChanceUp], "chance"),
+                one(Action::Ratchet, "ratchet"),
+                one(Action::Undo, "undo"),
+                one(Action::Play, "play"),
+            ],
+            Focus::Params if self.page == Page::Inserts => vec![
+                two(&[Action::Up, Action::Down], "select"),
+                two(&[Action::Left, Action::Right], "adjust"),
+                two(&[Action::PrevEffect, Action::NextEffect], "effect"),
+                two(&[Action::EffectEarlier, Action::EffectLater], "move"),
+                one(Action::RemoveEffect, "remove"),
+                one(Action::InsertChain, "chain"),
+                one(Action::Default, "default"),
+                one(Action::Page, "page"),
+                one(Action::Automate, "automate"),
+                one(Action::Focus, "grid"),
+            ],
+            Focus::Params => vec![
+                two(&[Action::Up, Action::Down], "select"),
+                two(&[Action::Left, Action::Right], "adjust"),
+                two(&[Action::CoarseUp, Action::CoarseDown], "coarse"),
+                one(Action::Default, "default"),
+                one(Action::Page, "page"),
+                one(Action::Automate, "automate"),
+                one(Action::Mute, "mute"),
+                one(Action::Solo, "solo"),
+                one(Action::Focus, "grid"),
+            ],
         }
+    }
+
+    /// The hints that fit in `w` columns, whole, always ending with the key
+    /// list's: the one hint that leads to all the others.
+    fn hint_line(&self, w: usize) -> String {
+        let help = format!("{} help", self.k(Action::Help));
+        let mut line = String::new();
+        for h in self.hints() {
+            if screen::text_width(&line) + screen::text_width(&h) + 2 + screen::text_width(&help) > w {
+                break;
+            }
+            line.push_str(&h);
+            line.push_str("  ");
+        }
+        line + &help
     }
 
     /// A text prompt from column `x` to `w`: the label, cut if it would
@@ -4688,12 +4891,25 @@ impl App {
     /// text (where typing goes) and the cursor.
     fn draw_input(&self, s: &mut Screen, x: u16, y: u16, w: u16, label: &str, text: &str) {
         let room = usize::from(w.saturating_sub(x));
-        let label: String = label.chars().take(room.saturating_sub(MIN_INPUT)).collect();
-        let x = x + s.put(x, y, &label, self.style(Role::Prompt));
-        let fits = usize::from(w.saturating_sub(x)).saturating_sub(1);
-        let tail: String = text.chars().skip(text.chars().count().saturating_sub(fits)).collect();
-        let x = x + s.put(x, y, &tail, self.style(Role::Input));
-        s.put(x, y, "█", self.style(Role::Input));
+        let label = screen::fit(label, room.saturating_sub(MIN_INPUT));
+        let x = x + s.put(x, y, label, self.style(Role::Prompt));
+        let input = self.style(Role::Input);
+        let (before, after) = text.split_at(cursor_byte(text, self.prompt_back));
+        // The character under the cursor, with its marks.
+        let under =
+            after.char_indices().skip(1).find(|&(_, c)| screen::char_width(c) != 0).map_or(after.len(), |(i, _)| i);
+        let (under, rest) = after.split_at(under);
+        let fits = usize::from(w.saturating_sub(x)).saturating_sub(screen::text_width(under).max(1));
+        let x = x + s.put(x, y, screen::fit_end(before, fits), input);
+        if under.is_empty() {
+            s.put(x, y, "█", input);
+        } else {
+            // Drawn the other way round.
+            let inverse = Style { fg: input.bg, bg: input.fg, ..input };
+            let inverse = if inverse.bg == Color::Default { inverse.on(Color::White) } else { inverse };
+            let n = s.put(x, y, under, inverse);
+            s.put(x + n, y, rest, input);
+        }
     }
 
     fn draw_status(&self, s: &mut Screen, w: u16, y: u16) {
@@ -4722,8 +4938,21 @@ impl App {
                         );
                         let long = format!("{what} (←→ what, Tab format, ↑↓ repeats; .mid for MIDI) file: ");
                         // The keys' help goes first when the line is short.
-                        if long.chars().count() + MIN_INPUT <= usize::from(w) { long } else { format!("{what} file: ") }
+                        if screen::text_width(&long) + MIN_INPUT <= usize::from(w) {
+                            long
+                        } else {
+                            format!("{what} file: ")
+                        }
                     }
+                };
+                // Typing or pasting more is cut; the line says why, first,
+                // so a long label cannot hide it.
+                let label = if text.len() + 4 > MAX_PROMPT {
+                    format!("[{MAX_PROMPT} bytes, full] {label}")
+                } else if self.paste_cut {
+                    format!("[paste cut] {label}")
+                } else {
+                    label
                 };
                 self.draw_input(s, 0, y, w, &label, text);
             }
@@ -4746,7 +4975,7 @@ impl App {
                 let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
                 match recent {
                     Some((m, _)) => s.put(0, y, m, self.style(Role::Message)),
-                    None => s.put(0, y, &self.hints(), self.style(Role::Hint)),
+                    None => s.put(0, y, &self.hint_line(usize::from(w)), self.style(Role::Hint)),
                 };
             }
         }
@@ -4885,7 +5114,20 @@ impl App {
                 }
             }
         }
-        let visible = usize::from(h.saturating_sub(7)).max(1);
+        // What the selected entry does, in full, below the list: the rows
+        // cut it at the screen's edge.
+        let about = match page.tab {
+            SettingsTab::Keys => actions_by_context().get(cursor).map(|a| a.help()),
+            SettingsTab::Colours => cursor.checked_sub(1).and_then(|i| Role::ALL.get(i)).map(|r| r.help()),
+            SettingsTab::Options => OPTIONS.get(cursor).map(|o| o.2),
+        };
+        let about = about.map_or(Vec::new(), |t| wrap(t, usize::from(s.width().saturating_sub(4)).max(20)));
+        let room = usize::from(h.saturating_sub(7));
+        let about: Vec<String> = if room >= about.len() + 4 { about } else { Vec::new() };
+        let visible = (room - if about.is_empty() { 0 } else { about.len() + 1 }).max(1);
+        for (k, line) in about.iter().enumerate() {
+            s.put(2, (4 + visible + 1 + k) as u16, line, off);
+        }
         let at = rows.iter().position(|r| r.2 == Some(cursor)).unwrap_or(0);
         // The heading above the first entry stays in view with it.
         let first = at.saturating_sub(visible - 1);
@@ -4938,28 +5180,51 @@ impl App {
     /// be changed.
     fn help_lines(&self) -> Vec<HelpLine> {
         let heading = |text: &str| HelpLine { keys: String::new(), text: text.to_string(), heading: true };
+        // Keys, the action's name (padded) and what it does.
+        let mut entries: Vec<(String, String, String)> = Vec::new();
         let mut lines = Vec::new();
         for ctx in Context::ALL {
-            lines.push(heading(ctx.title()));
+            entries.push((String::new(), String::new(), ctx.title().to_string()));
             for a in Action::ALL.iter().filter(|a| a.context() == ctx) {
-                let text = format!("{:<18} {}", a.id(), a.help());
-                lines.push(HelpLine { keys: self.keys.all_labels(*a), text, heading: false });
+                entries.push((self.keys.all_labels(*a), format!("{:<18} ", a.id()), a.help().to_string()));
             }
         }
-        lines.push(heading("Fixed keys"));
+        entries.push((String::new(), String::new(), "Fixed keys".into()));
         for (keys, text) in [
             ("y n", "answer a question (quit, delete a track)"),
             ("1-7", "the type of a new track, after add_track"),
-            ("Esc", "cancel a prompt, close a list"),
+            ("Esc Ctrl+C", "cancel a prompt, close a list"),
             ("Enter Del r Esc", "on the settings page: add a key or change a setting, remove a key, default, close"),
             ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
+            ("Home End ←→ Del", "in other prompts: move in the text, erase after the cursor"),
         ] {
-            lines.push(HelpLine { keys: keys.to_string(), text: text.to_string(), heading: false });
+            entries.push((keys.to_string(), String::new(), text.to_string()));
+        }
+        // Descriptions wrap under themselves rather than run off the screen;
+        // keys too many for their column get a line of their own.
+        let cols = usize::from(self.help_width.get().saturating_sub(HELP_TEXT + 1)).max(20);
+        for (keys, name, text) in entries {
+            if keys.is_empty() {
+                lines.push(heading(&text));
+                continue;
+            }
+            let mut keys = keys;
+            if screen::text_width(&keys) > usize::from(HELP_TEXT - 3) {
+                lines.push(HelpLine { keys: std::mem::take(&mut keys), text: String::new(), heading: false });
+            }
+            // Wrapped in what the name leaves, and continued under itself.
+            let indent = screen::text_width(&name);
+            for (i, part) in wrap(&text, cols.saturating_sub(indent).max(10)).into_iter().enumerate() {
+                let keys = if i == 0 { std::mem::take(&mut keys) } else { String::new() };
+                let text = if i == 0 { format!("{name}{part}") } else { format!("{:indent$}{part}", "") };
+                lines.push(HelpLine { keys, text, heading: false });
+            }
         }
         lines
     }
 
     fn draw_help(&self, s: &mut Screen, top: usize) {
+        self.help_width.set(s.width());
         let lines = self.help_lines();
         let rows = usize::from(s.height().saturating_sub(2)).max(1);
         self.help_rows.set(rows);
@@ -4980,7 +5245,7 @@ impl App {
                 s.put(1, y, &line.text, self.style(Role::Title));
             } else {
                 s.put(2, y, &line.keys, self.style(Role::HelpKey));
-                s.put(20, y, &line.text, self.style(Role::Text));
+                s.put(HELP_TEXT, y, &line.text, self.style(Role::Text));
             }
         }
     }
@@ -5052,6 +5317,36 @@ fn velocity_glyph(v: u8) -> char {
 }
 
 pub use crate::instrument::note_name;
+
+/// `text` in lines of at most `cols` columns, broken between words; a word
+/// longer than a line is cut.
+fn wrap(text: &str, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let need = screen::text_width(&line) + usize::from(!line.is_empty()) + screen::text_width(word);
+        if need > cols && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(screen::fit(word, cols));
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The byte of `text` where a prompt's cursor is, `back` characters
+/// before its end (or at its start, if it has fewer).
+fn cursor_byte(text: &str, back: usize) -> usize {
+    match back {
+        0 => text.len(),
+        n => text.char_indices().rev().nth(n - 1).map_or(0, |(i, _)| i),
+    }
+}
 
 fn with_extension(text: &str, ext: &str) -> PathBuf {
     let p = PathBuf::from(text);
@@ -5401,17 +5696,27 @@ pub fn run(
     let midi = path.as_deref().is_some_and(crate::smf::is_midi_path);
     let project_path = path.as_deref().filter(|_| !midi);
     let (base, lock, lock_notice) = session_lock(project_path, autosave::state_dir().as_deref())?;
+    // Why the project file could not be read, when it could not.
+    let mut damaged = None;
     let (project, path, mut message) = match path {
         Some(p) if midi => {
             let imported = crate::smf::load(&p)?;
             let msg = format!("Imported {}: {}; save it to keep it as a project.", p.display(), imported.summary());
             (imported.project, None, msg)
         }
-        Some(p) if p.exists() => {
-            let proj = Project::load(&p)?;
-            let msg = format!("Opened {}", p.display());
-            (proj, Some(p), msg)
-        }
+        // Something at the name, even a link to nothing, is not a new
+        // project: its autosave must not be discarded as one's would be.
+        Some(p) if std::fs::symlink_metadata(&p).is_ok() => match Project::load(&p) {
+            Ok(proj) => {
+                let msg = format!("Opened {}", p.display());
+                (proj, Some(p), msg)
+            }
+            // Its autosave may still be good; asked about below.
+            Err(e) => {
+                damaged = Some(e);
+                (Project::new(), Some(p), String::new())
+            }
+        },
         Some(p) => {
             let mut proj = Project::new();
             for k in [InstrumentKind::Kick, InstrumentKind::Snare, InstrumentKind::HatClosed, InstrumentKind::Synth] {
@@ -5434,24 +5739,38 @@ pub fn run(
     // What happened to an autosave; shown ahead of the other start-up news,
     // which audio or MIDI trouble may replace.
     let mut notice = lock_notice;
-    let (project, recovered) = match base.as_deref().and_then(|b| autosave::find(Some(b))) {
+    let found = base.as_deref().and_then(|b| autosave::find(Some(b)));
+    // Damaged, the project is not opened in the editor; only its autosave
+    // can be.
+    if let Some(e) = &damaged {
+        if !found.as_ref().is_some_and(|f| f.project.is_ok()) {
+            return Err(e.clone());
+        }
+    }
+    let (project, recovered) = match found {
         None => (project, false),
         Some(found) => match &found.project {
-            Ok(saved) => match ask_recovery(&mut term, &mut screen, &mut out, &found, &settings.theme)? {
-                Some(Recovery::Recover) => {
-                    notice =
-                        Some(format!("Recovered unsaved changes from {}; save to keep them.", found.path.display()));
-                    (saved.clone(), true)
+            Ok(saved) => {
+                match ask_recovery(&mut term, &mut screen, &mut out, &found, &settings.theme, damaged.as_deref())? {
+                    Some(Recovery::Recover) => {
+                        notice = Some(format!(
+                            "Recovered unsaved changes from {}; save to keep them.",
+                            found.path.display()
+                        ));
+                        (saved.clone(), true)
+                    }
+                    // The autosave is all there is of the project: kept.
+                    Some(Recovery::Discard) if damaged.is_some() => return Err(damaged.unwrap_or_default()),
+                    Some(Recovery::Discard) => {
+                        notice = Some(match std::fs::remove_file(&found.path) {
+                            Ok(()) => "Discarded the autosave.".to_string(),
+                            Err(e) => format!("Could not delete the autosave {}: {e}.", found.path.display()),
+                        });
+                        (project, false)
+                    }
+                    None => return Ok(()),
                 }
-                Some(Recovery::Discard) => {
-                    notice = Some(match std::fs::remove_file(&found.path) {
-                        Ok(()) => "Discarded the autosave.".to_string(),
-                        Err(e) => format!("Could not delete the autosave {}: {e}.", found.path.display()),
-                    });
-                    (project, false)
-                }
-                None => return Ok(()),
-            },
+            }
             Err(e) => {
                 notice = Some(match autosave::set_aside(&found.path) {
                     Ok(to) => format!("An autosave could not be read ({e}); it was moved to {}.", to.display()),
@@ -5509,21 +5828,63 @@ pub fn run(
     });
 
     let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+        // When the screen last changed, or input came.
+        let mut last_change = Instant::now();
+        // Whether a batch that ran out of time had seen a key or a resize:
+        // input already waiting after it was given before the user saw
+        // what that batch did.
+        let mut carried_stale = false;
         loop {
-            let mut timeout = Duration::from_millis(16);
-            while let Some(ev) = term.poll(timeout).map_err(|e| e.to_string())? {
+            // Idle, the screen is drawn less often: nothing on it moves.
+            let idle = last_change.elapsed() > IDLE_AFTER;
+            let mut timeout = if idle { IDLE_FRAME } else { FRAME };
+            // From the first event: the wait for it is not work.
+            let mut batch = None;
+            // A click aims at the frame the user sees: after a key or a
+            // resize in the same batch, what it points at may have moved.
+            let mut stale = false;
+            let mut waiting = None;
+            if std::mem::take(&mut carried_stale) {
+                waiting = term.poll(Duration::ZERO).map_err(|e| e.to_string())?;
+                stale = waiting.is_some();
+            }
+            while let Some(ev) = match waiting.take() {
+                Some(ev) => Some(ev),
+                None => term.poll(timeout).map_err(|e| e.to_string())?,
+            } {
+                let start = *batch.get_or_insert_with(Instant::now);
+                last_change = Instant::now();
                 match ev {
-                    Event::Key(k) => app.handle_key(k),
+                    Event::Key(k) => {
+                        app.handle_key(k);
+                        stale = true;
+                    }
+                    Event::Paste { text, cut } => {
+                        app.paste(&text, cut);
+                        stale = true;
+                    }
+                    Event::Mouse(m) if stale && !matches!(m.kind, MouseKind::Release) => {}
                     Event::Mouse(m) => {
-                        // Events before it in this batch may have changed
+                        // Clicks before it in this batch may have changed
                         // what is where; drawing again (without sending it)
                         // resolves the pointer against the current state.
                         app.draw(&mut screen);
                         app.handle_mouse(m);
                     }
-                    Event::Resize => screen.invalidate(),
+                    Event::Resize => {
+                        screen.invalidate();
+                        stale = true;
+                    }
                 }
                 timeout = Duration::ZERO;
+                // A flood of input still lets the rest of the loop run.
+                if start.elapsed() > FRAME {
+                    carried_stale = stale;
+                    break;
+                }
+            }
+            if term::end_requested() {
+                return Err("ended by a signal".into());
             }
             output.poll(&mut app);
             midi.poll(&mut app);
@@ -5543,6 +5904,7 @@ pub fn run(
             out.clear();
             screen.flush_into(&mut out);
             if !out.is_empty() {
+                last_change = Instant::now();
                 term.write(&out).map_err(|e| e.to_string())?;
             }
         }
@@ -5557,11 +5919,11 @@ pub fn run(
         // edits: keep them for the next start.
         Ok(Err(e)) => {
             app.end_recording();
-            app.autosave_now();
-            return Err(e);
+            let kept = app.autosave_now();
+            return Err(format!("{e}{kept}"));
         }
         Err(panic) => {
-            app.autosave_now();
+            let _ = app.autosave_now();
             drop(term);
             std::panic::resume_unwind(panic);
         }
@@ -5572,6 +5934,20 @@ pub fn run(
     // After the engine: what it sent last is let go.
     drop(midi_out);
     Ok(())
+}
+
+/// Locks the settings file at `path` for one save, waiting a moment for
+/// another session's to end. Without the lock nothing is saved: two
+/// sessions saving unlocked could each lose the other's change.
+fn lock_settings(path: &Path) -> Result<Lock, String> {
+    for _ in 0..50 {
+        match Lock::acquire(path) {
+            Ok(l) => return Ok(l),
+            Err(lock::Error::Held(_)) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(format!("{}; the settings were not saved", e.describe(path))),
+        }
+    }
+    Err("another session is saving the settings file; close the page again to retry".into())
 }
 
 /// Where a session autosaves, its lock, and news for the status line.
@@ -5646,29 +6022,42 @@ fn ask_recovery(
     out: &mut String,
     found: &autosave::Found,
     theme: &Theme,
+    damaged: Option<&str>,
 ) -> Result<Option<Recovery>, String> {
     let when = found.modified.and_then(|m| m.elapsed().ok()).map_or(String::new(), |d| format!(" {}", age(d)));
     let text = theme.get(Role::Text);
     let key = theme.get(Role::AnswerKey);
     loop {
+        if term::end_requested() {
+            return Err("ended by a signal; the autosave stays for the next start".into());
+        }
         let (w, h) = term.size();
         screen.resize(w, h);
         screen.clear();
         screen.put(2, 1, "Unsaved changes found", theme.get(Role::Warning).bold());
         screen.put(2, 3, "The last session ended without saving. Its edits were autosaved", text);
         screen.put(2, 4, &format!("{when} to {}", found.path.display()), text);
+        let discard =
+            if damaged.is_some() { "quit; the autosave stays" } else { "discard them and delete the autosave" };
         for (y, k, what) in [
             (6, "y", "recover them; they stay unsaved until you save"),
-            (7, "n", "discard them and delete the autosave"),
+            (7, "n", discard),
             (8, "q", "quit and decide next time"),
         ] {
             let x = screen.put(4, y, k, key);
             screen.put(4 + x + 2, y, what, text);
         }
+        if let Some(e) = damaged {
+            screen.put(2, 10, &format!("The project itself could not be read: {e}"), theme.get(Role::Warning));
+        }
         out.clear();
         screen.flush_into(out);
         term.write(out).map_err(|e| e.to_string())?;
         while let Some(ev) = term.poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            // A signal comes before a key that waited with it.
+            if term::end_requested() {
+                break;
+            }
             match ev {
                 Event::Key(k) => {
                     if let Some(answer) = recovery_key(k) {
@@ -5677,7 +6066,7 @@ fn ask_recovery(
                 }
                 Event::Resize => screen.invalidate(),
                 // The question is answered with keys.
-                Event::Mouse(_) => {}
+                Event::Mouse(_) | Event::Paste { .. } => {}
             }
         }
     }
@@ -5712,9 +6101,8 @@ fn ruler_labels(beats: &[(u16, u32, u32)]) -> Vec<(u16, String)> {
 /// columns.
 fn view_title(view: &str, name: &str, key: &str) -> String {
     let tail = format!(" {key}: grid");
-    let room = usize::from(LEFT - 2).saturating_sub(view.chars().count() + 3 + tail.chars().count());
-    let name: String = name.chars().take(room).collect();
-    format!("{view} · {name:<room$}{tail}")
+    let room = usize::from(LEFT - 2).saturating_sub(screen::text_width(view) + 3 + screen::text_width(&tail));
+    format!("{view} · {}{tail}", screen::pad(name, room))
 }
 
 #[cfg(test)]
@@ -6221,6 +6609,23 @@ mod tests {
         a.audio_failed("gone".into());
         assert_eq!(a.project.tracks[2].steps[0][1].map(|s| s.note), Some(60));
         assert!(a.status_text().unwrap().starts_with("Audio stopped"), "{:?}", a.status_text());
+    }
+
+    #[test]
+    fn a_take_that_lost_a_track_change_is_not_written() {
+        let mut p = four_steps();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        let (mut e, live, mut a) = live_app(p);
+        a.track = 1;
+        a.tick();
+        keys(&mut a, &[Key::Char('C')]);
+        run_engine(&mut e, 6000);
+        live.push(Message::note(0, 60, 100)).unwrap();
+        run_engine(&mut e, 100);
+        a.link.as_ref().unwrap().shared.layouts_lost.fetch_add(1, Ordering::Relaxed);
+        a.finish_note_recording();
+        assert_eq!(a.project.tracks[1].steps[0][1], None);
+        assert!(a.status_text().unwrap().contains("not written"), "{:?}", a.status_text());
     }
 
     #[test]
@@ -6882,6 +7287,12 @@ mod tests {
         assert!(Path::new(&stored).is_absolute());
         assert_eq!(sent(&mut rx), [(1, true)]);
         assert!(a.track_samples()[1].is_some());
+        // A history step is measured by the samples as loaded now, a file
+        // shared by two tracks once.
+        let mut twice = a.meta();
+        twice.tracks[0].sample = Some(stored.clone());
+        assert!(a.samples_fit(&twice, 24_000));
+        assert!(!a.samples_fit(&twice, 23_999));
 
         // Undo and redo move the sample, and the engine follows.
         keys(&mut a, &[Key::Char('u')]);
@@ -7072,13 +7483,20 @@ mod tests {
         a.mode = Mode::Prompt(PromptKind::Export, "x.wav".into());
         keys(&mut a, &[Key::Right]);
         assert_eq!(a.export_source_label(), "pattern A");
+        // No loop region yet: there is no region to choose, so the song
+        // comes round again.
         keys(&mut a, &[Key::Right]);
-        // No loop region yet: the region falls back to pattern A.
-        assert_eq!(a.export_source, Source::Region);
+        assert_eq!((a.export_source, a.export_source_label().as_str()), (Source::Song, "song"));
+        keys(&mut a, &[Key::Left]);
         assert_eq!(a.export_source_label(), "pattern A");
         a.project.loop_region = Some((3, 3));
-        assert_eq!(a.export_source_label(), "loop region");
+        keys(&mut a, &[Key::Right]);
+        assert_eq!((a.export_source, a.export_source_label().as_str()), (Source::Region, "loop region"));
         keys(&mut a, &[Key::Right, Key::Left, Key::Left]);
+        assert_eq!(a.export_source_label(), "pattern A");
+        // With no song either, only the pattern is left.
+        a.project.song.clear();
+        keys(&mut a, &[Key::Right]);
         assert_eq!(a.export_source_label(), "pattern A");
         a.pattern = 1;
         assert_eq!(a.export_source_label(), "pattern B");
@@ -7339,6 +7757,96 @@ mod tests {
     }
 
     #[test]
+    fn a_small_screen_keeps_the_song_s_rows_apart_and_in_view() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        a.song_view = true;
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        assert!(s.row_text(4).trim_start().starts_with("Tempo"), "{}", s.row_text(4));
+        assert!(!s.row_text(4).contains("pattern"), "the keys line stays off the Tempo row: {}", s.row_text(4));
+        // The last track's row, chosen with the keys, is on the screen.
+        a.song_row = a.track_count();
+        a.draw(&mut s);
+        let name = a.project.tracks[a.track_count() - 1].name.clone();
+        assert!((5..MIN_H).any(|y| s.row_text(y).starts_with('▸') && s.row_text(y).contains(&name)));
+        // With three rows, the keys line would land on the Tempo row.
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw_song(&mut s, MIN_W, 3);
+        assert!(!s.row_text(4).contains("pattern"), "{}", s.row_text(4));
+        let tempo = s.row_text(4);
+        // Drawn on a screen of its own, the Tempo row is the same.
+        let mut alone = Screen::new(MIN_W, MIN_H);
+        a.draw_song(&mut alone, MIN_W, 4);
+        assert_eq!(tempo, alone.row_text(4), "nothing of the keys line shows on it");
+    }
+
+    #[test]
+    fn the_selected_automation_lane_is_in_view() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        a.auto_view = true;
+        a.lane = MAX_LANES - 1;
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        let mark = format!("▸{MAX_LANES} ");
+        assert!(
+            (2..MIN_H).any(|y| s.row_text(y).starts_with(&mark)),
+            "{:#?}",
+            (0..MIN_H).map(|y| s.row_text(y)).collect::<Vec<_>>()
+        );
+        // Also with room for fewer lanes than there are.
+        for rows in 1..MAX_LANES as u16 {
+            let mut s = Screen::new(MIN_W, MIN_H);
+            a.draw_auto(&mut s, MIN_W, rows);
+            let lines: Vec<String> = (0..MIN_H).map(|y| s.row_text(y)).collect();
+            assert!(lines.iter().any(|l| l.starts_with(&mark)), "{rows} rows: {lines:#?}");
+        }
+    }
+
+    #[test]
+    fn the_header_s_news_leaves_the_controls_alone() {
+        let mut a = app();
+        a.audio_label = "audio offline".into();
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        let top = s.row_text(0);
+        assert!(top.contains(" in 4/4"), "{top}");
+        let meter = a.hits.borrow().iter().find(|h| h.target == Target::Meter).map(|h| h.x).unwrap();
+        assert_eq!(a.target_at(meter, 0), Some(Target::Meter));
+        // With room, it is all there.
+        let wide = frame(&a).row_text(0);
+        assert!(wide.contains("audio offline  CPU"), "{wide}");
+    }
+
+    #[test]
+    fn the_hints_keep_whole_words_and_the_help_key() {
+        let a = app();
+        let help = format!("{} help", a.k(Action::Help));
+        for w in [MIN_W, 80, 140] {
+            let line = a.hint_line(usize::from(w));
+            assert!(line.ends_with(&help) && screen::text_width(&line) <= usize::from(w), "{w}: {line}");
+            let hints = a.hints();
+            assert!(line.split("  ").all(|h| h == help || hints.contains(&h.to_string())), "{w}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_wide_track_name_keeps_the_grid_s_columns() {
+        let mut a = app();
+        a.project.tracks[0].name = "キック太鼓ドラム音".into();
+        let s = frame(&a);
+        let y = (0..30).find(|&y| s.row_text(y).contains("キック")).unwrap();
+        assert_eq!((s.char_at(26, y), s.char_at(28, y)), ('M', 'S'), "{}", s.row_text(y));
+        // The type sits where it does after a plain name.
+        let plain = frame(&app());
+        let row = plain.row_text(y);
+        let x = row[..row.rfind("Kick").unwrap()].chars().count() as u16;
+        let kind: String = (x..x + 4).map(|x| s.char_at(x, y)).collect();
+        assert_eq!(kind, "Kick", "{row} / {}", s.row_text(y));
+    }
+
+    #[test]
     fn a_long_panel_on_a_small_screen_pages_to_the_selected_parameter() {
         let mut a = app();
         a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
@@ -7357,9 +7865,10 @@ mod tests {
         };
         let (s, shown) = draw(&a);
         assert!(shown.contains(&a.param) && shown.len() < a.page_params().len(), "{shown:?}");
-        assert!((2..5).all(|y| s.row_text(y).contains('│')), "the grid keeps its rows");
-        assert!(s.row_text(5).starts_with("──"), "{}", s.row_text(5));
-        assert!(s.row_text(5).contains("· 1/"), "{}", s.row_text(5));
+        // The panel takes at most half the screen below the header.
+        assert!((2..8).all(|y| s.row_text(y).contains('│')), "the grid keeps its rows");
+        assert!(s.row_text(8).starts_with("──"), "{}", s.row_text(8));
+        assert!(s.row_text(8).contains("· 1/"), "{}", s.row_text(8));
         let last = *a.page_params().last().unwrap();
         while a.param != last {
             keys(&mut a, &[Key::Down]);
@@ -7398,6 +7907,10 @@ mod tests {
         assert_eq!(full, "Automation · A long track  A: grid");
         assert_eq!(full.chars().count(), usize::from(LEFT - 2));
         assert_eq!(view_title("Piano roll", "Bass", "v"), "Piano roll · Bass          v: grid");
+        // Wide characters take two columns each.
+        let wide = view_title("Automation", "鼓鼓鼓鼓鼓鼓鼓", "A");
+        assert_eq!(wide, "Automation · 鼓鼓鼓鼓鼓鼓  A: grid");
+        assert_eq!(screen::text_width(&wide), usize::from(LEFT - 2));
         let s = frame(&song_line_app());
         assert!(s.row_text(1).starts_with(" Piano roll · Synth"), "{}", s.row_text(1));
         assert!(s.row_text(1).contains("v: grid│"), "{}", s.row_text(1));
@@ -7843,6 +8356,18 @@ mod tests {
         a.undo();
         assert_eq!(a.project.tracks[t].sample, None);
         assert!(file.exists(), "undo keeps the file");
+        // Ending under a prompt, the take loads into its track and leaves
+        // the selection the prompt is about.
+        a.track = t;
+        a.toggle_recording();
+        assert!(a.recording());
+        a.track = 0;
+        a.mode = Mode::Prompt(PromptKind::Rename, "Kick 2".into());
+        a.finish_take(true, None);
+        assert_eq!(a.track, 0);
+        assert_eq!(a.project.tracks[t].sample.as_deref().map(PathBuf::from), Some(dir.join("song-Vox-02.wav")));
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!((a.project.tracks[0].name.as_str(), a.project.tracks[t].name.as_str()), ("Kick 2", "Vox"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7939,6 +8464,172 @@ mod tests {
         // A release with no press (the key was down before R) is ignored.
         a.midi_message(note_off(30));
         assert_eq!(a.step, 0);
+    }
+
+    #[test]
+    fn a_chord_moved_to_another_step_is_an_undo_step_of_its_own() {
+        let mut a = app();
+        let bass = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        (a.track, a.step, a.pattern) = (bass, 3, 0);
+        let before = |a: &App, i: usize| a.project.tracks[bass].steps[0][i];
+        let (three, four) = (before(&a, 3), before(&a, 4));
+        keys(&mut a, &[Key::Char('R')]);
+        a.midi_message(note_on(60, 90));
+        keys(&mut a, &[Key::Right]);
+        a.midi_message(note_on(64, 90));
+        a.midi_message(note_off(60));
+        a.midi_message(note_off(64));
+        let notes = |a: &App, i: usize| before(a, i).map(|s| s.notes().collect::<Vec<_>>());
+        assert_eq!((notes(&a, 3), notes(&a, 4)), (Some(vec![60]), Some(vec![60, 64])));
+        a.undo();
+        assert_eq!((notes(&a, 3), before(&a, 4)), (Some(vec![60]), four));
+        a.undo();
+        assert_eq!((before(&a, 3), before(&a, 4)), (three, four));
+        a.redo();
+        a.redo();
+        assert_eq!((notes(&a, 3), notes(&a, 4)), (Some(vec![60]), Some(vec![60, 64])));
+    }
+
+    #[test]
+    fn a_prompt_edits_at_its_cursor() {
+        let mut a = app();
+        a.mode = Mode::Prompt(PromptKind::Rename, "Bas".into());
+        let text = |a: &App| match &a.mode {
+            Mode::Prompt(_, t) => t.clone(),
+            m => panic!("{m:?}"),
+        };
+        keys(&mut a, &[Key::Left, Key::Left, Key::Char('x'), Key::Home, Key::Char('>')]);
+        assert_eq!(text(&a), ">Bxas");
+        keys(&mut a, &[Key::End, Key::Char('s'), Key::Left, Key::Delete, Key::Backspace]);
+        assert_eq!(text(&a), ">Bxa");
+        keys(&mut a, &[Key::Home, Key::Backspace, Key::Delete, Key::Left, Key::Right]);
+        assert_eq!(text(&a), "Bxa", "nothing before the start to erase");
+        // Drawn with the character under the cursor.
+        let mut s = Screen::new(80, 24);
+        a.draw(&mut s);
+        assert!(s.row_text(23).starts_with("Track name: Bxa"), "{}", s.row_text(23));
+        assert_ne!(s.style_at(13, 23), s.style_at(12, 23), "the cursor is on the x");
+        assert_eq!(s.style_at(12, 23), a.style(Role::Input));
+        // A letter and the accent written after it are one step, one
+        // deletion and one cell under the cursor.
+        a.mode = Mode::Prompt(PromptKind::Rename, "ae\u{301}x".into());
+        keys(&mut a, &[Key::End, Key::Left, Key::Left]);
+        assert_eq!(a.prompt_back, 3);
+        a.draw(&mut s);
+        assert!(s.row_text(23).starts_with("Track name: ae\u{301}x"), "{}", s.row_text(23));
+        assert_ne!(s.style_at(13, 23), a.style(Role::Input), "the cursor is on the é");
+        keys(&mut a, &[Key::Right]);
+        assert_eq!(a.prompt_back, 1);
+        keys(&mut a, &[Key::Left, Key::Delete]);
+        assert_eq!((text(&a), a.prompt_back), ("ax".into(), 1));
+        // Ctrl+C leaves the prompt as Esc does, and the next one starts at
+        // its end.
+        keys(&mut a, &[Key::Ctrl('c')]);
+        assert_eq!(a.mode, Mode::Normal);
+        a.mode = Mode::Prompt(PromptKind::Rename, "ab".into());
+        keys(&mut a, &[Key::Char('c')]);
+        assert_eq!(text(&a), "abc");
+        // Whatever closed the last one, a prompt opened by a key starts at
+        // the end of its text.
+        a.mode = Mode::Normal;
+        a.prompt_back = 2;
+        keys(&mut a, &[Key::Char('W'), Key::Char('x')]);
+        assert!(matches!(a.mode, Mode::Prompt(PromptKind::SaveAs, _)) && text(&a).ends_with('x'), "{:?}", a.mode);
+        // A long path is taken, up to a sample path's limit, in bytes.
+        a.mode = Mode::Prompt(PromptKind::LoadSample, "a".repeat(MAX_PROMPT - 1));
+        keys(&mut a, &[Key::Char('é'), Key::Char('b'), Key::Char('c')]);
+        assert_eq!(text(&a).len(), MAX_PROMPT);
+        assert!(text(&a).ends_with('b'));
+        assert!(a.status_text().unwrap().contains("at most 4096 bytes"));
+    }
+
+    #[test]
+    fn a_prompt_shows_the_end_of_wide_text() {
+        let mut a = app();
+        a.mode = Mode::Prompt(PromptKind::LoadSample, "钢琴".repeat(40));
+        let mut s = Screen::new(64, 20);
+        a.draw(&mut s);
+        let row = s.row_text(19);
+        assert!(row.trim_end().ends_with("琴█"), "{row}");
+        // At the start, the start of the text shows.
+        keys(&mut a, &[Key::Home]);
+        a.draw(&mut s);
+        assert!(s.row_text(19).contains("Load WAV sample: 钢琴钢"), "{}", s.row_text(19));
+    }
+
+    #[test]
+    fn pasted_text_goes_into_a_prompt_only() {
+        let mut a = app();
+        a.mode = Mode::Prompt(PromptKind::Rename, "A".into());
+        a.paste("Lead\r\nX\t", false);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Rename, "ALeadX".into()), "line breaks do not submit it");
+        keys(&mut a, &[Key::Home]);
+        a.paste("é", false);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Rename, "éALeadX".into()));
+        a.mode = Mode::Prompt(PromptKind::Rename, "a".repeat(MAX_PROMPT - 1));
+        a.paste("éé", false);
+        assert!(matches!(&a.mode, Mode::Prompt(_, t) if t.len() == MAX_PROMPT - 1));
+        assert!(a.status_text().unwrap().contains("cut"));
+        // The prompt itself says it is full, as the status line is not shown.
+        let mut s = Screen::new(80, 24);
+        a.draw(&mut s);
+        assert!(s.row_text(23).contains("[4096 bytes, full]"), "{}", s.row_text(23));
+        // Also beside the longest label, on the narrowest screen.
+        a.mode = Mode::Prompt(PromptKind::Export, "a".repeat(MAX_PROMPT - 1));
+        let mut narrow = Screen::new(MIN_W, 24);
+        a.draw(&mut narrow);
+        assert!(narrow.row_text(23).starts_with("[4096 bytes, full] Export"), "{}", narrow.row_text(23));
+        a.mode = Mode::Prompt(PromptKind::Rename, "a".repeat(MAX_PROMPT - 4));
+        a.draw(&mut s);
+        assert!(!s.row_text(23).contains("full"), "{}", s.row_text(23));
+        // Elsewhere it runs nothing.
+        a.mode = Mode::Normal;
+        let steps = a.project.tracks[0].steps.clone();
+        // A paste the terminal cut says so, even when what was left of it
+        // fits.
+        a.mode = Mode::Prompt(PromptKind::Rename, String::new());
+        a.paste("\t", true);
+        assert_eq!(a.status_text(), Some("Pasted text cut: a paste is read up to 8192 bytes"));
+        a.draw(&mut s);
+        assert!(s.row_text(23).contains("[paste cut]"), "{}", s.row_text(23));
+        keys(&mut a, &[Key::Char('x')]);
+        a.draw(&mut s);
+        assert!(!s.row_text(23).contains("cut"), "the next key clears it: {}", s.row_text(23));
+        a.mode = Mode::Normal;
+        a.paste("xXq", false);
+        assert_eq!((a.project.tracks[0].steps.clone(), a.quit), (steps, false));
+        assert_eq!(a.status_text(), Some("Pasting works in a text prompt only"));
+    }
+
+    #[test]
+    fn an_export_keeps_the_project_and_its_samples() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        let song = dir.join("song.tvo");
+        a.save_to(song.clone());
+        let saved = std::fs::read(&song).unwrap();
+        a.mode = Mode::Prompt(PromptKind::Export, song.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(std::fs::read(&song).unwrap(), saved);
+        assert!(a.status_text().unwrap().contains("is not a .wav or .mid file"), "{:?}", a.status_text());
+        // A sampler track whose file is missing would be silent in it.
+        assert!(a.edit(Edit::AddTrack(InstrumentKind::Sampler)));
+        let gone = dir.join("gone.wav").display().to_string();
+        let t = a.track_count() - 1;
+        a.project.tracks[t].sample = Some(gone.clone());
+        let out = dir.join("out.wav");
+        a.export_to(&out);
+        assert!(!out.exists());
+        assert_eq!(
+            a.status_text().unwrap(),
+            format!("Not exported: the sample {gone} is missing; {} loads it again", a.k(Action::LoadSample))
+        );
+        // As MIDI it does not matter.
+        a.export_to(&dir.join("out.mid"));
+        assert!(dir.join("out.mid").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8301,8 +8992,11 @@ mod tests {
         assert!(!file.exists() && !a.dirty);
         assert_eq!(a.autosave.path(), Some(file.as_path()));
         keys(&mut a, &[Key::Right, Key::Enter]);
-        a.autosave_now();
+        let kept = a.autosave_now();
         assert!(file.exists(), "an abnormal end writes at once");
+        assert_eq!(kept, format!("; the unsaved edits were autosaved to {}", file.display()));
+        a.save_to(dir.join("song.tvo"));
+        assert_eq!(a.autosave_now(), "", "nothing to keep");
         drop(a);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8549,7 +9243,7 @@ mod tests {
         let Mode::Help(top) = a.mode else { panic!("{:?}", a.mode) };
         assert_eq!(top, a.help_lines().len() - 38);
         a.draw(&mut s);
-        assert!(s.row_text(39).contains("export prompt"), "{}", s.row_text(39));
+        assert!(s.row_text(39).contains("in other prompts"), "{}", s.row_text(39));
         let vel = a.help_lines().into_iter().find(|l| l.text.starts_with("velocity_down ")).unwrap();
         assert!(vel.keys.starts_with('ö'), "{}", vel.keys);
         a.handle_key(Key::Up);
@@ -8874,7 +9568,63 @@ mod tests {
             "{status}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), other);
+        // The MIDI clock another session turned on plays here too.
+        std::fs::write(&path, "[options]\nmidi_clock = on\n").unwrap();
+        let mut third = app().with_settings_file(Some(path.clone()));
+        assert!(!third.midi_out.clock);
+        keys(&mut third, &[Key::F(2), Key::Left, Key::Enter, Key::Esc]);
+        assert!(third.midi_out.clock, "{:?}", third.status_text());
+        // While another session saves, this one waits, then gives up (here
+        // with the Colours tab's base theme changed).
+        let held = Lock::acquire(&path).unwrap();
+        keys(&mut third, &[Key::F(2), Key::Left, Key::Enter, Key::Esc]);
+        assert!(third.status_text().unwrap().contains("another session is saving"), "{:?}", third.status_text());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[options]\nmidi_clock = on\nmouse = off\n");
+        drop(held);
+        // Nor does it save past a lock it cannot take.
+        let lock_path = lock::path_for(&path).unwrap();
+        std::fs::write(&lock_path, "not a lock\n").unwrap();
+        keys(&mut third, &[Key::F(2), Key::Esc]);
+        let status = third.status_text().unwrap();
+        assert!(status.contains("is not a TINVO lock file; move it away; the settings were not saved"), "{status}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[options]\nmidi_clock = on\nmouse = off\n");
+        std::fs::remove_file(&lock_path).unwrap();
+        keys(&mut third, &[Key::F(2), Key::Esc]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[options]\nmidi_clock = on\nmouse = off\n\n[theme]\nbase = light\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn descriptions_are_shown_whole_on_a_narrow_screen() {
+        let mut a = app();
+        let mut s = Screen::new(80, 24);
+        let all_text = |s: &Screen| (0..24).map(|y| s.row_text(y).trim().to_string()).collect::<Vec<_>>().join(" ");
+        // The key list wraps them.
+        keys(&mut a, &[Key::Char('?')]);
+        a.draw(&mut s);
+        let line = a.help_lines().iter().position(|l| l.text.starts_with("delete_group ")).unwrap();
+        a.mode = Mode::Help(line);
+        a.draw(&mut s);
+        assert!(all_text(&s).contains("its tracks go to the master, its lanes go"), "{}", all_text(&s));
+        assert!((0..24).all(|y| screen::text_width(s.row_text(y).trim_end()) <= 80));
+        // Whole on a narrow screen too, continued lines and all.
+        let mut s = Screen::new(64, 24);
+        a.draw(&mut s);
+        let line = a.help_lines().iter().position(|l| l.text.starts_with("record_notes ")).unwrap();
+        a.mode = Mode::Help(line);
+        a.draw(&mut s);
+        let help = Action::RecordNotes.help();
+        assert!(all_text(&s).contains(help), "{}", all_text(&s));
+        // The settings page shows the selected one below its list.
+        a.mode = Mode::Normal;
+        keys(&mut a, &[Key::F(2)]);
+        a.settings_page.tab = SettingsTab::Options;
+        a.settings_page.cursor[SettingsTab::Options as usize] = 1;
+        a.draw(&mut s);
+        assert!(all_text(&s).contains("keeping what that pass played"), "{}", all_text(&s));
     }
 
     #[test]

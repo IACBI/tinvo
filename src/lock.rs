@@ -7,10 +7,16 @@
 //! locked. The file names the process holding it, for the message another
 //! session shows.
 //!
-//! On Windows the file is opened to be deleted when its handle closes. On
-//! Linux and macOS the holder deletes it before letting go, and a session
-//! that wins the lock checks that the file it locked is still the one at
-//! the path, so a lock on a file just deleted counts for nothing.
+//! The holder deletes the file as it lets go: on Windows by marking the
+//! handle it holds, on Linux and macOS by its name while that is still the
+//! file held. A session that wins the lock on Linux and macOS checks that
+//! the file it locked is still the one at the path, so a lock on a file
+//! just deleted counts for nothing. A crash leaves the file behind, naming
+//! a process that is gone, and the next session takes it over.
+//!
+//! What the file holds is checked through the handle that holds the lock,
+//! before anything is written: a file of another program at the name is
+//! refused and left as it was.
 //!
 //! The lock file is emptied and written, so a symbolic link or a hard link
 //! planted at its name could make that land on another file, such as the
@@ -19,7 +25,7 @@
 //! lock is refused with a message to remove it.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SUFFIX: &str = ".lock";
@@ -72,6 +78,16 @@ impl Lock {
         let path = path_for(project)
             .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "the path names no file")))?;
         let mut file = sys::open_locked(&path)?;
+        // A file at the name that TINVO did not write is someone else's:
+        // emptying it, or deleting it when the lock goes, would destroy it.
+        // Read through the handle held, so it is the file locked and no
+        // holder is still writing it; letting go of it here leaves it.
+        let mut text = String::new();
+        let read = Read::by_ref(&mut file).take(4096).read_to_string(&mut text);
+        if read.is_err() || !is_marker(&text) {
+            return Err(foreign(&path));
+        }
+        file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
         // Who holds it, for the message another session shows; emptied
         // first, now that it is known to be a plain file of its own. The
         // lock is held whether or not this is written.
@@ -100,12 +116,35 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         // Deleted while still held, so no other session can lock the file in
-        // between (on Windows it goes when the handle closes).
-        if cfg!(unix) {
-            let _ = std::fs::remove_file(&self.path);
+        // between; only the file held, not one put at the name since.
+        #[cfg(windows)]
+        if let Some(file) = &self.file {
+            sys::delete_when_closed(file);
+        }
+        #[cfg(unix)]
+        if let Some(file) = &self.file {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(at), Ok(held)) = (std::fs::symlink_metadata(&self.path), file.metadata()) {
+                if at.dev() == held.dev() && at.ino() == held.ino() {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
         }
         drop(self.file.take());
     }
+}
+
+/// Whether `text` is what a lock file holds: what [`Lock::acquire`] writes,
+/// or nothing, as a session that stopped before writing left it.
+fn is_marker(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    text.is_empty()
+        || (text.lines().count() == 1 && matches!(words[..], ["tinvo", _, "pid", pid] if pid.parse::<u32>().is_ok()))
+}
+
+/// The refusal for a file of another program at a lock's name.
+fn foreign(path: &Path) -> Error {
+    Error::Io(io::Error::other(format!("{} is not a TINVO lock file; move it away", path.display())))
 }
 
 /// The refusal for a lock file that is a link or not a plain file.
@@ -126,8 +165,7 @@ fn check_name(path: &Path) -> Result<(), Error> {
 
 /// The process id a lock file names.
 fn owner(path: &Path) -> Option<u32> {
-    let mut text = String::new();
-    File::open(path).ok()?.take(256).read_to_string(&mut text).ok()?;
+    let text = crate::fsutil::read_text(path, 4096).ok()?;
     let mut words = text.split_whitespace();
     words.position(|w| w == "pid")?;
     words.next()?.parse().ok()
@@ -228,6 +266,22 @@ mod sys {
 
     unsafe extern "system" {
         fn GetFileInformationByHandle(file: *mut c_void, info: *mut FileInformation) -> i32;
+        fn SetFileInformationByHandle(file: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
+    }
+
+    /// `FileDispositionInfo` of `FILE_INFO_BY_HANDLE_CLASS`.
+    const FILE_DISPOSITION_INFO: i32 = 4;
+
+    /// Marks the file `file` holds to be deleted once its handle closes.
+    /// Failing, it stays as a crash would leave it.
+    pub fn delete_when_closed(file: &File) {
+        // `FILE_DISPOSITION_INFO`, a single BOOLEAN.
+        let delete: u8 = 1;
+        // SAFETY: a valid handle opened with DELETE access, and a pointer to
+        // the one byte the class takes.
+        unsafe {
+            SetFileInformationByHandle(file.as_raw_handle(), FILE_DISPOSITION_INFO, (&raw const delete).cast(), 1)
+        };
     }
 
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
@@ -239,7 +293,6 @@ mod sys {
     const DELETE: u32 = 0x0001_0000;
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_DELETE: u32 = 0x4;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_SHARING_VIOLATION: i32 = 32;
 
@@ -249,17 +302,16 @@ mod sys {
             check_name(path)?;
             // Sharing no writing is the lock: another session asking to
             // write is refused while this handle is open. Reading is shared
-            // so it can say who holds the lock, and deleting because
-            // delete-on-close requires every handle to share it. A link
-            // planted at the name is opened itself, not followed, so
-            // delete-on-close can only ever remove this name.
+            // so it can say who holds the lock, and deleting so the holder
+            // can delete it as it lets go. A link planted at the name is
+            // opened itself, not followed.
             let opened = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path);
             match opened {
                 Ok(f) => {
@@ -296,7 +348,7 @@ mod sys {
 
     /// No locking here: the file only names the session.
     pub fn open_locked(path: &Path) -> Result<File, Error> {
-        OpenOptions::new().write(true).create(true).truncate(true).open(path).map_err(Error::Io)
+        OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(Error::Io)
     }
 }
 
@@ -350,8 +402,59 @@ mod tests {
         std::fs::write(dir.join("song.tvo.lock"), "tinvo 0.1.0 pid 1\n").unwrap();
         let lock = Lock::acquire(&song).unwrap();
         let text = std::fs::read_to_string(dir.join("song.tvo.lock")).unwrap();
-        assert!(text.contains(&format!("pid {}", std::process::id())), "{text}");
+        assert_eq!(text, format!("tinvo {} pid {}\n", env!("CARGO_PKG_VERSION"), std::process::id()));
         drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn letting_go_deletes_only_the_file_held() {
+        let dir = temp_dir("let-go");
+        let song = dir.join("song.tvo");
+        let path = dir.join("song.tvo.lock");
+        let lock = Lock::acquire(&song).unwrap();
+        // Another file put at the name since is someone else's.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "tinvo 0.25.0 pid 1\n").unwrap();
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tinvo 0.25.0 pid 1\n");
+        std::fs::remove_file(&path).unwrap();
+        drop(Lock::acquire(&song).unwrap());
+        assert!(std::fs::symlink_metadata(&path).is_err(), "its own file goes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_of_another_program_at_the_lock_s_name_is_kept() {
+        let dir = temp_dir("foreign");
+        let song = dir.join("song.tvo");
+        let path = dir.join("song.tvo.lock");
+        std::fs::write(&path, "my notes\n").unwrap();
+        let e = Lock::acquire(&song).expect_err("refused");
+        assert!(e.describe(&song).contains("not a TINVO lock file"), "{}", e.describe(&song));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my notes\n");
+        std::fs::write(&path, [0xff, 0xfe, 0]).unwrap();
+        assert!(Lock::acquire(&song).is_err(), "nor a binary one");
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, 0]);
+        for text in ["tinvo notes\n", "tinvo 0.25.0 pid 12\nmore\n", "tinvo 0.25.0\npid 12\n", "tinvo 0.25.0 pid me\n"]
+        {
+            std::fs::write(&path, text).unwrap();
+            assert!(Lock::acquire(&song).is_err(), "{text:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        // What a session leaves is taken.
+        std::fs::write(&path, "tinvo 0.24.1 pid 12\n").unwrap();
+        drop(Lock::acquire(&song).expect("a stale lock is taken"));
+        // A holder caught writing its line still holds the project.
+        let mut held = Lock::acquire(&song).unwrap();
+        let file = held.file.as_mut().unwrap();
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"tinvo 0.2").unwrap();
+        assert!(matches!(Lock::acquire(&song), Err(Error::Held(_))));
+        drop(held);
+        assert!(std::fs::symlink_metadata(&path).is_err(), "letting go deletes it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -367,6 +470,16 @@ mod tests {
             Err(Error::Io(e)) => assert!(e.to_string().contains("is not a plain file; remove it"), "{e}"),
             other => panic!("{other:?}"),
         }
+        assert_eq!(std::fs::read_to_string(&song).unwrap(), "the project");
+        let _ = std::fs::remove_file(&lock_path);
+        // One to a lock file is refused as a link.
+        std::fs::write(&song, "tinvo 0.1.0 pid 1\n").unwrap();
+        std::fs::hard_link(&song, &lock_path).unwrap();
+        match Lock::acquire(&song) {
+            Err(Error::Io(e)) => assert!(e.to_string().contains("is not a plain file; remove it"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        std::fs::write(&song, "the project").unwrap();
         assert_eq!(std::fs::read_to_string(&song).unwrap(), "the project");
         let _ = std::fs::remove_file(&lock_path);
         // A symbolic link to it, where the system allows making one.

@@ -421,6 +421,12 @@ impl Insert {
     }
 
     /// The tempo a delay's time follows.
+    /// The tempo its delay follows.
+    #[cfg(test)]
+    pub fn tempo(&self) -> f32 {
+        self.tempo
+    }
+
     pub fn set_tempo(&mut self, bpm: f32) {
         if bpm != self.tempo {
             self.tempo = bpm;

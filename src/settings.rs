@@ -377,9 +377,18 @@ fn keys_value(keys: &Keymap, a: Action) -> String {
 /// read (it changed since it was loaded) or, as a safeguard, if the result
 /// would not read back as `new`.
 pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
-    parse(old).map_err(|e| format!("the settings file has a mistake ({e}); it was not changed"))?;
+    let was = parse(old).map_err(|e| format!("the settings file has a mistake ({e}); it was not changed"))?;
     let base_theme = Theme::built_in(new.base).unwrap_or_default();
-    let mut lines: Vec<String> = old.lines().map(str::to_string).collect();
+    // Each line keeps its own line end; a line added takes Windows ones
+    // in a file that has them.
+    let eol = if old.contains("\r\n") { "\r\n" } else { "\n" };
+    let (mut lines, mut ends_of): (Vec<String>, Vec<&str>) = old
+        .split_inclusive('\n')
+        .map(|l| {
+            let body = l.strip_suffix('\n').map_or(l, |b| b.strip_suffix('\r').unwrap_or(b));
+            (body.to_string(), &l[body.len()..])
+        })
+        .unzip();
     // Which settings have a line, and where each section's lines end.
     let mut has_key = vec![false; Action::ALL.len()];
     let mut has_role = vec![false; Role::ALL.len()];
@@ -401,22 +410,24 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
         } else if let Some((name, _)) = t.split_once('=') {
             let name = name.trim().to_string();
             let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            // A line is written again only when its setting changed: one
+            // written another way (`left=h left`) stays as it is.
             let value = match section {
-                Section::Keys => Action::from_id(&name).map(|a| {
+                Section::Keys => Action::from_id(&name).and_then(|a| {
                     has_key[a as usize] = true;
-                    keys_value(&new.keys, a)
+                    (was.keys.keys(a) != new.keys.keys(a)).then(|| keys_value(&new.keys, a))
                 }),
                 Section::Theme if name == "base" => {
                     has_base = true;
-                    Some(new.base.to_string())
+                    (was.base != new.base).then(|| new.base.to_string())
                 }
-                Section::Theme => Role::from_id(&name).map(|r| {
+                Section::Theme => Role::from_id(&name).and_then(|r| {
                     has_role[r as usize] = true;
-                    theme::style_name(new.theme.get(r))
+                    (was.theme.get(r) != new.theme.get(r)).then(|| theme::style_name(new.theme.get(r)))
                 }),
-                Section::Options => OPTIONS.iter().position(|o| o.0 == name).map(|i| {
+                Section::Options => OPTIONS.iter().position(|o| o.0 == name).and_then(|i| {
                     has_option[i] = true;
-                    OPTIONS[i].1[new.option(i)].to_string()
+                    (was.option(i) != new.option(i)).then(|| OPTIONS[i].1[new.option(i)].to_string())
                 }),
                 Section::None => None,
             };
@@ -461,22 +472,35 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
         if new_lines.is_empty() {
             continue;
         }
-        match ends[i] {
-            Some(at) => {
-                lines.splice(at..at, new_lines);
-            }
+        let at = match ends[i] {
+            Some(at) => at,
             None => {
+                let mut head = Vec::new();
                 if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                    lines.push(String::new());
+                    head.push(String::new());
                 }
-                lines.push(["[keys]", "[theme]", "[options]"][i].to_string());
-                lines.extend(new_lines);
+                head.push(["[keys]", "[theme]", "[options]"][i].to_string());
+                let at = lines.len();
+                let n = head.len();
+                lines.splice(at..at, head);
+                ends_of.splice(at..at, std::iter::repeat_n(eol, n));
+                at + n
             }
-        }
+        };
+        let n = new_lines.len();
+        lines.splice(at..at, new_lines);
+        ends_of.splice(at..at, std::iter::repeat_n(eol, n));
     }
-    let mut text = lines.join("\n");
-    if !lines.is_empty() {
-        text.push('\n');
+    // A last line that had no line end gets one only with lines after it.
+    let last = ends_of.len().saturating_sub(1);
+    let mut text = String::new();
+    for (i, (line, end)) in lines.iter().zip(&ends_of).enumerate() {
+        text.push_str(line);
+        text.push_str(if end.is_empty() && i < last { eol } else { end });
+    }
+    // Larger, the next start would refuse to read it.
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("the settings file would be larger than {MAX_FILE_BYTES} bytes"));
     }
     match parse(&text) {
         Ok(read) if read == *new => Ok(text),
@@ -489,6 +513,28 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::tui::{Color, Key, Style};
+
+    #[test]
+    fn lines_of_settings_that_stay_are_kept_as_written() {
+        let old = "[keys]\r\nleft=h left\r\n# mine\r\n[options]\r\nmouse = on\r\n";
+        let mut new = parse(old).unwrap();
+        new.mouse = false;
+        assert_eq!(update_text(old, &new).unwrap(), "[keys]\r\nleft=h left\r\n# mine\r\n[options]\r\nmouse = off\r\n");
+        new.keys.bind(Action::Redo, vec![Key::F(9)]);
+        let text = update_text(old, &new).unwrap();
+        assert_eq!(text, "[keys]\r\nleft=h left\r\nredo = f9\r\n# mine\r\n[options]\r\nmouse = off\r\n");
+        // Each line keeps its own end, a last one none.
+        let mixed = "[keys]\nleft=h left\r\n[options]\nmouse = on";
+        let mut new = parse(mixed).unwrap();
+        new.mouse = false;
+        assert_eq!(update_text(mixed, &new).unwrap(), "[keys]\nleft=h left\r\n[options]\nmouse = off");
+        new.keys.bind(Action::Redo, vec![Key::F(9)]);
+        assert_eq!(update_text(mixed, &new).unwrap(), "[keys]\nleft=h left\r\nredo = f9\r\n[options]\nmouse = off");
+        // A file that would be too large to read back is not written.
+        let big = format!("{}\n", "#".repeat(MAX_FILE_BYTES as usize - 1));
+        let e = update_text(&big, &new).unwrap_err();
+        assert!(e.contains("larger than 1048576 bytes"), "{e}");
+    }
 
     #[test]
     fn changes_are_written_in_place_keeping_the_rest() {

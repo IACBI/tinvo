@@ -18,6 +18,10 @@ use tinvo::smf;
 use tinvo::tui::printable_line as shown;
 use tinvo::wav::{self, SampleFormat};
 
+/// Ends a usage error: the whole usage would push the error off a small
+/// terminal.
+const SEE_HELP: &str = "; tinvo --help shows the usage";
+
 const USAGE: &str = "\
 TINVO - terminal digital audio workstation
 
@@ -90,6 +94,9 @@ fn main() -> ExitCode {
         Some("demo") => cmd_demo(&args[1..]),
         Some("probe") => cmd_probe(&args[1..]),
         Some("loopback") => cmd_loopback(&args[1..]),
+        Some(c @ ("devices" | "midi" | "inputs")) if args.len() > 1 => {
+            Err(format!("{c} takes no arguments, not '{}'{SEE_HELP}", shown(&args[1])))
+        }
         Some("devices") => cmd_devices(),
         Some("midi") => cmd_midi(),
         Some("inputs") => cmd_inputs(),
@@ -128,7 +135,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         match a.as_str() {
             "--format" => {
                 let v = value("--format")?;
-                format = SampleFormat::from_id(&v).ok_or(format!("unknown format '{v}' (use 16, 24 or 32f)"))?;
+                format =
+                    SampleFormat::from_id(&v).ok_or(format!("unknown format '{}' (use 16, 24 or 32f)", shown(&v)))?;
             }
             "--loops" => {
                 opts.loops = value("--loops")?
@@ -137,13 +145,16 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     .filter(|n| (1..=1000).contains(n))
                     .ok_or("--loops must be 1..=1000")?;
             }
+            "--song" | "--region" | "--pattern" if opts.source != Source::Auto => {
+                return Err(format!("{}: --song, --region and --pattern each pick what to render; give one", shown(a)));
+            }
             "--song" => opts.source = Source::Song,
             "--region" => opts.source = Source::Region,
             "--pattern" => {
                 let v = value("--pattern")?;
                 let p = match v.as_bytes() {
                     [c @ b'A'..=b'P'] => c - b'A',
-                    _ => return Err(format!("--pattern takes a letter A-P, not '{v}'")),
+                    _ => return Err(format!("--pattern takes a letter A-P, not '{}'", shown(&v))),
                 };
                 opts.source = Source::Pattern(p);
             }
@@ -157,14 +168,16 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
                     .filter(|r| (8_000..=192_000).contains(r))
                     .ok_or("--rate must be 8000..=192000")?;
             }
-            s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
+            s if s.starts_with('-') => return Err(format!("unknown option '{}'", shown(s))),
             _ => positional.push(a.clone()),
         }
     }
     let [project, out] = positional.as_slice() else {
-        return Err(format!("render needs PROJECT and OUT.wav (or OUT.mid)\n\n{USAGE}"));
+        return Err(format!("render needs PROJECT and OUT.wav (or OUT.mid){SEE_HELP}"));
     };
-    let mut project = Project::load(project.as_ref())?;
+    let project_path = std::path::Path::new(project);
+    let mut project = Project::load(project_path)?;
+    render::check_destination(&project, Some(project_path), out.as_ref()).map_err(|e| format!("{} {e}", shown(out)))?;
     let mut range_name = None;
     if from.is_some() || to.is_some() {
         if opts.source != Source::Auto {
@@ -173,7 +186,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             );
         }
         // The range plays as the loop region does.
-        let range = project.marker_range(from.as_deref(), to.as_deref())?;
+        let range = project.marker_range(from.as_deref(), to.as_deref()).map_err(|e| shown(&e))?;
         range_name = project.range_name(range);
         project.loop_region = Some(range);
         opts.source = Source::Region;
@@ -206,6 +219,21 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
     }
+    // Every stem's file is checked before the mix is written.
+    let out_path = std::path::Path::new(out);
+    let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
+    let stem_paths: Vec<_> = if stems {
+        render::stems(&project)
+            .into_iter()
+            .map(|part| (out_path.with_file_name(format!("{stem}-{}.wav", part.file_part(&project))), part))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for (path, _) in &stem_paths {
+        render::check_destination(&project, Some(project_path), path)
+            .map_err(|e| format!("{} {e}", shown(&path.display().to_string())))?;
+    }
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
     let mut meter = ExportMeter::new(opts.sample_rate);
@@ -227,11 +255,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         stats.clipped
     );
     if stems {
-        let out_path = std::path::Path::new(out);
-        let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
         let mut files = Vec::new();
-        for part in render::stems(&project) {
-            let path = out_path.with_file_name(format!("{stem}-{}.wav", part.file_part(&project)));
+        for (path, part) in stem_paths {
             let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
             render::render_into(&render::stem_project(&project, part), &track_samples, &opts, &mut |b| file.write(b))?;
             files.push((path, file));
@@ -253,7 +278,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
 
 /// Reads a MIDI file into a new project file, which must not exist yet.
 fn cmd_import(args: &[String]) -> Result<(), String> {
-    let [input, out] = args else { return Err(format!("import needs SONG.mid and OUT.tvo\n\n{USAGE}")) };
+    let [input, out] = args else { return Err(format!("import needs SONG.mid and OUT.tvo{SEE_HELP}")) };
     let out_path = std::path::Path::new(out);
     if out_path.exists() {
         return Err(format!("{} exists; import writes a new project", shown(out)));
@@ -406,11 +431,11 @@ fn cmd_edit(args: &[String]) -> Result<(), String> {
     let (input, rest) = input_option(rest)?;
     match &rest[..] {
         [] => tinvo::app::run(None, config, midi_start, midi_out, input, settings, settings_path),
-        [s] if s.starts_with('-') => Err(format!("unknown option '{s}'\n\n{USAGE}")),
+        [s] if s.starts_with('-') => Err(format!("unknown option '{}'{SEE_HELP}", shown(s))),
         [path] => {
             tinvo::app::run(Some(PathBuf::from(path)), config, midi_start, midi_out, input, settings, settings_path)
         }
-        _ => Err(format!("too many arguments\n\n{USAGE}")),
+        _ => Err(format!("too many arguments{SEE_HELP}")),
     }
 }
 
@@ -419,14 +444,15 @@ fn cmd_settings(args: &[String]) -> Result<(), String> {
     let file = match args {
         [] => None,
         [f] if !f.starts_with('-') => Some(PathBuf::from(f)),
-        _ => return Err(format!("settings takes at most a file\n\n{USAGE}")),
+        _ => return Err(format!("settings takes at most a file{SEE_HELP}")),
     };
     let (settings, path, found) = read_settings(file)?;
     let source = match (&path, found) {
-        (Some(p), true) => format!("# Read from {}.", p.display()),
-        (Some(p), false) => {
-            format!("# {} does not exist: these are the defaults. Copy there the lines to change.", p.display())
-        }
+        (Some(p), true) => format!("# Read from {}.", shown(&p.display().to_string())),
+        (Some(p), false) => format!(
+            "# {} does not exist: these are the defaults. Copy there the lines to change.",
+            shown(&p.display().to_string())
+        ),
         (None, _) => "# No settings folder could be found (no APPDATA or HOME): these are the defaults.".to_string(),
     };
     print!("{source}\n{}", settings.to_text());
@@ -451,8 +477,8 @@ fn cmd_record(args: &[String]) -> Result<(), String> {
     let (input, rest) = input_option(args.to_vec())?;
     let (out, seconds) = match &rest[..] {
         [out] => (out, 5.0),
-        [out, s] => (out, s.parse::<f64>().map_err(|_| format!("'{s}' is not a number of seconds"))?),
-        _ => return Err(format!("record needs an output file\n\n{USAGE}")),
+        [out, s] => (out, s.parse::<f64>().map_err(|_| format!("'{}' is not a number of seconds", shown(s)))?),
+        _ => return Err(format!("record needs an output file{SEE_HELP}")),
     };
     if !(seconds > 0.0 && seconds <= 3600.0) {
         return Err("record length must be between 0 and 3600 seconds".into());
@@ -513,9 +539,10 @@ fn cmd_devices() -> Result<(), String> {
 
 fn cmd_probe(args: &[String]) -> Result<(), String> {
     let (config, args) = audio_options(args)?;
-    let seconds: f64 = match args.first() {
-        Some(s) => s.parse().ok().filter(|v| *v > 0.0 && *v <= 60.0).ok_or("SECONDS must be in (0, 60]")?,
-        None => 2.0,
+    let seconds: f64 = match args.as_slice() {
+        [s] => s.parse().ok().filter(|v| *v > 0.0 && *v <= 60.0).ok_or("SECONDS must be in (0, 60]")?,
+        [] => 2.0,
+        _ => return Err(format!("probe takes at most SECONDS{SEE_HELP}")),
     };
     struct Silence {
         frames: Arc<AtomicU64>,
@@ -591,7 +618,7 @@ fn cmd_loopback(args: &[String]) -> Result<(), String> {
     let (config, args) = audio_options(args)?;
     let (input, rest) = input_option(args)?;
     if let Some(a) = rest.first() {
-        return Err(format!("unknown argument '{a}'\n\n{USAGE}"));
+        return Err(format!("unknown argument '{}'{SEE_HELP}", shown(a)));
     }
     let t0 = Instant::now();
     let secs = |t: Instant| t.saturating_duration_since(t0).as_secs_f64();
@@ -783,7 +810,7 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
     while let Some(a) = it.next() {
         let mut number = |name: &str| -> Result<u64, String> {
             let v = it.next().ok_or(format!("{name} needs a value"))?;
-            v.parse().map_err(|_| format!("{name} takes a whole number, not '{v}'"))
+            v.parse().map_err(|_| format!("{name} takes a whole number, not '{}'", shown(v)))
         };
         match a.as_str() {
             "--seconds" => opts.time = Some(Duration::from_secs(number("--seconds")?)),
@@ -791,7 +818,7 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
             "--seed" => opts.seed = number("--seed")?,
             "--render-every" => opts.render_every = number("--render-every")?,
             "--check" => check = Some(PathBuf::from(it.next().ok_or("--check needs a file")?)),
-            s => return Err(format!("unknown option '{s}'")),
+            s => return Err(format!("unknown option '{}'", shown(s))),
         }
     }
     if let Some(path) = check {
@@ -855,15 +882,15 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [flag, file] if flag == "--instructions" => bench_instructions(file),
-        _ => Err(format!(
-            "bench takes no arguments, --check, --count SCENARIO SECONDS or --instructions FILE\n\n{USAGE}"
-        )),
+        _ => {
+            Err(format!("bench takes no arguments, --check, --count SCENARIO SECONDS or --instructions FILE{SEE_HELP}"))
+        }
     }
 }
 
 fn bench_scenario(id: &str) -> Result<bench::Scenario, String> {
     let ids: Vec<&str> = bench::SCENARIOS.iter().map(|s| s.id).collect();
-    bench::find(id).ok_or(format!("no scenario '{id}' (there are {})", ids.join(", ")))
+    bench::find(id).ok_or(format!("no scenario '{}' (there are {})", shown(id), ids.join(", ")))
 }
 
 /// Times every scenario in device-sized callbacks; with `check`, fails when
@@ -957,5 +984,43 @@ fn bench_instructions(file: &str) -> Result<(), String> {
             INSTRUCTION_TOLERANCE * 100.0,
             over.join(", ")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn usage_errors_are_one_line() {
+        let e = cmd_render(&args(&["--song", "--pattern", "B", "a.tvo", "b.wav"])).unwrap_err();
+        assert_eq!(e, "--pattern: --song, --region and --pattern each pick what to render; give one");
+        let e = cmd_probe(&args(&["1", "extra"])).unwrap_err();
+        assert_eq!(e, format!("probe takes at most SECONDS{SEE_HELP}"));
+        let e = cmd_render(&args(&["a.tvo"])).unwrap_err();
+        assert!(!e.contains('\n') && e.ends_with(SEE_HELP), "{e}");
+        // What was typed is shown escaped, on the one line.
+        let e = cmd_render(&args(&["--odd\nflag", "a.tvo", "b.wav"])).unwrap_err();
+        assert_eq!(e, "unknown option '--odd\\nflag'");
+        let e = cmd_bench(&args(&["--count", "odd\nscenario", "1"])).unwrap_err();
+        assert!(e.starts_with("no scenario 'odd\\nscenario' (there are "), "{e}");
+    }
+
+    #[test]
+    fn render_writes_neither_the_project_nor_another_kind_of_file() {
+        let dir = std::env::temp_dir().join(format!("tinvo-cli-dest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("song.tvo");
+        Project::demo().save(&song).unwrap();
+        let before = std::fs::read(&song).unwrap();
+        let s = song.display().to_string();
+        let e = cmd_render(&args(&[&s, &s])).unwrap_err();
+        assert!(e.ends_with("is not a .wav or .mid file"), "{e}");
+        assert_eq!(std::fs::read(&song).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

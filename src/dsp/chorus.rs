@@ -11,6 +11,8 @@
 use std::f64::consts::TAU;
 
 /// Centre of the sweep in seconds.
+/// Frames between pulls of the sweep back to unit amplitude.
+const NORM_FRAMES: u32 = 256;
 const CENTRE: f32 = 0.012;
 /// Widest sweep either side of the centre, in seconds.
 pub const MAX_DEPTH: f32 = 0.008;
@@ -36,6 +38,8 @@ pub struct Chorus {
     centre: f32,
     /// Frames since the input was last above `QUIET`.
     quiet: usize,
+    /// Frames since the sweep was last pulled back to unit amplitude.
+    since_norm: u32,
     sample_rate: f32,
 }
 
@@ -57,6 +61,7 @@ impl Chorus {
             depth_glide: (-1.0 / (DEPTH_SECONDS * sample_rate)).exp(),
             centre,
             quiet: usize::MAX,
+            since_norm: 0,
             sample_rate,
         };
         c.set(1.0, 0.003);
@@ -109,11 +114,17 @@ impl Chorus {
             );
             self.write = super::ring_next(self.write, self.frames);
             self.quiet = if x[0].abs() < QUIET && x[1].abs() < QUIET { self.quiet.saturating_add(1) } else { 0 };
+            // Rotation lets the amplitude drift by rounding; pull it back on
+            // a count of frames, not of calls, so the sweep is the same
+            // however the frames are split into blocks.
+            self.since_norm += 1;
+            if self.since_norm == NORM_FRAMES {
+                self.since_norm = 0;
+                let norm = (self.sin * self.sin + self.cos * self.cos).sqrt();
+                self.sin /= norm;
+                self.cos /= norm;
+            }
         }
-        // Rotation lets the amplitude drift by rounding; pull it back.
-        let norm = (self.sin * self.sin + self.cos * self.cos).sqrt();
-        self.sin /= norm;
-        self.cos /= norm;
     }
 
     /// Channel `ch` as it was `delay` frames ago (at least 1).
@@ -151,6 +162,26 @@ mod tests {
             c.process(i, o);
         }
         out
+    }
+
+    #[test]
+    fn the_sweep_is_the_same_however_the_frames_are_split() {
+        let x: Vec<f32> = (0..2 * 20_000).map(|i| ((i * 7919) % 101) as f32 / 101.0 - 0.5).collect();
+        let go = |size: usize| {
+            let mut c = Chorus::new(SR);
+            c.set(3.0, 0.004);
+            c.snap();
+            let mut out = vec![0.0; x.len()];
+            for (i, o) in x.chunks(2 * size).zip(out.chunks_mut(2 * size)) {
+                c.process(i, o);
+            }
+            // The sweep itself, which a later frame's output would show.
+            (out, c.sin.to_bits(), c.cos.to_bits())
+        };
+        let one = go(1);
+        for size in [7, 4096] {
+            assert!(go(size) == one, "blocks of {size}");
+        }
     }
 
     #[test]

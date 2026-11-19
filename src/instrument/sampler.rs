@@ -172,7 +172,14 @@ impl Sampler {
 
     fn update_derived(&mut self) {
         let pr = &self.params;
+        let was = self.one_shot;
         self.one_shot = pr[p::MODE] >= 0.5;
+        if was && !self.one_shot {
+            // Keys let go while it played one-shot end their notes now.
+            for v in self.voices.iter_mut().filter(|v| v.playing && !v.held) {
+                v.amp.gate_off();
+            }
+        }
         self.sinc = pr[p::INTERP] < 0.5;
         self.filter_on = pr[p::CUTOFF] < 20_000.0 || pr[p::RESO] > 0.0;
         let env = AdsrParams { attack: pr[p::A], decay: pr[p::D], sustain: pr[p::S], release: pr[p::R] };
@@ -208,7 +215,10 @@ impl Sampler {
                 .min_by_key(|(_, v)| v.age)
                 .map(|(i, _)| i)
         };
-        oldest(Some(false)).or_else(|| oldest(None)).unwrap_or(0)
+        // One-shot notes all play to their end, let go or not: the oldest
+        // goes first.
+        let free = if self.one_shot { None } else { oldest(Some(false)) };
+        free.or_else(|| oldest(None)).unwrap_or(0)
     }
 
     pub fn note_on(&mut self, note: u8, velocity: u8) -> VoiceId {
@@ -241,12 +251,16 @@ impl Sampler {
     }
 
     pub fn note_off(&mut self, id: VoiceId) {
-        if id == VoiceId::NONE || self.one_shot {
+        if id == VoiceId::NONE {
             return;
         }
+        let one_shot = self.one_shot;
         if let Some(v) = self.voices.iter_mut().find(|v| v.id == id.0 && v.held) {
             v.held = false;
-            v.amp.gate_off();
+            // One-shot plays on; the key is up if the mode turns back.
+            if !one_shot {
+                v.amp.gate_off();
+            }
         }
     }
 
@@ -396,6 +410,29 @@ mod tests {
         s.render(&mut buf);
         assert!(buf[4000..4700].iter().any(|x| x.abs() > 0.3), "plays on after note-off");
         assert!(buf[4800..].iter().all(|&x| x == 0.0), "and does not loop");
+    }
+
+    #[test]
+    fn a_key_let_go_in_one_shot_ends_its_loop_when_the_mode_turns_back() {
+        let mut s = sampler(sine_sample(500.0, 0.1, 48_000));
+        s.set_param(p::LOOP, 1.0);
+        s.set_param(p::MODE, 1.0);
+        let id = s.note_on(60, 127);
+        s.note_off(id);
+        let mut buf = vec![0.0f32; 1000];
+        s.render(&mut buf);
+        s.set_param(p::MODE, 0.0);
+        let mut tail = vec![0.0f32; 96_000];
+        s.render(&mut tail);
+        assert_eq!(s.active_voices(), 0, "released, not looping on");
+        // Meanwhile a key let go does not make its note the one to give way.
+        s.set_param(p::LOOP, 0.0);
+        s.set_param(p::MODE, 1.0);
+        let ids: Vec<VoiceId> = (0..s.voices.len()).map(|k| s.note_on(60 + k as u8, 100)).collect();
+        s.note_off(*ids.last().unwrap());
+        s.note_on(90, 100);
+        assert!(s.voices.iter().all(|v| v.id != ids[0].0), "the oldest gave way");
+        assert!(s.voices.iter().any(|v| v.id == ids.last().unwrap().0));
     }
 
     #[test]

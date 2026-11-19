@@ -16,6 +16,10 @@ use std::sync::OnceLock;
 pub const PAD: usize = SINC_TAPS / 2;
 /// Longest sample accepted, in frames (about 11 minutes at 48 kHz).
 pub const MAX_FRAMES: usize = 1 << 25;
+/// Most frames a project's samples hold together (512 MiB of audio, about
+/// 46 minutes at 48 kHz), so a project of long samples cannot take all
+/// memory when it opens.
+pub const PROJECT_FRAMES: usize = 1 << 27;
 /// Largest sample value kept (+60 dBFS). Float files can hold any value;
 /// beyond this they are corrupt rather than loud, and the products of the
 /// gains on the way to the output (velocity, strip, sends, master) could
@@ -108,13 +112,24 @@ impl Sample {
 /// [`MAX_FRAMES`] from the header, before anything is allocated for the
 /// audio, which is then mixed down block by block.
 pub fn load(path: &Path) -> Result<Sample, String> {
-    load_limited(path, MAX_FRAMES)
+    load_within(path, MAX_FRAMES)
 }
 
-fn load_limited(path: &Path, max_frames: usize) -> Result<Sample, String> {
+/// Like [`load`], for a sample that may hold at most `max_frames`: what is
+/// left of the project's [`PROJECT_FRAMES`].
+pub fn load_within(path: &Path, max_frames: usize) -> Result<Sample, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    let mut file = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| fail(&e))?);
-    read_limited(&mut file, max_frames).map_err(|e| fail(&e))
+    // Opening a named pipe or a device would wait for it, with the editor
+    // stopped until it gave in. Checked by name first, and again on what
+    // was opened, in case the name changed in between.
+    if !std::fs::metadata(path).map_err(|e| fail(&e))?.is_file() {
+        return Err(fail(&"not a file"));
+    }
+    let file = crate::fsutil::open_without_waiting(path).map_err(|e| fail(&e))?;
+    if !file.metadata().map_err(|e| fail(&e))?.is_file() {
+        return Err(fail(&"not a file"));
+    }
+    read_limited(&mut std::io::BufReader::new(file), max_frames).map_err(|e| fail(&e))
 }
 
 /// Reads a WAV stream into a mono [`Sample`], like [`load`].
@@ -129,7 +144,11 @@ fn read_limited<R: Read + Seek>(file: &mut R, max_frames: usize) -> Result<Sampl
         return Err(fail(&"the file contains no audio"));
     }
     if info.frames > max_frames as u64 {
-        return Err(fail(&format!("longer than {max_frames} frames")));
+        return Err(fail(&if max_frames < MAX_FRAMES {
+            format!("longer than the {max_frames} frames left of the {PROJECT_FRAMES} a project's samples may hold")
+        } else {
+            format!("longer than {max_frames} frames")
+        }));
     }
     let ch = usize::from(info.channels);
     let gain = 1.0 / ch as f32;
@@ -259,8 +278,18 @@ mod tests {
         assert_eq!((s.frames(), s.sample_rate, s.source_channels), (100, 44_100, 2));
         assert!(s.audio().iter().all(|&x| (x - 0.125).abs() < 1e-6));
         // The length limit applies from the header.
-        assert!(load_limited(&path, 99).unwrap_err().contains("longer than 99 frames"));
-        assert_eq!(load_limited(&path, 100).unwrap().frames(), 100);
+        assert!(load_within(&path, 99).unwrap_err().contains("longer than the 99 frames left"));
+        // Only a file is opened: a pipe or a device would keep the editor
+        // waiting (a folder stands in for them here).
+        assert_eq!(load(&dir).unwrap_err(), format!("{}: not a file", dir.display()));
+        // A pipe put at the name after that check opens without waiting.
+        #[cfg(unix)]
+        if crate::fsutil::OPENS_WITHOUT_WAITING {
+            let fifo = dir.join("pipe.wav");
+            assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+            assert_eq!(load(&fifo).unwrap_err(), format!("{}: not a file", fifo.display()));
+        }
+        assert_eq!(load_within(&path, 100).unwrap().frames(), 100);
         std::fs::write(&path, b"not a wav").unwrap();
         assert!(load(&path).unwrap_err().contains("st.wav"));
         assert!(load(&dir.join("missing.wav")).is_err());

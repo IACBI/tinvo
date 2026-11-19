@@ -4,15 +4,169 @@
 //! and mouse records, VT processing for output). Linux and macOS use
 //! termios and `poll`, and ask the terminal for SGR mouse reports.
 
-use super::input::{Key, Mouse};
+use super::input::{Decoded, Key, Mouse, decode};
 use std::io::{self, Write};
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Key(Key),
     Mouse(Mouse),
+    /// Text pasted in one piece (bracketed paste, on Linux and macOS), with
+    /// its line breaks and tabs as `\n` and `\t`, and whether it was cut
+    /// at [`MAX_PASTE`] bytes.
+    Paste {
+        text: String,
+        cut: bool,
+    },
     Resize,
+}
+
+/// The most bytes of text a paste brings in; the rest is dropped. Twice
+/// what a prompt takes, so a prompt sees that a long paste was cut.
+pub const MAX_PASTE: usize = 8192;
+
+/// The end of a bracketed paste.
+#[cfg_attr(windows, allow(dead_code))]
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// What [`Decoder::next`] found.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
+enum Next {
+    Event(Event),
+    /// The bytes so far start a sequence; the rest is still to come.
+    More,
+    /// Nothing left to decode.
+    Empty,
+}
+
+/// Turns the VT input bytes Linux and macOS terminals send into events.
+#[derive(Default)]
+#[cfg_attr(windows, allow(dead_code))]
+struct Decoder {
+    pending: Vec<u8>,
+    /// The text of a bracketed paste under way, and whether it was cut.
+    paste: Option<(String, bool)>,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl Decoder {
+    /// The next whole event in the bytes read so far. Keys inside a paste
+    /// become its text instead: a pasted line break must not submit a
+    /// prompt, nor pasted letters run commands.
+    fn next(&mut self) -> Next {
+        loop {
+            if self.paste.is_some() {
+                return self.next_in_paste();
+            }
+            if self.pending.is_empty() {
+                return Next::Empty;
+            }
+            let (event, n) = match decode(&self.pending) {
+                Decoded::Incomplete => return Next::More,
+                Decoded::Key(k, n) => (Some(Event::Key(k)), n),
+                Decoded::Mouse(m, n) => (Some(Event::Mouse(m)), n),
+                Decoded::PasteStart(n) => {
+                    self.paste = Some((String::new(), false));
+                    (None, n)
+                }
+                // An end with no start.
+                Decoded::PasteEnd(n) | Decoded::Skip(n) => (None, n),
+            };
+            self.pending.drain(..n);
+            if let Some(e) = event {
+                return Next::Event(e);
+            }
+        }
+    }
+
+    /// Inside a paste, the text up to its end marker. The marker is looked
+    /// for first, so a sequence cut short in the text cannot take in its
+    /// bytes and leave the paste open.
+    fn next_in_paste(&mut self) -> Next {
+        let end = find(&self.pending, PASTE_END);
+        // What may be the start of the marker waits for the rest.
+        let body = end.unwrap_or(self.pending.len() - marker_start(&self.pending));
+        let Some((text, cut)) = &mut self.paste else { return Next::Empty };
+        let mut at = 0;
+        while at < body {
+            // ESC before a character is text here, not Alt with a key: only
+            // the ESC is dropped.
+            let rest = &self.pending[at..body];
+            if rest[0] == 0x1b && rest.get(1).is_some_and(|&b| b != b'[' && b != b'O') {
+                at += 1;
+                continue;
+            }
+            let n = match decode(rest) {
+                Decoded::Incomplete => break,
+                Decoded::Key(k, n) => {
+                    let ch = match k {
+                        Key::Char(c) => Some(c),
+                        Key::Enter => Some('\n'),
+                        Key::Tab => Some('\t'),
+                        _ => None,
+                    };
+                    if let Some(c) = ch {
+                        // Cut at the first character that does not fit, so
+                        // what is kept is the start of the text.
+                        *cut |= text.len() + c.len_utf8() > MAX_PASTE;
+                        if !*cut {
+                            text.push(c);
+                        }
+                    }
+                    n
+                }
+                Decoded::Mouse(_, n) | Decoded::PasteStart(n) | Decoded::PasteEnd(n) | Decoded::Skip(n) => n,
+            };
+            at += n;
+        }
+        if let Some(i) = end {
+            // A sequence left unfinished in the text goes with it.
+            self.pending.drain(..i + PASTE_END.len());
+            return match self.paste.take() {
+                Some((text, cut)) => Next::Event(Event::Paste { text, cut }),
+                None => Next::Empty,
+            };
+        }
+        self.pending.drain(..at);
+        if self.pending.is_empty() { Next::Empty } else { Next::More }
+    }
+
+    /// The rest of a sequence did not come in time: a lone ESC is the
+    /// Escape key; anything else is dropped whole, so none of a partial
+    /// sequence's bytes is taken for a key. In a paste, what may be the
+    /// start of its end marker is kept: the paste ends only with it.
+    fn timed_out(&mut self) -> Option<Event> {
+        if self.paste.is_some() {
+            let keep = marker_start(&self.pending);
+            self.pending.drain(..self.pending.len() - keep);
+            return None;
+        }
+        let lone_esc = self.pending == [0x1b];
+        self.pending.clear();
+        lone_esc.then_some(Event::Key(Key::Esc))
+    }
+}
+
+/// Where `needle` first starts in `bytes`.
+#[cfg_attr(windows, allow(dead_code))]
+fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    bytes.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The length of the longest end of `bytes` that starts the paste's end
+/// marker without being all of it.
+#[cfg_attr(windows, allow(dead_code))]
+fn marker_start(bytes: &[u8]) -> usize {
+    (1..PASTE_END.len()).rev().find(|&k| bytes.ends_with(&PASTE_END[..k])).unwrap_or(0)
+}
+
+/// Whether the process was asked to end (SIGTERM, or SIGHUP when its
+/// terminal went away) while the terminal was taken over. Always false on
+/// Windows.
+pub fn end_requested() -> bool {
+    sys::end_requested()
 }
 
 /// Enter alternate screen, hide cursor, disable line wrap.
@@ -25,8 +179,12 @@ const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// Undo `MOUSE_ON`.
 #[cfg(not(windows))]
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
-/// Undo `ENTER_SEQ` and `MOUSE_ON`.
-const LEAVE_SEQ: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
+/// Mark pasted text (2004). Not on Windows, where the console delivers the
+/// markers as typed keys.
+#[cfg(not(windows))]
+const PASTE_ON: &str = "\x1b[?2004h";
+/// Undo `ENTER_SEQ`, `MOUSE_ON` and `PASTE_ON`.
+const LEAVE_SEQ: &str = "\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 /// A terminal in raw mode. Dropping it restores the original state.
 pub struct Terminal {
@@ -39,6 +197,8 @@ impl Terminal {
         let sys = sys::RawMode::enable(mouse)?;
         let mut t = Self { sys };
         t.write(ENTER_SEQ)?;
+        #[cfg(not(windows))]
+        t.write(PASTE_ON)?;
         #[cfg(not(windows))]
         if mouse {
             t.write(MOUSE_ON)?;
@@ -200,6 +360,21 @@ mod sys {
         /// The buttons held at the last mouse record, which reports only
         /// which are down, not which changed.
         buttons: u32,
+        /// A key record's repeats still to report, and the key.
+        repeat: Option<(Key, u16)>,
+        /// The first half of a character outside the Basic Multilingual
+        /// Plane, which the console sends as two records.
+        high: Option<u16>,
+    }
+
+    /// The most repeats one key record reports.
+    const MAX_REPEAT: u16 = 64;
+
+    /// The most records standing for nothing read past a poll's deadline.
+    const MAX_SKIPPED: u32 = 256;
+
+    pub fn end_requested() -> bool {
+        false
     }
 
     impl RawMode {
@@ -222,7 +397,7 @@ mod sys {
                     SetConsoleMode(input, input_mode);
                     return Err(io::Error::other(format!("console lacks VT support: {err}")));
                 }
-                Ok(Self { input, output, input_mode, output_mode, buttons: 0 })
+                Ok(Self { input, output, input_mode, output_mode, buttons: 0, repeat: None, high: None })
             }
         }
 
@@ -264,7 +439,12 @@ mod sys {
             mouse_event(m, origin, &mut self.buttons)
         }
         pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+            if let Some((key, n)) = self.repeat.take() {
+                self.repeat = (n > 1).then_some((key, n - 1));
+                return Ok(Some(Event::Key(key)));
+            }
             let deadline = Instant::now() + timeout;
+            let mut skipped = 0;
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let ms = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
@@ -285,7 +465,9 @@ mod sys {
                             // and both are 16 bytes.
                             let k: KeyEventRecord = unsafe { std::mem::transmute(rec.event) };
                             if k.key_down != 0 {
-                                if let Some(key) = map_key(&k) {
+                                if let Some(key) = map_key(&k, &mut self.high) {
+                                    let more = k.repeat_count.saturating_sub(1).min(MAX_REPEAT - 1);
+                                    self.repeat = (more > 0).then_some((key, more));
                                     return Ok(Some(Event::Key(key)));
                                 }
                             }
@@ -302,8 +484,15 @@ mod sys {
                         _ => {}
                     }
                 }
+                // Records that stand for nothing (releases, moves) are read
+                // past the deadline while more wait, so a zero timeout
+                // still finds an event queued behind them; a bounded
+                // number, so a flood of them cannot hold the loop.
                 if Instant::now() >= deadline {
-                    return Ok(None);
+                    skipped += 1;
+                    if skipped > MAX_SKIPPED {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -344,11 +533,16 @@ mod sys {
         Some(Mouse { kind, x, y })
     }
 
-    fn map_key(k: &KeyEventRecord) -> Option<Key> {
+    /// The key record `k` stands for; `high` holds the first half of a
+    /// surrogate pair until the next key press, which must carry its second
+    /// half. (Releases come between the two halves, so they keep it.)
+    fn map_key(k: &KeyEventRecord, high: &mut Option<u16>) -> Option<Key> {
         let state = k.control_key_state;
         let ctrl = state & CTRL_PRESSED != 0;
         // AltGr arrives as Ctrl+Alt and produces a printable character.
         let alt = state & ALT_PRESSED != 0;
+        // A first half is good for the very next key press only.
+        let first_half = high.take();
         let key = match k.virtual_key_code {
             0x08 => Key::Backspace,
             0x09 if state & SHIFT_PRESSED != 0 => Key::BackTab,
@@ -366,13 +560,23 @@ mod sys {
             0x2E => Key::Delete,
             vk @ 0x70..=0x7B => Key::F((vk - 0x70 + 1) as u8),
             vk @ 0x41..=0x5A if ctrl && !alt => Key::Ctrl(char::from(vk as u8).to_ascii_lowercase()),
-            _ => match k.unicode_char {
-                0 => return None,
-                c => match char::from_u32(u32::from(c)) {
+            _ => {
+                let code = match (k.unicode_char, first_half) {
+                    (0, _) => return None,
+                    (c @ 0xD800..=0xDBFF, _) => {
+                        *high = Some(c);
+                        return None;
+                    }
+                    (c @ 0xDC00..=0xDFFF, Some(h)) => {
+                        0x10000 + ((u32::from(h) - 0xD800) << 10) + (u32::from(c) - 0xDC00)
+                    }
+                    (c, _) => u32::from(c),
+                };
+                match char::from_u32(code) {
                     Some(ch) if !ch.is_control() => Key::Char(ch),
                     _ => return None,
-                },
-            },
+                }
+            }
         };
         Some(key)
     }
@@ -380,6 +584,35 @@ mod sys {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn typed(unicode_char: u16) -> KeyEventRecord {
+            KeyEventRecord {
+                key_down: 1,
+                repeat_count: 1,
+                virtual_key_code: 0,
+                virtual_scan_code: 0,
+                unicode_char,
+                control_key_state: 0,
+            }
+        }
+
+        #[test]
+        fn a_surrogate_pair_is_one_character() {
+            let mut high = None;
+            assert_eq!(map_key(&typed(0xD83C), &mut high), None);
+            assert_eq!(map_key(&typed(0xDFB5), &mut high), Some(Key::Char('🎵')));
+            assert_eq!(high, None);
+            // A lone half is dropped, and does not stick to the next key.
+            assert_eq!(map_key(&typed(0xDFB5), &mut high), None);
+            assert_eq!(map_key(&typed(0xD83C), &mut high), None);
+            assert_eq!(map_key(&typed(u16::from(b'a')), &mut high), Some(Key::Char('a')));
+            assert_eq!(high, None);
+            // Nor across another key.
+            assert_eq!(map_key(&typed(0xD83C), &mut high), None);
+            let enter = KeyEventRecord { virtual_key_code: 0x0D, ..typed(0x0D) };
+            assert_eq!(map_key(&enter, &mut high), Some(Key::Enter));
+            assert_eq!(map_key(&typed(0xDFB5), &mut high), None);
+        }
 
         fn rec(x: i16, y: i16, button_state: u32, event_flags: u32) -> MouseEventRecord {
             MouseEventRecord { position: Coord { x, y }, button_state, control_key_state: 0, event_flags }
@@ -411,11 +644,11 @@ mod sys {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
-    use super::super::input::{Decoded, decode};
-    use super::Event;
+    use super::{Decoder, Event, Next};
     use std::ffi::{c_int, c_ulong, c_void};
     use std::io;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     #[cfg(target_os = "linux")]
     #[repr(C)]
@@ -484,11 +717,26 @@ mod sys {
         fn poll(fds: *mut PollFd, n: NfdsT, timeout: c_int) -> c_int;
         fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        fn signal(sig: c_int, handler: usize) -> usize;
+    }
+
+    const SIGHUP: c_int = 1;
+    const SIGTERM: c_int = 15;
+    const SIG_DFL: usize = 0;
+
+    static END: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_end(_: c_int) {
+        END.store(true, Ordering::Relaxed);
+    }
+
+    pub fn end_requested() -> bool {
+        END.load(Ordering::Relaxed)
     }
 
     pub struct RawMode {
         original: Termios,
-        pending: Vec<u8>,
+        decoder: Decoder,
         last_size: (u16, u16),
     }
 
@@ -529,7 +777,15 @@ mod sys {
                     return Err(io::Error::last_os_error());
                 }
             }
-            let mut m = Self { original, pending: Vec::with_capacity(64), last_size: (0, 0) };
+            // Ended from outside, the session still autosaves and gives the
+            // terminal back: the poll returns, interrupted, and the editor's
+            // loop sees the request.
+            // SAFETY: the handler only stores to an atomic.
+            unsafe {
+                signal(SIGHUP, on_end as extern "C" fn(c_int) as usize);
+                signal(SIGTERM, on_end as extern "C" fn(c_int) as usize);
+            }
+            let mut m = Self { original, decoder: Decoder::default(), last_size: (0, 0) };
             m.last_size = m.size();
             Ok(m)
         }
@@ -540,8 +796,13 @@ mod sys {
         }
 
         pub fn restore(&mut self) {
-            // SAFETY: restoring the attributes read in `enable`.
-            unsafe { tcsetattr(STDIN, TCSANOW, &self.original) };
+            // SAFETY: restoring the attributes read in `enable`, and the
+            // default handling of the signals.
+            unsafe {
+                tcsetattr(STDIN, TCSANOW, &self.original);
+                signal(SIGHUP, SIG_DFL);
+                signal(SIGTERM, SIG_DFL);
+            }
         }
 
         pub fn size(&self) -> (u16, u16) {
@@ -564,7 +825,7 @@ mod sys {
         }
 
         fn fill(&mut self) -> io::Result<()> {
-            read_into(STDIN, &mut self.pending)
+            read_into(STDIN, &mut self.decoder.pending)
         }
 
         pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
@@ -573,39 +834,29 @@ mod sys {
                 self.last_size = size;
                 return Ok(Some(Event::Resize));
             }
-            if self.pending.is_empty() {
-                let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
-                if !Self::wait_readable(ms)? {
-                    return Ok(None);
-                }
-                self.fill()?;
-            }
+            let mut waited = false;
+            let mut more_since = None;
             loop {
-                if self.pending.is_empty() {
-                    return Ok(None);
-                }
-                match decode(&self.pending) {
-                    Decoded::Key(k, n) => {
-                        self.pending.drain(..n);
-                        return Ok(Some(Event::Key(k)));
-                    }
-                    Decoded::Mouse(m, n) => {
-                        self.pending.drain(..n);
-                        return Ok(Some(Event::Mouse(m)));
-                    }
-                    Decoded::Skip(n) => {
-                        self.pending.drain(..n);
-                    }
-                    Decoded::Incomplete => {
-                        if Self::wait_readable(ESC_TIMEOUT_MS)? {
-                            self.fill()?;
-                        } else if self.pending[0] == 0x1b {
-                            self.pending.drain(..1);
-                            return Ok(Some(Event::Key(super::Key::Esc)));
-                        } else {
-                            // A truncated multi-byte character: drop it.
-                            self.pending.clear();
+                match self.decoder.next() {
+                    Next::Event(e) => return Ok(Some(e)),
+                    Next::Empty if waited => return Ok(None),
+                    Next::Empty => {
+                        waited = true;
+                        let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
+                        if !Self::wait_readable(ms)? {
                             return Ok(None);
+                        }
+                        self.fill()?;
+                    }
+                    // The rest of a sequence has ESC_TIMEOUT_MS from when it
+                    // was first waited for, however its bytes trickle in.
+                    Next::More => {
+                        let since = *more_since.get_or_insert_with(Instant::now);
+                        let left = ESC_TIMEOUT_MS - since.elapsed().as_millis().min(ESC_TIMEOUT_MS as u128) as c_int;
+                        if left > 0 && Self::wait_readable(left)? {
+                            self.fill()?;
+                        } else {
+                            return Ok(self.decoder.timed_out());
                         }
                     }
                 }
@@ -643,6 +894,10 @@ mod sys {
     use std::io;
     use std::time::Duration;
 
+    pub fn end_requested() -> bool {
+        false
+    }
+
     pub struct RawMode;
 
     impl RawMode {
@@ -659,5 +914,78 @@ mod sys {
         pub fn poll(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decoder(bytes: &[u8]) -> Decoder {
+        Decoder { pending: bytes.to_vec(), paste: None }
+    }
+
+    fn events(d: &mut Decoder) -> Vec<Event> {
+        let mut out = Vec::new();
+        while let Next::Event(e) = d.next() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn a_paste_is_one_event_and_runs_no_keys() {
+        let mut d = decoder(b"q\x1b[200~Lead\r\nX\x1b[A\x1b[201~w");
+        assert_eq!(
+            events(&mut d),
+            [
+                Event::Key(Key::Char('q')),
+                Event::Paste { text: "Lead\n\nX".into(), cut: false },
+                Event::Key(Key::Char('w'))
+            ]
+        );
+        // One split across reads goes on where it left off.
+        let mut d = decoder(b"\x1b[200~ab");
+        assert_eq!(d.next(), Next::Empty);
+        d.pending.extend_from_slice(b"c\x1b[201~");
+        assert_eq!(events(&mut d), [Event::Paste { text: "abc".into(), cut: false }]);
+        // Past the limit, the rest is dropped, from the first character
+        // that does not fit.
+        let mut long = b"\x1b[200~".to_vec();
+        long.extend(std::iter::repeat_n(b'x', MAX_PASTE - 1));
+        long.extend_from_slice("éx".as_bytes());
+        long.extend_from_slice(b"\x1b[201~");
+        let got = events(&mut decoder(&long));
+        assert_eq!(got, [Event::Paste { text: "x".repeat(MAX_PASTE - 1), cut: true }]);
+        // An end with no start is no event.
+        assert_eq!(events(&mut decoder(b"\x1b[201~a")), [Event::Key(Key::Char('a'))]);
+        // Text ending in what starts a sequence still ends at the marker.
+        let got = events(&mut decoder(b"\x1b[200~ab\x1b[\x1b[201~q"));
+        assert_eq!(got, [Event::Paste { text: "ab".into(), cut: false }, Event::Key(Key::Char('q'))]);
+        // A lone ESC in the text takes nothing after it with it.
+        let got = events(&mut decoder(b"\x1b[200~foo\x1bbar\x1b\r\x1b[201~"));
+        assert_eq!(got, [Event::Paste { text: "foobar\n".into(), cut: false }]);
+        // A marker split across reads, its start held past a wait.
+        let mut d = decoder(b"\x1b[200~ab\x1b[2");
+        assert_eq!(d.next(), Next::More);
+        assert_eq!(d.timed_out(), None);
+        assert_eq!(d.pending, b"\x1b[2");
+        d.pending.extend_from_slice(b"01~z");
+        assert_eq!(events(&mut d), [Event::Paste { text: "ab".into(), cut: false }, Event::Key(Key::Char('z'))]);
+    }
+
+    #[test]
+    fn a_sequence_cut_short_is_dropped_whole() {
+        let mut d = decoder(b"\x1b[");
+        assert_eq!(d.next(), Next::More);
+        assert_eq!(d.timed_out(), None);
+        assert!(d.pending.is_empty(), "the `[` is not left to run as a key");
+        let mut d = decoder(b"\x1b");
+        assert_eq!(d.next(), Next::More);
+        assert_eq!(d.timed_out(), Some(Event::Key(Key::Esc)));
+        let mut d = decoder(&"é".as_bytes()[..1]);
+        assert_eq!(d.next(), Next::More);
+        assert_eq!(d.timed_out(), None);
+        assert!(d.pending.is_empty());
     }
 }
