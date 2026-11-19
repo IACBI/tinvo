@@ -12,10 +12,16 @@ use tinvo::clap::ffi::{
     CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS,
     CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, ClapPlugin,
 };
-use tinvo::clap::host::{Instance, MAX_EVENTS, Mode, ParamInfo, PluginHost, Request, Role};
+use tinvo::clap::host::{
+    Instance, MAX_EVENTS, MAX_LATENCY_SECONDS, MAX_PARAM_EVENTS, Mode, ParamInfo, PluginHost, Request, Role,
+    max_latency,
+};
 use tinvo::clap::scan::{self, Catalog, Options};
 use tinvo::clap::{PluginRef, Roles};
-use tinvo::engine::{ChainId, Command as EngineCommand, Edit, Engine, RETIRE_QUEUE, Retired, Shared, Step};
+use tinvo::engine::{
+    ChainId, Command as EngineCommand, Edit, Engine, LaneTarget, PluginAt, PluginPlace, RETIRE_QUEUE, Retired, Shared,
+    Step,
+};
 use tinvo::insert::{EffectKind, Insert};
 use tinvo::instrument::InstrumentKind;
 use tinvo::project::Project;
@@ -1839,6 +1845,459 @@ fn an_instance_goes_into_the_plugin_insert_a_slot_will_hold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A synth track holding one note for its whole pattern, then `more`.
+fn held_note(more: &[Edit]) -> Vec<Edit> {
+    let mut e = vec![
+        Edit::AddTrack(InstrumentKind::Synth),
+        Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 100, 16)) },
+    ];
+    e.extend_from_slice(more);
+    e
+}
+
+/// The factor `wet` is `dry` scaled by.
+fn factor(wet: &[f32], dry: &[f32]) -> f32 {
+    let dd: f32 = dry.iter().map(|d| d * d).sum();
+    assert!(dd > 1e-6, "something to compare");
+    wet.iter().zip(dry).map(|(w, d)| w * d).sum::<f32>() / dd
+}
+
+/// Renders `frames` of both, the factor the plugin scales the second
+/// half of them by.
+fn scaled_by(e: &mut Engine, dry: &mut Engine, frames: usize) -> f32 {
+    let (w, d) = (render(e, frames, 64), render(dry, frames, 64));
+    factor(&w[frames..], &d[frames..])
+}
+
+/// A gain insert from `file` with its instance's token.
+fn gain_insert(host: &mut PluginHost, file: &Path) -> (Box<Insert>, u64) {
+    let gain = create(host, file, GAIN, Role::Effect).unwrap();
+    let token = gain.token();
+    let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+    assert!(insert.attach(Box::new(gain)).unwrap().is_none());
+    (insert, token)
+}
+
+const STEP: usize = 6000;
+
+#[test]
+fn a_plugin_parameter_is_set_unless_a_lane_holds_it() {
+    let dir = temp_dir("engine-params");
+    let file = install(&dir, "params");
+    let mut host = PluginHost::new();
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    let (mut e, _rx) = plugin_engine(&held_note(&[
+        Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
+        Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 4, value: Some(0.75) },
+    ]));
+    let (mut dry, _dry_rx) = plugin_engine(&held_note(&[]));
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut host, &file).0),
+    });
+    render(&mut e, 1000, 64);
+    render(&mut dry, 1000, 64);
+    e.handle(EngineCommand::Play);
+    dry.handle(EngineCommand::Play);
+    let place = PluginPlace::Slot(ChainId::Track(0), 0);
+    let set = |value: f64| EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value, serial: 1 };
+    e.handle(set(0.25));
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.25).abs() < 1e-4, "set before its lane has a point");
+    // Somewhere else, or another plugin's, it is nothing to this one.
+    e.handle(EngineCommand::SetPluginParam { place, plugin: sine_ref(), id: 10, value: 0.9, serial: 2 });
+    let elsewhere = PluginPlace::Slot(ChainId::Track(0), 1);
+    e.handle(EngineCommand::SetPluginParam { place: elsewhere, plugin: gain_ref(), id: 10, value: 0.9, serial: 3 });
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.25).abs() < 1e-4);
+    render(&mut e, 2 * STEP, 64);
+    render(&mut dry, 2 * STEP, 64);
+    // From step 4 its lane holds it.
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "the lane's point");
+    e.handle(set(0.1));
+    e.handle(EngineCommand::Edit(Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.2) }));
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "held over both");
+    // Back at step 0, with no point in force, the lane leaves it at its
+    // base.
+    render(&mut e, 16 * STEP - 5 * STEP, 64);
+    render(&mut dry, 16 * STEP - 5 * STEP, 64);
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.2).abs() < 1e-4, "its base");
+    e.handle(set(0.4));
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.4).abs() < 1e-4, "free to set again");
+    e.handle(EngineCommand::Edit(Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.3) }));
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.3).abs() < 1e-4, "a new base, at once");
+    render(&mut e, STEP, 64);
+    render(&mut dry, STEP, 64);
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "held again");
+    // A lane let go of leaves it at its base too.
+    e.handle(EngineCommand::Edit(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false }));
+    assert!((scaled_by(&mut e, &mut dry, STEP) - 0.3).abs() < 1e-4, "its base once the lane is gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_instance_that_comes_gets_the_lane_s_value() {
+    let dir = temp_dir("engine-replay");
+    let file = install(&dir, "replay");
+    let mut host = PluginHost::new();
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    let (mut e, mut rx) = plugin_engine(&held_note(&[
+        Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
+        Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(0.75) },
+    ]));
+    let (mut dry, _dry_rx) = plugin_engine(&held_note(&[]));
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut host, &file).0),
+    });
+    render(&mut e, 1000, 64);
+    render(&mut dry, 1000, 64);
+    e.handle(EngineCommand::Play);
+    dry.handle(EngineCommand::Play);
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.75).abs() < 1e-4);
+    // Another instance (at 0.5) in its place.
+    let other = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let token = other.token();
+    e.handle(EngineCommand::SetSlotPlugin { chain: ChainId::Track(0), slot: 0, instance: Box::new(other) });
+    assert_eq!(came_back(&mut rx).iter().map(|b| b.0).collect::<Vec<_>>(), ["plugin"]);
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.75).abs() < 1e-4, "a new instance");
+    // One back from a restart that forgot it.
+    e.handle(EngineCommand::Lend(token));
+    let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+    lent.restart().unwrap();
+    assert!(lent.set_param(10, 0.1, 9));
+    e.handle(EngineCommand::Return(lent));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.75).abs() < 1e-4, "back from a restart");
+    // And a new insert, which fades in over the old one.
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut host, &file).0),
+    });
+    render(&mut e, 1000, 64);
+    render(&mut dry, 1000, 64);
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.75).abs() < 1e-4, "a new insert");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_value_set_while_its_lane_holds_nothing_outlasts_a_return() {
+    let dir = temp_dir("engine-free-lane");
+    let file = install(&dir, "free-lane");
+    let mut host = PluginHost::new();
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    let sine_track = Edit::AddTrack(InstrumentKind::Plugin(sine_ref()));
+    let (mut e, mut rx) = plugin_engine(&held_note(&[
+        sine_track,
+        Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
+        Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 8, value: Some(0.75) },
+        Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.2) },
+    ]));
+    let (mut dry, _dry_rx) = plugin_engine(&held_note(&[sine_track]));
+    let (insert, token) = gain_insert(&mut host, &file);
+    e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
+    for x in [&mut e, &mut dry] {
+        render(x, 1000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    let place = PluginPlace::Slot(ChainId::Track(0), 0);
+    let set = |value, serial| EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value, serial };
+    e.handle(set(0.4, 1));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.4).abs() < 1e-4);
+    // Set while lent out, it is the value the instance comes back to.
+    e.handle(EngineCommand::Lend(token));
+    let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+    e.handle(set(0.7, 2));
+    lent.restart().unwrap();
+    e.handle(EngineCommand::Return(lent));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.7).abs() < 1e-4, "not the lane's base");
+    let sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    e.handle(EngineCommand::SetPlugin { track: 1, instance: Box::new(sine) });
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.7).abs() < 1e-4, "nor once another instance came");
+    // A new insert is at its own value.
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut host, &file).0),
+    });
+    render(&mut e, 1000, 64);
+    render(&mut dry, 1000, 64);
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.5).abs() < 1e-4, "a new insert");
+    drop(came_back(&mut rx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn changes_kept_for_a_lent_instance_wait_for_room_in_its_queue() {
+    let dir = temp_dir("engine-full-queue");
+    let file = install(&dir, "many");
+    let mut host = PluginHost::new();
+    let (mut e, mut rx) = plugin_engine(&held_note(&[]));
+    let (mut dry, _dry_rx) = plugin_engine(&held_note(&[]));
+    let (insert, token) = gain_insert(&mut host, &file);
+    e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
+    for x in [&mut e, &mut dry] {
+        render(x, 1000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    let place = PluginPlace::Slot(ChainId::Track(0), 0);
+    let set = |value, serial| EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value, serial };
+    // Back with its queue full, given what was kept a call later.
+    let mut lend = |e: &mut Engine, value| {
+        e.handle(EngineCommand::Lend(token));
+        let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+        e.handle(set(value, 1));
+        lent.restart().unwrap();
+        for id in 100..100 + MAX_PARAM_EVENTS as u32 {
+            assert!(lent.set_param(id, 1.0, 0));
+        }
+        assert_eq!(lent.params_queued(), MAX_PARAM_EVENTS);
+        e.handle(EngineCommand::Return(lent));
+    };
+    lend(&mut e, 0.7);
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.7).abs() < 1e-4, "kept until there was room");
+    // A change after it waits behind it.
+    lend(&mut e, 0.9);
+    e.handle(set(0.3, 2));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.3).abs() < 1e-4, "the last change");
+    drop(came_back(&mut rx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_removed_track_leaves_a_master_plugin_at_its_lane_s_base() {
+    let dir = temp_dir("engine-remove-lane");
+    let file = install(&dir, "remove-lane");
+    let mut host = PluginHost::new();
+    let target = LaneTarget::Plugin { at: PluginAt::MasterSlot(0), plugin: gain_ref(), id: 10 };
+    // Track 0 holds the lane; track 1 is heard.
+    let mut edits = vec![Edit::AddTrack(InstrumentKind::Kick)];
+    edits.extend(held_note(&[]).into_iter().map(|e| match e {
+        Edit::SetStep { pattern, step, value, .. } => Edit::SetStep { track: 1, pattern, step, value },
+        e => e,
+    }));
+    let (mut dry, _dry_rx) = plugin_engine(&edits);
+    edits.extend([
+        Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
+        Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(0.75) },
+        Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.2) },
+    ]);
+    let (mut e, _rx) = plugin_engine(&edits);
+    e.handle(EngineCommand::SetSlot { chain: ChainId::Master, slot: 0, insert: Some(gain_insert(&mut host, &file).0) });
+    for x in [&mut e, &mut dry] {
+        render(x, 1000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.75).abs() < 1e-4);
+    for x in [&mut e, &mut dry] {
+        x.handle(EngineCommand::Edit(Edit::RemoveTrack(0)));
+    }
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.2).abs() < 1e-4, "at its base");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_path_waits_for_a_late_plugin() {
+    let dir = temp_dir("engine-latency");
+    let file = install(&dir, "latency");
+    let mut host = PluginHost::new();
+    // Track 0 is silent; track 1 plays, as late as track 0's plugin.
+    let edits = [
+        Edit::AddTrack(InstrumentKind::Plugin(sine_ref())),
+        Edit::AddTrack(InstrumentKind::Synth),
+        Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) },
+    ];
+    let (mut r, _r_rx) = plugin_engine(&edits);
+    render(&mut r, 2000, 64);
+    r.handle(EngineCommand::Play);
+    let reference = render(&mut r, 4000, 64);
+    let at = first_sound(&reference).unwrap();
+    let base = r.latency();
+    let insert = || gain_insert(&mut PluginHost::new(), &file).0;
+    for (case, late) in
+        [("insert", 64), ("bypassed insert", 64), ("instrument", 64), ("attached", 64), ("restarted", 128)]
+    {
+        let (mut e, mut rx) = plugin_engine(&edits);
+        match case {
+            "instrument" => {
+                let sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+                e.handle(EngineCommand::SetPlugin { track: 0, instance: Box::new(sine) });
+            }
+            "attached" => {
+                let empty = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+                e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(empty) });
+                render(&mut e, 1000, 64);
+                assert_eq!(e.latency(), base, "none yet");
+                let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+                e.handle(EngineCommand::SetSlotPlugin { chain: ChainId::Track(0), slot: 0, instance: Box::new(gain) });
+            }
+            "restarted" => {
+                let (insert, token) = gain_insert(&mut host, &file);
+                e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
+                render(&mut e, 1000, 64);
+                e.handle(EngineCommand::Lend(token));
+                let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+                render(&mut e, 1000, 64);
+                assert_eq!(e.latency(), base, "lent out");
+                lent.restart().unwrap();
+                e.handle(EngineCommand::Return(lent));
+            }
+            _ => e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert()) }),
+        }
+        if case == "bypassed insert" {
+            e.handle(EngineCommand::Edit(Edit::SetSlotParam {
+                chain: ChainId::Track(0),
+                slot: 0,
+                index: 0,
+                value: 1.0,
+            }));
+        }
+        render(&mut e, 2000, 64);
+        assert_eq!(e.latency(), base + late, "{case}");
+        e.handle(EngineCommand::Play);
+        let out = render(&mut e, 4000, 64);
+        assert_eq!(first_sound(&out), Some(at + late), "{case}");
+        for i in 0..2 * (4000 - late) {
+            assert!((out[i + 2 * late] - reference[i]).abs() <= 1e-6, "{case}: sample {i}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bypassed_late_plugin_passes_its_input_as_late() {
+    let dir = temp_dir("engine-bypass-late");
+    let file = install(&dir, "latency");
+    let (mut r, _r_rx) = plugin_engine(&held_note(&[]));
+    let (mut e, _rx) = plugin_engine(&held_note(&[]));
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut PluginHost::new(), &file).0),
+    });
+    for x in [&mut r, &mut e] {
+        render(x, 2000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    let (wet, dry) = (render(&mut e, 4000, 64), render(&mut r, 4000, 64));
+    assert_eq!(first_sound(&wet), first_sound(&dry).map(|f| f + 64));
+    for i in 0..2 * (4000 - 64) {
+        assert!((wet[i + 128] - 0.5 * dry[i]).abs() <= 1e-6, "halved, 64 frames late: sample {i}");
+    }
+    // Bypassed, its input comes out as late as its output did; it fades
+    // from one to the other in 10 ms.
+    e.handle(EngineCommand::Edit(Edit::SetSlotParam { chain: ChainId::Track(0), slot: 0, index: 0, value: 1.0 }));
+    let (wet, dry) = (render(&mut e, 4000, 64), render(&mut r, 4000, 64));
+    assert_eq!(e.latency(), r.latency() + 64, "still late");
+    let late = |i: usize| if i >= 128 { dry[i - 128] } else { 0.0 };
+    for (i, w) in wet.iter().enumerate().skip(2 * 500) {
+        assert!((w - late(i)).abs() <= 1e-6, "sample {i}: {w} {}", late(i));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_late_plugin_brought_back_plays_nothing_from_before() {
+    let dir = temp_dir("engine-unbypass-late");
+    let file = install(&dir, "latency");
+    let note = [
+        Edit::AddTrack(InstrumentKind::Synth),
+        Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 100, 1)) },
+    ];
+    let (mut r, _r_rx) = plugin_engine(&note);
+    let (mut e, _rx) = plugin_engine(&note);
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut PluginHost::new(), &file).0),
+    });
+    for x in [&mut r, &mut e] {
+        render(x, 2000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    assert!(render(&mut e, 2000, 64).iter().any(|x| x.abs() > 1e-3), "the note");
+    render(&mut r, 2000, 64);
+    // Bypassed while the note plays, it is skipped with the note in it.
+    let bypass = |value| EngineCommand::Edit(Edit::SetSlotParam { chain: ChainId::Track(0), slot: 0, index: 0, value });
+    e.handle(bypass(1.0));
+    let (wet, dry) = (render(&mut e, 4 * STEP, 64), render(&mut r, 4 * STEP, 64));
+    for out in [&wet, &dry] {
+        assert!(out[out.len() - 2000..].iter().all(|x| x.abs() <= 1e-6), "the note is over");
+    }
+    e.handle(bypass(0.0));
+    let back = render(&mut e, 4000, 64);
+    for (i, x) in back.iter().enumerate() {
+        assert!(x.abs() <= 1e-6, "sample {i}: {x}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_late_plugin_that_fails_passes_its_input_as_late() {
+    let dir = temp_dir("engine-late-fail");
+    let file = install(&dir, "latefail");
+    let (mut r, _r_rx) = plugin_engine(&held_note(&[]));
+    let (mut e, _rx) = plugin_engine(&held_note(&[]));
+    e.handle(EngineCommand::SetSlot {
+        chain: ChainId::Track(0),
+        slot: 0,
+        insert: Some(gain_insert(&mut PluginHost::new(), &file).0),
+    });
+    for x in [&mut r, &mut e] {
+        render(x, 2000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    // It failed in the warm-up; the track is still in time.
+    assert_eq!(e.latency(), r.latency() + 64);
+    let (wet, dry) = (render(&mut e, 4000, 64), render(&mut r, 4000, 64));
+    assert!(dry.iter().any(|x| x.abs() > 1e-3));
+    for (i, w) in wet.iter().enumerate() {
+        let late = if i >= 128 { dry[i - 128] } else { 0.0 };
+        assert!((w - late).abs() <= 1e-6, "its input, 64 frames late: sample {i}: {w} {late}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_later_than_is_made_up_for_is_refused_or_said() {
+    let dir = temp_dir("engine-too-late");
+    let file = install(&dir, "latency");
+    let mut host = PluginHost::new();
+    // At 100 Hz the 64 frames are 640 ms.
+    // SAFETY: the test plugin, loaded only through plugin hosts here.
+    let made = unsafe { host.create(&file, GAIN, Role::Effect, Mode::Realtime, 100.0, 64) };
+    assert_eq!(made.unwrap_err(), "comes 640 ms late, more than the 500 ms made up for");
+    assert_eq!((MAX_LATENCY_SECONDS, max_latency(100.0)), (0.5, 50));
+    // At 200 Hz each is 320 ms: four on one track are more than its
+    // aligner makes up for, besides the gates.
+    let rate = 200.0;
+    let shared = Arc::new(Shared::new());
+    let edits = [Edit::AddTrack(InstrumentKind::Synth), Edit::AddTrack(InstrumentKind::Synth)];
+    let mut e = Engine::with_edits(rate as f32, &edits, Arc::clone(&shared), None);
+    let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
+    e.attach_retirement(tx);
+    assert!(4 * 64 > tinvo::align::longest(rate as f32));
+    for slot in 0..4 {
+        // SAFETY: as above.
+        let gain = unsafe { host.create(&file, GAIN, Role::Effect, Mode::Realtime, rate, 64) }.unwrap();
+        let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), rate as f32, 120.0));
+        assert!(insert.attach(Box::new(gain)).unwrap().is_none());
+        e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot, insert: Some(insert) });
+        render(&mut e, 64, 16);
+        let over = shared.latency_over.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(over, usize::from(slot + 1) * 64 > tinvo::align::longest(rate as f32), "{} inserts", slot + 1);
+    }
+    assert!(shared.latency_over.load(std::sync::atomic::Ordering::Relaxed));
+    for slot in 1..4 {
+        e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot, insert: None });
+    }
+    render(&mut e, 64, 16);
+    assert!(64 <= tinvo::align::longest(rate as f32));
+    assert!(!shared.latency_over.load(std::sync::atomic::Ordering::Relaxed), "in time again");
+    drop(came_back(&mut rx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The test plugin installed as `stem`, alone in a folder, for renders.
 fn catalog_plugins(dir: &Path, stem: &str) -> CatalogPlugins {
     let folder = dir.join(stem);
@@ -1925,6 +2384,52 @@ fn an_export_names_the_plugin_that_cannot_play() {
         let e = export(&p, &mut catalog_plugins(&dir, stem)).unwrap_err();
         assert!(e.starts_with(why), "{stem}: {e}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_export_lines_up_a_late_plugin_and_refuses_one_that_changes() {
+    let dir = temp_dir("render-latency");
+    // The sine through a gain, and a synth through a bypassed gain, both
+    // on the first beat: the paths 128 and 64 frames late with the test
+    // plugin late.
+    let mut p = sine_song();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetStep { track: 1, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) }).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(1), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    p.apply(Edit::SetSlotParam { chain: ChainId::Track(1), slot: 0, index: 0, value: 1.0 }).unwrap();
+    let dry = export(&p, &mut catalog_plugins(&dir, "fixture")).unwrap();
+    let late = export(&p, &mut catalog_plugins(&dir, "latency")).unwrap();
+    assert_eq!(late.len(), dry.len(), "rendered ahead as far as it is late");
+    assert_eq!(first_sound(&late), Some(0), "on the beat");
+    for (i, (l, d)) in late.iter().zip(&dry).enumerate() {
+        assert!((l - d).abs() <= 1e-6, "sample {i}: {l} {d}");
+    }
+    let p = sine_song();
+    let e = export(&p, &mut catalog_plugins(&dir, "relatency")).unwrap_err();
+    assert_eq!(e, "Test Sine changed its latency while rendering");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_export_refuses_plugins_later_than_it_makes_up_for() {
+    let dir = temp_dir("render-too-late");
+    // Four late gains on one track: at 200 Hz, 1280 ms.
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) }).unwrap();
+    for slot in 0..4 {
+        p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    }
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    let opts = RenderOptions { sample_rate: 200, loops: 1, ..Default::default() };
+    let mut plugins = catalog_plugins(&dir.join("low"), "latency");
+    let e = render_into(&p, &[], &opts, &mut plugins, &mut |_| Ok(())).unwrap_err();
+    assert_eq!(e, "the plugins on one path come later together than the 500 ms an export makes up for");
+    // At 48 kHz, 5 ms.
+    assert!(export(&p, &mut catalog_plugins(&dir.join("high"), "latency")).is_ok());
+    drop(plugins);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

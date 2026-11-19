@@ -61,6 +61,14 @@ pub const MAX_PARAMS: usize = 4096;
 pub const MAX_PARAM_EVENTS: usize = 256;
 /// The largest state saved or loaded, in bytes.
 pub const MAX_STATE: usize = 16 << 20;
+/// The latest a plugin's output may come, in seconds: the engine makes up
+/// for this much on any one path.
+pub const MAX_LATENCY_SECONDS: f64 = 0.5;
+
+/// [`MAX_LATENCY_SECONDS`] in frames at `sample_rate`.
+pub fn max_latency(sample_rate: f64) -> usize {
+    (MAX_LATENCY_SECONDS * sample_rate) as usize
+}
 
 /// Events an instance can be given between two process calls, and notes it
 /// can hold: each held note keeps one of these for its release, so a
@@ -655,6 +663,8 @@ impl PluginHost {
             params: Arc::from([]),
             param_ids: Vec::new(),
             latency: 0,
+            dry: Vec::new(),
+            dry_at: 0,
             held: Vec::with_capacity(MAX_EVENTS),
             next_note: 0,
             steady: 0,
@@ -921,6 +931,10 @@ pub struct Instance {
     /// (id, index into `params`), by id.
     param_ids: Vec<(u32, u32)>,
     latency: u32,
+    /// An effect's input as late as its output ([`Instance::delay_dry`]):
+    /// `latency` stereo frames, and where the next goes.
+    dry: Vec<f32>,
+    dry_at: usize,
     held: Vec<Held>,
     next_note: i32,
     steady: i64,
@@ -1076,6 +1090,25 @@ impl Instance {
         true
     }
 
+    /// Delays `io` (interleaved stereo) by the frames an effect's output
+    /// comes late ([`Instance::latency`]), so its input can be mixed with
+    /// its output, or stand in for it, in time. Each call carries on from
+    /// the last, from silence when it was activated. Never allocates.
+    pub fn delay_dry(&mut self, io: &mut [f32]) {
+        let n = self.dry.len() / 2;
+        if n == 0 {
+            return;
+        }
+        for f in io.chunks_exact_mut(2) {
+            let at = 2 * self.dry_at;
+            let late = [self.dry[at], self.dry[at + 1]];
+            self.dry[at] = f[0];
+            self.dry[at + 1] = f[1];
+            f.copy_from_slice(&late);
+            self.dry_at = if self.dry_at + 1 == n { 0 } else { self.dry_at + 1 };
+        }
+    }
+
     /// Parameter changes waiting for the plugin.
     pub fn params_queued(&self) -> usize {
         self.params_queued
@@ -1142,7 +1175,22 @@ impl Instance {
         self.activated = true;
         self.failed = false;
         // SAFETY: main thread, active.
-        self.latency = self.exts.latency.map_or(0, |get| unsafe { get(self.plugin) });
+        let latency = self.exts.latency.map_or(0, |get| unsafe { get(self.plugin) });
+        if latency as usize > max_latency(self.sample_rate) {
+            // SAFETY: main thread, active and not processing.
+            unsafe { (self.fns.deactivate)(self.plugin) };
+            self.activated = false;
+            let ms = (f64::from(latency) / self.sample_rate * 1000.0).round();
+            return Err(format!("comes {ms} ms late, more than the {} ms made up for", MAX_LATENCY_SECONDS * 1000.0));
+        }
+        self.latency = latency;
+        let dry = if self.role == Role::Effect { 2 * latency as usize } else { 0 };
+        if self.dry.len() == dry {
+            self.dry.fill(0.0);
+        } else {
+            self.dry = vec![0.0; dry];
+        }
+        self.dry_at = 0;
         Ok(())
     }
 
@@ -1653,6 +1701,8 @@ impl Drop for Instance {
                 params: std::mem::take(&mut self.params),
                 param_ids: std::mem::take(&mut self.param_ids),
                 latency: self.latency,
+                dry: std::mem::take(&mut self.dry),
+                dry_at: self.dry_at,
                 held: std::mem::take(&mut self.held),
                 next_note: self.next_note,
                 steady: self.steady,

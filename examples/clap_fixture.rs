@@ -35,8 +35,13 @@
 //! - `incomplete`: creates plugins without a `process`;
 //! - `initfail`: its plugins' `init` fails;
 //! - `nomain`: port 0 each way is not flagged main;
-//! - `latency`: the gain says its output comes 64 frames late, and it
-//!   does; 64 more at each activation after;
+//! - `latency`: both plugins say their output comes 64 frames late, and
+//!   it does; 64 more at each activation after; `relatency`: the same,
+//!   asking for a restart in its first process call as `restart` does;
+//!   `latefail`: the same, failing its second process call as `procerror`
+//!   does;
+//! - `many`: the gain has 300 more parameters (ids 100 to 399, none doing
+//!   anything), more than a host queues for one call;
 //! - `meter`: the gain reports its read-only meter after every call, and
 //!   once, a change of its own to its mode, after which (in a main-thread
 //!   callback) it renames its gain "Volume", shows its hold and clears
@@ -105,6 +110,9 @@ enum Mode {
     SaveFail,
     LoadFail,
     Dirty,
+    Relatency,
+    LateFail,
+    Many,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -116,7 +124,7 @@ static BROKEN: AtomicU32 = AtomicU32::new(0);
 static SAVES: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 25] = [
+    const ALL: [Mode; 28] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -142,8 +150,16 @@ fn mode() -> Mode {
         Mode::SaveFail,
         Mode::LoadFail,
         Mode::Dirty,
+        Mode::Relatency,
+        Mode::LateFail,
+        Mode::Many,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
+}
+
+/// Whether its output comes late.
+fn late() -> bool {
+    matches!(mode(), Mode::Latency | Mode::Relatency | Mode::LateFail)
 }
 
 /// Static C data: only ever read, by any thread.
@@ -227,6 +243,7 @@ unsafe extern "C" fn probe(p: *const ClapPlugin) -> u32 {
 }
 
 /// One of the plugins' parameters.
+#[derive(Clone, Copy)]
 struct Param {
     id: u32,
     flags: u32,
@@ -248,7 +265,32 @@ const LEVEL: u32 = 20;
 /// 64 at the first, 128 at the second, and so on.
 const LATENCY: u32 = 64;
 
-static GAIN_PARAMS: [Param; 5] = [
+/// The gain's own parameters, before the ones it has in `many`.
+const OWN: usize = 5;
+const EXTRA: usize = 300;
+static GAIN_PARAMS: [Param; OWN + EXTRA] = {
+    let extra = Param {
+        id: 0,
+        flags: CLAP_PARAM_IS_AUTOMATABLE,
+        name: c"Extra",
+        module: c"More",
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+    };
+    let (own, mut all) = (OWN_PARAMS, [extra; OWN + EXTRA]);
+    let mut i = 0;
+    while i < OWN + EXTRA {
+        if i < OWN {
+            all[i] = own[i];
+        } else {
+            all[i].id = 100 + (i - OWN) as u32;
+        }
+        i += 1;
+    }
+    all
+};
+const OWN_PARAMS: [Param; OWN] = [
     Param {
         id: GAIN,
         flags: CLAP_PARAM_IS_AUTOMATABLE,
@@ -342,7 +384,7 @@ struct Instance {
     frames: AtomicU32,
     steady: AtomicU32,
     /// Its parameters' values, as `f64` bits, in the order of its table.
-    values: [AtomicU64; 5],
+    values: [AtomicU64; OWN + EXTRA],
     params_set: AtomicU32,
     flushes: AtomicU32,
     overlaps: AtomicU32,
@@ -403,7 +445,11 @@ impl Instance {
     }
 
     fn params(&self) -> &'static [Param] {
-        if self.sine { &SINE_PARAMS } else { &GAIN_PARAMS }
+        match () {
+            _ if self.sine => &SINE_PARAMS,
+            _ if mode() == Mode::Many => &GAIN_PARAMS,
+            _ => &GAIN_PARAMS[..OWN],
+        }
     }
 
     fn value(&self, id: u32) -> Option<f64> {
@@ -522,7 +568,7 @@ unsafe extern "C" fn plugin_activate(p: *const ClapPlugin, sample_rate: f64, min
     audio.max_frames = max;
     audio.next_steady = 0;
     let n = me.activates.fetch_add(1, Ordering::Relaxed) + 1;
-    let latency = if mode() == Mode::Latency { LATENCY * n } else { 0 };
+    let latency = if late() { LATENCY * n } else { 0 };
     audio.delay = vec![[0.0; 2]; latency as usize];
     audio.delay_at = 0;
     me.latency.store(latency, Ordering::Relaxed);
@@ -578,6 +624,20 @@ unsafe fn channel<'a>(b: &ClapAudioBuffer, c: usize, frames: usize) -> &'a mut [
     unsafe { std::slice::from_raw_parts_mut(*b.data32.add(c), frames) }
 }
 
+/// Delays the output as late as it says it comes.
+fn delay(audio: &mut Audio, l: &mut [f32], r: &mut [f32]) {
+    let n = audio.delay.len();
+    if n == 0 {
+        return;
+    }
+    for (l, r) in l.iter_mut().zip(r.iter_mut()) {
+        let late = audio.delay[audio.delay_at];
+        audio.delay[audio.delay_at] = [*l, *r];
+        audio.delay_at = (audio.delay_at + 1) % n;
+        (*l, *r) = (late[0], late[1]);
+    }
+}
+
 unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapProcess) -> ClapProcessStatus {
     // SAFETY: as above, and the host's process data for this call.
     let (me, pr) = unsafe { (me(p), &*process) };
@@ -599,7 +659,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
     me.steady.store(u32::try_from(audio.next_steady).unwrap_or(u32::MAX), Ordering::Relaxed);
     me.processes.fetch_add(1, Ordering::Relaxed);
     me.frames.fetch_add(pr.frames_count, Ordering::Relaxed);
-    if matches!(mode(), Mode::Restart | Mode::Leak) && !audio.asked {
+    if matches!(mode(), Mode::Restart | Mode::Leak | Mode::Relatency) && !audio.asked {
         audio.asked = true;
         // SAFETY: the host's thread-safe callbacks.
         unsafe {
@@ -611,7 +671,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             }
         }
     }
-    if mode() == Mode::ProcessError && me.processes.load(Ordering::Relaxed) == 2 {
+    if matches!(mode(), Mode::ProcessError | Mode::LateFail) && me.processes.load(Ordering::Relaxed) == 2 {
         return CLAP_PROCESS_ERROR;
     }
     if mode() == Mode::ProcessErrors && me.processes.load(Ordering::Relaxed) >= 2 {
@@ -678,6 +738,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             me.require(e.is_null());
             next += 1;
         }
+        delay(audio, l, r);
         if l.iter().all(|&x| x == 0.0) {
             // Silent: both channels constant, which a host may use.
             outs[0].constant_mask = 0b11;
@@ -706,18 +767,9 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
                 *o = gain * i + offset;
             }
         }
-        if mode() == Mode::Latency {
-            // SAFETY: the main output, stereo as checked.
-            let (l, r) = unsafe { (channel(&outs[0], 0, frames), channel(&outs[0], 1, frames)) };
-            let n = audio.delay.len();
-            for i in 0..frames {
-                let late = audio.delay[audio.delay_at];
-                audio.delay[audio.delay_at] = [l[i], r[i]];
-                audio.delay_at = (audio.delay_at + 1) % n;
-                l[i] = late[0];
-                r[i] = late[1];
-            }
-        }
+        // SAFETY: the main output, stereo as checked.
+        let (l, r) = unsafe { (channel(&outs[0], 0, frames), channel(&outs[0], 1, frames)) };
+        delay(audio, l, r);
         if mode() == Mode::Normal && me.value(HOLD) == Some(1.0) {
             // Held until the main thread saves a state, with the meter at 1
             // meanwhile; given up after a while, which the test sees.
@@ -1170,7 +1222,7 @@ unsafe extern "C" fn plugin_extension(p: *const ClapPlugin, id: *const c_char) -
         (&raw const PARAMS).cast()
     } else if id == CLAP_EXT_STATE {
         (&raw const STATE).cast()
-    } else if id == CLAP_EXT_LATENCY && mode() == Mode::Latency && !me.sine {
+    } else if id == CLAP_EXT_LATENCY && late() {
         (&raw const LATENCY_EXT).cast()
     } else if id == c"org.tinvo.test.stats" {
         (&raw const STATS_EXT).cast()
@@ -1395,6 +1447,18 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "latency" => {
             set(Mode::Latency);
+            true
+        }
+        "relatency" => {
+            set(Mode::Relatency);
+            true
+        }
+        "latefail" => {
+            set(Mode::LateFail);
+            true
+        }
+        "many" => {
+            set(Mode::Many);
             true
         }
         "meter" => {

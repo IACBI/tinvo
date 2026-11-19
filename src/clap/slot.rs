@@ -5,10 +5,11 @@
 //! back, stopped, for the engine to return to the UI thread. A slot can
 //! lend its instance out to be restarted ([`PluginSlot::lend`]) and keep its
 //! place until it comes back ([`PluginSlot::give_back`]); an instance put
-//! in meanwhile, or the slot going, ends that.
+//! in meanwhile, or the slot going, ends that. Parameter changes given
+//! while it is lent wait in the slot for the instance to come back.
 
 use super::PluginRef;
-use super::host::{Instance, Role};
+use super::host::{Instance, MAX_PARAM_EVENTS, Role};
 use std::fmt;
 
 enum Held {
@@ -18,12 +19,22 @@ enum Held {
     Lent(u64),
 }
 
+/// Parameter changes a slot keeps for an instance lent out, one a
+/// parameter.
+const WAITING: usize = 32;
+
+/// A parameter change for an instance lent out: id, value, serial.
+#[derive(Clone, Copy, Default)]
+struct Change(u32, f64, u64);
+
 /// A slot for an instance of one plugin, in one role, at one sample rate.
 pub struct PluginSlot {
     plugin: PluginRef,
     role: Role,
     sample_rate: f64,
     held: Held,
+    waiting: [Change; WAITING],
+    waiting_count: usize,
 }
 
 impl fmt::Debug for PluginSlot {
@@ -40,15 +51,23 @@ impl fmt::Debug for PluginSlot {
 impl PluginSlot {
     /// An empty slot for `plugin` as a `role`, at `sample_rate`.
     pub fn new(plugin: PluginRef, role: Role, sample_rate: f64) -> PluginSlot {
-        PluginSlot { plugin, role, sample_rate, held: Held::Empty }
+        PluginSlot {
+            plugin,
+            role,
+            sample_rate,
+            held: Held::Empty,
+            waiting: [Change::default(); WAITING],
+            waiting_count: 0,
+        }
     }
 
     pub fn plugin(&self) -> PluginRef {
         self.plugin
     }
 
-    /// The instance playing here.
+    /// The instance playing here, given first what waited for it.
     pub fn instance(&mut self) -> Option<&mut Instance> {
+        self.hand_over();
         match &mut self.held {
             Held::Playing(i) => Some(i),
             _ => None,
@@ -68,6 +87,57 @@ impl PluginSlot {
     /// ([`Instance::has_tail`]).
     pub fn has_tail(&self) -> bool {
         matches!(&self.held, Held::Playing(i) if i.has_tail())
+    }
+
+    /// The frames the instance playing here delays its output by; none
+    /// while there is none (a slot lent out passes its input, or is silent).
+    pub fn latency(&self) -> usize {
+        match &self.held {
+            Held::Playing(i) => i.latency() as usize,
+            _ => 0,
+        }
+    }
+
+    /// Sets parameter `id` of the instance here ([`Instance::set_param`]),
+    /// or of the one lent out once it is back. False where there is none,
+    /// or it cannot take the change. Real-time safe.
+    pub fn set_param(&mut self, id: u32, value: f64, serial: u64) -> bool {
+        self.hand_over();
+        match &mut self.held {
+            // Behind what still waits, so it is not overtaken.
+            Held::Playing(i) if self.waiting_count == 0 => i.set_param(id, value, serial),
+            Held::Playing(_) | Held::Lent(_) => self.wait(Change(id, value, serial)),
+            Held::Empty => false,
+        }
+    }
+
+    /// Keeps `change` for later, replacing one waiting for its parameter.
+    fn wait(&mut self, change: Change) -> bool {
+        let n = self.waiting_count;
+        if let Some(c) = self.waiting[..n].iter_mut().find(|c| c.0 == change.0) {
+            *c = change;
+        } else if n < WAITING {
+            self.waiting[n] = change;
+            self.waiting_count += 1;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// Gives the instance playing here the changes that waited for it,
+    /// keeping those its queue has no room for yet.
+    fn hand_over(&mut self) {
+        let Held::Playing(i) = &mut self.held else { return };
+        let mut kept = 0;
+        for k in 0..self.waiting_count {
+            let c = self.waiting[k];
+            if !i.set_param(c.0, c.1, c.2) && i.params_queued() == MAX_PARAM_EVENTS {
+                self.waiting[kept] = c;
+                kept += 1;
+            }
+        }
+        self.waiting_count = kept;
     }
 
     /// Whether this slot's plugin, role and sample rate are `instance`'s.
@@ -118,6 +188,8 @@ impl PluginSlot {
     }
 
     fn take_and(&mut self, next: Held) -> Option<Box<Instance>> {
+        // What waited was for the instance lent, whatever comes next.
+        self.waiting_count = 0;
         match std::mem::replace(&mut self.held, next) {
             Held::Playing(mut i) => {
                 i.stop();

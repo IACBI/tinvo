@@ -226,11 +226,15 @@ impl Playing {
                 return Err(format!("{} cannot play there", name()));
             }
         }
+        // Every path in time from the first frame.
+        engine.settle_latency();
         Ok(playing)
     }
 
     /// Serves what the instances asked for since the last call: a restart
-    /// is done in place; a failure fails the render.
+    /// is done in place; a failure fails the render, and so does a restart
+    /// that makes it come later or sooner, which the frames already
+    /// rendered could not be lined up with.
     fn serve(&mut self, engine: &mut Engine, plugins: &mut dyn PluginSource) -> Result<(), String> {
         for request in plugins.poll() {
             // What its parameters and state did is no render's concern.
@@ -242,7 +246,11 @@ impl Playing {
             engine.handle(Command::Lend(token));
             while let Some(r) = self.back.pop() {
                 if let Retired::Lent(mut i) = r {
+                    let latency = i.latency();
                     i.restart().map_err(|e| format!("{name} could not restart: {e}"))?;
+                    if i.latency() != latency {
+                        return Err(format!("{name} changed its latency while rendering"));
+                    }
                     engine.handle(Command::Return(i));
                 }
             }
@@ -257,8 +265,9 @@ impl Playing {
 /// depend on the length of the render. `samples` holds each track's sample
 /// (see [`Project::load_samples`]); missing entries play silence. Every
 /// plugin place gets an instance from `plugins` before anything is
-/// rendered. A `sink` error, or a plugin that cannot load or fails, stops
-/// the render and is returned.
+/// rendered. A `sink` error, a plugin that cannot load or fails, or plugins
+/// on one path later together than is made up for, stop the render, and
+/// the error is returned.
 pub fn render_into(
     project: &Project,
     samples: &[Option<Arc<Sample>>],
@@ -267,11 +276,16 @@ pub fn render_into(
     sink: &mut dyn FnMut(&[f32]) -> Result<(), String>,
 ) -> Result<u64, String> {
     let sr = opts.sample_rate;
-    let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::new(Shared::new()), None);
+    let shared = Arc::new(Shared::new());
+    let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::clone(&shared), None);
     for (track, sample) in samples.iter().enumerate() {
         engine.set_sample(track, sample.clone());
     }
     let mut playing = Playing::attach(&mut engine, project, sr, plugins)?;
+    if shared.latency_over.load(std::sync::atomic::Ordering::Relaxed) {
+        let ms = crate::clap::host::MAX_LATENCY_SECONDS * 1000.0;
+        return Err(format!("the plugins on one path come later together than the {ms} ms an export makes up for"));
+    }
     match resolve(project, opts.source) {
         Source::Song => {
             engine.apply(Edit::SetLoop(None));
@@ -294,31 +308,33 @@ pub fn render_into(
     // at the same musical point either way.
     // Read once: a lane can switch the limiter during the preroll.
     let latency = engine.latency() as u64;
-    let mut skip = latency;
-    while skip > 0 {
-        let n = skip.min(CHUNK as u64) as usize;
-        engine.process(&mut buf[..n * 2]);
-        playing.serve(&mut engine, plugins)?;
-        skip -= n as u64;
-    }
-    let stop_at = main.saturating_sub(latency);
-    let mut done = 0u64;
-    let mut stopped = false;
-    while done < main {
-        if !stopped && done == stop_at {
+    // Frames played, the preroll's first: the transport stops after `main`
+    // of them, however late the output comes.
+    let (total, mut at, mut stopped) = (latency + main, 0u64, false);
+    while at < total {
+        if !stopped && at == main {
             engine.handle(Command::Stop);
             stopped = true;
         }
-        let limit = if stopped { main } else { stop_at };
-        let n = (limit - done).min(CHUNK as u64) as usize;
+        let mut end = (at + CHUNK as u64).min(total);
+        if !stopped {
+            end = end.min(main);
+        }
+        if at < latency {
+            end = end.min(latency);
+        }
+        let n = (end - at) as usize;
         engine.process(&mut buf[..n * 2]);
         playing.serve(&mut engine, plugins)?;
-        sink(&buf[..n * 2])?;
-        done += n as u64;
+        if at >= latency {
+            sink(&buf[..n * 2])?;
+        }
+        at = end;
     }
     if !stopped {
         engine.handle(Command::Stop);
     }
+    let mut done = main;
 
     // The tail ends after `quiet_needed` frames of silence once the effects
     // hold nothing more (a long delay's echo can follow a quiet spell). The
@@ -434,7 +450,13 @@ pub fn stem_project(project: &Project, stem: Stem) -> Project {
     // effect no longer there.
     let limiter = crate::engine::LaneTarget::Mix(crate::mix::mp::LIMITER as u8);
     for lane in solo.tracks.iter_mut().flat_map(|t| t.lanes.iter_mut()) {
-        let master = matches!(lane.target, Some(crate::engine::LaneTarget::MasterSlot { .. }));
+        let master = matches!(
+            lane.target,
+            Some(
+                crate::engine::LaneTarget::MasterSlot { .. }
+                    | crate::engine::LaneTarget::Plugin { at: crate::engine::PluginAt::MasterSlot(_), .. }
+            )
+        );
         if lane.target == Some(limiter) || master {
             *lane = crate::project::LaneData::new(None, false);
         }

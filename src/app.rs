@@ -384,6 +384,7 @@ fn describe(e: &Edit) -> &'static str {
         Edit::SetLoop(_) => "loop region",
         Edit::SetLane { .. } => "automation lane",
         Edit::SetPoint { .. } => "automation point",
+        Edit::SetLaneBase { .. } => "automation base",
         Edit::AddTrack(_) | Edit::InsertTrack { .. } => "add track",
         Edit::RemoveTrack(_) => "delete track",
         Edit::SetStep { .. } => "step",
@@ -498,6 +499,8 @@ fn param_of_target(t: LaneTarget) -> usize {
         LaneTarget::Slot { slot, index, .. } => param_of_slot(ChainId::Track(0), slot, index),
         LaneTarget::GroupSlot { group, slot, index, .. } => param_of_slot(ChainId::Group(group), slot, index),
         LaneTarget::MasterSlot { slot, index, .. } => param_of_slot(ChainId::Master, slot, index),
+        // A plugin's parameters are not on the panel.
+        LaneTarget::Plugin { .. } => 0,
     }
 }
 

@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::clap::PluginRef;
 use tinvo::clap::host::{Instance, Mode, PluginHost, Role, prepare_audio_thread};
 use tinvo::dsp::noise::Rng;
-use tinvo::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Retired, Shared, Step, Take};
+use tinvo::engine::{
+    ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, PluginAt, PluginPlace, Retired, Shared, Step, Take,
+};
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use tinvo::insert::{EffectKind, Insert, MAX_INSERTS, MAX_SLOTS};
 use tinvo::instrument::InstrumentKind;
@@ -676,22 +678,54 @@ fn plugins() -> usize {
     calls
 }
 
-/// Plugin tracks and a plugin insert in the engine, through its command
+/// The test plugin copied as `latency` (its output late, and later at each
+/// restart) to a folder of its own.
+fn late_fixture() -> std::path::PathBuf {
+    let from = fixture();
+    let dir = std::env::temp_dir().join(format!("tinvo-realtime-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let to = dir.join(from.file_name().unwrap().to_string_lossy().replace("clap_fixture", "latency"));
+    std::fs::copy(&from, &to).unwrap();
+    to
+}
+
+/// Plugin tracks and plugin inserts in the engine, through its command
 /// queue: instances put in (an insert's too), replaced, lent out and returned to be
-/// restarted, a plugin track added and removed (its instance coming back
-/// when its fade ends), while a song plays at every buffer size.
+/// restarted (one coming later each time), a plugin track added and removed
+/// (its instance coming back when its fade ends), lanes and commands
+/// setting their parameters, while a song plays at every buffer size.
 fn plugins_in_the_engine() -> usize {
     let mut host = PluginHost::new();
-    let file = fixture();
+    let (file, late) = (fixture(), late_fixture());
     let (sine, gain) = (PluginRef::new("org.tinvo.test.sine").unwrap(), PluginRef::new("org.tinvo.test.gain").unwrap());
     // SAFETY: the test plugin, loaded only through this host.
-    let mut make = |id: PluginRef, role| {
-        Box::new(unsafe { host.create(&file, id.id(), role, Mode::Realtime, SR as f64, 64) }.unwrap())
+    let mut make_from = |file: &std::path::Path, id: PluginRef, role| {
+        Box::new(unsafe { host.create(file, id.id(), role, Mode::Realtime, SR as f64, 64) }.unwrap())
     };
     let mut edits = vec![Edit::AddTrack(InstrumentKind::Plugin(sine)), Edit::AddTrack(InstrumentKind::Synth)];
     for s in 0..16u8 {
         edits.push(Edit::SetStep { track: 0, pattern: 0, step: s, value: Some(Step::new(48 + 3 * s, 100, 1 + s % 3)) });
     }
+    // A ramp on the sine's level, held points on the gains', one with a
+    // base.
+    let lanes = [
+        (LaneTarget::Plugin { at: PluginAt::Instrument, plugin: sine, id: 20 }, true),
+        (LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain, id: 10 }, false),
+        (LaneTarget::Plugin { at: PluginAt::Slot(1), plugin: gain, id: 14 }, false),
+    ];
+    for (k, (target, ramp)) in lanes.into_iter().enumerate() {
+        let lane = k as u8;
+        edits.push(Edit::SetLane { track: 0, lane, target: Some(target), ramp });
+        for (step, value) in [(2, 0.2), (7, 0.9), (12, 0.05)] {
+            edits.push(Edit::SetPoint { track: 0, lane, pattern: 0, step, value: Some(value) });
+        }
+    }
+    edits.push(Edit::SetLaneBase { track: 0, lane: 1, value: Some(0.6) });
+    let late_gain = make_from(&late, gain, Role::Effect);
+    let late_token = late_gain.token();
+    let mut late_insert = Box::new(Insert::new(EffectKind::Plugin(gain), SR, 120.0));
+    assert!(late_insert.attach(late_gain).unwrap().is_none());
+    let mut make = |id: PluginRef, role| make_from(&file, id, role);
     let (mut commands, rx) = spsc::channel(4096);
     let (tx, mut retired) = spsc::channel(256);
     let mut engine = Engine::with_edits(SR, &edits, Arc::new(Shared::new()), Some(rx));
@@ -705,17 +739,18 @@ fn plugins_in_the_engine() -> usize {
     let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain), SR, 120.0));
     assert!(insert.attach(effect).unwrap().is_none());
     send(Command::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
+    send(Command::SetSlot { chain: ChainId::Track(0), slot: 1, insert: Some(late_insert) });
     send(Command::Play);
     let mut buf = vec![0.0f32; 2 * 4096];
-    let (mut calls, mut heard, mut lent) = (0, false, 0);
+    let (mut calls, mut heard, mut lent, mut added_token) = (0, false, 0, None);
     // The instances removed and replaced, and those that came back.
     let (mut expected, mut gone) = (Vec::new(), Vec::new());
     for i in 0..3000 {
         match i {
-            _ if i % 300 == 150 => send(Command::Lend(if i % 600 == 150 { sine_token } else { gain_token })),
             1200 => {
                 send(Command::Edit(Edit::AddTrack(InstrumentKind::Plugin(sine))));
                 let added = make(sine, Role::Instrument);
+                added_token = Some(added.token());
                 expected.push(added.token());
                 send(Command::SetPlugin { track: 2, instance: added });
                 send(Command::Edit(Edit::SetStep { track: 2, pattern: 0, step: 3, value: Some(Step::new(70, 90, 2)) }));
@@ -733,6 +768,19 @@ fn plugins_in_the_engine() -> usize {
                 sine_token = next.token();
                 send(Command::SetPlugin { track: 0, instance: next });
             }
+            _ if i % 300 == 150 => send(Command::Lend(if i % 600 == 150 { sine_token } else { gain_token })),
+            _ if i % 500 == 400 => send(Command::Lend(late_token)),
+            _ if i % 7 == 3 => send(Command::SetPluginParam {
+                place: PluginPlace::Slot(ChainId::Track(0), 1),
+                plugin: gain,
+                id: 10,
+                value: (i % 10) as f64 / 10.0,
+                serial: i as u64,
+            }),
+            _ if i % 400 == 50 => {
+                let value = (i % 3 == 0).then_some(0.3);
+                send(Command::Edit(Edit::SetLaneBase { track: 0, lane: 2, value }));
+            }
             _ => {}
         }
         let frames = SIZES[i % SIZES.len()];
@@ -748,7 +796,11 @@ fn plugins_in_the_engine() -> usize {
                     lent += 1;
                     send(Command::Return(i));
                 }
-                Retired::Plugin(i) => gone.push(i.token()),
+                Retired::Plugin(p) => {
+                    // The added track's, only once the track is gone.
+                    assert!(Some(p.token()) != added_token || i >= 2000, "track 2 played");
+                    gone.push(p.token());
+                }
                 _ => {}
             }
         }
@@ -757,7 +809,8 @@ fn plugins_in_the_engine() -> usize {
     drop(make);
     while retired.pop().is_some() {}
     let _ = host.poll();
-    assert!(heard && lent == 10, "the plugins played ({heard}) and were lent out ten times ({lent})");
+    assert!(heard && lent == 16, "the plugins played ({heard}) and were lent out 16 times ({lent})");
+    let _ = std::fs::remove_dir_all(late.parent().unwrap());
     gone.sort_unstable();
     expected.sort_unstable();
     assert_eq!(gone, expected, "the removed and replaced instances came back");

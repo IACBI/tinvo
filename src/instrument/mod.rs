@@ -487,6 +487,14 @@ impl Instrument {
         matches!(self, Instrument::Plugin(p) if p.has_tail())
     }
 
+    /// The frames a plugin instrument's output comes late by.
+    pub fn latency(&self) -> usize {
+        match self {
+            Instrument::Plugin(p) => p.latency(),
+            _ => 0,
+        }
+    }
+
     /// A plugin instrument's slot.
     pub fn plugin_slot(&mut self) -> Option<&mut PluginSlot> {
         match self {
