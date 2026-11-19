@@ -41,10 +41,31 @@ fn fixture() -> PathBuf {
 }
 
 fn temp_dir(name: &str) -> PathBuf {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(sweep_earlier_runs);
     let d = std::env::temp_dir().join(format!("tinvo-clap-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Removes the folders earlier runs left. A test's plugin file stays loaded
+/// until its process ends, and on Windows that keeps the file, and its
+/// folder, from being removed when the test ends. An hour old, a folder is
+/// no other run's still going.
+fn sweep_earlier_runs() {
+    let own = format!("-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("tinvo-clap-it-") || name.ends_with(&own) {
+            continue;
+        }
+        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a > Duration::from_secs(3600)) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Puts the test plugin in `dir` as `stem.clap`: a file, or on macOS a
