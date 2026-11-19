@@ -1,11 +1,14 @@
-//! Scanning real CLAP plugin files: the test plugin in
-//! `examples/clap_fixture.rs`, copied under the names that make it crash,
-//! hang or fail, read by TINVO's own `scan-clap` child processes.
+//! Real CLAP plugin files: the test plugin in `examples/clap_fixture.rs`,
+//! copied under the names that make it crash, hang or fail, read by TINVO's
+//! own `scan-clap` child processes; and its instances played in this
+//! process.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tinvo::clap::Roles;
+use tinvo::clap::ffi::ClapPlugin;
+use tinvo::clap::host::{Instance, MAX_EVENTS, Mode, PluginHost, Request, Role};
 use tinvo::clap::scan::{self, Catalog, Options};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_tinvo");
@@ -287,4 +290,487 @@ fn tinvo_plugins_lists_what_clap_path_holds() {
         scan::read_cache(&state.join("tinvo").join("plugins.txt")).into_iter().map(|e| e.path).collect();
     assert!(cached.contains(&a.join("fixture.clap")) && cached.contains(&b.join("refuse.clap")), "{cached:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Playing plugins in this process: the test plugin's instances, which
+// check every call against CLAP's rules and count what breaks one. CLAP's
+// main thread is the program's on Windows and macOS; the test plugin uses
+// nothing of the system's that cares, so each test's own thread stands in
+// for it.
+
+/// What the test plugin's `org.tinvo.test.stats` reports; the plugin has
+/// the same.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stats {
+    entry_inits: u32,
+    live: u32,
+    activates: u32,
+    deactivates: u32,
+    starts: u32,
+    stops: u32,
+    processes: u32,
+    callbacks: u32,
+    broken: u32,
+    notes_on: u32,
+    notes_off: u32,
+    offline: u32,
+    max_frames: u32,
+    frames: u32,
+}
+
+#[repr(C)]
+struct StatsExt {
+    get: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut Stats),
+    probe: unsafe extern "C" fn(plugin: *const ClapPlugin) -> u32,
+}
+
+fn stats(i: &Instance) -> Stats {
+    let ext = i.extension(c"org.tinvo.test.stats").cast::<StatsExt>();
+    assert!(!ext.is_null(), "the test plugin's stats");
+    let mut s = Stats::default();
+    // SAFETY: the test plugin's extension, given its own instance.
+    unsafe { ((*ext).get)(i.as_ptr(), &mut s) };
+    s
+}
+
+/// What the host's `clap.thread-check` tells the plugin of this thread, as
+/// (main, audio).
+fn thread_check(i: &Instance) -> (bool, bool) {
+    let ext = i.extension(c"org.tinvo.test.stats").cast::<StatsExt>();
+    // SAFETY: as in `stats`.
+    let bits = unsafe { ((*ext).probe)(i.as_ptr()) };
+    (bits & 1 != 0, bits & 2 != 0)
+}
+
+const GAIN: &str = "org.tinvo.test.gain";
+const SINE: &str = "org.tinvo.test.sine";
+const RATE: f64 = 48_000.0;
+
+/// Creates `id` from `file` for `role`, in real time at 48 kHz in calls of
+/// up to 64 frames.
+fn create(host: &mut PluginHost, file: &Path, id: &str, role: Role) -> Result<Instance, String> {
+    // SAFETY: the test plugin, loaded only through plugin hosts here.
+    unsafe { host.create(file, id, role, Mode::Realtime, RATE, 64) }
+}
+
+/// Interleaved stereo: left a ramp, right its negative, so the channels
+/// cannot be mistaken for each other.
+fn ramp(frames: usize) -> Vec<f32> {
+    (0..frames).flat_map(|i| [i as f32 / 100.0, -(i as f32) / 100.0]).collect()
+}
+
+fn halved(frames: usize) -> Vec<f32> {
+    ramp(frames).iter().map(|x| x * 0.5).collect()
+}
+
+#[test]
+fn an_effect_plays_on_the_audio_thread_and_ends_on_the_main_one() {
+    let dir = temp_dir("effect");
+    let file = install(&dir, "effect");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert!(gain.is_playing());
+    assert_eq!(gain.layout().inputs, [2]);
+    assert_eq!(gain.layout().outputs, [2]);
+    assert_eq!(gain.layout().notes, None);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // Odd sizes, and one past the largest call, which is split.
+            for frames in [1, 31, 64, 200, 7] {
+                let mut io = ramp(frames);
+                assert!(gain.process(&mut io));
+                assert_eq!(io, halved(frames), "{frames} frames");
+            }
+            gain.stop();
+        });
+    });
+    let s = stats(&gain);
+    assert_eq!(s.broken, 0, "{s:?}");
+    assert_eq!((s.activates, s.starts, s.stops, s.deactivates), (1, 1, 1, 0), "{s:?}");
+    assert_eq!((s.processes, s.frames, s.max_frames), (8, 303, 64), "{s:?}");
+    // Steady time past what it can count becomes unknown, and stays so.
+    gain.skip(i64::MAX as usize - 400);
+    for _ in 0..3 {
+        let mut io = ramp(64);
+        assert!(gain.process(&mut io));
+        gain.skip(usize::MAX);
+    }
+    gain.stop();
+    assert_eq!(stats(&gain).broken, 0);
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_instrument_plays_notes_from_the_start_of_the_next_call() {
+    let dir = temp_dir("instrument");
+    let file = install(&dir, "instrument");
+    let mut host = PluginHost::new();
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    assert_eq!(sine.layout().notes, Some((0, true)), "CLAP's own notes where they are taken");
+    let mut io = vec![1.0; 2 * 16];
+    assert!(sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "an instrument's output replaces what was there");
+    assert_eq!(sine.note_on(60, f32::NAN), None, "no velocity, no note");
+    assert_eq!(sine.queued(), 0);
+    let note = sine.note_on(69, 0.8).unwrap();
+    assert!(sine.process(&mut io));
+    assert_eq!((io[0], io[1]), (0.25, 0.125), "from the call's first frame, the right half the left");
+    for f in io.chunks_exact(2) {
+        assert_eq!(f[1], 0.5 * f[0]);
+    }
+    sine.note_off(note);
+    sine.note_off(note);
+    assert!(sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "released, once");
+    // Two notes on one key are two notes.
+    let (a, b) = (sine.note_on(60, 1.0).unwrap(), sine.note_on(60, 1.0).unwrap());
+    assert_ne!(a, b);
+    assert!(sine.process(&mut io));
+    assert_eq!(io[0], 0.5, "two voices");
+    sine.note_off(a);
+    sine.note_off(b);
+    assert!(sine.process(&mut io));
+    let s = stats(&sine);
+    assert_eq!((s.notes_on, s.notes_off, s.broken), (3, 3, 0), "{s:?}");
+    sine.stop();
+    drop(sine);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_midi_instrument_gets_one_note_a_key() {
+    let dir = temp_dir("midi");
+    let file = install(&dir, "midi");
+    let mut host = PluginHost::new();
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    assert_eq!(sine.layout().notes, Some((0, false)));
+    let mut io = vec![0.0; 2 * 8];
+    let a = sine.note_on(60, 0.5).unwrap();
+    let b = sine.note_on(60, 0.5).unwrap();
+    assert!(sine.process(&mut io));
+    assert_eq!(io[0], 0.25, "one voice: the first ended as the second began");
+    sine.note_off(a);
+    assert!(sine.process(&mut io));
+    assert_ne!(io[0], 0.0, "the first one's release is dropped");
+    sine.note_off(b);
+    assert!(sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0));
+    let s = stats(&sine);
+    assert_eq!((s.notes_on, s.notes_off, s.broken), (2, 2, 0), "{s:?}");
+    sine.stop();
+    drop(sine);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_note_played_can_be_released() {
+    let dir = temp_dir("full");
+    let file = install(&dir, "full");
+    let mut host = PluginHost::new();
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let mut io = vec![0.0; 2 * 4];
+    let mut notes = Vec::new();
+    while let Some(n) = sine.note_on((notes.len() % 128) as u8, 1.0) {
+        notes.push(n);
+    }
+    assert_eq!(notes.len(), MAX_EVENTS / 2, "in one call, each note keeps room for its release");
+    sine.release_all();
+    assert!(sine.process(&mut io));
+    let s = stats(&sine);
+    assert_eq!((s.notes_on, s.notes_off, s.broken), (256, 256, 0), "{s:?}");
+    // Held across calls, they keep their room.
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        while let Some(n) = sine.note_on((held.len() % 128) as u8, 1.0) {
+            held.push(n);
+        }
+        assert!(sine.process(&mut io));
+    }
+    assert_eq!(held.len(), MAX_EVENTS - 1);
+    for n in held {
+        sine.note_off(n);
+    }
+    assert!(sine.process(&mut io));
+    let s = stats(&sine);
+    assert_eq!((s.notes_on, s.notes_off, s.broken), (767, 767, 0), "{s:?}");
+    sine.stop();
+    drop(sine);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_audio_port_gets_buffers() {
+    let dir = temp_dir("sidechain");
+    let file = install(&dir, "sidechain");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert_eq!((gain.layout().inputs.as_slice(), gain.layout().outputs.as_slice()), (&[2, 2][..], &[2, 1][..]));
+    let mut io = ramp(64);
+    assert!(gain.process(&mut io));
+    assert_eq!(io, halved(64), "the main ports are the ones heard");
+    assert_eq!(stats(&gain).broken, 0, "the second input is silent");
+    gain.stop();
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_that_cannot_play_a_role_or_start_says_why() {
+    let dir = temp_dir("refusals");
+    let mut host = PluginHost::new();
+    let normal = install(&dir, "roles");
+    let err = |r: Result<Instance, String>| r.err().expect("refused");
+    assert_eq!(err(create(&mut host, &normal, SINE, Role::Effect)), "has no mono or stereo main input");
+    assert_eq!(err(create(&mut host, &normal, GAIN, Role::Instrument)), "takes no notes");
+    assert_eq!(
+        err(create(&mut host, &normal, "org.tinvo.test.unnamed", Role::Effect)),
+        "has no plugin 'org.tinvo.test.unnamed' (or could not create it)"
+    );
+    let file = install(&dir, "noactivate");
+    assert_eq!(err(create(&mut host, &file, GAIN, Role::Effect)), "could not start at 48000 Hz");
+    let file = install(&dir, "incomplete");
+    assert_eq!(err(create(&mut host, &file, GAIN, Role::Effect)), "is an incomplete plugin");
+    let file = install(&dir, "refuse");
+    assert_eq!(err(create(&mut host, &file, GAIN, Role::Effect)), "refused to start (its init failed)");
+
+    // One that cannot start processing passes its input, and says so once.
+    let file = install(&dir, "nostart");
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let mut io = ramp(16);
+    assert!(!gain.process(&mut io));
+    assert!(!gain.process(&mut io));
+    assert_eq!(io, ramp(16), "passed as it was");
+    assert!(!gain.is_playing());
+    assert_eq!(host.poll(), [Request::Failed(gain.token())]);
+    assert_eq!(host.poll(), []);
+    let s = stats(&gain);
+    assert_eq!((s.starts, s.processes, s.broken), (0, 0, 0), "{s:?}");
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let mut io = vec![1.0; 8];
+    assert!(!sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "an instrument that cannot start is silent");
+    drop((gain, sine));
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rendering_a_file_asks_for_offline_processing() {
+    let dir = temp_dir("offline");
+    let mut host = PluginHost::new();
+    let offline = |host: &mut PluginHost, file: &Path| {
+        // SAFETY: as in `create`.
+        unsafe { host.create(file, GAIN, Role::Effect, Mode::Offline, RATE, 64) }
+    };
+    let file = install(&dir, "offline");
+    let mut gain = offline(&mut host, &file).unwrap();
+    assert_eq!(stats(&gain).offline, 1);
+    // A file rendered on the main thread: it plays both roles.
+    let mut io = ramp(64);
+    assert!(gain.process(&mut io));
+    gain.stop();
+    assert_eq!(stats(&gain).broken, 0);
+    let realtime = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert_eq!(stats(&realtime).offline, 0);
+    let file = install(&dir, "hardrt");
+    assert_eq!(offline(&mut host, &file).err().unwrap(), "can only run in real time, not render a file");
+    let file = install(&dir, "offlinerefuse");
+    assert_eq!(offline(&mut host, &file).err().unwrap(), "refused to render offline");
+    let refusing = create(&mut host, &file, GAIN, Role::Effect).expect("in real time it plays");
+    drop((gain, realtime, refusing));
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_restart_and_a_main_thread_callback_are_served() {
+    let dir = temp_dir("restart");
+    let file = install(&dir, "restart");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let mut io = ramp(32);
+    std::thread::scope(|s| {
+        s.spawn(|| assert!(gain.process(&mut io)));
+    });
+    assert_eq!(host.poll(), [Request::Restart(gain.token())]);
+    assert_eq!(stats(&gain).callbacks, 1, "on_main_thread, from the poll");
+    assert_eq!(host.poll(), []);
+    assert_eq!(stats(&gain).callbacks, 1, "once a request");
+    std::thread::scope(|s| {
+        s.spawn(|| gain.stop());
+    });
+    gain.restart().unwrap();
+    let mut io = ramp(32);
+    assert!(gain.process(&mut io));
+    assert_eq!(io, halved(32));
+    gain.stop();
+    let s = stats(&gain);
+    assert_eq!((s.activates, s.deactivates, s.starts, s.stops, s.broken), (2, 1, 2, 2, 0), "{s:?}");
+    // One still processing is stopped first.
+    assert!(gain.process(&mut io));
+    gain.restart().unwrap();
+    let s = stats(&gain);
+    assert_eq!((s.activates, s.deactivates, s.starts, s.stops, s.broken), (3, 2, 3, 3, 0), "{s:?}");
+    assert!(gain.process(&mut io));
+    gain.stop();
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_file_is_initialised_once_and_let_go_after_its_last_instance() {
+    let dir = temp_dir("lifecycle");
+    let file = install(&dir, "lifecycle");
+    let report = dir.join("lifecycle.deinit");
+    let mut host = PluginHost::new();
+    let mut playing = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let note = playing.note_on(64, 1.0).unwrap();
+    std::thread::scope(|s| {
+        // One processing on the audio thread while another (an export's)
+        // is created and processed on the main one.
+        let audio = s.spawn(|| {
+            let mut io = vec![0.0; 128];
+            for _ in 0..200 {
+                assert!(playing.process(&mut io));
+            }
+        });
+        // SAFETY: as in `create`.
+        let mut export = unsafe { host.create(&file, GAIN, Role::Effect, Mode::Offline, RATE, 64) }.unwrap();
+        let mut io = ramp(64);
+        assert!(export.process(&mut io));
+        export.stop();
+        let s = stats(&export);
+        assert_eq!((s.entry_inits, s.live, s.broken), (1, 2, 0), "{s:?}");
+        drop(export);
+        audio.join().unwrap();
+    });
+    playing.note_off(note);
+    let mut io = vec![0.0; 8];
+    assert!(playing.process(&mut io));
+    let s = stats(&playing);
+    assert_eq!((s.entry_inits, s.live, s.broken), (1, 1, 0), "{s:?}");
+    host.poll();
+    assert!(!report.exists(), "in use");
+    // Left processing: it is stopped where it is dropped, playing the
+    // audio thread; its file goes with it.
+    drop(playing);
+    let text = std::fs::read_to_string(&report).expect("deinitialised");
+    assert_eq!(text, "inits=1 live=0 broken=0\n");
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The test plugin's report from `deinit`, under `stem`.
+fn deinit_report(dir: &Path, stem: &str) -> String {
+    std::fs::read_to_string(dir.join(format!("{stem}.deinit"))).unwrap_or_else(|_| format!("{stem} is still loaded"))
+}
+
+#[test]
+fn an_instance_that_comes_to_nothing_is_destroyed_once_and_its_file_let_go() {
+    let dir = temp_dir("nothing");
+    let mut host = PluginHost::new();
+    for (stem, role, why) in [
+        ("initfail", Role::Effect, "refused to start (its init failed)"),
+        ("noactivate", Role::Effect, "could not start at 48000 Hz"),
+        ("incomplete", Role::Effect, "is an incomplete plugin"),
+        ("nomain", Role::Effect, "has no mono or stereo main output"),
+    ] {
+        let file = install(&dir, stem);
+        assert_eq!(create(&mut host, &file, GAIN, role).err().as_deref(), Some(why));
+        assert_eq!(deinit_report(&dir, stem), "inits=1 live=0 broken=0\n", "{stem}");
+    }
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_restart_ends_an_instrument_s_voices() {
+    let dir = temp_dir("revoice");
+    let file = install(&dir, "revoice");
+    let mut host = PluginHost::new();
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let note = sine.note_on(60, 1.0).unwrap();
+    let mut io = vec![0.0; 16];
+    assert!(sine.process(&mut io));
+    assert_ne!(io[0], 0.0);
+    // The plugin keeps voices across deactivation; CLAP's reset ends them.
+    sine.restart().unwrap();
+    assert!(sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "{io:?}");
+    sine.note_off(note);
+    assert!(sine.process(&mut io));
+    let s = stats(&sine);
+    assert_eq!((s.notes_on, s.notes_off, s.broken), (1, 0, 0), "the release of a note from before is not sent");
+    sine.stop();
+    drop(sine);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_process_call_stops_the_instance_until_it_is_restarted() {
+    let dir = temp_dir("procerror");
+    let file = install(&dir, "procerror");
+    let mut host = PluginHost::new();
+    let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+    let note = sine.note_on(60, 1.0).unwrap();
+    let mut io = vec![0.0; 16];
+    assert!(sine.process(&mut io));
+    assert_ne!(io[0], 0.0);
+    sine.note_off(note);
+    // The plugin fails before reading the release.
+    assert!(!sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "silent");
+    assert!(!sine.is_playing());
+    assert_eq!(sine.queued(), 1, "the release it did not read is kept");
+    assert_eq!(host.poll(), [Request::Failed(sine.token())]);
+    assert!(!sine.process(&mut io), "not called again");
+    assert_eq!(sine.queued(), 1);
+    assert_eq!(stats(&sine).processes, 2);
+    sine.restart().unwrap();
+    assert!(sine.process(&mut io));
+    assert!(io.iter().all(|&x| x == 0.0), "the voice the lost release left is reset");
+    let s = stats(&sine);
+    assert_eq!((s.processes, s.broken), (3, 0), "{s:?}");
+    sine.stop();
+    drop(sine);
+    assert_eq!(deinit_report(&dir, "procerror"), "inits=1 live=0 broken=0\n");
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_instance_is_main_threaded_on_its_own_host_s_thread_only() {
+    let dir = temp_dir("leak");
+    let file = install(&dir, "leak");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    assert_eq!(thread_check(&gain), (true, false));
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            // Another thread with a host of its own is not this instance's
+            // main thread.
+            let _other = PluginHost::new();
+            assert_eq!(thread_check(&gain), (false, false));
+            assert_eq!(gain.restart().err().as_deref(), Some("can only be restarted on its host's thread"));
+            let mut io = ramp(8);
+            // It asks for a restart and a callback here, before it is lost.
+            assert!(gain.process(&mut io), "processing can be anywhere");
+            gain.stop();
+            assert_eq!(stats(&gain).broken, 0);
+            // Dropped here, it is leaked, never destroyed off its thread.
+            drop(gain);
+        });
+    });
+    assert_eq!(host.poll(), [], "nor served");
+    assert_eq!(deinit_report(&dir, "leak"), "leak is still loaded", "the leaked instance keeps its file");
+    drop(host);
 }

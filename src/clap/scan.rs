@@ -35,7 +35,9 @@ const RESULT_HEADER: &str = "tinvo-clap-scan 1";
 /// The first line of the cache: its format, and the system and processor
 /// the files were read on (a plugin file can hold code for several).
 fn cache_header() -> String {
-    format!("tinvo-plugins 1 {} {}", std::env::consts::OS, std::env::consts::ARCH)
+    // 2: plugin ids are taken whole or not at all, so a cache of 1 may
+    // hold ids cut short.
+    format!("tinvo-plugins 2 {} {}", std::env::consts::OS, std::env::consts::ARCH)
 }
 const MAX_RESULT_BYTES: usize = 1 << 20;
 const MAX_CACHE_BYTES: u64 = 16 << 20;

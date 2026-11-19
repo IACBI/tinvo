@@ -7,6 +7,7 @@ use super::ffi::*;
 use super::{PluginInfo, Roles};
 use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// At most this many descriptors are read from one factory.
 const MAX_DESCRIPTORS: u32 = 256;
@@ -21,22 +22,65 @@ pub struct Dso {
     entry: *const ClapPluginEntry,
     deinit: unsafe extern "C" fn(),
     // Dropped after `deinit` has run, in `Drop::drop`.
-    _library: sys::Library,
+    library: sys::Library,
 }
+
+// SAFETY: what a `Dso` holds is the entry and its factory, whose functions
+// CLAP marks thread-safe; `init` ran in `open`, and `deinit` runs in `drop`,
+// which the plugin host keeps on its main thread (`host.rs`).
+unsafe impl Send for Dso {}
+// SAFETY: as above; `&Dso` reaches only the thread-safe functions.
+unsafe impl Sync for Dso {}
 
 impl Dso {
     /// Loads the plugin file at `path` (a `.clap` file, or on macOS a
     /// `.clap` bundle) and initialises it.
     ///
     /// # Safety
-    /// Loading a library runs its code in this process, which may do
-    /// anything; its `clap_entry` must be a `clap_plugin_entry_t`. No other
-    /// thread may be loading or using the same file meanwhile, since CLAP
-    /// allows one `init` at a time. TINVO calls it only in a scan's child.
+    /// Loading a library runs its code in this process, and nothing TINVO
+    /// checks (pointers, versions, layouts) can make that safe: the file is
+    /// trusted by being loaded. Its `clap_entry` must be a
+    /// `clap_plugin_entry_t`. No other thread may be loading or using the
+    /// same file meanwhile, since CLAP allows one `init` at a time, and the
+    /// file must not be initialised already in this process: the scanner
+    /// calls this once in a child of its own, and the plugin host goes
+    /// through [`Dso::open_among`].
     pub unsafe fn open(path: &Path) -> Result<Dso, String> {
+        // SAFETY: passed on from the caller.
+        match unsafe { Self::open_library(path, &[]) }? {
+            Opened::New(d) => Ok(d),
+            Opened::Loaded(_) => unreachable!("nothing to share"),
+        }
+    }
+
+    /// Like [`Dso::open`], but if the library the operating system loads
+    /// for `path` is one of `loaded` already (another path to the same
+    /// image, as the system tells), that one is returned and not
+    /// initialised again.
+    ///
+    /// # Safety
+    /// As [`Dso::open`], with `loaded` holding every plugin file this
+    /// process has initialised and not yet deinitialised.
+    pub unsafe fn open_among(path: &Path, loaded: &[Arc<Dso>]) -> Result<Arc<Dso>, String> {
+        // SAFETY: passed on from the caller.
+        Ok(match unsafe { Self::open_library(path, loaded) }? {
+            Opened::New(d) => Arc::new(d),
+            Opened::Loaded(d) => d,
+        })
+    }
+
+    /// # Safety
+    /// As [`Dso::open_among`].
+    unsafe fn open_library(path: &Path, loaded: &[Arc<Dso>]) -> Result<Opened, String> {
         let path = std::path::absolute(path).map_err(|e| e.to_string())?;
         let binary = sys::binary_of(&path)?;
         let library = sys::Library::open(&binary)?;
+        // The system hands out one handle per loaded image, so a second
+        // load of the same one only counts it again; dropping `library`
+        // undoes that.
+        if let Some(d) = loaded.iter().find(|d| d.library.handle() == library.handle()) {
+            return Ok(Opened::Loaded(d.clone()));
+        }
         let entry = library.entry()?;
         // SAFETY: `entry` points at the plugin's exported `clap_entry`, which
         // lives as long as the library; its version is read first, as the
@@ -58,19 +102,22 @@ impl Dso {
         if !unsafe { init(c_path.as_ptr()) } {
             return Err("refused to start (its init failed)".into());
         }
-        Ok(Dso { entry, deinit, _library: library })
+        Ok(Opened::New(Dso { entry, deinit, library }))
     }
 
-    /// The plugins its factory offers.
-    pub fn plugins(&self) -> Result<Vec<PluginInfo>, String> {
+    /// Its plugin factory, valid as long as the `Dso`.
+    pub fn factory(&self) -> Result<*const ClapPluginFactory, String> {
         // SAFETY: checked non-null in `open`; get_factory is thread-safe.
         let factory = unsafe {
             let get_factory = (*self.entry).get_factory.ok_or("has no get_factory")?;
             get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()).cast::<ClapPluginFactory>()
         };
-        if factory.is_null() {
-            return Err("has no plugin factory".into());
-        }
+        if factory.is_null() { Err("has no plugin factory".into()) } else { Ok(factory) }
+    }
+
+    /// The plugins its factory offers.
+    pub fn plugins(&self) -> Result<Vec<PluginInfo>, String> {
+        let factory = self.factory()?;
         // SAFETY: a factory the plugin returned, valid while it is initialised.
         let (count, get) = unsafe { ((*factory).get_plugin_count, (*factory).get_plugin_descriptor) };
         let (Some(count), Some(get)) = (count, get) else {
@@ -94,9 +141,15 @@ impl Dso {
 impl Drop for Dso {
     fn drop(&mut self) {
         // SAFETY: init succeeded in `open`; this is its one deinit, and the
-        // library is closed only after it (when `_library` drops).
+        // library is closed only after it (when `library` drops).
         unsafe { (self.deinit)() };
     }
+}
+
+/// What [`Dso::open_library`] found.
+enum Opened {
+    New(Dso),
+    Loaded(Arc<Dso>),
 }
 
 /// The executable of the macOS bundle at `path`, as CoreFoundation finds it
@@ -121,8 +174,12 @@ unsafe fn describe(desc: *const ClapPluginDescriptor) -> Option<PluginInfo> {
         return None;
     }
     // SAFETY: the descriptor's strings, by the caller's promise.
-    let text = |p: *const c_char| unsafe { bounded(p) }.unwrap_or_default();
-    let id = text(d.id);
+    let text = |p: *const c_char| unsafe { bounded(p) }.map(|b| String::from_utf8_lossy(&b).into_owned());
+    let text = |p: *const c_char| text(p).unwrap_or_default();
+    // The id is what a host asks the factory for, so it is taken whole and
+    // exact or not at all.
+    // SAFETY: as above.
+    let id = unsafe { bounded(d.id) }.filter(|b| b.len() < MAX_STRING).and_then(|b| String::from_utf8(b).ok())?;
     let name = text(d.name);
     if id.trim().is_empty() || name.trim().is_empty() {
         return None;
@@ -150,13 +207,14 @@ unsafe fn describe(desc: *const ClapPluginDescriptor) -> Option<PluginInfo> {
     })
 }
 
-/// The string at `p`, read up to its NUL or [`MAX_STRING`] bytes; `None`
+/// The bytes of the string at `p`, read up to its NUL or [`MAX_STRING`]
+/// bytes (so exactly `MAX_STRING` of them means it was cut short); `None`
 /// for a null pointer.
 ///
 /// # Safety
 /// `p` must be null or point at a NUL-terminated string, or at least
 /// [`MAX_STRING`] readable bytes.
-unsafe fn bounded(p: *const c_char) -> Option<String> {
+unsafe fn bounded(p: *const c_char) -> Option<Vec<u8>> {
     if p.is_null() {
         return None;
     }
@@ -169,7 +227,7 @@ unsafe fn bounded(p: *const c_char) -> Option<String> {
         }
         bytes.push(b);
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(bytes)
 }
 
 #[cfg(unix)]
@@ -222,6 +280,11 @@ mod sys {
                 return Err(format!("cannot be loaded ({})", last_error()));
             }
             Ok(Library { handle, path: path.to_path_buf() })
+        }
+
+        /// The system's handle, the same for every load of one image.
+        pub fn handle(&self) -> usize {
+            self.handle as usize
         }
 
         /// The library's own `clap_entry`.
@@ -379,6 +442,11 @@ mod sys {
             Ok(Library { handle })
         }
 
+        /// The module's handle, the same for every load of one image.
+        pub fn handle(&self) -> usize {
+            self.handle as usize
+        }
+
         /// The library's own `clap_entry` (GetProcAddress looks in this
         /// module only, and finds exported data as well as functions).
         pub fn entry(&self) -> Result<*const ClapPluginEntry, String> {
@@ -416,6 +484,10 @@ mod sys {
 
         pub fn entry(&self) -> Result<*const ClapPluginEntry, String> {
             Err("cannot be loaded on this system".into())
+        }
+
+        pub fn handle(&self) -> usize {
+            0
         }
     }
 

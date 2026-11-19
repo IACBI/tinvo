@@ -9,6 +9,7 @@
 //! pairs its `init` with one `deinit`. [`ffi`] holds the C types.
 
 pub mod ffi;
+pub mod host;
 pub mod library;
 pub mod scan;
 

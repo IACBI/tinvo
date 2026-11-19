@@ -3,9 +3,11 @@
 //! This binary replaces the global allocator with one that counts calls
 //! while armed, and arms it only around work that runs on a real-time
 //! thread: `Engine::process` (with whatever commands, samples and live
-//! notes are waiting for it), the capture side of recording, and the MIDI
-//! byte parser and mailboxes the backend threads use. It runs without the
-//! test harness, on one thread, so nothing else allocates while armed.
+//! notes are waiting for it), the capture side of recording, the MIDI
+//! byte parser and mailboxes the backend threads use, and a CLAP plugin
+//! instance's notes and processing (the test plugin allocates through its
+//! own copy of the standard library, so what is counted is TINVO's side). It runs without the
+//! test harness, one thread at a time, so nothing else allocates while armed.
 //!
 //! On the first allocation while armed it prints a backtrace, so a failure
 //! names the code that allocated.
@@ -14,6 +16,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tinvo::clap::host::{Mode, PluginHost, Role, prepare_audio_thread};
 use tinvo::dsp::noise::Rng;
 use tinvo::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, Retired, Shared, Step, Take};
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
@@ -585,11 +588,86 @@ fn midi() -> usize {
     calls
 }
 
+/// The test plugin built from `examples/clap_fixture.rs`, which `cargo
+/// test` builds beside this binary.
+fn fixture() -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        "clap_fixture.dll"
+    } else if cfg!(target_os = "macos") {
+        "libclap_fixture.dylib"
+    } else {
+        "libclap_fixture.so"
+    };
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .take(6)
+        .map(|dir| dir.join("examples").join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("{name} is not built: run cargo test, or cargo build --example clap_fixture"))
+}
+
+/// A plugin instrument and a plugin effect: notes, releases and processing
+/// at every buffer size, a start, and the stop before they leave, on a
+/// fresh thread that has called `prepare_audio_thread`, as an audio
+/// callback's would. (On macOS a thread's first use of thread-local storage
+/// may call the system's allocator directly, which this allocator cannot
+/// see; preparing the thread is what keeps that out of the callback.)
+fn plugins() -> usize {
+    let mut host = PluginHost::new();
+    let file = fixture();
+    // SAFETY: the test plugin, loaded only through this host.
+    let create =
+        |host: &mut PluginHost, id, role| unsafe { host.create(&file, id, role, Mode::Realtime, SR as f64, 64) };
+    let mut sine = create(&mut host, "org.tinvo.test.sine", Role::Instrument).unwrap();
+    let mut gain = create(&mut host, "org.tinvo.test.gain", Role::Effect).unwrap();
+    let mut buf = vec![0.0f32; 2 * 4096];
+    let mut rng = Rng::new(5);
+    let mut held = Vec::with_capacity(1024);
+    let mut calls = 0;
+    let mut played = true;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            prepare_audio_thread();
+            for i in 0..400 {
+                let frames = SIZES[i % SIZES.len()];
+                let io = &mut buf[..2 * frames];
+                calls += armed(|| {
+                    for _ in 0..rng.next_u64() % 8 {
+                        if let Some(n) = sine.note_on((rng.next_u64() % 128) as u8, 0.7) {
+                            held.push(n);
+                        }
+                    }
+                    for _ in 0..rng.next_u64() % 6 {
+                        if let Some(n) = held.pop() {
+                            sine.note_off(n);
+                        }
+                    }
+                    if i % 97 == 0 {
+                        sine.release_all();
+                        held.clear();
+                    }
+                    played &= sine.process(io);
+                    played &= gain.process(io);
+                    if i == 399 {
+                        sine.stop();
+                        gain.stop();
+                    }
+                });
+            }
+        });
+    });
+    drop((sine, gain));
+    let _ = host.poll();
+    assert!(played, "the plugins played");
+    calls
+}
+
 /// A check: how often the allocator was called while armed.
 type Check = fn() -> usize;
 
 fn main() {
-    let checks: [(&str, Check); 9] = [
+    let checks: [(&str, Check); 10] = [
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
         ("as many tracks as a project holds, likewise", full_song),
@@ -599,6 +677,7 @@ fn main() {
         ("MIDI out and its clock", midi_out),
         ("the capture side of recording", capture),
         ("MIDI parsing and mailboxes", midi),
+        ("a CLAP instrument and effect playing", plugins),
     ];
     let mut failed = 0;
     for (name, check) in checks {
