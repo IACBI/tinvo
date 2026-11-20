@@ -678,9 +678,28 @@ fn plugins() -> usize {
     calls
 }
 
+/// Removes the folders earlier runs left: a run cannot remove its own while
+/// the plugin it loaded stays loaded, as on Windows it does until the
+/// process ends.
+fn sweep_earlier_runs() {
+    let own = format!("tinvo-realtime-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("tinvo-realtime-") || name == own {
+            continue;
+        }
+        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|a| a > std::time::Duration::from_secs(3600)) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// The test plugin copied as `latency` (its output late, and later at each
 /// restart) to a folder of its own.
 fn late_fixture() -> std::path::PathBuf {
+    sweep_earlier_runs();
     let from = fixture();
     let dir = std::env::temp_dir().join(format!("tinvo-realtime-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
