@@ -1712,12 +1712,28 @@ mod x11 {
         unsafe { std::mem::transmute_copy(&p) }
     }
 
+    /// The errors the server sent the test's connection.
+    static ERRORS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    unsafe extern "C" fn count_error(_: *mut c_void, _: *mut c_void) -> c_int {
+        ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+
+    type ErrorHandler = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+
     impl Test {
+        /// Opened before TINVO's connection, with an error handler of the
+        /// test's set first: TINVO's must leave it the errors of every
+        /// connection but its own.
         pub fn open() -> Self {
             // SAFETY: libX11's own functions, by the types `Xlib.h` gives.
             unsafe {
                 let lib = dlopen(c"libX11.so.6".as_ptr(), 2);
                 assert!(!lib.is_null(), "libX11 is installed");
+                let set: unsafe extern "C" fn(Option<ErrorHandler>) -> Option<ErrorHandler> =
+                    symbol(lib, c"XSetErrorHandler");
+                set(Some(count_error));
                 let open: unsafe extern "C" fn(*const c_char) -> *mut c_void = symbol(lib, c"XOpenDisplay");
                 let display = open(std::ptr::null());
                 assert!(!display.is_null(), "the display opens");
@@ -1737,11 +1753,16 @@ mod x11 {
             }
         }
 
+        /// How many errors the server sent the test's connection.
+        pub fn errors(&self) -> u32 {
+            ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         /// Its size, if it is a window still.
         pub fn size(&self, window: u64) -> Option<(u32, u32)> {
             let (mut root, mut x, mut y, mut w, mut h, mut border, mut depth) = (0, 0, 0, 0, 0, 0, 0);
             // SAFETY: an open display and room for every answer; an error
-            // for a window gone is answered by TINVO's handler (no exit).
+            // for a window gone is counted by the test's handler.
             let ok = unsafe {
                 (self.sync)(self.display, 0);
                 let f = self.get_geometry;
@@ -1853,11 +1874,11 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_x11() {
     let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
     let probe = GuiProbe::of(&gain);
     assert_eq!(Windows::api(), Some(CLAP_WINDOW_API_X11));
+    let x = x11::Test::open();
     let mut windows = Windows::new();
     assert_eq!(windows.descriptor(), None, "no connection before a window");
     // Put in a window of its size, shown.
     assert_eq!(windows.open(gain.handle(), "Test Gain"), Ok(GuiMode::Embedded));
-    let x = x11::Test::open();
     let window = probe.stats().parent;
     assert_eq!(x.size(window), Some((300, 200)));
     assert!(probe.log().iter().any(|l| l.starts_with("scale ")), "told the display's scale");
@@ -1898,7 +1919,9 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_x11() {
     assert!(x.readable(fd));
     assert_eq!(windows.pump(), [gain.token()]);
     assert_eq!(probe.log()[probe.log().len() - 2..], ["hide", "destroy"]);
+    let errors = x.errors();
     assert_eq!(x.size(window), None);
+    assert_eq!(x.errors(), errors + 1, "another connection's errors go to the handler set before TINVO's");
     assert_eq!(x.size(child), Some((10, 10)), "moved out first");
     assert!(!windows.is_open(gain.token()));
     // A close the user asked for that TINVO's closing and opening it again
