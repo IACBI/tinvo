@@ -17,9 +17,13 @@ use std::ffi::CStr;
 mod win32;
 #[cfg(windows)]
 use win32 as platform;
+#[cfg(target_os = "linux")]
+mod x11;
+#[cfg(target_os = "linux")]
+use x11 as platform;
 
 /// Where TINVO opens no plugin windows yet.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::{Event, GuiMode, PluginHandle};
     use std::ffi::CStr;
@@ -35,23 +39,28 @@ mod platform {
     }
 
     pub(super) fn forget(_: u64) {}
+
+    pub(super) fn descriptor() -> Option<i32> {
+        None
+    }
 }
 
 /// What a window of TINVO's recorded for the plugin window in it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 enum Event {
     /// The user closed the window of the instance with this token.
     Closed(u64),
     /// Its client area took this size.
     Resized(u64, u32, u32),
     /// It moved to a monitor of this scale.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Scaled(u64, f64),
 }
 
 impl Event {
     /// The token of the instance whose window recorded it.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     fn token(&self) -> u64 {
         match *self {
             Event::Closed(t) | Event::Resized(t, ..) | Event::Scaled(t, _) => t,
@@ -84,8 +93,16 @@ impl Windows {
     pub fn api() -> Option<&'static CStr> {
         #[cfg(windows)]
         return Some(super::ffi::CLAP_WINDOW_API_WIN32);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        return Some(super::ffi::CLAP_WINDOW_API_X11);
+        #[cfg(not(any(windows, target_os = "linux")))]
         None
+    }
+
+    /// The descriptor the main loop waits on for what the windowing
+    /// system sends TINVO's windows, where it has one (X11) and it is open.
+    pub fn descriptor(&self) -> Option<i32> {
+        platform::descriptor()
     }
 
     /// Whether the window of the instance with `token` is open.

@@ -1639,6 +1639,217 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_windows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A connection of the test's own to the X display, through Xlib loaded at
+/// run time: it sizes and closes TINVO's windows as a window manager would.
+#[cfg(target_os = "linux")]
+mod x11 {
+    use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
+
+    unsafe extern "C" {
+        fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+        fn poll(fds: *mut PollFd, n: c_ulong, timeout: c_int) -> c_int;
+    }
+
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: i16,
+        revents: i16,
+    }
+
+    /// `XClientMessageEvent`, padded to an `XEvent`.
+    #[repr(C)]
+    struct ClientMessage {
+        kind: c_int,
+        serial: c_ulong,
+        send_event: c_int,
+        display: *mut c_void,
+        window: c_ulong,
+        message_type: c_ulong,
+        format: c_int,
+        data: [c_long; 5],
+        pad: [c_long; 12],
+    }
+
+    type Geometry = unsafe extern "C" fn(
+        *mut c_void,
+        c_ulong,
+        *mut c_ulong,
+        *mut c_int,
+        *mut c_int,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+        *mut c_uint,
+    ) -> c_int;
+
+    pub struct Test {
+        display: *mut c_void,
+        get_geometry: Geometry,
+        resize_window: unsafe extern "C" fn(*mut c_void, c_ulong, c_uint, c_uint) -> c_int,
+        sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+        send_event: unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_long, *mut ClientMessage) -> c_int,
+        intern_atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong,
+    }
+
+    /// # Safety
+    /// `T` is the type of the function `name` names.
+    unsafe fn symbol<T: Copy>(lib: *mut c_void, name: &CStr) -> T {
+        // SAFETY: a loaded library and a NUL-terminated name.
+        let p = unsafe { dlsym(lib, name.as_ptr()) };
+        assert!(!p.is_null(), "libX11 has {name:?}");
+        // SAFETY: as the caller says.
+        unsafe { std::mem::transmute_copy(&p) }
+    }
+
+    impl Test {
+        pub fn open() -> Self {
+            // SAFETY: libX11's own functions, by the types `Xlib.h` gives.
+            unsafe {
+                let lib = dlopen(c"libX11.so.6".as_ptr(), 2);
+                assert!(!lib.is_null(), "libX11 is installed");
+                let open: unsafe extern "C" fn(*const c_char) -> *mut c_void = symbol(lib, c"XOpenDisplay");
+                let display = open(std::ptr::null());
+                assert!(!display.is_null(), "the display opens");
+                Self {
+                    display,
+                    get_geometry: symbol(lib, c"XGetGeometry"),
+                    resize_window: symbol(lib, c"XResizeWindow"),
+                    sync: symbol(lib, c"XSync"),
+                    send_event: symbol(lib, c"XSendEvent"),
+                    intern_atom: symbol(lib, c"XInternAtom"),
+                }
+            }
+        }
+
+        /// Its size, if it is a window still.
+        pub fn size(&self, window: u64) -> Option<(u32, u32)> {
+            let (mut root, mut x, mut y, mut w, mut h, mut border, mut depth) = (0, 0, 0, 0, 0, 0, 0);
+            // SAFETY: an open display and room for every answer; an error
+            // for a window gone is answered by TINVO's handler (no exit).
+            let ok = unsafe {
+                (self.sync)(self.display, 0);
+                let f = self.get_geometry;
+                f(self.display, window as c_ulong, &mut root, &mut x, &mut y, &mut w, &mut h, &mut border, &mut depth)
+            };
+            (ok != 0).then_some((w, h))
+        }
+
+        /// Sizes it as a window manager would for a drag.
+        pub fn resize(&self, window: u64, w: u32, h: u32) {
+            // SAFETY: an open display.
+            unsafe {
+                (self.resize_window)(self.display, window as c_ulong, w, h);
+                (self.sync)(self.display, 0);
+            }
+        }
+
+        /// Asks its owner to close it, as a window manager does for the
+        /// user (`WM_DELETE_WINDOW`).
+        pub fn close(&self, window: u64) {
+            // SAFETY: an open display, NUL-terminated names and a whole
+            // event, sent to the window's owner (no mask).
+            unsafe {
+                let atom = |name: &CStr| (self.intern_atom)(self.display, name.as_ptr(), 0);
+                let mut ev = ClientMessage {
+                    kind: 33,
+                    serial: 0,
+                    send_event: 1,
+                    display: self.display,
+                    window: window as c_ulong,
+                    message_type: atom(c"WM_PROTOCOLS"),
+                    format: 32,
+                    data: [atom(c"WM_DELETE_WINDOW") as c_long, 0, 0, 0, 0],
+                    pad: [0; 12],
+                };
+                assert_ne!((self.send_event)(self.display, window as c_ulong, 0, 0, &mut ev), 0);
+                (self.sync)(self.display, 0);
+            }
+        }
+
+        /// Whether `fd` has something to read within a second.
+        pub fn readable(&self, fd: i32) -> bool {
+            let mut p = PollFd { fd, events: 1, revents: 0 };
+            // SAFETY: one pollfd.
+            unsafe { poll(&mut p, 1, 1000) == 1 && p.revents & 1 != 0 }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_x11() {
+    use tinvo::clap::window::Windows;
+    if std::env::var_os("DISPLAY").is_none() {
+        assert!(std::env::var_os("TINVO_REQUIRE_X11").is_none(), "an X display to test on");
+        eprintln!("skipped: no X display");
+        return;
+    }
+    let dir = temp_dir("gui-x11");
+    let file = install(&dir, "gui");
+    let mut host = PluginHost::new();
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let probe = GuiProbe::of(&gain);
+    assert_eq!(Windows::api(), Some(CLAP_WINDOW_API_X11));
+    let mut windows = Windows::new();
+    assert_eq!(windows.descriptor(), None, "no connection before a window");
+    // Put in a window of its size, shown.
+    assert_eq!(windows.open(gain.handle(), "Test Gain"), Ok(GuiMode::Embedded));
+    let x = x11::Test::open();
+    let window = probe.stats().parent;
+    assert_eq!(x.size(window), Some((300, 200)));
+    assert!(probe.log().iter().any(|l| l.starts_with("scale ")), "told the display's scale");
+    let fd = windows.descriptor().expect("its connection waited on");
+    // Its own sizing reaches it as no drag.
+    windows.pump();
+    assert!(!probe.log().iter().any(|l| l.starts_with("size")));
+    // Sized as a window manager would for a drag: the plugin takes the
+    // nearest size it can, and the window follows; that is no drag either.
+    x.resize(window, 455, 333);
+    assert!(x.readable(fd), "what the server sends wakes the main loop");
+    windows.pump();
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 450x330"));
+    assert_eq!(x.size(window), Some((450, 330)));
+    windows.pump();
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // Asked for by the plugin.
+    assert!(probe.poke(0, 200, 120));
+    assert_eq!(x.size(window), Some((200, 120)));
+    windows.pump();
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // Closed by the user: the plugin's window goes, then TINVO's.
+    x.close(window);
+    assert!(x.readable(fd));
+    assert_eq!(windows.pump(), [gain.token()]);
+    assert_eq!(probe.log()[probe.log().len() - 2..], ["hide", "destroy"]);
+    assert_eq!(x.size(window), None);
+    assert!(!windows.is_open(gain.token()));
+    // A close the user asked for that TINVO's closing and opening it again
+    // overtook is no close of the new window.
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    x.close(probe.stats().parent);
+    windows.close(gain.token());
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert!(windows.is_open(gain.token()));
+    // Closed with the set, or by its plugin: let go of either way.
+    let window = probe.stats().parent;
+    drop(windows);
+    assert_eq!(x.size(window), None);
+    assert_eq!(probe.log().last().map(String::as_str), Some("destroy"));
+    let mut windows = Windows::new();
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    assert!(probe.poke(3, 1, 0));
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert!(!windows.is_open(gain.token()));
+    assert_eq!(probe.stats().broken, 0, "every window call by CLAP's rules");
+    drop(windows);
+    drop(gain);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_handle_works_on_its_host_s_thread_while_the_plugin_plays_elsewhere() {
     let dir = temp_dir("handle");

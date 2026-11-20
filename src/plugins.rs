@@ -202,10 +202,16 @@ impl Plugins {
 
     /// The file descriptors the instances wait on, with the CLAP flags
     /// they wait for, and the round of waiting they are for: readiness
-    /// found for them is served with that round.
+    /// found for them is served with that round. The windows' own
+    /// connection is among them where it has one: no instance registers
+    /// it, and what it sends is read by the windows' pump.
     pub fn fds(&mut self) -> (Vec<(i32, u32)>, u64) {
         self.fd_round += 1;
-        (self.host.fds(), self.fd_round)
+        let mut fds = self.host.fds();
+        if let Some(fd) = self.windows.descriptor().filter(|fd| fds.iter().all(|f| f.0 != *fd)) {
+            fds.push((fd, crate::tui::term::READ));
+        }
+        (fds, self.fd_round)
     }
 
     /// Serves what the instances run on the main thread between the

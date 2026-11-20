@@ -355,6 +355,11 @@ pub(super) fn open(handle: &PluginHandle, api: &'static CStr, title: &str) -> Re
     Ok(mode)
 }
 
+/// None: the thread's messages wake the main loop themselves.
+pub(super) fn descriptor() -> Option<i32> {
+    None
+}
+
 /// Lets go of the window of the instance with `token`.
 pub(super) fn forget(token: u64) {
     OPEN.with(|o| o.borrow_mut().retain(|h| h.token() != token));
