@@ -2035,6 +2035,12 @@ pub struct PluginHandle {
     _main: PhantomData<*const ()>,
 }
 
+impl Clone for PluginHandle {
+    fn clone(&self) -> Self {
+        Self { host: self.host.clone(), _main: PhantomData }
+    }
+}
+
 impl PluginHandle {
     /// Its instance's token.
     pub fn token(&self) -> u64 {

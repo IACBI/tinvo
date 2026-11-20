@@ -221,7 +221,19 @@ impl Terminal {
 
     /// Waits up to `timeout` for the next event.
     pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
-        self.sys.poll(timeout)
+        self.sys.poll(timeout, &mut Wake::default())
+    }
+
+    /// Waits up to `timeout` for the next event, or for what `wake` also
+    /// waits for: `None` then, with what of it is ready in `wake`.
+    pub fn poll_waking(&mut self, timeout: Duration, wake: &mut Wake) -> io::Result<Option<Event>> {
+        self.sys.poll(timeout, wake)
+    }
+
+    /// Adds to `wake.ready` what of its descriptors is ready now, without
+    /// waiting: input that keeps coming must not keep them waiting.
+    pub fn check_wake(&mut self, wake: &mut Wake) -> io::Result<()> {
+        check_descriptors(wake)
     }
 
     pub fn write(&mut self, s: &str) -> io::Result<()> {
@@ -236,6 +248,43 @@ impl Drop for Terminal {
         let _ = self.write(LEAVE_SEQ);
         self.sys.restore();
     }
+}
+
+/// A descriptor is ready to be read (CLAP's `CLAP_POSIX_FD_READ`).
+pub const READ: u32 = 1;
+/// Ready to be written (`CLAP_POSIX_FD_WRITE`).
+pub const WRITE: u32 = 2;
+/// In error or hung up (`CLAP_POSIX_FD_ERROR`).
+pub const ERROR: u32 = 4;
+
+/// What a wait for input also wakes for: plugins' windows, timers and file
+/// descriptors, served on the main thread between waits.
+#[derive(Debug, Default)]
+pub struct Wake {
+    /// A window message for this thread (Windows).
+    pub messages: bool,
+    /// Descriptors with the flags ([`READ`], [`WRITE`]) to wait for (Unix).
+    pub fds: Vec<(i32, u32)>,
+    /// Those found ready since it was last emptied, each once with the
+    /// flags it was ready with.
+    pub ready: Vec<(i32, u32)>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Wake {
+    fn add_ready(&mut self, fd: i32, flags: u32) {
+        match self.ready.iter_mut().find(|r| r.0 == fd) {
+            Some(r) => r.1 |= flags,
+            None => self.ready.push((fd, flags)),
+        }
+    }
+}
+
+/// Adds to `wake.ready` what of its descriptors is ready now, without
+/// waiting, and with no terminal (an export serves the plugins' between
+/// its chunks). Windows has none.
+pub fn check_descriptors(wake: &mut Wake) -> io::Result<()> {
+    sys::check(wake)
 }
 
 /// Makes panics readable: leaves the alternate screen before the default hook
@@ -253,7 +302,7 @@ pub fn install_panic_hook() {
 #[cfg(windows)]
 mod sys {
     use super::super::input::{Button, Mouse, MouseKind};
-    use super::{Event, Key};
+    use super::{Event, Key, Wake};
     use std::ffi::c_void;
     use std::io;
     use std::time::{Duration, Instant};
@@ -284,6 +333,16 @@ mod sys {
     const MOUSE_WHEELED: u32 = 0x4;
     const MOUSE_HWHEELED: u32 = 0x8;
     const WAIT_OBJECT_0: u32 = 0;
+
+    /// Window messages are served by whoever pumps them; there are no
+    /// descriptors to check.
+    pub fn check(_wake: &mut Wake) -> io::Result<()> {
+        Ok(())
+    }
+    /// Pointer and touch input included (`0x1CFF` from Windows 8).
+    const QS_ALLINPUT: u32 = 0x1CFF;
+    /// Wakes for messages already in the queue too, not only new ones.
+    const MWMO_INPUTAVAILABLE: u32 = 0x4;
     const SHIFT_PRESSED: u32 = 0x10;
     const CTRL_PRESSED: u32 = 0x4 | 0x8;
     const ALT_PRESSED: u32 = 0x1 | 0x2;
@@ -349,6 +408,11 @@ mod sys {
         fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut ScreenBufferInfo) -> i32;
         fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MsgWaitForMultipleObjectsEx(count: u32, handles: *const Handle, millis: u32, wake: u32, flags: u32) -> u32;
         fn ReadConsoleInputW(handle: Handle, buffer: *mut InputRecord, length: u32, read: *mut u32) -> i32;
     }
 
@@ -438,7 +502,7 @@ mod sys {
             let origin = self.window().map_or((0, 0), |w| (w.left, w.top));
             mouse_event(m, origin, &mut self.buttons)
         }
-        pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        pub fn poll(&mut self, timeout: Duration, wake: &mut Wake) -> io::Result<Option<Event>> {
             if let Some((key, n)) = self.repeat.take() {
                 self.repeat = (n > 1).then_some((key, n - 1));
                 return Ok(Some(Event::Key(key)));
@@ -449,7 +513,15 @@ mod sys {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let ms = left.as_millis().min(u128::from(u32::MAX - 1)) as u32;
                 // SAFETY: valid console input handle.
-                if unsafe { WaitForSingleObject(self.input, ms) } != WAIT_OBJECT_0 {
+                let woke = unsafe {
+                    if wake.messages {
+                        MsgWaitForMultipleObjectsEx(1, &self.input, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+                    } else {
+                        WaitForSingleObject(self.input, ms)
+                    }
+                };
+                // Timed out, or a window message (`WAIT_OBJECT_0 + 1`).
+                if woke != WAIT_OBJECT_0 {
                     return Ok(None);
                 }
                 let mut rec = InputRecord::default();
@@ -644,7 +716,7 @@ mod sys {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
-    use super::{Decoder, Event, Next};
+    use super::{Decoder, ERROR, Event, Next, READ, WRITE, Wake};
     use std::ffi::{c_int, c_ulong, c_void};
     use std::io;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -704,6 +776,10 @@ mod sys {
     const TIOCGWINSZ: c_ulong = 0x4008_7468;
     const TCSANOW: c_int = 0;
     const POLLIN: i16 = 1;
+    const POLLOUT: i16 = 4;
+    const POLLERR: i16 = 8;
+    const POLLHUP: i16 = 0x10;
+    const POLLNVAL: i16 = 0x20;
     const STDIN: c_int = 0;
     const STDOUT: c_int = 1;
     /// How long to wait for the rest of an escape sequence before treating
@@ -738,6 +814,59 @@ mod sys {
         original: Termios,
         decoder: Decoder,
         last_size: (u16, u16),
+        /// When the rest of an escape sequence was first waited for: kept
+        /// across a wait that something else ended.
+        more_since: Option<Instant>,
+        /// The descriptors of the last wait, kept for the next.
+        polled: Vec<PollFd>,
+    }
+
+    /// Waits up to `timeout_ms` for `input` to be readable or one of
+    /// `wake`'s descriptors ready, through `polled`, adding those ready to
+    /// `wake.ready`; true if `input` is.
+    fn wait_on(polled: &mut Vec<PollFd>, input: Option<c_int>, timeout_ms: c_int, wake: &mut Wake) -> io::Result<bool> {
+        polled.clear();
+        if let Some(fd) = input {
+            polled.push(PollFd { fd, events: POLLIN, revents: 0 });
+        }
+        // Each descriptor once: macOS reports only one of two entries for
+        // the same one.
+        for &(fd, flags) in &wake.fds {
+            let events = if flags & READ != 0 { POLLIN } else { 0 } | if flags & WRITE != 0 { POLLOUT } else { 0 };
+            match polled.iter_mut().find(|p| p.fd == fd) {
+                Some(p) => p.events |= events,
+                None => polled.push(PollFd { fd, events, revents: 0 }),
+            }
+        }
+        if polled.is_empty() {
+            return Ok(false);
+        }
+        // SAFETY: as many valid pollfds as given.
+        let r = unsafe { poll(polled.as_mut_ptr(), polled.len() as NfdsT, timeout_ms) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            // A signal (e.g. SIGWINCH) interrupted the wait.
+            return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
+        }
+        for i in 0..wake.fds.len() {
+            let (fd, asked) = wake.fds[i];
+            let Some(p) = polled.iter().find(|p| p.fd == fd) else { continue };
+            // Only the ways it waits: input shares an entry with it.
+            let flags = (if p.revents & POLLIN != 0 { READ } else { 0 }
+                | if p.revents & POLLOUT != 0 { WRITE } else { 0 })
+                & asked
+                | if p.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 { ERROR } else { 0 };
+            if flags != 0 {
+                wake.add_ready(fd, flags);
+            }
+        }
+        // Its end or an error is for the read that follows to report; room
+        // to write is a descriptor's sharing its entry.
+        Ok(input.is_some() && polled[0].revents & !POLLOUT != 0)
+    }
+
+    pub fn check(wake: &mut Wake) -> io::Result<()> {
+        wait_on(&mut Vec::new(), None, 0, wake).map(drop)
     }
 
     /// Reads what `fd` has into `pending`. The end of input is an error:
@@ -785,7 +914,8 @@ mod sys {
                 signal(SIGHUP, on_end as extern "C" fn(c_int) as usize);
                 signal(SIGTERM, on_end as extern "C" fn(c_int) as usize);
             }
-            let mut m = Self { original, decoder: Decoder::default(), last_size: (0, 0) };
+            let mut m =
+                Self { original, decoder: Decoder::default(), last_size: (0, 0), more_since: None, polled: Vec::new() };
             m.last_size = m.size();
             Ok(m)
         }
@@ -812,50 +942,61 @@ mod sys {
             if r != 0 || ws.cols == 0 || ws.rows == 0 { (80, 24) } else { (ws.cols, ws.rows) }
         }
 
-        fn wait_readable(timeout_ms: c_int) -> io::Result<bool> {
-            let mut fd = PollFd { fd: STDIN, events: POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd.
-            let r = unsafe { poll(&mut fd, 1, timeout_ms) };
-            if r < 0 {
-                let e = io::Error::last_os_error();
-                // A signal (e.g. SIGWINCH) interrupted the wait.
-                return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
-            }
-            Ok(r > 0)
+        /// Waits up to `timeout_ms` for input (if `input`) or one of
+        /// `wake`'s descriptors, adding those ready to its `ready`; true if
+        /// input is waiting.
+        fn wait(&mut self, timeout_ms: c_int, input: bool, wake: &mut Wake) -> io::Result<bool> {
+            wait_on(&mut self.polled, input.then_some(STDIN), timeout_ms, wake)
         }
 
         fn fill(&mut self) -> io::Result<()> {
             read_into(STDIN, &mut self.decoder.pending)
         }
 
-        pub fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        pub fn poll(&mut self, timeout: Duration, wake: &mut Wake) -> io::Result<Option<Event>> {
             let size = self.size();
             if size != self.last_size {
                 self.last_size = size;
                 return Ok(Some(Event::Resize));
             }
             let mut waited = false;
-            let mut more_since = None;
+            // Every wait of this call ends by the caller's timeout.
+            let start = Instant::now();
+            let until = || timeout.saturating_sub(start.elapsed()).as_millis().min(i32::MAX as u128) as c_int;
             loop {
                 match self.decoder.next() {
-                    Next::Event(e) => return Ok(Some(e)),
-                    Next::Empty if waited => return Ok(None),
+                    Next::Event(e) => {
+                        self.more_since = None;
+                        return Ok(Some(e));
+                    }
+                    // A sequence skipped whole leaves no deadline behind.
+                    Next::Empty if waited => {
+                        self.more_since = None;
+                        return Ok(None);
+                    }
                     Next::Empty => {
+                        self.more_since = None;
                         waited = true;
-                        let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
-                        if !Self::wait_readable(ms)? {
+                        if !self.wait(until(), true, wake)? {
                             return Ok(None);
                         }
                         self.fill()?;
                     }
                     // The rest of a sequence has ESC_TIMEOUT_MS from when it
-                    // was first waited for, however its bytes trickle in.
+                    // was first waited for, however its bytes trickle in,
+                    // and whatever else ends a wait meanwhile: a descriptor,
+                    // or the caller's timeout coming first.
                     Next::More => {
-                        let since = *more_since.get_or_insert_with(Instant::now);
-                        let left = ESC_TIMEOUT_MS - since.elapsed().as_millis().min(ESC_TIMEOUT_MS as u128) as c_int;
-                        if left > 0 && Self::wait_readable(left)? {
+                        let since = *self.more_since.get_or_insert_with(Instant::now);
+                        let left = |since: Instant| {
+                            ESC_TIMEOUT_MS - since.elapsed().as_millis().min(ESC_TIMEOUT_MS as u128) as c_int
+                        };
+                        if left(since) > 0 && self.wait(left(since).min(until()), true, wake)? {
                             self.fill()?;
+                        } else if left(since) > 0 {
+                            return Ok(None);
                         } else {
+                            self.more_since = None;
                             return Ok(self.decoder.timed_out());
                         }
                     }
@@ -868,6 +1009,46 @@ mod sys {
     mod tests {
         use super::*;
         use std::os::fd::AsRawFd;
+
+        unsafe extern "C" {
+            fn pipe(fds: *mut c_int) -> c_int;
+            fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
+            fn close(fd: c_int) -> c_int;
+        }
+
+        #[test]
+        fn a_wait_wakes_for_descriptors_with_their_flags() {
+            let mut fds = [0; 2];
+            // SAFETY: room for two descriptors.
+            assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+            let [r, w] = fds;
+            let mut polled = Vec::new();
+            let mut wake = Wake { fds: vec![(r, READ), (w, WRITE)], ..Wake::default() };
+            // Nothing to read yet; room to write.
+            assert!(!wait_on(&mut polled, None, 0, &mut wake).unwrap());
+            assert_eq!(wake.ready, [(w, WRITE)]);
+            // SAFETY: a byte from a static, to the pipe's write end.
+            assert_eq!(unsafe { write(w, b"x".as_ptr().cast(), 1) }, 1);
+            let mut also = Wake { fds: vec![(r, READ)], ..Wake::default() };
+            assert!(wait_on(&mut polled, Some(r), 1000, &mut also).unwrap(), "input readable");
+            assert_eq!(also.ready, [(r, READ)]);
+            assert!(!wait_on(&mut polled, None, 0, &mut wake).unwrap());
+            assert_eq!(wake.ready, [(w, WRITE), (r, READ)], "kept until emptied, merged");
+            // Input's own descriptor waited on for writing too: input is
+            // what is readable, the descriptor what is writable.
+            let mut both = Wake { fds: vec![(w, WRITE), (r, WRITE)], ..Wake::default() };
+            assert!(wait_on(&mut polled, Some(r), 1000, &mut both).unwrap());
+            assert_eq!(both.ready, [(w, WRITE)], "a read end is never writable");
+            // Nothing to wait on: no wait.
+            let start = Instant::now();
+            assert!(!wait_on(&mut polled, None, 1000, &mut Wake::default()).unwrap());
+            assert!(start.elapsed() < Duration::from_millis(500));
+            // SAFETY: descriptors this test opened, closed once.
+            unsafe {
+                close(r);
+                close(w);
+            }
+        }
 
         #[test]
         fn input_is_read_and_its_end_is_an_error() {
@@ -890,12 +1071,16 @@ mod sys {
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod sys {
-    use super::Event;
+    use super::{Event, Wake};
     use std::io;
     use std::time::Duration;
 
     pub fn end_requested() -> bool {
         false
+    }
+
+    pub fn check(_wake: &mut Wake) -> io::Result<()> {
+        Ok(())
     }
 
     pub struct RawMode;
@@ -911,7 +1096,7 @@ mod sys {
         pub fn size(&self) -> (u16, u16) {
             (80, 24)
         }
-        pub fn poll(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+        pub fn poll(&mut self, _timeout: Duration, _wake: &mut Wake) -> io::Result<Option<Event>> {
             Ok(None)
         }
     }

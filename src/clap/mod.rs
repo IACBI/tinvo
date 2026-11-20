@@ -13,6 +13,7 @@ pub mod host;
 pub mod library;
 pub mod scan;
 pub mod slot;
+pub mod window;
 
 /// What a plugin is for, from its descriptor's features: it can be more
 /// than one, or none TINVO knows.

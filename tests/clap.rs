@@ -1013,6 +1013,7 @@ struct GuiStats {
     width: u32,
     height: u32,
     broken: u32,
+    parent: u64,
 }
 
 #[repr(C)]
@@ -1461,6 +1462,180 @@ fn a_floating_plugin_window_and_what_its_plugin_leaves_registered() {
     assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
     host.dispatch(Instant::now() + Duration::from_secs(1), &[(0, CLAP_POSIX_FD_READ)]);
     assert_eq!(GuiProbe::of(&other).stats().broken, 0, "every instance");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Win32 functions the native window test checks windows with.
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Default, Debug)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        pub fn IsWindow(hwnd: *mut c_void) -> i32;
+        pub fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        pub fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        pub fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        pub fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+        pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+
+    /// Its client area's size.
+    pub fn client(hwnd: *mut c_void) -> (i32, i32) {
+        let mut r = Rect::default();
+        // SAFETY: a window of this thread, and room for its rectangle.
+        unsafe { GetClientRect(hwnd, &mut r) };
+        (r.right, r.bottom)
+    }
+
+    /// Sizes it as a user's drag would, to a client area of `w` by `h`.
+    pub fn drag(hwnd: *mut c_void, w: i32, h: i32) {
+        let (mut outer, (cw, ch)) = (Rect::default(), client(hwnd));
+        // SAFETY: as above; SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE.
+        unsafe {
+            GetWindowRect(hwnd, &mut outer);
+            let (fw, fh) = (outer.right - outer.left - cw, outer.bottom - outer.top - ch);
+            SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, w + fw, h + fh, 0x2 | 0x4 | 0x10);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_windows() {
+    use tinvo::clap::window::Windows;
+    let dir = temp_dir("gui-win32");
+    let file = install(&dir, "gui");
+    let mut host = PluginHost::new();
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let probe = GuiProbe::of(&gain);
+    assert_eq!(Windows::api(), Some(CLAP_WINDOW_API_WIN32));
+    let mut windows = Windows::new();
+    // Put in a window of its size, shown.
+    assert_eq!(windows.open(gain.handle(), "Test Gain"), Ok(GuiMode::Embedded));
+    assert!(windows.is_open(gain.token()));
+    let hwnd = probe.stats().parent as *mut std::ffi::c_void;
+    // SAFETY: a window handle, checked for what it is.
+    assert!(unsafe { win32::IsWindow(hwnd) != 0 && win32::IsWindowVisible(hwnd) != 0 });
+    assert_eq!(win32::client(hwnd), (300, 200));
+    assert!(probe.log().iter().any(|l| l.starts_with("scale ")), "told its monitor's scale");
+    assert_eq!(windows.open(gain.handle(), "again"), Ok(GuiMode::Embedded), "open already");
+    // Its own sizing reaches it as no drag.
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert!(!probe.log().iter().any(|l| l.starts_with("size")));
+    // Dragged: the plugin takes the nearest size it can, and the window
+    // follows; that is no drag either.
+    win32::drag(hwnd, 455, 333);
+    windows.pump();
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 450x330"));
+    assert_eq!(win32::client(hwnd), (450, 330));
+    windows.pump();
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // Asked for by the plugin: it gets that exact size, or the request
+    // fails and the window keeps its own (a captioned one has a least
+    // width).
+    assert!(probe.poke(0, 200, 120));
+    assert_eq!(win32::client(hwnd), (200, 120));
+    assert!(!probe.poke(0, 20, 120));
+    assert_eq!(win32::client(hwnd), (200, 120));
+    windows.pump();
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // Moved to a monitor of twice the scale: put where Windows suggests,
+    // the plugin told, and the window the size the plugin has.
+    let mut suggested = win32::Rect::default();
+    // SAFETY: a window of this thread, and room for its rectangle.
+    unsafe { win32::GetWindowRect(hwnd, &mut suggested) };
+    (suggested.left, suggested.top) = (suggested.left + 30, suggested.top + 20);
+    (suggested.right, suggested.bottom) = (suggested.right + 90, suggested.bottom + 60);
+    // SAFETY: a window of this thread; WM_DPICHANGED with 192 DPI both
+    // ways and the (larger) rectangle Windows would suggest.
+    unsafe { win32::SendMessageW(hwnd, 0x02E0, 192 | 192 << 16, &raw mut suggested as isize) };
+    windows.pump();
+    assert_eq!(probe.log().last().map(String::as_str), Some("scale 2"));
+    assert_eq!(win32::client(hwnd), (200, 120), "the size the plugin has");
+    let mut now = win32::Rect::default();
+    // SAFETY: as above.
+    unsafe { win32::GetWindowRect(hwnd, &mut now) };
+    assert_eq!((now.left, now.top), (suggested.left, suggested.top), "where Windows suggests");
+    // Dragged, by a plugin that takes a size narrower than the window can
+    // be (it refused 20 above): both go back to the size they agreed.
+    assert!(probe.poke(10, 8, 0));
+    win32::drag(hwnd, 249, 125);
+    windows.pump();
+    assert_eq!(probe.log()[probe.log().len() - 2..], ["size 10x120", "size 200x120"]);
+    assert_eq!(win32::client(hwnd), (200, 120));
+    // In Windows' own loop for a drag: its sizes served as they come, a
+    // size TINVO sets no drag of its own, and the plugin's own resize
+    // meanwhile answered.
+    // SAFETY: a window of this thread; WM_ENTERSIZEMOVE.
+    unsafe { win32::SendMessageW(hwnd, 0x0231, 0, 0) };
+    win32::drag(hwnd, 305, 205);
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 300x200"), "before any pump");
+    assert_eq!(win32::client(hwnd), (300, 200));
+    assert!(probe.poke(0, 400, 250));
+    assert_eq!(win32::client(hwnd), (400, 250));
+    // SAFETY: as above; WM_EXITSIZEMOVE.
+    unsafe { win32::SendMessageW(hwnd, 0x0232, 0, 0) };
+    let sizes = probe.log().iter().filter(|l| l.starts_with("size")).count();
+    windows.pump();
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), sizes, "nothing left over");
+    assert_eq!(win32::client(hwnd), (400, 250));
+    // What one set's window recorded waits for that set.
+    let other = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let mut others = Windows::new();
+    others.open(other.handle(), "Other Gain").unwrap();
+    let other_hwnd = GuiProbe::of(&other).stats().parent as *mut std::ffi::c_void;
+    // SAFETY: a window of this thread; WM_CLOSE, handled at once.
+    unsafe { win32::SendMessageW(other_hwnd, 0x0010, 0, 0) };
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert_eq!(others.pump(), [other.token()]);
+    drop(others);
+    drop(other);
+    // Closed by the user: the plugin's window goes, then TINVO's.
+    // SAFETY: a window of this thread; WM_CLOSE.
+    assert!(unsafe { win32::PostMessageW(hwnd, 0x0010, 0, 0) } != 0);
+    // SAFETY: as above.
+    assert!(unsafe { win32::IsWindow(hwnd) } != 0, "standing until it is served");
+    assert_eq!(windows.pump(), [gain.token()]);
+    assert_eq!(probe.log()[probe.log().len() - 2..], ["hide", "destroy"]);
+    // SAFETY: a handle, checked.
+    assert!(unsafe { win32::IsWindow(hwnd) } == 0);
+    assert!(!windows.is_open(gain.token()));
+    // A close the user asked for that TINVO's closing and opening it again
+    // overtook is no close of the new window.
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    let hwnd = probe.stats().parent as *mut std::ffi::c_void;
+    // SAFETY: a window of this thread; WM_CLOSE, handled at once.
+    unsafe { win32::SendMessageW(hwnd, 0x0010, 0, 0) };
+    windows.close(gain.token());
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert!(windows.is_open(gain.token()));
+    // Closed with the set, or by its plugin: let go of either way.
+    let hwnd = probe.stats().parent as *mut std::ffi::c_void;
+    drop(windows);
+    // SAFETY: a handle, checked.
+    assert!(unsafe { win32::IsWindow(hwnd) } == 0);
+    assert_eq!(probe.log().last().map(String::as_str), Some("destroy"));
+    let mut windows = Windows::new();
+    windows.open(gain.handle(), "Test Gain").unwrap();
+    assert!(probe.poke(3, 1, 0));
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(windows.pump(), Vec::<u64>::new());
+    assert!(!windows.is_open(gain.token()));
+    assert_eq!(probe.stats().broken, 0, "every window call by CLAP's rules");
+    drop(windows);
+    drop(gain);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
