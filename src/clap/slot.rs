@@ -35,6 +35,9 @@ pub struct PluginSlot {
     held: Held,
     waiting: [Change; WAITING],
     waiting_count: usize,
+    /// The last serial refused while changes waited, acknowledged once
+    /// they are handed over.
+    refused: u64,
 }
 
 impl fmt::Debug for PluginSlot {
@@ -58,6 +61,7 @@ impl PluginSlot {
             held: Held::Empty,
             waiting: [Change::default(); WAITING],
             waiting_count: 0,
+            refused: 0,
         }
     }
 
@@ -111,6 +115,17 @@ impl PluginSlot {
         }
     }
 
+    /// Acknowledges `serial` with nothing set, as a change the instance
+    /// here, or the one lent out once it is back, refused. Real-time safe.
+    pub fn acknowledge(&mut self, serial: u64) {
+        self.hand_over();
+        match &mut self.held {
+            Held::Playing(i) if self.waiting_count == 0 => i.acknowledge(serial),
+            Held::Playing(_) | Held::Lent(_) => self.refused = self.refused.max(serial),
+            Held::Empty => {}
+        }
+    }
+
     /// Keeps `change` for later, replacing one waiting for its parameter.
     fn wait(&mut self, change: Change) -> bool {
         let n = self.waiting_count;
@@ -138,6 +153,9 @@ impl PluginSlot {
             }
         }
         self.waiting_count = kept;
+        if kept == 0 && self.refused > 0 {
+            i.acknowledge(std::mem::take(&mut self.refused));
+        }
     }
 
     /// Whether this slot's plugin, role and sample rate are `instance`'s.
@@ -190,6 +208,7 @@ impl PluginSlot {
     fn take_and(&mut self, next: Held) -> Option<Box<Instance>> {
         // What waited was for the instance lent, whatever comes next.
         self.waiting_count = 0;
+        self.refused = 0;
         match std::mem::replace(&mut self.held, next) {
             Held::Playing(mut i) => {
                 i.stop();

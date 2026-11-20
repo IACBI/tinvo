@@ -2252,12 +2252,15 @@ impl Engine {
                 l.applied.is_some() && l.target.and_then(|x| x.plugin_param(i as u8)) == Some((place, plugin, id))
             })
         };
-        if self.tracks[..n].iter().enumerate().any(named) {
-            return;
-        }
+        let held = self.tracks[..n].iter().enumerate().any(named);
         let Self { tracks, groups, group_count, master_chain, .. } = self;
         if let Some(s) = plugin_slot_at(&mut tracks[..n], &mut groups[..*group_count], master_chain, place, plugin) {
-            s.set_param(id, value, serial);
+            // Refused, it is still acknowledged: the editor waits on it.
+            if held {
+                s.acknowledge(serial);
+            } else {
+                s.set_param(id, value, serial);
+            }
         }
     }
 
