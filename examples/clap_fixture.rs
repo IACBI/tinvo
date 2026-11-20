@@ -237,7 +237,9 @@ struct Gui {
     gone: bool,
     /// Closes it from inside the next call: 1 `show`, 2 `create`; or 3
     /// asks for 777x555 inside the next `set_size`; or 4 unregisters the
-    /// timers `poke` kept inside the next timer's call.
+    /// timers `poke` kept inside the next timer's call; 5 closes it inside
+    /// the next `adjust_size`; 6 asks for 777x555 inside the next `show`;
+    /// 7 closes it inside the next `can_resize`.
     trap: u32,
     /// Its pipe's read and write ends, the read end registered.
     pipe: Option<(i32, i32)>,
@@ -255,6 +257,8 @@ pub struct GuiStats {
     pub fd: i32,
     pub width: u32,
     pub height: u32,
+    /// Rules broken by every instance of this file, those gone too.
+    pub broken: u32,
 }
 
 #[repr(C)]
@@ -524,6 +528,9 @@ unsafe extern "C" fn gui_can_resize(p: *const ClapPlugin) -> bool {
     let me = unsafe { me(p) };
     me.on_window();
     me.require(embedded(me));
+    if me.sprung(7) {
+        me.closed_by_user();
+    }
     true
 }
 
@@ -546,6 +553,9 @@ unsafe extern "C" fn gui_adjust_size(p: *const ClapPlugin, width: *mut u32, heig
     unsafe {
         width.write((*width / 10 * 10).max(10));
         height.write((*height / 10 * 10).max(10));
+    }
+    if me.sprung(5) {
+        me.closed_by_user();
     }
     true
 }
@@ -610,6 +620,11 @@ unsafe extern "C" fn gui_show(p: *const ClapPlugin) -> bool {
     if me.sprung(1) {
         me.closed_by_user();
     }
+    if me.sprung(6) {
+        // SAFETY: the host's own extension.
+        let host = unsafe { me.host_extension(CLAP_EXT_GUI).cast::<ClapHostGui>().as_ref() };
+        me.require(host.and_then(|h| h.request_resize).is_some_and(|f| unsafe { f(me.host, 777, 555) }));
+    }
     true
 }
 
@@ -672,6 +687,7 @@ unsafe extern "C" fn gui_stats(p: *const ClapPlugin, out: *mut GuiStats) {
         fd: g.pipe.map_or(-1, |p| p.0),
         width: g.size.0,
         height: g.size.1,
+        broken: BROKEN.load(Ordering::Relaxed),
     };
     unsafe { out.write(stats) };
 }

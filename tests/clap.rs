@@ -1012,6 +1012,7 @@ struct GuiStats {
     fd: i32,
     width: u32,
     height: u32,
+    broken: u32,
 }
 
 #[repr(C)]
@@ -1202,9 +1203,13 @@ fn a_plugin_window_is_embedded_in_one_of_tinvo_s() {
     host.poll();
     assert_eq!(probe.log().last().map(String::as_str), Some("hide"));
     assert_eq!(taken(&parent), ["hide"]);
+    // Shown with a size taken from another thread waiting, and asking for
+    // another while it shows: the later one stands.
+    assert!(probe.poke(10, 6, 0));
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
     assert!(probe.poke(1, 0, 0));
     host.poll();
-    assert_eq!(taken(&parent), ["show"]);
+    assert_eq!(taken(&parent), ["resize 777x555", "show"]);
     assert!(probe.poke(4, 0, 0));
     host.poll();
     assert_eq!(taken(&parent), ["resizable true"]);
@@ -1237,7 +1242,7 @@ fn a_plugin_window_is_embedded_in_one_of_tinvo_s() {
     assert_eq!(taken(&parent), ["resizable true", "resize 300x200", "show"]);
     handle.gui_close();
     gain.stop();
-    assert_eq!(stats(&gain).broken, 0, "every window call by CLAP's rules");
+    assert_eq!(probe.stats().broken, 0, "every window call by CLAP's rules");
     drop(gain);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1288,6 +1293,19 @@ fn a_plugin_window_closed_by_its_plugin_or_with_it_is_destroyed_once() {
     handle.gui_close();
     assert_eq!(probe.log()[before..], ["closed by the user", "destroy"]);
     assert_eq!(host.poll(), [], "closed by TINVO, not reported");
+    // Destroyed by the user while it takes a drag: not sized after.
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert!(probe.poke(10, 5, 0));
+    let before = probe.log().len();
+    handle.gui_resized(455, 333);
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(probe.log()[before..], ["closed by the user", "destroy"]);
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert!(probe.poke(10, 7, 0));
+    handle.gui_resized(455, 333);
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
     // Closed only: hidden, then destroyed, as TINVO keeps no hidden window.
     let (_, _, make) = inert();
     handle.gui_open(api, "Test Gain", make).unwrap();
@@ -1327,7 +1345,7 @@ fn a_plugin_window_closed_by_its_plugin_or_with_it_is_destroyed_once() {
     assert_eq!(handle.gui_support(api), GuiSupport::default());
     handle.gui_resized(10, 10);
     handle.gui_close();
-    assert_eq!(stats(&other).broken, 0, "destroyed with its window gone first");
+    assert_eq!(GuiProbe::of(&other).stats().broken, 0, "every instance, destroyed with its window gone first");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1409,7 +1427,7 @@ fn a_plugin_s_timers_and_descriptors_are_served_on_the_main_thread() {
     } else {
         assert!(!probe.poke(7, 1000, CLAP_POSIX_FD_READ), "no descriptors on Windows");
     }
-    assert_eq!(stats(&gain).broken, 0);
+    assert_eq!(probe.stats().broken, 0);
     drop(gain);
     // An instance made for an offline render is offered neither.
     // SAFETY: the test plugin, loaded only through plugin hosts here.
@@ -1442,7 +1460,7 @@ fn a_floating_plugin_window_and_what_its_plugin_leaves_registered() {
     drop(gain);
     assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
     host.dispatch(Instant::now() + Duration::from_secs(1), &[(0, CLAP_POSIX_FD_READ)]);
-    assert_eq!(stats(&other).broken, 0);
+    assert_eq!(GuiProbe::of(&other).stats().broken, 0, "every instance");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

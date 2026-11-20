@@ -384,7 +384,15 @@ impl HostData {
     /// and new resize hints. On the main thread, from [`PluginHost::poll`].
     pub(super) fn serve_gui(&self, plugin: *const ClapPlugin, requests: &mut Vec<Request>) {
         let Some(gui) = self.exts.get().and_then(|e| e.gui) else { return };
-        let asked = std::mem::take(&mut *lock(&self.gui.asked));
+        // A resize stays asked for until it is served, so one the plugin
+        // gets on the main thread meanwhile (inside `show`, say) cancels it.
+        let asked = {
+            let mut a = lock(&self.gui.asked);
+            let resize = a.resize.take();
+            let asked = std::mem::take(&mut *a);
+            a.resize = resize;
+            asked
+        };
         if !self.gui.is_open.load(Ordering::Acquire) {
             return;
         }
@@ -404,9 +412,7 @@ impl HostData {
         if self.gui.gone.load(Ordering::Acquire) {
             return closed(requests);
         }
-        // Taken now, so one the plugin got on the main thread meanwhile
-        // has cancelled it.
-        let resize = lock(&self.gui.asked).resize.take().or(asked.resize);
+        let resize = lock(&self.gui.asked).resize.take();
         if let Some((w, h)) = resize {
             let refused = {
                 let mut open = lock(&self.gui.open);
@@ -433,7 +439,7 @@ impl HostData {
         }
         if asked.hints {
             // SAFETY: as above.
-            let hints = unsafe { resize_hints(plugin, gui) };
+            let hints = unsafe { resize_hints(self, plugin, gui) };
             if let Some(p) = lock(&self.gui.open).as_mut().and_then(|o| o.parent.as_mut()) {
                 p.set_resizable(hints);
             }
@@ -457,14 +463,15 @@ impl HostData {
     }
 }
 
-/// How an embedded plugin window may be resized: `None` if not at all.
+/// How an embedded plugin window may be resized: `None` if not at all, or
+/// if the plugin destroys it meanwhile (which the caller checks).
 ///
 /// # Safety
 /// Main thread, `plugin` live, `gui` its own.
-unsafe fn resize_hints(plugin: *const ClapPlugin, gui: GuiFns) -> Option<ClapGuiResizeHints> {
+unsafe fn resize_hints(h: &HostData, plugin: *const ClapPlugin, gui: GuiFns) -> Option<ClapGuiResizeHints> {
     // SAFETY: by the caller's promise.
     unsafe {
-        if !gui.can_resize.is_some_and(|f| f(plugin)) {
+        if !gui.can_resize.is_some_and(|f| f(plugin)) || h.gui.gone.load(Ordering::Acquire) {
             return None;
         }
         let both =
@@ -597,7 +604,7 @@ impl PluginHandle {
             if gone() {
                 return closed();
             }
-            let hints = resize_hints(plugin, gui);
+            let hints = resize_hints(h, plugin, gui);
             let (mut w, mut hgt) = (0, 0);
             if gone() {
                 return closed();
@@ -671,11 +678,12 @@ impl PluginHandle {
         let (mut w, mut h) = (width, height);
         // SAFETY: main thread, a live plugin, embedded.
         let fitted = unsafe {
-            match (resize_hints(plugin, gui), gui.adjust_size, gui.set_size) {
+            // Destroyed by the plugin between any two calls: no more calls.
+            match (resize_hints(&self.host, plugin, gui), gui.adjust_size, gui.set_size) {
                 (Some(_), Some(adjust), Some(set)) => {
-                    adjust(plugin, &mut w, &mut h) && w > 0 && h > 0 && set(plugin, w, h)
+                    adjust(plugin, &mut w, &mut h) && w > 0 && h > 0 && !gone() && set(plugin, w, h)
                 }
-                (Some(_), None, Some(set)) => set(plugin, w, h),
+                (Some(_), None, Some(set)) => !gone() && set(plugin, w, h),
                 _ => false,
             }
         };
