@@ -1691,7 +1691,16 @@ mod x11 {
         sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
         send_event: unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_long, *mut ClientMessage) -> c_int,
         intern_atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong,
+        create_simple_window: CreateSimpleWindow,
+        change_property:
+            unsafe extern "C" fn(*mut c_void, c_ulong, c_ulong, c_ulong, c_int, c_int, *const u8, c_int) -> c_int,
+        select_input: unsafe extern "C" fn(*mut c_void, c_ulong, c_long) -> c_int,
+        pending: unsafe extern "C" fn(*mut c_void) -> c_int,
+        next_event: unsafe extern "C" fn(*mut c_void, *mut ClientMessage) -> c_int,
     }
+
+    type CreateSimpleWindow =
+        unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_int, c_uint, c_uint, c_uint, c_ulong, c_ulong) -> c_ulong;
 
     /// # Safety
     /// `T` is the type of the function `name` names.
@@ -1719,6 +1728,11 @@ mod x11 {
                     sync: symbol(lib, c"XSync"),
                     send_event: symbol(lib, c"XSendEvent"),
                     intern_atom: symbol(lib, c"XInternAtom"),
+                    create_simple_window: symbol(lib, c"XCreateSimpleWindow"),
+                    change_property: symbol(lib, c"XChangeProperty"),
+                    select_input: symbol(lib, c"XSelectInput"),
+                    pending: symbol(lib, c"XPending"),
+                    next_event: symbol(lib, c"XNextEvent"),
                 }
             }
         }
@@ -1768,6 +1782,51 @@ mod x11 {
             }
         }
 
+        fn atom(&self, name: &CStr) -> c_ulong {
+            // SAFETY: an open display and a NUL-terminated name.
+            unsafe { (self.intern_atom)(self.display, name.as_ptr(), 0) }
+        }
+
+        /// Makes a window in `parent`, unmapped, as a plugin speaking
+        /// XEmbed would (asking to be mapped), and watches it.
+        pub fn xembed_child(&self, parent: u64) -> u64 {
+            // SAFETY: an open display, a window of the server's, and the
+            // property's two longs.
+            unsafe {
+                let child = (self.create_simple_window)(self.display, parent as c_ulong, 0, 0, 10, 10, 0, 0, 0);
+                let info = self.atom(c"_XEMBED_INFO");
+                let data: [c_long; 2] = [0, 1];
+                (self.change_property)(self.display, child, info, info, 32, 0, data.as_ptr().cast(), 2);
+                (self.select_input)(self.display, child, 1 << 17);
+                (self.sync)(self.display, 0);
+                child
+            }
+        }
+
+        /// What happened to `window` since it was watched, as words.
+        pub fn events(&self, window: u64) -> Vec<String> {
+            let xembed = self.atom(c"_XEMBED");
+            let mut seen = Vec::new();
+            // SAFETY: an open display and room for one event; each kind
+            // read is laid out as the one it names.
+            unsafe {
+                (self.sync)(self.display, 0);
+                while (self.pending)(self.display) > 0 {
+                    let mut ev: ClientMessage = std::mem::zeroed();
+                    (self.next_event)(self.display, &mut ev);
+                    match ev.kind {
+                        33 if ev.window == window as c_ulong && ev.message_type == xembed => {
+                            seen.push(format!("xembed {} in {}", ev.data[1], ev.data[3]));
+                        }
+                        // `MapNotify`, its window where a client message has it.
+                        19 if ev.window == window as c_ulong => seen.push("mapped".into()),
+                        _ => {}
+                    }
+                }
+            }
+            seen
+        }
+
         /// Whether `fd` has something to read within a second.
         pub fn readable(&self, fd: i32) -> bool {
             let mut p = PollFd { fd, events: 1, revents: 0 };
@@ -1781,11 +1840,13 @@ mod x11 {
 #[test]
 fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_x11() {
     use tinvo::clap::window::Windows;
-    if std::env::var_os("DISPLAY").is_none() {
-        assert!(std::env::var_os("TINVO_REQUIRE_X11").is_none(), "an X display to test on");
-        eprintln!("skipped: no X display");
+    // A window manager would answer the sizes asked for: the test needs a
+    // server with none, which CI starts (Xvfb).
+    if std::env::var_os("TINVO_REQUIRE_X11").is_none() {
+        eprintln!("skipped: set TINVO_REQUIRE_X11, with DISPLAY on an X server without a window manager");
         return;
     }
+    assert!(std::env::var_os("DISPLAY").is_some(), "an X display to test on");
     let dir = temp_dir("gui-x11");
     let file = install(&dir, "gui");
     let mut host = PluginHost::new();
@@ -1818,12 +1879,27 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_x11() {
     assert_eq!(x.size(window), Some((200, 120)));
     windows.pump();
     assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
-    // Closed by the user: the plugin's window goes, then TINVO's.
+    // A plugin window speaking XEmbed: told once it is embedded, in which
+    // window, and mapped as it asks, when the window is shown.
+    let child = x.xembed_child(window);
+    assert!(probe.poke(2, 0, 0));
+    host.poll();
+    assert!(probe.poke(1, 0, 0));
+    host.poll();
+    assert_eq!(x.events(child), [format!("xembed 0 in {window}"), "mapped".into()]);
+    assert!(probe.poke(2, 0, 0) && probe.poke(1, 0, 0));
+    host.poll();
+    assert_eq!(probe.log().last().map(String::as_str), Some("show"));
+    assert_eq!(x.events(child), Vec::<String>::new(), "told once");
+    // Closed by the user: the plugin's window goes, then TINVO's, which
+    // takes nothing of the plugin's with it (the plugin's destruction may
+    // be on its way still).
     x.close(window);
     assert!(x.readable(fd));
     assert_eq!(windows.pump(), [gain.token()]);
     assert_eq!(probe.log()[probe.log().len() - 2..], ["hide", "destroy"]);
     assert_eq!(x.size(window), None);
+    assert_eq!(x.size(child), Some((10, 10)), "moved out first");
     assert!(!windows.is_open(gain.token()));
     // A close the user asked for that TINVO's closing and opening it again
     // overtook is no close of the new window.

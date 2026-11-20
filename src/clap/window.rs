@@ -43,6 +43,10 @@ mod platform {
     pub(super) fn descriptor() -> Option<i32> {
         None
     }
+
+    pub(super) fn queued() -> bool {
+        false
+    }
 }
 
 /// What a window of TINVO's recorded for the plugin window in it.
@@ -146,6 +150,21 @@ impl Windows {
     /// the tokens of the windows the user closed. Windows whose plugin
     /// closed them, or went, are let go of.
     pub fn pump(&mut self) -> Vec<u64> {
+        let mut closed = Vec::new();
+        // What serving them had the system read meanwhile is served too (X11
+        // reads events while it waits on the server for something else),
+        // in a few rounds at most.
+        for _ in 0..4 {
+            self.serve(&mut closed);
+            if !platform::queued() {
+                break;
+            }
+        }
+        closed
+    }
+
+    /// One round of [`Windows::pump`], adding the tokens closed to `closed`.
+    fn serve(&mut self, closed: &mut Vec<u64>) {
         let mut events = platform::pump(|token| self.is_open(token));
         // Only the last size of each window: the ones before are past.
         let mut i = events.len();
@@ -158,7 +177,6 @@ impl Windows {
                 }
             }
         }
-        let mut closed = Vec::new();
         for event in events {
             match event {
                 Event::Closed(token) => {
@@ -186,7 +204,6 @@ impl Windows {
             }
             open
         });
-        closed
     }
 }
 
