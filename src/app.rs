@@ -314,18 +314,14 @@ struct ParamChange {
     after: f64,
 }
 
-/// A value sent to a plugin from the panel, shown until the plugin has it.
+/// A value sent to a plugin from the panel, shown until the plugin has it
+/// (or refused it), and sent again to the instance a new engine gets.
 struct Pending {
     token: u64,
     id: u32,
     value: f64,
     serial: u64,
-    at: Instant,
 }
-
-/// How long a value sent to a plugin is shown in place of the plugin's
-/// own, at most: one the plugin never takes is let go.
-const PENDING_FOR: Duration = Duration::from_secs(1);
 
 /// What the editor knows of a parameter, to show and change it: a built-in
 /// one's spec, or a plugin's as its playing instance describes it.
@@ -981,6 +977,10 @@ pub struct App {
     live: Vec<Live>,
     /// Values sent to plugins from the panel that they may not have yet.
     pending: Vec<Pending>,
+    /// Values a plugin had yet to get when its engine went: the plugin
+    /// place, the plugin, the parameter and the value, sent again to the
+    /// instance made for that place, until every place has been given one.
+    carried: Vec<(PluginPlace, PluginRef, u32, f64)>,
     /// The serial of the last value sent to a plugin from the panel.
     serial: u64,
     /// The engine's [`Shared::latency_over`] as last seen.
@@ -1167,6 +1167,7 @@ impl App {
             ready: None,
             live: Vec::new(),
             pending: Vec::new(),
+            carried: Vec::new(),
             serial: 0,
             late: false,
             unsettled: false,
@@ -1293,8 +1294,15 @@ impl App {
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
         // A new engine has no instances: the old ones went with the old,
-        // whose states the new start from.
+        // whose states the new start from, and the values they had yet to
+        // get.
         self.sync_states();
+        let (live, plugins) = (&self.live, &self.plugins);
+        let carried = self.pending.iter().filter_map(|p| {
+            let place = live.iter().find(|l| l.handle.token() == p.token)?.place;
+            Some((place, plugins.plugin_of(p.token)?, p.id, p.value))
+        });
+        self.carried = carried.collect();
         self.live.clear();
         self.pending.clear();
         self.late = false;
@@ -1768,6 +1776,13 @@ impl App {
                     }
                     None => false,
                 });
+                self.carried.retain_mut(|c| match project::follow_place(c.0, &applied) {
+                    Some(p) => {
+                        c.0 = p;
+                        true
+                    }
+                    None => false,
+                });
                 // The plugin page follows its plugin, and goes back to the
                 // inserts when it goes.
                 if self.page == Page::Plugin {
@@ -1851,7 +1866,8 @@ impl App {
     fn sync_for_save(&mut self) -> Vec<String> {
         // Taken first: a value delivered while the state is saved may or
         // may not be in it.
-        let unsent = self.live.iter().any(|l| l.saves && l.handle.is_alive() && l.handle.delivered() < l.sent);
+        let unsent = !self.carried.is_empty()
+            || self.live.iter().any(|l| l.saves && l.handle.is_alive() && l.handle.delivered() < l.sent);
         let failed = self.sync_states();
         self.unsettled = unsent;
         failed
@@ -2622,8 +2638,8 @@ impl App {
         }
         let h = &self.live_at(place, plugin)?.handle;
         let (token, delivered) = (h.token(), h.delivered());
-        let sent = self.pending.iter().rev().find(|p| p.token == token && p.id == id);
-        match sent.filter(|p| p.serial > delivered && p.at.elapsed() < PENDING_FOR) {
+        let sent = self.pending.iter().find(|p| p.token == token && p.id == id);
+        match sent.filter(|p| p.serial > delivered) {
             Some(p) => Some(p.value),
             None => h.value(id),
         }
@@ -2645,7 +2661,8 @@ impl App {
         self.serial += 1;
         let serial = self.serial;
         if let Some(token) = self.live_at(place, plugin).map(|l| l.handle.token()) {
-            self.pending.push(Pending { token, id, value, serial, at: Instant::now() });
+            self.pending.retain(|p| p.token != token || p.id != id);
+            self.pending.push(Pending { token, id, value, serial });
             if let Some(l) = self.live.iter_mut().find(|l| l.handle.token() == token) {
                 l.sent = serial;
             }
@@ -3827,9 +3844,16 @@ impl App {
                 self.send(match place {
                     PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
                     PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
-                })
+                });
+                let ours = |c: &(PluginPlace, PluginRef, u32, f64)| c.0 == place && c.1 == plugin;
+                let (carried, others) = std::mem::take(&mut self.carried).into_iter().partition(ours);
+                self.carried = others;
+                for (_, _, id, value) in carried {
+                    self.send_plugin_param(place, plugin, id, value);
+                }
             }
             Err(e) => {
+                self.carried.retain(|c| c.0 != place);
                 let line = format!("{}: {} cannot load: {e}", self.place_text(place), self.plugins.name(plugin));
                 self.plugin_problem(line);
             }
@@ -3863,6 +3887,8 @@ impl App {
         for (place, plugin) in self.project.plugin_places() {
             self.attach_place(place, plugin);
         }
+        // For a place that has another plugin now, or none.
+        self.carried.clear();
         self.summarize_problems();
     }
 
@@ -3914,12 +3940,9 @@ impl App {
         let requests = self.plugins.poll();
         self.serve_plugins(requests);
         let live = &self.live;
-        self.pending.retain(|p| {
-            p.at.elapsed() < PENDING_FOR
-                && live.iter().any(|l| l.handle.token() == p.token && l.handle.delivered() < p.serial)
-        });
+        self.pending.retain(|p| live.iter().any(|l| l.handle.token() == p.token && l.handle.delivered() < p.serial));
         let settled = |l: &Live| !l.saves || !l.handle.is_alive() || l.handle.delivered() >= l.sent;
-        if self.unsettled && self.live.iter().all(settled) {
+        if self.unsettled && self.carried.is_empty() && self.live.iter().all(settled) {
             self.unsettled = false;
             self.touch();
         }
@@ -3945,6 +3968,7 @@ impl App {
             let Some(l) = self.live.iter().find(|l| l.handle.token() == token) else { continue };
             let Some(plugin) = self.plugins.plugin_of(token) else { continue };
             self.pending.retain(|p| p.token != token || p.id != id);
+            self.carried.retain(|c| c.1 != plugin || c.2 != id);
             if all {
                 // For every instance of the plugin: the history's places are
                 // its own, not today's.

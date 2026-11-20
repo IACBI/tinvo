@@ -103,16 +103,25 @@ impl PluginSlot {
     }
 
     /// Sets parameter `id` of the instance here ([`Instance::set_param`]),
-    /// or of the one lent out once it is back. False where there is none,
-    /// or it cannot take the change. Real-time safe.
+    /// or of the one lent out once it is back; one the instance has no room
+    /// for yet waits too. False where there is none, or it cannot take the
+    /// change. Real-time safe.
     pub fn set_param(&mut self, id: u32, value: f64, serial: u64) -> bool {
         self.hand_over();
         match &mut self.held {
             // Behind what still waits, so it is not overtaken.
-            Held::Playing(i) if self.waiting_count == 0 => i.set_param(id, value, serial),
-            Held::Playing(_) | Held::Lent(_) => self.wait(Change(id, value, serial)),
-            Held::Empty => false,
+            Held::Playing(i) if self.waiting_count == 0 => {
+                if i.set_param(id, value, serial) {
+                    return true;
+                }
+                if i.params_queued() < MAX_PARAM_EVENTS {
+                    return false;
+                }
+            }
+            Held::Playing(_) | Held::Lent(_) => {}
+            Held::Empty => return false,
         }
+        self.wait(Change(id, value, serial))
     }
 
     /// Acknowledges `serial` with nothing set, as a change the instance

@@ -981,6 +981,28 @@ fn a_parameter_change_reaches_a_plugin_not_processed_through_a_flush() {
 }
 
 #[test]
+fn a_change_with_no_room_yet_is_not_acknowledged() {
+    let dir = temp_dir("room");
+    let file = install(&dir, "many");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let handle = gain.handle();
+    for id in 100..100 + MAX_PARAM_EVENTS as u32 {
+        assert!(gain.set_param(id, 1.0, 1));
+    }
+    assert!(!gain.set_param(10, 0.25, 2), "no room");
+    processed(&mut gain, 8);
+    assert_eq!(handle.delivered(), 1, "for its sender to try again");
+    assert!(gain.set_param(10, 0.25, 2));
+    processed(&mut gain, 8);
+    assert_eq!((handle.delivered(), handle.value(10)), (2, Some(0.25)));
+    gain.stop();
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_handle_works_on_its_host_s_thread_while_the_plugin_plays_elsewhere() {
     let dir = temp_dir("handle");
     let file = install(&dir, "handle");
@@ -2113,6 +2135,16 @@ fn changes_kept_for_a_lent_instance_wait_for_room_in_its_queue() {
     lend(&mut e, 0.9);
     e.handle(set(0.3, 2));
     assert!((scaled_by(&mut e, &mut dry, 2000) - 0.3).abs() < 1e-4, "the last change");
+    // One for an instance back with no room waits for room too.
+    e.handle(EngineCommand::Lend(token));
+    let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+    lent.restart().unwrap();
+    for id in 100..100 + MAX_PARAM_EVENTS as u32 {
+        assert!(lent.set_param(id, 1.0, 0));
+    }
+    e.handle(EngineCommand::Return(lent));
+    e.handle(set(0.6, 3));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.6).abs() < 1e-4, "not dropped");
     drop(came_back(&mut rx));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3111,6 +3143,40 @@ fn a_plugin_page_stays_on_its_plugin_when_tracks_come_back() {
     let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
     assert_eq!(ed.app.project.tracks[1].lanes[0].target, Some(target));
     assert!(ed.app.project.tracks[0].lanes.iter().all(|l| l.target.is_none()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_value_the_plugin_had_yet_to_get_reaches_a_new_engine() {
+    let dir = temp_dir("editor-carried");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "carried", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    ed.key(Key::Right);
+    // The device reopened before the engine had it.
+    ed.reconnect();
+    let song = dir.join("song.tvo");
+    ed.app.save_to(song.clone());
+    assert!(ed.app.dirty, "the state saved lacks it");
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.app.save_to(song.clone());
+    assert!(!ed.app.dirty);
+    let slot = PluginPlace::Slot(ChainId::Track(0), 0);
+    assert_eq!(gain_in(&mut host, &file, Project::load(&song).unwrap().plugin_state(slot).unwrap()), Some(0.51));
+    drop(ed);
+    drop(host);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

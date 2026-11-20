@@ -1049,12 +1049,14 @@ impl Instance {
     /// `serial` is acknowledged once the plugin has it, or it was dropped
     /// with its parameter ([`PluginHandle::delivered`]); serials are to
     /// grow. False, with nothing queued, for an id it lacks, a read-only
-    /// one, a value that is not a number, or no room left: its serial is
-    /// then acknowledged as one refused ([`Instance::acknowledge`]). Never
-    /// allocates.
+    /// one, a value that is not a number, or no room left; but for no room,
+    /// which a caller may try again, its serial is then acknowledged as one
+    /// refused ([`Instance::acknowledge`]). Never allocates.
     pub fn set_param(&mut self, id: u32, value: f64, serial: u64) -> bool {
         let queued = self.queue_param(id, value, serial);
-        self.high = self.high.max(serial);
+        if queued || self.params_queued < MAX_PARAM_EVENTS {
+            self.high = self.high.max(serial);
+        }
         queued
     }
 
