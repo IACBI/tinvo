@@ -2909,6 +2909,7 @@ fn the_panel_shows_and_sets_a_plugin_s_parameters() {
     let target = LaneTarget::Plugin { at: PluginAt::Slot(1), plugin: gain_ref(), id: 10 };
     let lane = |ed: &Editor| ed.app.project.tracks[0].lanes[0].clone();
     assert_eq!(lane(&ed).target, Some(target));
+    assert_eq!(lane(&ed).base, Some(0.5), "the gain's value where no point is");
     ed.key(Key::Enter);
     assert_eq!(lane(&ed).points[0][0], Some(0.5), "the gain's value");
     ed.key(Key::Char(']'));
@@ -2928,10 +2929,10 @@ fn the_panel_shows_and_sets_a_plugin_s_parameters() {
     assert!(screen(&ed.app).contains("Gain at step 3: 71.0 % (ramp)"), "{}", screen(&ed.app));
     ed.key(Key::Tab);
     ed.key(Key::Right);
-    assert!((lane(&ed).base.unwrap() - 0.51).abs() < 1e-6, "the plugin's value, nudged");
+    assert!((lane(&ed).base.unwrap() - 0.51).abs() < 1e-6, "its base, nudged");
     assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
     ed.key(Key::Char('u'));
-    assert_eq!(lane(&ed).base, None);
+    assert_eq!(lane(&ed).base, Some(0.5));
     // Back to the inserts page, at its slot.
     ed.key(Key::Char('f'));
     assert_eq!(ed.app.page, Page::Inserts);
@@ -2945,6 +2946,104 @@ fn the_panel_shows_and_sets_a_plugin_s_parameters() {
     let said = "org.tinvo.test.none is not playing: its parameters show once it does (f: inserts)";
     assert_eq!(ed.app.status_text(), Some(said));
     assert!(screen(&ed.app).contains(" Plugin slot 3 · org.tinvo.test.none · not playing "));
+    // With nothing on it, nothing gets a lane.
+    let lanes = ed.app.project.tracks[0].lanes.clone();
+    ed.key(Key::Char('A'));
+    assert_eq!(ed.app.status_text(), Some("No parameter here to give a lane"));
+    assert_eq!(ed.app.project.tracks[0].lanes, lanes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_page_follows_its_plugin_and_its_values_reach_the_project() {
+    let dir = temp_dir("editor-page");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "page", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    // Saved before the plugin has a value sent to it, the project stays
+    // unsaved until it has.
+    ed.key(Key::Right);
+    let song = dir.join("song.tvo");
+    let slot = PluginPlace::Slot(ChainId::Track(0), 0);
+    let saved = |ed: &mut Editor, host: &mut PluginHost| {
+        ed.app.save_to(song.clone());
+        gain_in(host, &file, Project::load(&song).unwrap().plugin_state(slot).unwrap())
+    };
+    assert_eq!(saved(&mut ed, &mut host), Some(0.5));
+    assert!(ed.app.dirty);
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert!(ed.app.dirty);
+    assert_eq!(saved(&mut ed, &mut host), Some(0.51));
+    assert!(!ed.app.dirty);
+    // Undoing a lane's first base sends back the value the plugin had.
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    assert!(ed.app.edit(Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false }));
+    ed.key(Key::Right);
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(ed.app.project.tracks[0].lanes[0].base, Some(0.52));
+    ed.key(Key::Char('u'));
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(ed.app.project.tracks[0].lanes[0].base, None);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.key(Key::Char('U'));
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("52.0 %"));
+    // Moved, the page goes with it; taken out, the page goes back to the
+    // inserts.
+    assert!(ed.app.edit(Edit::SwapSlots { chain: ChainId::Track(0), a: 0, b: 3 }));
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert!(screen(&ed.app).contains(" Synth slot 4 · Test Gain "), "{}", screen(&ed.app));
+    ed.key(Key::Char('u'));
+    assert!(screen(&ed.app).contains(" Synth slot 1 · Test Gain "), "{}", screen(&ed.app));
+    // (Its lane would keep it there.)
+    assert!(ed.app.edit(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false }));
+    assert!(ed.app.edit(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: None }));
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Char('u'));
+    ed.pump();
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("52.0 %"), "with its state");
+    // With the device gone, nothing plays to set.
+    ed.app.audio_failed("gone".into());
+    ed.engine = Editor::engine(&ed.app).0;
+    ed.app.tick();
+    assert!(screen(&ed.app).contains(" Synth slot 1 · Test Gain · not playing "), "{}", screen(&ed.app));
+    drop(ed);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_master_plugin_s_page_needs_no_track() {
+    let dir = temp_dir("editor-master-page");
+    let mut p = Project::new();
+    p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "master", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    while ed.app.page != Page::Inserts {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    ed.key(Key::Right);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

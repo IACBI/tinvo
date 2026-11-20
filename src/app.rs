@@ -977,6 +977,10 @@ pub struct App {
     serial: u64,
     /// The engine's [`Shared::latency_over`] as last seen.
     late: bool,
+    /// A state was saved into the project before its plugin had every
+    /// value sent to it from the panel: once it has, the project is
+    /// unsaved again.
+    unsettled: bool,
     /// While undo or redo applies its edits: the plugin places they made,
     /// given instances once the states they had are back.
     created: Option<Vec<(PluginPlace, PluginRef)>>,
@@ -1157,6 +1161,7 @@ impl App {
             pending: Vec::new(),
             serial: 0,
             late: false,
+            unsettled: false,
             created: None,
         }
     }
@@ -1755,6 +1760,15 @@ impl App {
                     }
                     None => false,
                 });
+                // The plugin page follows its plugin, and goes back to the
+                // inserts when it goes.
+                if self.page == Page::Plugin {
+                    let chain = self.insert_chain();
+                    match project::follow_place(PluginPlace::Slot(chain, self.plugin_slot), &applied) {
+                        Some(PluginPlace::Slot(c, slot)) if c == chain => self.plugin_slot = slot,
+                        _ => self.page = Page::Inserts,
+                    }
+                }
                 if let Some(created) = &mut self.created {
                     created.retain_mut(|(place, _)| match project::follow_place(*place, &applied) {
                         Some(p) => {
@@ -1820,6 +1834,11 @@ impl App {
                 }
             }
         }
+        let live = &self.live;
+        let waiting = |p: &Pending| {
+            live.iter().any(|l| l.saves && l.handle.token() == p.token && l.handle.delivered() < p.serial)
+        };
+        self.unsettled |= self.pending.iter().any(waiting);
         failed
     }
 
@@ -1995,7 +2014,8 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.redo.clone(), &c.meta_after.clone(), &mut c.meta_before);
-        if let Some(p) = c.param {
+        // With edits, those (a lane's base) give the value again.
+        if let Some(p) = c.param.filter(|_| c.redo.is_empty()) {
             self.send_plugin_param(p.place, p.plugin, p.id, p.after);
         }
         self.after_history_move(&c, "Redid");
@@ -2529,7 +2549,11 @@ impl App {
 
     /// The instance of `plugin` playing at `place`.
     fn live_at(&self, place: PluginPlace, plugin: PluginRef) -> Option<&Live> {
-        self.live.iter().find(|l| l.place == place && self.plugins.plugin_of(l.handle.token()) == Some(plugin))
+        let playing = |l: &&Live| {
+            let token = l.handle.token();
+            l.handle.is_alive() && !self.plugins.given_up(token) && self.plugins.plugin_of(token) == Some(plugin)
+        };
+        self.live.iter().filter(|l| l.place == place).find(playing)
     }
 
     /// The plugin parameter panel parameter `i` is, and where its plugin
@@ -2622,10 +2646,19 @@ impl App {
         }
         let Some(value) = p.clamp(value) else { return };
         if let Some((track, lane)) = self.plugin_lane(place, plugin, p.id) {
-            self.edit_with(
-                Edit::SetLaneBase { track: track as u8, lane: lane as u8, value: Some(value as f32) },
-                coalesce,
-            );
+            // A lane with no base yet left the plugin's own value, which
+            // undo then sends back.
+            let had = match self.project.tracks[track].lanes[lane].base {
+                Some(_) => None,
+                None => self.plugin_value(place, plugin, p.id),
+            };
+            let (track, lane) = (track as u8, lane as u8);
+            let undo_len = self.undo.len();
+            self.edit_with(Edit::SetLaneBase { track, lane, value: Some(value as f32) }, coalesce);
+            let pushed = self.undo.len() > undo_len;
+            if let (Some(before), true, Some(last)) = (had, pushed, self.undo.back_mut()) {
+                last.param = Some(ParamChange { place, plugin, id: p.id, before, after: value });
+            }
             return;
         }
         let Some(before) = self.plugin_value(place, plugin, p.id) else { return };
@@ -2711,7 +2744,10 @@ impl App {
     /// stands for the slot, so it shows the slot's number and effect.
     fn param_text(&self, i: usize) -> (String, String) {
         if i >= PLUGIN_INDEX {
-            return self.knob(i).map_or_else(Default::default, |k| (k.label(), k.format(self.param_value(i))));
+            let Some((place, plugin, p)) = self.panel_param(i) else { return Default::default() };
+            let v = self.plugin_value(place, plugin, p.id).unwrap_or(p.default);
+            let text = self.live_at(place, plugin).and_then(|l| l.handle.text(p.id, v));
+            return (p.name, text.unwrap_or_else(|| format!("{v:.2}")));
         }
         if let Some((chain, slot, 0)) = slot_of_param(i, self.track as u8) {
             return match self.slot_data(chain, slot) {
@@ -3863,6 +3899,10 @@ impl App {
             p.at.elapsed() < PENDING_FOR
                 && live.iter().any(|l| l.handle.token() == p.token && l.handle.delivered() < p.serial)
         });
+        if self.unsettled && self.pending.is_empty() {
+            self.unsettled = false;
+            self.touch();
+        }
         let late = self.link.as_ref().is_some_and(|l| l.shared.latency_over.load(Ordering::Relaxed));
         if late && !self.late {
             self.plugin_problem(
@@ -3874,15 +3914,28 @@ impl App {
     }
 
     /// Removes the lanes on each plugin parameter in `cleared` (an
-    /// instance's token and the parameter's id), whose id the plugin may
-    /// give another from now on, as one undo step.
-    fn clear_lanes(&mut self, cleared: &[(u64, u32)]) {
+    /// instance's token, the parameter's id and whether everything about
+    /// it was cleared) as one undo step. One cleared of everything may be
+    /// another parameter from now on, so the values the history would send
+    /// it go too.
+    fn clear_lanes(&mut self, cleared: &[(u64, u32, bool)]) {
         let mut edits = Vec::new();
         let mut names = Vec::new();
-        for &(token, id) in cleared {
+        for &(token, id, all) in cleared {
             let Some(l) = self.live.iter().find(|l| l.handle.token() == token) else { continue };
             let Some(plugin) = self.plugins.plugin_of(token) else { continue };
             self.pending.retain(|p| p.token != token || p.id != id);
+            if all {
+                let gone = |c: &mut Change| {
+                    if c.param.is_some_and(|p| p.plugin == plugin && p.id == id) {
+                        c.param = None;
+                    }
+                    // Nothing left to do or undo.
+                    !(c.param.is_none() && c.undo.is_empty() && c.redo.is_empty())
+                };
+                self.undo.retain_mut(gone);
+                self.redo.retain_mut(gone);
+            }
             for (t, track) in self.project.tracks.iter().enumerate() {
                 for (k, lane) in track.lanes.iter().enumerate() {
                     if lane.target.and_then(|x| x.plugin_param(t as u8)) == Some((l.place, plugin, id)) {
@@ -3927,7 +3980,7 @@ impl App {
             }
             if let Request::Cleared { token, id, flags } = request {
                 if flags & (CLAP_PARAM_CLEAR_ALL | CLAP_PARAM_CLEAR_AUTOMATIONS) != 0 {
-                    cleared.push((token, id));
+                    cleared.push((token, id, flags & CLAP_PARAM_CLEAR_ALL != 0));
                 }
                 continue;
             }
@@ -4254,7 +4307,7 @@ impl App {
         if self.track_count() == 0
             && !self.song_view
             && self.focus == Focus::Params
-            && matches!(self.page, Page::Mix | Page::Inserts)
+            && matches!(self.page, Page::Mix | Page::Inserts | Page::Plugin)
         {
             self.key_params(key);
             return;
@@ -4541,6 +4594,10 @@ impl App {
     /// Opens the lane for panel parameter `target`, giving it a free lane if
     /// it has none.
     fn automate_param(&mut self, param: usize) {
+        if !self.page_params().contains(&param) {
+            self.set_status("No parameter here to give a lane");
+            return;
+        }
         let (label, target) = if param >= PLUGIN_INDEX {
             let Some((place, plugin, p)) = self.panel_param(param) else { return };
             if !p.is_automatable() || p.is_readonly() {
@@ -4572,8 +4629,17 @@ impl App {
         if let Some(k) = t.lanes.iter().position(|l| l.target == Some(target)) {
             self.lane = k;
         } else if let Some(k) = t.lanes.iter().position(|l| l.target.is_none()) {
-            let track = self.track as u8;
-            if !self.edit(Edit::SetLane { track, lane: k as u8, target: Some(target), ramp: false }) {
+            let (track, lane) = (self.track as u8, k as u8);
+            let set = Edit::SetLane { track, lane, target: Some(target), ramp: false };
+            // A plugin's lane starts with its value now as its base, which
+            // it leaves the plugin at where no point is.
+            let base = target.plugin_param(track).and_then(|(place, plugin, id)| self.plugin_value(place, plugin, id));
+            match base {
+                Some(v) => self.edit_group(vec![set, Edit::SetLaneBase { track, lane, value: Some(v as f32) }], "lane"),
+                None if !self.edit(set) => return,
+                None => {}
+            }
+            if self.project.tracks[self.track].lanes[k].target != Some(target) {
                 return;
             }
             self.lane = k;
@@ -4966,10 +5032,19 @@ impl App {
             Some(a @ (Action::Left | Action::Right | Action::CoarseUp | Action::CoarseDown)) => {
                 let dir = if matches!(a, Action::Left | Action::CoarseDown) { -1 } else { 1 };
                 let coarse = matches!(a, Action::CoarseUp | Action::CoarseDown);
+                if let Some((place, plugin, p)) = self.panel_param(i) {
+                    let Some(v) = self.plugin_value(place, plugin, p.id) else { return };
+                    self.set_plugin_value(place, plugin, &p, plugin_nudge(&p, v, dir, coarse), true);
+                    return;
+                }
                 let Some(v) = self.knob(i).map(|k| k.nudge(self.param_value(i), dir, coarse)) else { return };
                 self.set_param_value(i, v, true);
             }
             Some(Action::Default) => {
+                if let Some((place, plugin, p)) = self.panel_param(i) {
+                    self.set_plugin_value(place, plugin, &p, p.default, false);
+                    return;
+                }
                 let Some(d) = self.knob(i).map(|k| k.default()) else { return };
                 self.set_param_value(i, d, false);
             }
@@ -4998,8 +5073,9 @@ impl App {
         }
         match self.project.save(&path) {
             Ok(()) => {
-                // A state that could not be saved is still unsaved.
-                self.dirty = !failed.is_empty();
+                // A state that could not be saved, or saved before its
+                // plugin had a value sent to it, is still unsaved.
+                self.dirty = !failed.is_empty() || self.unsettled;
                 self.autosave.saved(&path, self.revision);
                 self.set_status(match (unlocked, failed.first()) {
                     (_, Some(f)) => format!("Saved {}, but {f}; its last saved state was kept", path.display()),
