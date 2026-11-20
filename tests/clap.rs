@@ -1409,6 +1409,13 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_windows() {
     assert_eq!(win32::client(hwnd), (200, 120));
     windows.pump();
     assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // A drag the plugin's own resize overtook before a pump is past.
+    win32::drag(hwnd, 455, 333);
+    assert!(probe.poke(0, 220, 140));
+    windows.pump();
+    assert_eq!(win32::client(hwnd), (220, 140));
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    assert!(probe.poke(0, 200, 120));
     // Moved to a monitor of twice the scale: put where Windows suggests,
     // the plugin told, and the window the size the plugin has.
     let mut suggested = win32::Rect::default();

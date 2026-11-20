@@ -8,9 +8,9 @@
 //! application it is: TINVO is one with windows but no Dock icon or menu
 //! bar (`NSApplicationActivationPolicyAccessory`).
 //!
-//! A window's delegate records a close the user asks for (left standing
-//! until its plugin's window is destroyed first) and the sizes the window
-//! takes, for [`pump`]; while the user drags its border AppKit runs a loop
+//! A window's delegate records a close the user asks for (the window hides
+//! at once, and its plugin's window is destroyed at the pump before TINVO's
+//! is let go of) and the sizes the window takes, for [`pump`]; while the user drags its border AppKit runs a loop
 //! of its own inside one event, so those sizes go to the plugin at once,
 //! never from inside a size TINVO set itself. Sizes are in points, which
 //! the plugin is given as they are (CLAP's Cocoa windows are not scaled).
@@ -28,6 +28,12 @@ use std::time::Duration;
 
 type Id = *mut c_void;
 type Sel = *const c_void;
+/// Objective-C's `BOOL`: a signed char on x86-64 that may hold any value,
+/// a C `bool` on arm64. A byte read as not zero, and given as 1 or 0, is
+/// either.
+type Bool = i8;
+const YES: Bool = 1;
+const NO: Bool = 0;
 
 /// How long the main loop waits at most while a window is open: about a
 /// frame, so the window's events are handed out as smoothly as it draws.
@@ -82,7 +88,7 @@ unsafe extern "C" {
     #[cfg(target_arch = "x86_64")]
     fn objc_msgSend_stret();
     fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
-    fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> bool;
+    fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> Bool;
     fn objc_registerClassPair(class: Id);
     fn objc_autoreleasePoolPush() -> *mut c_void;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
@@ -130,15 +136,31 @@ unsafe fn string(s: &str) -> Id {
     unsafe { send!(Id; class(c"NSString"), c"stringWithUTF8String:", s.as_ptr() => *const c_char) }
 }
 
-/// Runs `f` in an autorelease pool of its own: TINVO runs no run loop of
-/// AppKit's that would drain one.
+/// An autorelease pool for as long as it lives, on the thread that made
+/// it: TINVO runs no run loop of AppKit's that would drain one. Pools are
+/// let go of in the reverse order they were made, as their scopes end.
+pub(super) struct Pool(*mut c_void);
+
+impl Pool {
+    pub(super) fn push() -> Self {
+        // SAFETY: the runtime's own pool, popped by `drop` on this thread
+        // (the pointer keeps it from being sent to another).
+        Self(unsafe { objc_autoreleasePoolPush() })
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // SAFETY: pushed by `push` on this thread; the pools made in its
+        // scope after it were dropped first.
+        unsafe { objc_autoreleasePoolPop(self.0) };
+    }
+}
+
+/// Runs `f` in an autorelease pool of its own.
 fn pool<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: a pool pushed and popped on this thread, around `f` only.
-    let p = unsafe { objc_autoreleasePoolPush() };
-    let out = f();
-    // SAFETY: as above.
-    unsafe { objc_autoreleasePoolPop(p) };
-    out
+    let _pool = Pool::push();
+    f()
 }
 
 thread_local! {
@@ -177,6 +199,15 @@ fn record(window: Id, event: Event) {
     });
 }
 
+/// Drops the sizes `window` recorded: a size given since is newer.
+fn unrecord_sizes(window: Id) {
+    EVENTS.with(|e| {
+        if let Ok(mut e) = e.try_borrow_mut() {
+            e.retain(|(win, ev)| *win != window as usize || !matches!(ev, Event::Resized(..)));
+        }
+    });
+}
+
 /// Offers a size the user's drag made to the plugin at once, inside
 /// AppKit's own loop for it; false if it cannot be now (inside TINVO's own
 /// sizing or another serving), for `pump` to serve.
@@ -194,12 +225,15 @@ fn serve_drag(token: u64, width: u32, height: u32) -> bool {
     })
 }
 
-/// `-windowShouldClose:`: the plugin's window goes first, at the pump.
-unsafe extern "C" fn window_should_close(_: Id, _: Sel, window: Id) -> bool {
+/// `-windowShouldClose:`: the window may hide (refused, AppKit would beep),
+/// for its plugin's window is destroyed at the pump before TINVO's window
+/// is let go of: closing one that is not released when closed only hides
+/// it.
+unsafe extern "C" fn window_should_close(_: Id, _: Sel, window: Id) -> Bool {
     if let Some(token) = token_of(window) {
         record(window, Event::Closed(token));
     }
-    false
+    YES
 }
 
 /// `-windowDidResize:`.
@@ -211,16 +245,12 @@ unsafe extern "C" fn window_did_resize(_: Id, _: Sel, notification: Id) {
     let (window, size, live) = unsafe {
         let window = send!(Id; notification, c"object");
         let view = send!(Id; window, c"contentView");
-        (window, frame_size(view), send!(bool; window, c"inLiveResize"))
+        (window, frame_size(view), send!(Bool; window, c"inLiveResize") != NO)
     };
     let Some(token) = token_of(window) else { return };
     let (w, h) = (size.width.round().max(1.0) as u32, size.height.round().max(1.0) as u32);
     if live && serve_drag(token, w, h) {
-        EVENTS.with(|e| {
-            if let Ok(mut e) = e.try_borrow_mut() {
-                e.retain(|(win, ev)| *win != window as usize || !matches!(ev, Event::Resized(..)));
-            }
-        });
+        unrecord_sizes(window);
     } else {
         record(window, Event::Resized(token, w, h));
     }
@@ -264,11 +294,11 @@ fn app() -> Result<Id, String> {
     }
     // SAFETY: AppKit's own classes and methods, of these signatures.
     let app = pool(|| unsafe {
-        if !send!(bool; class(c"NSThread"), c"isMainThread") {
+        if send!(Bool; class(c"NSThread"), c"isMainThread") == NO {
             return Err("plugin windows open only on the main thread on macOS".to_string());
         }
         let app = send!(Id; class(c"NSApplication"), c"sharedApplication");
-        send!(bool; app, c"setActivationPolicy:", ACCESSORY => isize);
+        send!(Bool; app, c"setActivationPolicy:", ACCESSORY => isize);
         send!(();  app, c"finishLaunching");
         Ok(app)
     })?;
@@ -292,6 +322,9 @@ pub(super) fn queued() -> bool {
 /// Opens `handle`'s plugin window with the Cocoa API.
 pub(super) fn open(handle: &PluginHandle, api: &'static CStr, title: &str) -> Result<GuiMode, String> {
     let token = handle.token();
+    // Even for a window the plugin floats itself, whose events the pump
+    // hands out.
+    app()?;
     let mode = pool(|| {
         handle.gui_open(api, title, || Parent::new(token, title).map(|p| Box::new(p) as Box<dyn ParentWindow>))
     })?;
@@ -323,7 +356,7 @@ pub(super) fn pump(owns: impl Fn(u64) -> bool) -> Vec<Event> {
                 let mode = string("kCFRunLoopDefaultMode");
                 for _ in 0..MAX_EVENTS {
                     let event = send!(Id; app, c"nextEventMatchingMask:untilDate:inMode:dequeue:",
-                        ANY_EVENT => usize, past => Id, mode => Id, true => bool);
+                        ANY_EVENT => usize, past => Id, mode => Id, YES => Bool);
                     if event.is_null() {
                         break;
                     }
@@ -357,11 +390,11 @@ impl Parent {
             let rect = Rect { x: 0.0, y: 0.0, size: Size { width: 1.0, height: 1.0 } };
             let alloc = send!(Id; class(c"NSWindow"), c"alloc");
             let window = send!(Id; alloc, c"initWithContentRect:styleMask:backing:defer:",
-                rect => Rect, TITLED | CLOSABLE | MINIATURIZABLE => usize, BUFFERED => usize, false => bool);
+                rect => Rect, TITLED | CLOSABLE | MINIATURIZABLE => usize, BUFFERED => usize, NO => Bool);
             if window.is_null() {
                 return Err("could not make a window".into());
             }
-            send!((); window, c"setReleasedWhenClosed:", false => bool);
+            send!((); window, c"setReleasedWhenClosed:", NO => Bool);
             send!((); window, c"setTitle:", string(title) => Id);
             send!((); window, c"setDelegate:", delegate() => Id);
             window
@@ -419,6 +452,7 @@ impl ParentWindow for Parent {
                 // SAFETY: a window of TINVO's; a size by value.
                 unsafe { send!((); self.window, c"setContentSize:", size => Size) };
                 if self.content_size() == size {
+                    unrecord_sizes(self.window);
                     return true;
                 }
                 self.limit(was);
@@ -451,7 +485,7 @@ impl ParentWindow for Parent {
                 send!((); self.window, c"center");
                 send!((); self.window, c"makeKeyAndOrderFront:", null_mut::<c_void>() => Id);
                 if let Some(app) = APP.get() {
-                    send!((); app as Id, c"activateIgnoringOtherApps:", true => bool);
+                    send!((); app as Id, c"activateIgnoringOtherApps:", YES => Bool);
                 }
             }
         });

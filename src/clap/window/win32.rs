@@ -502,6 +502,8 @@ impl ParentWindow for Parent {
                 GetWindowRect(self.hwnd, &mut was) != 0 && SetWindowPos(self.hwnd, null_mut(), 0, 0, w, h, flags) != 0
             };
             if ok && self.client() == (width, height) {
+                // What the user's sizing recorded before is past.
+                unrecord(self.hwnd, |e| matches!(e, Event::Resized(..)));
                 return true;
             }
             // SAFETY: as above.

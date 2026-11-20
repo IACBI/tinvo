@@ -227,6 +227,8 @@ impl Plugins {
     /// number), and the windows' messages.
     pub fn serve_main_thread(&mut self, ready: &[(i32, u32)], round: u64) {
         let ready = if round == self.fd_round { ready } else { &[] };
+        // Exports serve them often, within one time round the main loop.
+        let _pool = crate::clap::window::Pool::push();
         self.host.dispatch(Instant::now(), ready);
         self.windows.pump();
     }

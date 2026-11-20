@@ -76,6 +76,24 @@ impl Event {
     }
 }
 
+/// An autorelease pool on macOS for as long as it lives, so what plugins
+/// and AppKit autorelease on the main thread is let go of each time round
+/// the main loop; nothing elsewhere.
+pub struct Pool {
+    #[cfg(target_os = "macos")]
+    _pool: platform::Pool,
+}
+
+impl Pool {
+    /// A pool for the scope it is held in.
+    pub fn push() -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            _pool: platform::Pool::push(),
+        }
+    }
+}
+
 /// The plugin windows open, each by its instance. Made on the main thread,
 /// which plays CLAP's, and its methods run there.
 pub struct Windows {

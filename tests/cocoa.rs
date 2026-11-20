@@ -93,8 +93,8 @@ mod macos {
     }
 
     fn visible(window: Id) -> bool {
-        // SAFETY: a live window.
-        unsafe { get(window, c"isVisible") }
+        // SAFETY: a live window; `BOOL` is a byte on either architecture.
+        unsafe { get::<i8>(window, c"isVisible") != 0 }
     }
 
     /// Sizes it as a user would, to content of `w` by `h` points.
@@ -143,10 +143,18 @@ mod macos {
         assert_eq!(content(window), (200, 120));
         windows.pump();
         assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
-        // Closed by the user: standing until served, then the plugin's
-        // window goes, then TINVO's.
+        // A size the user gave that the plugin's own resize overtook
+        // before a pump is past.
+        drag(window, 455, 333);
+        assert!(probe.poke(0, 220, 140));
+        windows.pump();
+        assert_eq!(content(window), (220, 140));
+        assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+        // Closed by the user: hidden at once (a close refused would beep),
+        // then at the pump the plugin's window goes, then TINVO's.
         close(window);
-        assert!(visible(window), "standing until it is served");
+        assert!(!visible(window), "hidden at once");
+        assert_ne!(probe.log().last().map(String::as_str), Some("destroy"), "destroyed at the pump");
         assert_eq!(windows.pump(), [gain.token()]);
         assert_eq!(probe.log()[probe.log().len() - 2..], ["hide", "destroy"]);
         assert!(!windows.is_open(gain.token()));

@@ -7101,6 +7101,9 @@ pub unsafe fn run(
         // timers and descriptors.
         let mut wake = Wake { messages: cfg!(windows), ..Wake::default() };
         loop {
+            // What plugins (and AppKit) autorelease is let go of each time
+            // round.
+            let _pool = crate::clap::window::Pool::push();
             // Idle, the screen is drawn less often: nothing on it moves.
             let idle = last_change.elapsed() > IDLE_AFTER;
             let mut timeout = match idle {
