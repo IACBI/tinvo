@@ -335,16 +335,16 @@ impl Instance {
         unsafe { self.host_extension(CLAP_EXT_POSIX_FD_SUPPORT).cast::<ClapHostPosixFdSupport>().as_ref() }
     }
 
-    /// Takes back its timer and descriptor, but in `floatgui`, which
-    /// leaves them for its host to forget.
+    /// Takes back its window's timer and descriptor, once, and closes the
+    /// pipe; but in `floatgui`, which leaves them for its host to forget.
     fn unregister(&self) {
-        let (timer, pipe) = {
-            let mut g = self.gui();
-            (g.timer.take(), g.pipe)
-        };
         if mode() == Mode::FloatGui {
             return;
         }
+        let (timer, pipe) = {
+            let mut g = self.gui();
+            (g.timer.take(), g.pipe.take())
+        };
         // SAFETY: the host's own functions, on the main thread.
         unsafe {
             if let (Some(id), Some(f)) = (timer, self.host_timers().and_then(|t| t.unregister_timer)) {
@@ -353,6 +353,9 @@ impl Instance {
             if let (Some((r, _)), Some(f)) = (pipe, self.host_fds().and_then(|t| t.unregister_fd)) {
                 self.require(f(self.host, r));
             }
+        }
+        if let Some(pipe) = pipe {
+            pipes::shut(pipe);
         }
     }
 }
