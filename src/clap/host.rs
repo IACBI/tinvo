@@ -197,7 +197,9 @@ pub enum Request {
     /// restart; its automation; its modulation).
     Cleared { token: u64, id: u32, flags: u32 },
     /// The state of the instance with this token changed and should be
-    /// saved again.
+    /// saved again: the plugin said so, or changed a parameter itself. The
+    /// changes sent to it ([`Instance::set_param`]) are not reported: the
+    /// sender knows of them.
     StateDirty(u64),
 }
 
@@ -1553,11 +1555,9 @@ impl Instance {
             // them, with the notes they belong to.
             return false;
         }
-        // By field: `b` still borrows the buffers. Changes the host made
-        // change what the plugin would save, as CLAP says.
-        if self.params_queued > 0 {
-            self.host.dirty.store(true, Ordering::Release);
-        }
+        // By field: `b` still borrows the buffers. The changes sent change
+        // what the plugin would save, as CLAP says, but whoever sent them
+        // knows: an automation lane's are already in the project.
         self.events.clear();
         self.serials.clear();
         self.params_queued = 0;
@@ -1638,9 +1638,6 @@ impl Instance {
         self.serials.drain(..n);
         self.params_queued -= n;
         settle(&self.serials, self.high, &self.host.delivered);
-        if n > 0 {
-            self.host.dirty.store(true, Ordering::Release);
-        }
     }
 
     /// Whether its last process call said it has a tail still to play

@@ -946,7 +946,6 @@ fn a_parameter_change_reaches_a_plugin_not_processed_through_a_flush() {
     let mut host = PluginHost::new();
     let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
     let handle = gain.handle();
-    let token = gain.token();
     std::thread::scope(|s| {
         s.spawn(|| {
             processed(&mut gain, 8);
@@ -962,7 +961,7 @@ fn a_parameter_change_reaches_a_plugin_not_processed_through_a_flush() {
     let s = stats(&gain);
     assert_eq!((s.flushes, s.params_set, s.broken), (1, 1, 0), "on the audio thread, once: {s:?}");
     assert_eq!((gain.params_queued(), handle.delivered(), handle.value(10)), (1, 7, Some(0.25)));
-    assert_eq!(host.poll(), [Request::StateDirty(token)], "what the plugin would save changed");
+    assert_eq!(host.poll(), [], "the changes sent are the sender's to know of");
     std::thread::scope(|s| {
         s.spawn(|| {
             let offset: Vec<f32> = scaled(8, 0.25).iter().map(|x| x + 0.5).collect();
@@ -1045,7 +1044,7 @@ fn a_saved_state_is_loaded_before_the_plugin_starts() {
     gain.set_param(11, 2.0, 2);
     processed(&mut gain, 8);
     gain.stop();
-    assert_eq!(host.poll(), [Request::StateDirty(gain.token())]);
+    assert_eq!(host.poll(), []);
     let saved = gain.handle().save_state().unwrap().unwrap();
     assert_eq!(gain.save_state().unwrap().as_deref(), Some(&saved[..]));
     let make = |host: &mut PluginHost, state: &[u8]| unsafe {
@@ -1086,18 +1085,17 @@ fn a_plugin_s_own_changes_and_a_dirty_state_are_reported() {
     let file = install(&dir, "plain");
     let mut host = PluginHost::new();
     let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
-    let token = gain.token();
     processed(&mut gain, 8);
     assert_eq!(host.poll(), [], "nothing changed");
-    // A change the host made dirties the state, as CLAP says, though the
-    // plugin does not say so; processed or flushed.
+    // A change the host sent is the sender's to know of, processed or
+    // flushed: an automation lane's is in the project already.
     gain.set_param(10, 0.3, 1);
     processed(&mut gain, 8);
-    assert_eq!(host.poll(), [Request::StateDirty(token)]);
     assert_eq!(host.poll(), []);
     gain.set_param(10, 0.4, 2);
     gain.skip(8);
-    assert_eq!(host.poll(), [Request::StateDirty(token)]);
+    assert_eq!(host.poll(), []);
+    assert_eq!(gain.handle().value(10), Some(0.4), "flushed");
     gain.stop();
     drop(gain);
 
@@ -2014,15 +2012,54 @@ fn a_value_set_while_its_lane_holds_nothing_outlasts_a_return() {
     let sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
     e.handle(EngineCommand::SetPlugin { track: 1, instance: Box::new(sine) });
     assert!((scaled_by(&mut e, &mut dry, 2000) - 0.7).abs() < 1e-4, "nor once another instance came");
-    // A new insert is at its own value.
-    e.handle(EngineCommand::SetSlot {
-        chain: ChainId::Track(0),
-        slot: 0,
-        insert: Some(gain_insert(&mut host, &file).0),
-    });
+    // A new instance, whatever it loaded, starts at the lane's base: an
+    // insert placed with it, one given to the insert, a plugin track's.
+    let at = |host: &mut PluginHost, value| {
+        let mut gain = create(host, &file, GAIN, Role::Effect).unwrap();
+        assert!(gain.set_param(10, value, 1));
+        processed(&mut gain, 8);
+        Box::new(gain)
+    };
+    let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+    assert!(insert.attach(at(&mut host, 0.75)).unwrap().is_none());
+    e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
     render(&mut e, 1000, 64);
     render(&mut dry, 1000, 64);
-    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.5).abs() < 1e-4, "a new insert");
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.2).abs() < 1e-4, "a new insert");
+    e.handle(EngineCommand::SetSlotPlugin { chain: ChainId::Track(0), slot: 0, instance: at(&mut host, 0.75) });
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.2).abs() < 1e-4, "a new instance in it");
+    drop(came_back(&mut rx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_plugin_instrument_starts_at_its_lane_s_base() {
+    let dir = temp_dir("engine-instrument-base");
+    let file = install(&dir, "instrument-base");
+    let mut host = PluginHost::new();
+    let target = LaneTarget::Plugin { at: PluginAt::Instrument, plugin: sine_ref(), id: 20 };
+    let note = Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(69, 100, 16)) };
+    let sine = Edit::AddTrack(InstrumentKind::Plugin(sine_ref()));
+    let (mut e, mut rx) = plugin_engine(&[
+        sine,
+        note,
+        Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
+        Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 8, value: Some(0.9) },
+        Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.25) },
+    ]);
+    let (mut dry, mut dry_rx) = plugin_engine(&[sine, note]);
+    // Both sines at 0.9 (a level a point left in a saved state); the one
+    // under the lane is put back to its base.
+    for (x, rx) in [(&mut e, &mut rx), (&mut dry, &mut dry_rx)] {
+        let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+        assert!(sine.set_param(20, 0.9, 1));
+        processed(&mut sine, 8);
+        x.handle(EngineCommand::SetPlugin { track: 0, instance: Box::new(sine) });
+        drop(came_back(rx));
+        render(x, 1000, 64);
+        x.handle(EngineCommand::Play);
+    }
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.25 / 0.9).abs() < 1e-3, "at its base");
     drop(came_back(&mut rx));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2809,6 +2846,10 @@ fn the_editor_keeps_each_plugin_s_state() {
         gain_in(&mut host, &file, p.plugin_state(place).unwrap())
     };
     assert_eq!(saved_at(&mut ed, slot), Some(0.25), "started from it");
+    // Unchanged, it keeps its storage, which the history shares.
+    let before = ed.app.project.plugin_state(slot).cloned().unwrap();
+    ed.app.save_to(file_path.clone());
+    assert!(Arc::ptr_eq(&before, ed.app.project.plugin_state(slot).unwrap()));
     let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.75, serial: 1 };
     ed.engine.handle(set);
     render(&mut ed.engine, 256, 64);
@@ -2853,6 +2894,14 @@ fn the_editor_keeps_each_plugin_s_state() {
     ed.reconnect();
     assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
     assert_eq!(saved_at(&mut ed, slot), Some(0.3), "a new engine");
+    // A device lost: its engine and instances go before a new one comes.
+    set_now(&mut ed, 0.45, 13);
+    ed.app.audio_failed("unplugged".into());
+    ed.engine = Editor::engine(&ed.app).0;
+    ed.app.tick();
+    ed.reconnect();
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    assert_eq!(saved_at(&mut ed, slot), Some(0.45), "a lost device");
     set_now(&mut ed, 0.35, 12);
     ed.app.mode = EditorMode::Plugins(PluginPicker { target: PluginFor::Slot(ChainId::Track(0), 0), cursor: 0 });
     ed.key(Key::Enter);
@@ -2864,11 +2913,17 @@ fn the_editor_keeps_each_plugin_s_state() {
         ed.engine.handle(EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value, serial });
         render(&mut ed.engine, 256, 64);
     };
-    at_now(&mut ed, 0.2, 4);
     ed.app.export_loops = 1;
-    ed.app.export_to(&dir.join("song.wav"));
-    assert!(ed.app.status_text().unwrap().starts_with("Exported"));
-    assert_eq!(gain_in(&mut host, &file, ed.app.project.plugin_state(slot).unwrap()), Some(0.2), "exported");
+    assert!(ed.app.edit(Edit::SetStep { track: 0, pattern: 0, step: 0, value: Some(Step::new(48, 100, 4)) }));
+    let exported = |ed: &mut Editor, value, name: &str| {
+        at_now(ed, value, 4);
+        let path = dir.join(name);
+        ed.app.export_to(&path);
+        assert!(ed.app.status_text().unwrap().starts_with("Exported"));
+        tinvo::sample::load(&path).unwrap().audio().to_vec()
+    };
+    let (fifth, tenth) = (exported(&mut ed, 0.2, "fifth.wav"), exported(&mut ed, 0.1, "tenth.wav"));
+    assert!((factor(&tenth, &fifth) - 0.5).abs() < 1e-3, "each export at the level it had");
     at_now(&mut ed, 0.4, 5);
     assert!(ed.app.edit(Edit::SetMute { track: 0, mute: true }));
     assert!(ed.app.autosave_now().contains("autosaved"));
@@ -2876,14 +2931,34 @@ fn the_editor_keeps_each_plugin_s_state() {
     assert_eq!(gain_in(&mut host, &file, autosaved.plugin_state(slot).unwrap()), Some(0.4), "autosaved");
     drop(ed);
     // One that cannot load it plays at its defaults, and says so.
-    let mut ed = Editor::new(&dir, "loadfail", p);
+    let mut ed = Editor::new(&dir, "loadfail", p.clone());
     assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
     let problems = ed.app.plugin_problems();
     assert_eq!(problems.len(), 1);
     assert!(
-        problems[0].ends_with("Test Gain plays at its defaults: it could not load its saved state"),
+        problems[0].ends_with("Test Gain plays at its defaults: it could not load its saved state; that state is kept"),
         "{problems:?}"
     );
+    // Kept for a version that can, however its stand-in is changed.
+    let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.9, serial: 1 };
+    ed.engine.handle(set);
+    render(&mut ed.engine, 256, 64);
+    ed.app.save_to(dir.join("kept.tvo"));
+    let kept = Project::load(&dir.join("kept.tvo")).unwrap();
+    assert_eq!(kept.plugin_state(slot), p.plugin_state(slot));
+    drop(ed);
+    // One that cannot save it: the save says so, and it stays unsaved; an
+    // export says it played as last saved.
+    let mut ed = Editor::new(&dir, "savefail", p);
+    ed.pump();
+    ed.app.save_to(dir.join("failed.tvo"));
+    let said = ed.app.status_text().unwrap().to_string();
+    assert!(said.ends_with("could not save its state; its last saved state was kept"), "{said}");
+    assert!(ed.app.dirty);
+    ed.app.export_loops = 1;
+    ed.app.export_to(&dir.join("failed.wav"));
+    let said = ed.app.status_text().unwrap().to_string();
+    assert!(said.ends_with(" could not save its state, so it played as last saved"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2893,6 +2968,16 @@ fn a_plugin_s_changed_state_is_an_unsaved_change() {
     let mut p = Project::new();
     p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
     p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "plain", p.clone());
+    ed.pump();
+    // The engine changing its parameter, as a lane does, changes nothing
+    // unsaved.
+    let place = PluginPlace::Slot(ChainId::Track(0), 0);
+    ed.engine.handle(EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value: 0.9, serial: 1 });
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert!(!ed.app.dirty);
+    drop(ed);
     let mut ed = Editor::new(&dir, "dirty", p);
     ed.pump();
     ed.app.tick();

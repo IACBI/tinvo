@@ -730,6 +730,8 @@ pub struct App {
     /// What export plays; `Pattern` means the pattern being edited.
     pub export_source: Source,
     pub quit: bool,
+    /// The quit was asked about first, with edits unsaved.
+    quit_confirmed: bool,
     /// Per-track template for newly placed steps, parallel to `project.tracks`.
     brushes: Vec<Step>,
     /// A copied pattern: its length and each track's steps and lane points.
@@ -955,6 +957,7 @@ impl App {
             paste_cut: false,
             export_source: Source::Auto,
             quit: false,
+            quit_confirmed: false,
             brushes,
             clipboard: None,
             bank: HashMap::new(),
@@ -1105,6 +1108,8 @@ impl App {
     /// until the run loop reconnects.
     pub fn audio_failed(&mut self, err: String) {
         self.finish_note_recording();
+        // Before the instances it played come home and are destroyed.
+        self.sync_states();
         if self.link.take().is_some() {
             self.audio_label = "audio offline".into();
             self.playing = false;
@@ -1488,7 +1493,7 @@ impl App {
         self.sync_states_before(&[e]);
         let meta_before = self.meta();
         let Some(applied) = self.apply_raw(e) else { return false };
-        if inverse == [applied] {
+        if inverse == [applied] && self.meta() == meta_before {
             // Already in that state (e.g. tempo at its limit): nothing to undo.
             return true;
         }
@@ -1640,19 +1645,48 @@ impl App {
     /// Saves every playing plugin's state into the project, for a save,
     /// an export, a new engine or an edit that may remove it. A plugin
     /// that cannot save keeps the state it had.
-    fn sync_states(&mut self) {
+    ///
+    /// Returns what could not be saved, a line for each plugin.
+    fn sync_states(&mut self) -> Vec<String> {
+        let mut failed = Vec::new();
         for (place, handle) in &self.live {
-            if let Ok(state) = handle.save_state() {
-                self.project.set_plugin_state(*place, state.map(Into::into));
+            if !handle.is_alive() {
+                continue;
+            }
+            match handle.save_state() {
+                // The same bytes keep their storage, which the history may
+                // share.
+                Ok(state) if state.as_deref() == self.project.plugin_state(*place).map(|s| &s[..]) => {}
+                Ok(state) => {
+                    self.project.set_plugin_state(*place, state.map(Into::into));
+                }
+                Err(e) => {
+                    let name = self.plugins.plugin_of(handle.token()).map(|r| self.plugins.name(r));
+                    failed.push(format!("{} {e}", name.unwrap_or_else(|| "A plugin".into())));
+                }
             }
         }
+        failed
     }
 
-    /// [`App::sync_states`] if `edits` may remove a plugin, so its state
-    /// goes into the history.
+    /// Whether `edits`, in turn, remove a plugin playing in the engine.
+    fn removes_live(&self, edits: &[Edit]) -> bool {
+        let mut places: Vec<PluginPlace> = self.live.iter().map(|(p, _)| *p).collect();
+        edits.iter().any(|e| {
+            places.iter_mut().any(|p| match project::follow_place(*p, e) {
+                Some(q) => {
+                    *p = q;
+                    false
+                }
+                None => true,
+            })
+        })
+    }
+
+    /// [`App::sync_states`] if `edits` remove a playing plugin, so its
+    /// state goes into the history.
     fn sync_states_before(&mut self, edits: &[Edit]) {
-        let removes = |e: &Edit| matches!(e, Edit::RemoveTrack(_) | Edit::RemoveGroup(_) | Edit::SetSlot { .. });
-        if edits.iter().any(removes) {
+        if self.removes_live(edits) {
             self.sync_states();
         }
     }
@@ -1662,7 +1696,7 @@ impl App {
     /// starting from the state it had. `now` is the step's other side,
     /// given the states of the plugins it may remove.
     fn apply_history(&mut self, edits: &[Edit], meta: &Meta, now: &mut Meta) {
-        if edits.iter().any(|e| matches!(e, Edit::RemoveTrack(_) | Edit::RemoveGroup(_) | Edit::SetSlot { .. })) {
+        if self.removes_live(edits) {
             self.sync_states();
             now.states = self.meta().states;
         }
@@ -2050,6 +2084,12 @@ impl App {
         self.tick_autosave(Instant::now());
         self.tick_recording();
         self.tick_plugins();
+        // A plugin's change that came after a quit with nothing unsaved
+        // asks first.
+        if self.quit && self.dirty && !self.quit_confirmed {
+            self.quit = false;
+            self.mode = Mode::Confirm(Confirm::Quit);
+        }
         // A finished take may have selected its track.
         self.clamp_cursor();
         if self.link.is_some() && self.live_track_sent != Some(self.track) {
@@ -2830,7 +2870,7 @@ impl App {
             return;
         }
         match c {
-            Confirm::Quit => self.quit = true,
+            Confirm::Quit => (self.quit, self.quit_confirmed) = (true, true),
             Confirm::DeleteTrack => {
                 if self.track < self.track_count() {
                     let name = self.project.tracks[self.track].name.clone();
@@ -3345,26 +3385,31 @@ impl App {
         if self.link.is_none() {
             return;
         }
-        let made = match self.ready.take() {
-            Some((r, i)) if r == plugin => Ok(i),
+        let (made, unloaded) = match self.ready.take() {
+            Some((r, i)) if r == plugin => (Ok(i), None),
             _ if self.plugins.catalog().is_none() => return,
             _ => {
                 let state = self.project.plugin_state(place).cloned();
-                let made = self.plugins.make(plugin, place.role(), self.sample_rate, state.as_deref());
-                match made {
+                match self.plugins.make(plugin, place.role(), self.sample_rate, state.as_deref()) {
                     Err(e) if state.is_some() => {
-                        let (at, name) = (self.place_text(place), self.plugins.name(plugin));
-                        self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}"));
-                        self.plugins.make(plugin, place.role(), self.sample_rate, None)
+                        (self.plugins.make(plugin, place.role(), self.sample_rate, None), Some(e))
                     }
-                    made => made,
+                    made => (made, None),
                 }
             }
         };
         match made {
             Ok(i) => {
                 self.live.retain(|(p, _)| *p != place);
-                self.live.push((place, i.handle()));
+                match unloaded {
+                    // Not saved over: the state is kept for a version of
+                    // the plugin that can load it.
+                    Some(e) => {
+                        let (at, name) = (self.place_text(place), self.plugins.name(plugin));
+                        self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}; that state is kept"));
+                    }
+                    None => self.live.push((place, i.handle())),
+                }
                 self.send(match place {
                     PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
                     PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
@@ -4492,7 +4537,7 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
-        self.sync_states();
+        let failed = self.sync_states();
         // Saving to another file moves the session there, lock and all; a
         // file another session has open is refused.
         let moving = self.lock.as_ref().is_none_or(|l| !l.is_for(&path));
@@ -4511,11 +4556,15 @@ impl App {
         }
         match self.project.save(&path) {
             Ok(()) => {
-                self.dirty = false;
+                // A state that could not be saved is still unsaved.
+                self.dirty = !failed.is_empty();
                 self.autosave.saved(&path, self.revision);
-                self.set_status(match unlocked {
-                    Some(why) => format!("Saved {}, but {why}; another session could open it too", path.display()),
-                    None => format!("Saved {}", path.display()),
+                self.set_status(match (unlocked, failed.first()) {
+                    (_, Some(f)) => format!("Saved {}, but {f}; its last saved state was kept", path.display()),
+                    (Some(why), None) => {
+                        format!("Saved {}, but {why}; another session could open it too", path.display())
+                    }
+                    (None, None) => format!("Saved {}", path.display()),
                 });
                 self.path = Some(path);
                 // The old project is let go of even if the new one could
@@ -4548,7 +4597,7 @@ impl App {
     }
 
     pub fn export_to(&mut self, path: &Path) {
-        self.sync_states();
+        let failed = self.sync_states();
         if let Err(e) = render::check_destination(&self.project, self.path.as_deref(), path) {
             return self.set_status(format!("Not exported: {} {e}", path.display()));
         }
@@ -4617,8 +4666,11 @@ impl App {
                 } else {
                     String::new()
                 };
+                // A plugin whose state could not be saved played as last
+                // saved.
+                let stale = failed.first().map_or(String::new(), |f| format!("; {f}, so it played as last saved"));
                 self.set_status(format!(
-                    "Exported {:.1} s {} to {} in {:.2} s ({}{clip})",
+                    "Exported {:.1} s {} to {} in {:.2} s ({}{clip}){stale}",
                     secs,
                     self.export_format.label(),
                     path.display(),
@@ -8664,6 +8716,15 @@ mod tests {
         let mut a = app();
         keys(&mut a, &[Key::Char('q')]);
         assert!(a.quit);
+        // Something unsaved before the session ends (a plugin's own
+        // change) asks first after all.
+        a.dirty = true;
+        a.tick();
+        assert!(!a.quit);
+        assert_eq!(a.mode, Mode::Confirm(Confirm::Quit));
+        keys(&mut a, &[Key::Char('y')]);
+        a.tick();
+        assert!(a.quit, "once asked");
         let mut a = app();
         keys(&mut a, &[Key::Char('T'), Key::Char('q')]);
         assert!(!a.quit);
@@ -9592,6 +9653,18 @@ mod tests {
         a.redo();
         a.undo();
         assert_eq!(a.project.plugin_state(PluginPlace::Track(n + 1)), Some(&second));
+        // The same plugin put in a slot again starts afresh: a change, undone
+        // with its state.
+        let slot = PluginPlace::Slot(ChainId::Track(n), 0);
+        let put = Edit::SetSlot { chain: ChainId::Track(n), slot: 0, kind: Some(EffectKind::Plugin(one)) };
+        assert!(a.edit(put));
+        assert!(a.project.set_plugin_state(slot, Some(first.clone())));
+        a.dirty = false;
+        assert!(a.edit(put));
+        assert_eq!(a.project.plugin_state(slot), None);
+        assert!(a.dirty);
+        a.undo();
+        assert_eq!(a.project.plugin_state(slot), Some(&first));
     }
 
     #[test]

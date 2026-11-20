@@ -2010,9 +2010,30 @@ impl Project {
     }
 
     /// Saves atomically: writes a temporary file, then renames it over the
-    /// target so a crash can never leave a half-written project.
+    /// target so a crash can never leave a half-written project. A project
+    /// a load would refuse (over [`MAX_FILE_BYTES`], or a plugin state over
+    /// [`MAX_STATE`](crate::clap::host::MAX_STATE)) is not written, so the
+    /// file there stays as it was.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        crate::fsutil::write_atomic(path, self.to_text_in(project_dir(path).as_deref()).as_bytes())
+        self.save_within(path, MAX_FILE_BYTES)
+    }
+
+    /// [`Project::save`], with a file of at most `max` bytes.
+    fn save_within(&self, path: &Path, max: u64) -> std::io::Result<()> {
+        let max_state = crate::clap::host::MAX_STATE;
+        let states = self.plugin_places().into_iter().filter_map(|(place, _)| self.plugin_state(place));
+        if states.into_iter().any(|s| s.len() > max_state) {
+            let mib = max_state >> 20;
+            return Err(std::io::Error::other(format!("a plugin's state is over the {mib} MiB a project keeps")));
+        }
+        let text = self.to_text_in(project_dir(path).as_deref());
+        if text.len() as u64 > max {
+            let (size, mib) = (text.len() >> 20, max >> 20);
+            return Err(std::io::Error::other(format!(
+                "the project would be {size} MiB, over the {mib} MiB a project file can hold"
+            )));
+        }
+        crate::fsutil::write_atomic(path, text.as_bytes())
     }
 
     /// Loads every track's sample file. Returns one entry per track (`None`
@@ -3318,9 +3339,38 @@ mod tests {
             assert!(text.contains(line), "{line}");
         }
         assert_eq!(Project::from_text(&text).unwrap(), p);
-        // Nothing of it in an older file.
-        let old = text.replacen("tinvo 17", "tinvo 16", 1);
-        assert!(Project::from_text(&old).unwrap_err().message.contains("state"));
+        // Nothing of it in an older file: each line on its own, in its
+        // place, is refused.
+        let lines: Vec<&str> = text.lines().collect();
+        // The plugin lanes' points go with them.
+        let plugin_lanes: Vec<String> = lines
+            .iter()
+            .filter(|l| l.starts_with("lane ") && l.contains("plugin."))
+            .map(|l| format!("point {} ", l.split(' ').nth(1).unwrap()))
+            .collect();
+        let added = |l: &str| {
+            ["state ", "insert_state ", "master_insert_state ", "lane_base "].iter().any(|k| l.starts_with(k))
+                || (l.starts_with("lane ") && l.contains("plugin."))
+                || plugin_lanes.iter().any(|p| l.starts_with(p.as_str()))
+        };
+        let kept = |with: Option<usize>| -> String {
+            let mut out = vec!["tinvo 16"];
+            out.extend(
+                lines.iter().enumerate().skip(1).filter(|&(k, l)| Some(k) == with || !added(l)).map(|(_, l)| *l),
+            );
+            out.join(
+                "
+",
+            )
+        };
+        assert!(Project::from_text(&kept(None)).is_ok());
+        for (k, line) in lines.iter().enumerate().filter(|(_, l)| added(l)) {
+            // A point is no new line, and needs its lane.
+            if line.starts_with("point ") {
+                continue;
+            }
+            assert!(Project::from_text(&kept(Some(k))).is_err(), "{line} in format 16");
+        }
         // What a file cannot say.
         let mut q = Project::new();
         q.apply(Edit::AddTrack(InstrumentKind::Plugin(synth))).unwrap();
@@ -3350,6 +3400,30 @@ mod tests {
         kick.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
         let e = Project::from_text(&kick.to_text().replacen("\nend", "\nstate AAEC\nend", 1)).unwrap_err();
         assert!(e.message.contains("a kick track has no plugin state"), "{e}");
+    }
+
+    #[test]
+    fn a_project_a_load_would_refuse_is_not_saved() {
+        use crate::clap::PluginRef;
+        let dir = std::env::temp_dir().join(format!("tinvo-project-too-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.tvo");
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Plugin(PluginRef::new("com.example.big").unwrap()))).unwrap();
+        p.save(&path).unwrap();
+        let kept = std::fs::read(&path).unwrap();
+        let max = crate::clap::host::MAX_STATE;
+        assert!(p.set_plugin_state(PluginPlace::Track(0), Some(vec![0u8; max + 1].into())));
+        let e = p.save(&path).unwrap_err();
+        assert_eq!(e.to_string(), "a plugin's state is over the 16 MiB a project keeps");
+        assert!(p.set_plugin_state(PluginPlace::Track(0), Some(vec![0u8; 3 << 20].into())));
+        let e = p.save_within(&path, 2 << 20).unwrap_err();
+        assert_eq!(e.to_string(), "the project would be 4 MiB, over the 2 MiB a project file can hold");
+        assert_eq!(std::fs::read(&path).unwrap(), kept, "the file there as it was");
+        p.save_within(&path, 5 << 20).unwrap();
+        assert_eq!(Project::load(&path).unwrap(), p);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
