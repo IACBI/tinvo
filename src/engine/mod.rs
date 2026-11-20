@@ -2107,11 +2107,12 @@ impl Engine {
                         b.automate(usize::from(index), l.applied);
                     }
                 }
-                // And a plugin's parameter the value its lane holds.
+                // And a plugin's parameter the value its lane holds, or
+                // its base: what the instance loaded may be from a point.
                 for l in &t.lanes {
                     let Some((place, plugin, pid)) = l.target.and_then(|x| x.plugin_param(i as u8)) else { continue };
                     if place == PluginPlace::Slot(id, slot) {
-                        deliver(b.plugin_slot().filter(|p| p.plugin() == plugin), pid, l.applied, f32::NAN);
+                        deliver(b.plugin_slot().filter(|p| p.plugin() == plugin), pid, l.applied, l.base);
                     }
                 }
             }
@@ -2163,6 +2164,7 @@ impl Engine {
                     retire_any(&mut self.retired, Retired::Plugin(i));
                 }
                 self.replay_plugin_lanes();
+                self.give_bases(PluginPlace::Track(track as u8));
             }
             Err(i) => retire_instance(&mut self.retired, i),
         }
@@ -2171,6 +2173,7 @@ impl Engine {
     /// Same as handling [`Command::SetSlotPlugin`].
     pub fn set_slot_plugin(&mut self, chain: ChainId, slot: u8, instance: Box<Instance>) {
         debug_assert!(self.retired.is_some(), "an engine taking plugin instances needs a retirement queue");
+        let place = PluginPlace::Slot(chain, slot);
         let chain = match chain {
             ChainId::Track(t) => self.tracks[..self.track_count].get_mut(usize::from(t)).map(|t| &mut t.chain),
             ChainId::Group(g) => self.groups[..self.group_count].get_mut(usize::from(g)).map(|g| &mut g.chain),
@@ -2191,6 +2194,7 @@ impl Engine {
             Ok(old) => {
                 old.into_iter().for_each(|i| retire_any(&mut self.retired, Retired::Plugin(i)));
                 self.replay_plugin_lanes();
+                self.give_bases(place);
             }
             Err(i) => retire_instance(&mut self.retired, i),
         }
@@ -2205,6 +2209,25 @@ impl Engine {
             }
         }
         self.automate(self.now);
+    }
+
+    /// Sends a new instance at `at` the base of each lane on it that holds
+    /// no point: the state it loaded may be from one that did.
+    fn give_bases(&mut self, at: PluginPlace) {
+        let n = self.track_count;
+        let Self { tracks, groups, group_count, master_chain, .. } = self;
+        for i in 0..n {
+            for k in 0..tracks[i].lanes.len() {
+                let l = &tracks[i].lanes[k];
+                let Some((place, plugin, id)) = l.target.and_then(|x| x.plugin_param(i as u8)) else { continue };
+                if place != at || l.applied.is_some() || l.base.is_nan() {
+                    continue;
+                }
+                let base = l.base;
+                let slot = plugin_slot_at(&mut tracks[..n], &mut groups[..*group_count], master_chain, place, plugin);
+                deliver(slot, id, None, base);
+            }
+        }
     }
 
     /// Counts every chain's latency again, after an instance went or came

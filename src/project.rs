@@ -78,7 +78,7 @@
 //! and loading is lossless.
 
 use crate::clap::PluginRef;
-use crate::engine::ChainId;
+use crate::engine::{ChainId, PluginAt};
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
     MAX_SWING, MAX_TEMPO, MAX_TRACKS, MIN_SWING, MIN_TEMPO, Meter, Part, Step, entry_tempo, loop_region, span_frames,
@@ -90,15 +90,16 @@ use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
 use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
+use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 16;
+pub const FORMAT_VERSION: u32 = 17;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
 const MAX_NAME_CHARS: usize = 32;
 /// The largest project file read. The largest project TINVO writes is a
 /// few MiB.
-pub const MAX_FILE_BYTES: u64 = 64 << 20;
+pub const MAX_FILE_BYTES: u64 = 256 << 20;
 
 /// Mixer parameters presented alongside instrument parameters.
 pub use crate::engine::{PAN, VOLUME};
@@ -129,16 +130,21 @@ pub struct TrackData {
     pub parts: Box<[Part; MAX_SONG]>,
     /// Its insert chain.
     pub chain: ChainData,
+    /// A plugin instrument's state, as it last saved it (`clap.state`):
+    /// what an instance of it loads before it plays.
+    pub state: Option<Arc<[u8]>>,
 }
 
 pub use crate::engine::PluginPlace;
 
 /// An effect in an insert slot and its settings.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SlotData {
     pub kind: EffectKind,
     /// One value per [`EffectKind::params`]; the rest are unused.
     pub params: [f32; MAX_INSERT_PARAMS],
+    /// A plugin's state, as for [`TrackData::state`].
+    pub state: Option<Arc<[u8]>>,
 }
 
 impl SlotData {
@@ -148,7 +154,7 @@ impl SlotData {
         for (p, spec) in params.iter_mut().zip(kind.params()) {
             *p = spec.default;
         }
-        Self { kind, params }
+        Self { kind, params, state: None }
     }
 }
 
@@ -210,7 +216,8 @@ impl TrackData {
             sample: None,
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
             parts: Box::new([Part::Follow; MAX_SONG]),
-            chain: [None; MAX_SLOTS],
+            chain: [const { None }; MAX_SLOTS],
+            state: None,
         }
     }
 }
@@ -236,7 +243,7 @@ impl GroupData {
             pan: 0.0,
             mute: false,
             params: std::array::from_fn(|i| group_param(i).map_or(0.0, |s| s.default)),
-            chain: [None; MAX_SLOTS],
+            chain: [const { None }; MAX_SLOTS],
         }
     }
 }
@@ -401,7 +408,7 @@ impl Project {
             markers: Vec::new(),
             tempo_points: Box::new([None; MAX_SONG]),
             tempo_ramp: false,
-            master_chain: [None; MAX_SLOTS],
+            master_chain: [const { None }; MAX_SLOTS],
         }
     }
 
@@ -831,6 +838,39 @@ impl Project {
         out
     }
 
+    /// The state kept for the plugin playing at `place`, as it last saved
+    /// it.
+    pub fn plugin_state(&self, place: PluginPlace) -> Option<&Arc<[u8]>> {
+        match place {
+            PluginPlace::Track(t) => self.tracks.get(usize::from(t))?.state.as_ref(),
+            PluginPlace::Slot(c, slot) => self.chain(c).ok()?.get(usize::from(slot))?.as_ref()?.state.as_ref(),
+        }
+    }
+
+    /// Keeps `state` for the plugin playing at `place`; false (and nothing
+    /// kept) if no plugin plays there.
+    pub fn set_plugin_state(&mut self, place: PluginPlace, state: Option<Arc<[u8]>>) -> bool {
+        let held = match place {
+            PluginPlace::Track(t) => {
+                self.tracks.get_mut(usize::from(t)).filter(|t| t.kind.plugin().is_some()).map(|t| &mut t.state)
+            }
+            PluginPlace::Slot(c, slot) => self
+                .chain_mut(c)
+                .ok()
+                .and_then(|c| c.get_mut(usize::from(slot)))
+                .and_then(|d| d.as_mut())
+                .filter(|d| d.kind.plugin().is_some())
+                .map(|d| &mut d.state),
+        };
+        match held {
+            Some(h) => {
+                *h = state;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether a lane automates the effect in slot `slot` of chain `c`.
     pub fn slot_automated(&self, c: ChainId, slot: u8) -> bool {
         self.tracks.iter().enumerate().any(|(i, t)| {
@@ -849,7 +889,7 @@ impl Project {
         if old.is_none() && kind.is_some() && self.insert_count() >= MAX_INSERTS {
             return Err(EditError::TooManyInserts);
         }
-        if old.map(|d| d.kind) != kind && self.slot_automated(c, slot) {
+        if old.as_ref().map(|d| d.kind) != kind && self.slot_automated(c, slot) {
             return Err(EditError::SlotAutomated(slot));
         }
         Ok(())
@@ -863,7 +903,7 @@ impl Project {
 
     /// The spec of parameter `index` of the effect in slot `slot` of `c`.
     fn slot_param(&self, c: ChainId, slot: u8, index: u8) -> Result<&'static ParamSpec, EditError> {
-        let d = self.check_slot(c, slot)?.ok_or(EditError::EmptySlot(slot))?;
+        let d = self.check_slot(c, slot)?.as_ref().ok_or(EditError::EmptySlot(slot))?;
         d.kind.params().get(usize::from(index)).ok_or(EditError::NoSuchParam(index))
     }
 
@@ -954,7 +994,7 @@ impl Project {
                 let there = match place {
                     PluginPlace::Track(_) => t.kind.plugin(),
                     PluginPlace::Slot(c, slot) => {
-                        self.check_slot(c, slot).ok().and_then(|d| d.and_then(|d| d.kind.plugin()))
+                        self.check_slot(c, slot).ok().and_then(|d| d.as_ref().and_then(|d| d.kind.plugin()))
                     }
                 };
                 if there != Some(plugin) {
@@ -963,7 +1003,7 @@ impl Project {
             }
             // An insert's parameter while the slot holds that effect.
             if let Some((c, slot, kind, _)) = x.slot(track) {
-                if !self.check_slot(c, slot).is_ok_and(|d| d.is_some_and(|d| d.kind == kind)) {
+                if !self.check_slot(c, slot).is_ok_and(|d| d.as_ref().is_some_and(|d| d.kind == kind)) {
                     return Err(EditError::NoSuchTarget(x));
                 }
             }
@@ -1349,7 +1389,7 @@ impl Project {
             Edit::SetSlot { chain, slot, kind } => {
                 self.check_set_slot(chain, slot, kind)?;
                 let mut v = Vec::new();
-                push_slot(&mut v, chain, slot, *self.check_slot(chain, slot)?);
+                push_slot(&mut v, chain, slot, self.check_slot(chain, slot)?.as_ref());
                 v
             }
             Edit::SwapSlots { chain, a, b } => {
@@ -1358,7 +1398,7 @@ impl Project {
             }
             Edit::SetSlotParam { chain, slot, index, .. } => {
                 self.slot_param(chain, slot, index)?;
-                let old = self.check_slot(chain, slot)?.map_or(0.0, |d| d.params[usize::from(index)]);
+                let old = self.check_slot(chain, slot)?.as_ref().map_or(0.0, |d| d.params[usize::from(index)]);
                 vec![Edit::SetSlotParam { chain, slot, index, value: old }]
             }
         };
@@ -1465,10 +1505,16 @@ impl Project {
                     let _ = writeln!(s, "param {} {}", spec.id, v);
                 }
             }
+            if let Some(state) = &t.state {
+                let _ = writeln!(s, "state {}", crate::base64::encode(state));
+            }
             write_chain(&mut s, "insert", &t.chain);
             for (k, l) in t.lanes.iter().enumerate() {
                 if let Some(id) = l.target.and_then(|x| lane_id(x, t.kind)) {
                     let _ = writeln!(s, "lane {k} {id} {}", if l.ramp { "ramp" } else { "hold" });
+                    if let Some(v) = l.base {
+                        let _ = writeln!(s, "lane_base {k} {v}");
+                    }
                 }
             }
             for (p, steps) in t.steps.iter().enumerate() {
@@ -1563,6 +1609,7 @@ impl Project {
                     "insert" | "insert_param" => {
                         parse_insert_line(&mut g.chain, &mut inserts, key == "insert_param", rest, ver).map_err(err)?;
                     }
+                    "insert_state" if ver >= 17 => parse_insert_state(&mut g.chain, rest).map_err(err)?,
                     "end" => p.groups.push(current_group.take().expect("inside a group block")),
                     _ => return Err(err(format!("unknown group key '{key}'"))),
                 }
@@ -1611,6 +1658,30 @@ impl Project {
                         }
                         parse_insert_line(&mut t.chain, &mut inserts, key == "insert_param", rest, ver).map_err(err)?;
                     }
+                    "insert_state" if ver >= 17 => parse_insert_state(&mut t.chain, rest).map_err(err)?,
+                    "state" if ver >= 17 => {
+                        if t.kind.plugin().is_none() {
+                            return Err(err(format!("a {} track has no plugin state", t.kind.id())));
+                        }
+                        if t.state.is_some() {
+                            return Err(err("the state given twice".into()));
+                        }
+                        t.state = Some(parse_state(rest).map_err(err)?);
+                    }
+                    "lane_base" if ver >= 17 => {
+                        let f = fields(rest, 2);
+                        let [k, v] = f[..] else { return Err(err("expected 'lane_base <lane> <value>'".into())) };
+                        let k: usize = parse_num(k).map_err(err)?;
+                        let l = t
+                            .lanes
+                            .get_mut(k)
+                            .filter(|l| matches!(l.target, Some(LaneTarget::Plugin { .. })))
+                            .ok_or_else(|| err(format!("lane {k} is not on a plugin parameter")))?;
+                        if l.base.is_some() {
+                            return Err(err(format!("lane {k}'s base given twice")));
+                        }
+                        l.base = Some(parse_finite(v).map_err(err)?);
+                    }
                     "lane" if ver >= 6 => {
                         let f = fields(rest, 3);
                         let [k, id, mode] = f[..] else {
@@ -1640,9 +1711,18 @@ impl Project {
                             kind,
                             index,
                         });
-                        let target = (0..2 + count)
-                            .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
-                            .map(LaneTarget::Track)
+                        let plugin = if ver >= 17 { plugin_lane_target(id, t.kind, &t.chain, &p) } else { None };
+                        let target = match plugin {
+                            Some(x) => Some(x.map_err(err)?),
+                            None => None,
+                        };
+                        let target = target
+                            .into_iter()
+                            .chain(
+                                (0..2 + count)
+                                    .filter(|&x| x < 2 || track_param_since(t.kind, usize::from(x - 2)) <= ver)
+                                    .map(LaneTarget::Track),
+                            )
                             .chain(mix.map(LaneTarget::Mix))
                             .chain(group_targets)
                             .chain(slots)
@@ -1669,16 +1749,21 @@ impl Project {
                         let f = fields(rest, 3);
                         let [k, i, v] = f[..] else { return Err(err("expected 'point <lane> <step> <value>'".into())) };
                         let (k, i): (usize, usize) = (parse_num(k).map_err(err)?, parse_num(i).map_err(err)?);
-                        let spec = t
-                            .lanes
-                            .get(k)
-                            .and_then(|l| l.target)
-                            .and_then(|x| x.spec(t.kind))
-                            .ok_or_else(|| err(format!("lane {k} is not defined")))?;
+                        let target = t.lanes.get(k).and_then(|l| l.target);
+                        let spec = target.and_then(|x| x.spec(t.kind));
+                        let plugin = matches!(target, Some(LaneTarget::Plugin { .. }));
+                        if spec.is_none() && !plugin {
+                            return Err(err(format!("lane {k} is not defined")));
+                        }
                         if i >= MAX_STEPS {
                             return Err(err(format!("step index {i} out of range")));
                         }
-                        t.lanes[k].points[pattern][i] = Some(parse_in(v, spec).map_err(err)?);
+                        // A plugin's values are the plugin's to keep in range.
+                        let value = match spec {
+                            Some(spec) => parse_in(v, spec),
+                            None => parse_finite(v),
+                        };
+                        t.lanes[k].points[pattern][i] = Some(value.map_err(err)?);
                     }
                     "param" => {
                         let (id, value) = rest
@@ -1855,6 +1940,12 @@ impl Project {
                     let param = key == "master_insert_param";
                     parse_insert_line(&mut p.master_chain, &mut inserts, param, rest, ver).map_err(err)?;
                 }
+                "master_insert_state" if ver >= 17 => {
+                    if !p.tracks.is_empty() || !p.groups.is_empty() {
+                        return Err(err("the master's inserts come before groups and tracks".into()));
+                    }
+                    parse_insert_state(&mut p.master_chain, rest).map_err(err)?;
+                }
                 "mix" if ver >= 8 => {
                     let (id, value) = rest
                         .split_once(char::is_whitespace)
@@ -1919,9 +2010,30 @@ impl Project {
     }
 
     /// Saves atomically: writes a temporary file, then renames it over the
-    /// target so a crash can never leave a half-written project.
+    /// target so a crash can never leave a half-written project. A project
+    /// a load would refuse (over [`MAX_FILE_BYTES`], or a plugin state over
+    /// [`MAX_STATE`](crate::clap::host::MAX_STATE)) is not written, so the
+    /// file there stays as it was.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        crate::fsutil::write_atomic(path, self.to_text_in(project_dir(path).as_deref()).as_bytes())
+        self.save_within(path, MAX_FILE_BYTES)
+    }
+
+    /// [`Project::save`], with a file of at most `max` bytes.
+    fn save_within(&self, path: &Path, max: u64) -> std::io::Result<()> {
+        let max_state = crate::clap::host::MAX_STATE;
+        let states = self.plugin_places().into_iter().filter_map(|(place, _)| self.plugin_state(place));
+        if states.into_iter().any(|s| s.len() > max_state) {
+            let mib = max_state >> 20;
+            return Err(std::io::Error::other(format!("a plugin's state is over the {mib} MiB a project keeps")));
+        }
+        let text = self.to_text_in(project_dir(path).as_deref());
+        if text.len() as u64 > max {
+            let (size, mib) = (text.len() >> 20, max >> 20);
+            return Err(std::io::Error::other(format!(
+                "the project would be {size} MiB, over the {mib} MiB a project file can hold"
+            )));
+        }
+        crate::fsutil::write_atomic(path, text.as_bytes())
     }
 
     /// Loads every track's sample file. Returns one entry per track (`None`
@@ -1971,19 +2083,96 @@ impl Project {
 
 /// How a lane's target is named in the file: its parameter's id, behind
 /// `group<n>.` (1 for the first group) for a group's and `insert<k>.` for
-/// an insert's (`master.insert<k>.` on the master's chain).
+/// an insert's (`master.insert<k>.` on the master's chain); a plugin's,
+/// `plugin.<id>` behind where the plugin plays, its stable id in decimal.
 fn lane_id(target: LaneTarget, kind: InstrumentKind) -> Option<String> {
-    let id = target.spec(kind)?.id;
     let group = |g: u8| u32::from(g) + 1;
+    if let LaneTarget::Plugin { at, id, .. } = target {
+        return Some(match at {
+            PluginAt::Instrument => format!("plugin.{id}"),
+            PluginAt::Slot(slot) => format!("insert{slot}.plugin.{id}"),
+            PluginAt::GroupSlot { group: g, slot } => format!("group{}.insert{slot}.plugin.{id}", group(g)),
+            PluginAt::MasterSlot(slot) => format!("master.insert{slot}.plugin.{id}"),
+        });
+    }
+    let id = target.spec(kind)?.id;
     Some(match target {
         LaneTarget::Group { group: g, .. } => format!("group{}.{id}", group(g)),
         LaneTarget::Slot { slot, .. } => format!("insert{slot}.{id}"),
         LaneTarget::GroupSlot { group: g, slot, .. } => format!("group{}.insert{slot}.{id}", group(g)),
         LaneTarget::MasterSlot { slot, .. } => format!("master.insert{slot}.{id}"),
-        LaneTarget::Track(_) | LaneTarget::Mix(_) => id.to_string(),
-        // Named by the plugin's own id, not a spec's.
-        LaneTarget::Plugin { .. } => return None,
+        LaneTarget::Track(_) | LaneTarget::Mix(_) | LaneTarget::Plugin { .. } => id.to_string(),
     })
+}
+
+/// The plugin parameter lane id `id` names ([`lane_id`]) from a track of
+/// `kind` with chain `chain`, in `p` as read so far: `None` if it does not
+/// name one, an error if the plugin is not there.
+fn plugin_lane_target(
+    id: &str,
+    kind: InstrumentKind,
+    chain: &ChainData,
+    p: &Project,
+) -> Option<Result<LaneTarget, String>> {
+    let (place, param) = id.rsplit_once("plugin.")?;
+    let place = match place {
+        "" => "",
+        x => x.strip_suffix('.')?,
+    };
+    let slot_of =
+        |s: &str| s.strip_prefix("insert").and_then(|k| k.parse::<u8>().ok()).filter(|&k| usize::from(k) < MAX_SLOTS);
+    let at = if place.is_empty() {
+        PluginAt::Instrument
+    } else if let Some(rest) = place.strip_prefix("master.") {
+        PluginAt::MasterSlot(slot_of(rest)?)
+    } else if let Some((g, rest)) = place.strip_prefix("group").and_then(|x| x.split_once('.')) {
+        let group = g.parse::<u8>().ok().filter(|&g| g >= 1)? - 1;
+        PluginAt::GroupSlot { group, slot: slot_of(rest)? }
+    } else {
+        PluginAt::Slot(slot_of(place)?)
+    };
+    let Ok(param) = param.parse::<u32>() else { return Some(Err(format!("'{param}' is not a parameter id"))) };
+    let slot = |c: &ChainData, s: u8| c[usize::from(s)].as_ref().and_then(|d| d.kind.plugin());
+    let plugin = match at {
+        PluginAt::Instrument => kind.plugin(),
+        PluginAt::Slot(s) => slot(chain, s),
+        PluginAt::GroupSlot { group, slot: s } => p.groups.get(usize::from(group)).and_then(|g| slot(&g.chain, s)),
+        PluginAt::MasterSlot(s) => slot(&p.master_chain, s),
+    };
+    Some(match plugin {
+        Some(plugin) => Ok(LaneTarget::Plugin { at, plugin, id: param }),
+        None => Err(format!("no plugin plays where '{id}' says")),
+    })
+}
+
+/// Reads a `<key>_state <slot> <base64>` line's fields into the plugin
+/// insert in `chain`'s slot.
+fn parse_insert_state(chain: &mut ChainData, rest: &str) -> Result<(), String> {
+    let (slot, state) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let slot: usize = parse_num(slot)?;
+    let d = chain.get_mut(slot).ok_or_else(|| format!("insert slot {slot} out of range (0..{MAX_SLOTS})"))?;
+    let d = d
+        .as_mut()
+        .filter(|d| d.kind.plugin().is_some())
+        .ok_or_else(|| format!("insert slot {slot} holds no plugin"))?;
+    if d.state.is_some() {
+        return Err(format!("insert slot {slot}'s state given twice"));
+    }
+    d.state = Some(parse_state(state.trim())?);
+    Ok(())
+}
+
+/// A plugin's state, as a `state` line writes it.
+fn parse_state(text: &str) -> Result<Arc<[u8]>, String> {
+    let max = crate::clap::host::MAX_STATE;
+    if text.len() > max.div_ceil(3) * 4 {
+        return Err(format!("a plugin's state is at most {max} bytes"));
+    }
+    let bytes = crate::base64::decode(text).ok_or("a plugin's state is written in base64")?;
+    if bytes.len() > max {
+        return Err(format!("a plugin's state is at most {max} bytes"));
+    }
+    Ok(bytes.into())
 }
 
 /// Every lane target of an insert parameter on chain `chain`, as `make`
@@ -1995,7 +2184,7 @@ fn slot_targets<'a>(
     chain
         .iter()
         .enumerate()
-        .filter_map(|(s, d)| d.map(|d| (s as u8, d.kind)))
+        .filter_map(|(s, d)| d.as_ref().map(|d| (s as u8, d.kind)))
         .flat_map(move |(s, kind)| (0..kind.params().len() as u8).map(move |i| make(s, kind, i)))
 }
 
@@ -2072,7 +2261,7 @@ fn effect_text(kind: EffectKind) -> String {
 
 /// Writes chain `c` as `<key> <slot> <effect>` lines, each followed by
 /// `<key>_param <slot> <id> <value>` lines for its settings off their
-/// default.
+/// default and a plugin's `<key>_state <slot> <base64>`.
 fn write_chain(s: &mut String, key: &str, c: &ChainData) {
     for (slot, d) in c.iter().enumerate() {
         let Some(d) = d else { continue };
@@ -2081,6 +2270,9 @@ fn write_chain(s: &mut String, key: &str, c: &ChainData) {
             if v != spec.default {
                 let _ = writeln!(s, "{key}_param {slot} {} {v}", spec.id);
             }
+        }
+        if let Some(state) = &d.state {
+            let _ = writeln!(s, "{key}_state {slot} {}", crate::base64::encode(state));
         }
     }
 }
@@ -2211,14 +2403,46 @@ fn push_group_state(e: &mut Vec<Edit>, group: u8, g: &GroupData) {
 fn push_chain(e: &mut Vec<Edit>, chain: ChainId, c: &ChainData) {
     for (slot, d) in c.iter().enumerate() {
         if d.is_some() {
-            push_slot(e, chain, slot as u8, *d);
+            push_slot(e, chain, slot as u8, d.as_ref());
         }
     }
 }
 
+/// Where what plays at plugin place `place` is after `e`: `None` once it
+/// is gone, its track, group or slot removed or the slot set anew.
+pub fn follow_place(place: PluginPlace, e: &Edit) -> Option<PluginPlace> {
+    let track = |t: u8| match *e {
+        Edit::InsertTrack { index, .. } if index <= t => Some(t + 1),
+        Edit::RemoveTrack(r) if r == t => None,
+        Edit::RemoveTrack(r) if r < t => Some(t - 1),
+        _ => Some(t),
+    };
+    let (chain, slot) = match place {
+        PluginPlace::Track(t) => return track(t).map(PluginPlace::Track),
+        PluginPlace::Slot(chain, slot) => (chain, slot),
+    };
+    let chain = match chain {
+        ChainId::Track(t) => ChainId::Track(track(t)?),
+        ChainId::Group(g) => ChainId::Group(match *e {
+            Edit::InsertGroup(i) if i <= g => g + 1,
+            Edit::RemoveGroup(i) if i == g => return None,
+            Edit::RemoveGroup(i) if i < g => g - 1,
+            _ => g,
+        }),
+        ChainId::Master => ChainId::Master,
+    };
+    let slot = match *e {
+        Edit::SetSlot { chain: c, slot: s, .. } if c == chain && s == slot => return None,
+        Edit::SwapSlots { chain: c, a, b } if c == chain && slot == a => b,
+        Edit::SwapSlots { chain: c, a, b } if c == chain && slot == b => a,
+        _ => slot,
+    };
+    Some(PluginPlace::Slot(chain, slot))
+}
+
 /// Appends the edits that put `d` (an effect and its settings, or nothing)
 /// in slot `slot` of `chain`.
-fn push_slot(e: &mut Vec<Edit>, chain: ChainId, slot: u8, d: Option<SlotData>) {
+fn push_slot(e: &mut Vec<Edit>, chain: ChainId, slot: u8, d: Option<&SlotData>) {
     e.push(Edit::SetSlot { chain, slot, kind: d.map(|d| d.kind) });
     if let Some(d) = d {
         for (index, spec) in d.kind.params().iter().enumerate() {
@@ -2280,6 +2504,15 @@ fn parse_bool(s: &str) -> Result<bool, String> {
         "false" => Ok(false),
         _ => Err(format!("expected true or false, got '{s}'")),
     }
+}
+
+/// A plugin parameter's value: any finite number.
+fn parse_finite(s: &str) -> Result<f32, String> {
+    let v: f32 = parse_num(s)?;
+    if !v.is_finite() {
+        return Err(format!("{v} is not a finite number"));
+    }
+    Ok(v)
 }
 
 fn parse_in(s: &str, spec: &ParamSpec) -> Result<f32, String> {
@@ -2419,7 +2652,7 @@ mod tests {
         assert_eq!(p.apply(Edit::SwapSlots { chain: t, a: 2, b: 8 }), Err(EditError::NoSuchSlot(8)));
         // Values are clamped to the parameter's range.
         p.apply(Edit::SetSlotParam { chain: t, slot: 2, index: 1, value: 1e9 }).unwrap();
-        assert_eq!(p.tracks[0].chain[2].unwrap().params[1], Drive.params()[1].max);
+        assert_eq!(p.tracks[0].chain[2].as_ref().unwrap().params[1], Drive.params()[1].max);
         // A lane must automate the kind the slot holds.
         let wrong = LaneTarget::Slot { slot: 2, kind: Eq, index: 1 };
         assert!(p.apply(Edit::SetLane { track: 0, lane: 0, target: Some(wrong), ramp: false }).is_err());
@@ -2432,7 +2665,7 @@ mod tests {
         assert_eq!(p.apply(Edit::SetSlot { chain: t, slot: 2, kind: None }), Err(EditError::SlotAutomated(2)));
         p.apply(Edit::SetSlot { chain: t, slot: 2, kind: Some(Drive) }).unwrap();
         assert_eq!(
-            p.tracks[0].chain[2].unwrap().params[1],
+            p.tracks[0].chain[2].as_ref().unwrap().params[1],
             Drive.params()[1].default,
             "a new effect is at its defaults"
         );
@@ -2541,9 +2774,9 @@ mod tests {
         let good = "tinvo 15\nmaster_insert 2 chorus\nmaster_insert_param 2 mix 0.5\ngroup G\ninsert 0 eq\nend\n\
                     track kick\ninsert 7 drive\ninsert_param 7 drive 0.25\nlane 0 group1.insert0.bypass hold\nend";
         let p = Project::from_text(good).unwrap();
-        assert_eq!(p.master_chain[2].unwrap().params[3], 0.5);
-        assert_eq!(p.groups[0].chain[0].unwrap().kind, EffectKind::Eq);
-        assert_eq!(p.tracks[0].chain[7].unwrap().params[1], 0.25);
+        assert_eq!(p.master_chain[2].as_ref().unwrap().params[3], 0.5);
+        assert_eq!(p.groups[0].chain[0].as_ref().unwrap().kind, EffectKind::Eq);
+        assert_eq!(p.tracks[0].chain[7].as_ref().unwrap().params[1], 0.25);
         assert_eq!(
             p.tracks[0].lanes[0].target,
             Some(LaneTarget::GroupSlot { group: 0, slot: 0, kind: EffectKind::Eq, index: 0 })
@@ -3048,6 +3281,203 @@ mod tests {
         assert_eq!(p.apply(point(0, 64)), Err(EditError::NoSuchStep(64)));
         assert_eq!(p.inverse(&point(2, 0)), Err(EditError::LaneUnassigned(2)));
         assert!(p.apply(point(0, 63)).is_ok());
+    }
+
+    #[test]
+    fn plugin_states_lanes_and_bases_are_written_and_read() {
+        use crate::clap::PluginRef;
+        let (synth, gain) = (PluginRef::new("com.example.synth").unwrap(), PluginRef::new("com.example.gain").unwrap());
+        let plugin = |c, slot| Edit::SetSlot { chain: c, slot, kind: Some(EffectKind::Plugin(gain)) };
+        let mut p = Project::new();
+        p.apply(plugin(ChainId::Master, 1)).unwrap();
+        p.apply(Edit::InsertGroup(0)).unwrap();
+        p.apply(plugin(ChainId::Group(0), 0)).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Plugin(synth))).unwrap();
+        p.apply(plugin(ChainId::Track(0), 2)).unwrap();
+        p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 3, kind: Some(EffectKind::Drive) }).unwrap();
+        let state = |n: usize| -> Arc<[u8]> { (0..n).map(|i| (i * 7) as u8).collect::<Vec<u8>>().into() };
+        let places = [
+            PluginPlace::Track(0),
+            PluginPlace::Slot(ChainId::Track(0), 2),
+            PluginPlace::Slot(ChainId::Group(0), 0),
+            PluginPlace::Slot(ChainId::Master, 1),
+        ];
+        for (k, place) in places.into_iter().enumerate() {
+            assert!(p.set_plugin_state(place, Some(state(40 * k))), "{place:?}");
+            assert_eq!(p.plugin_state(place), Some(&state(40 * k)));
+        }
+        // Only where a plugin plays.
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        for place in [
+            PluginPlace::Track(1),
+            PluginPlace::Track(2),
+            PluginPlace::Slot(ChainId::Track(0), 3),
+            PluginPlace::Slot(ChainId::Track(0), 4),
+        ] {
+            assert!(!p.set_plugin_state(place, Some(state(1))));
+            assert_eq!(p.plugin_state(place), None);
+        }
+        p.apply(Edit::RemoveTrack(1)).unwrap();
+        let on = |at, plugin, id| Some(LaneTarget::Plugin { at, plugin, id });
+        let lanes = [
+            on(PluginAt::Instrument, synth, 7),
+            on(PluginAt::Slot(2), gain, 4_000_000_000),
+            on(PluginAt::GroupSlot { group: 0, slot: 0 }, gain, 3),
+            on(PluginAt::MasterSlot(1), gain, 0),
+        ];
+        for (k, target) in lanes.into_iter().enumerate() {
+            let lane = k as u8;
+            p.apply(Edit::SetLane { track: 0, lane, target, ramp: k == 0 }).unwrap();
+            p.apply(Edit::SetPoint { track: 0, lane, pattern: 0, step: 5, value: Some(-1234.5) }).unwrap();
+            if k % 2 == 1 {
+                p.apply(Edit::SetLaneBase { track: 0, lane, value: Some(0.25) }).unwrap();
+            }
+        }
+        let text = p.to_text();
+        for line in ["lane 1 insert2.plugin.4000000000 hold", "lane_base 1 0.25", "lane 2 group1.insert0.plugin.3 hold"]
+        {
+            assert!(text.contains(line), "{line}");
+        }
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        // Nothing of it in an older file: each line on its own, in its
+        // place, is refused.
+        let lines: Vec<&str> = text.lines().collect();
+        // The plugin lanes' points go with them.
+        let plugin_lanes: Vec<String> = lines
+            .iter()
+            .filter(|l| l.starts_with("lane ") && l.contains("plugin."))
+            .map(|l| format!("point {} ", l.split(' ').nth(1).unwrap()))
+            .collect();
+        let added = |l: &str| {
+            ["state ", "insert_state ", "master_insert_state ", "lane_base "].iter().any(|k| l.starts_with(k))
+                || (l.starts_with("lane ") && l.contains("plugin."))
+                || plugin_lanes.iter().any(|p| l.starts_with(p.as_str()))
+        };
+        let kept = |with: Option<usize>| -> String {
+            let mut out = vec!["tinvo 16"];
+            out.extend(
+                lines.iter().enumerate().skip(1).filter(|&(k, l)| Some(k) == with || !added(l)).map(|(_, l)| *l),
+            );
+            out.join(
+                "
+",
+            )
+        };
+        assert!(Project::from_text(&kept(None)).is_ok());
+        for (k, line) in lines.iter().enumerate().filter(|(_, l)| added(l)) {
+            // A point is no new line, and needs its lane.
+            if line.starts_with("point ") {
+                continue;
+            }
+            assert!(Project::from_text(&kept(Some(k))).is_err(), "{line} in format 16");
+        }
+        // What a file cannot say.
+        let mut q = Project::new();
+        q.apply(Edit::AddTrack(InstrumentKind::Plugin(synth))).unwrap();
+        q.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 3, kind: Some(EffectKind::Drive) }).unwrap();
+        q.apply(Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(0)), ramp: false }).unwrap();
+        q.apply(Edit::SetLane { track: 0, lane: 1, target: on(PluginAt::Instrument, synth, 9), ramp: false }).unwrap();
+        let base = q.to_text();
+        let with = |line: &str| Project::from_text(&base.replacen("\nend", &format!("\n{line}\nend"), 1));
+        assert!(with("state AAEC").is_ok());
+        for (line, why) in [
+            ("state AAEC\nstate AAEC", "the state given twice"),
+            ("state @@@@", "written in base64"),
+            ("state AAE", "written in base64"),
+            ("insert_state 3 AAEC", "insert slot 3 holds no plugin"),
+            ("insert_state 9 AAEC", "insert slot 9 out of range"),
+            ("lane_base 0 0.5", "lane 0 is not on a plugin parameter"),
+            ("lane_base 1 0.5\nlane_base 1 0.5", "lane 1's base given twice"),
+            ("lane_base 1 inf", "not a finite number"),
+            ("point 1 0 nan", "not a finite number"),
+            ("lane 2 insert5.plugin.3 hold", "no plugin plays where 'insert5.plugin.3' says"),
+            ("lane 2 plugin.x hold", "'x' is not a parameter id"),
+        ] {
+            let e = with(line).unwrap_err();
+            assert!(e.message.contains(why), "{line}: {e}");
+        }
+        let mut kick = Project::new();
+        kick.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        let e = Project::from_text(&kick.to_text().replacen("\nend", "\nstate AAEC\nend", 1)).unwrap_err();
+        assert!(e.message.contains("a kick track has no plugin state"), "{e}");
+    }
+
+    #[test]
+    fn a_project_a_load_would_refuse_is_not_saved() {
+        use crate::clap::PluginRef;
+        let dir = std::env::temp_dir().join(format!("tinvo-project-too-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.tvo");
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Plugin(PluginRef::new("com.example.big").unwrap()))).unwrap();
+        p.save(&path).unwrap();
+        let kept = std::fs::read(&path).unwrap();
+        let max = crate::clap::host::MAX_STATE;
+        assert!(p.set_plugin_state(PluginPlace::Track(0), Some(vec![0u8; max + 1].into())));
+        let e = p.save(&path).unwrap_err();
+        assert_eq!(e.to_string(), "a plugin's state is over the 16 MiB a project keeps");
+        assert!(p.set_plugin_state(PluginPlace::Track(0), Some(vec![0u8; 3 << 20].into())));
+        let e = p.save_within(&path, 2 << 20).unwrap_err();
+        assert_eq!(e.to_string(), "the project would be 4 MiB, over the 2 MiB a project file can hold");
+        assert_eq!(std::fs::read(&path).unwrap(), kept, "the file there as it was");
+        p.save_within(&path, 5 << 20).unwrap();
+        assert_eq!(Project::load(&path).unwrap(), p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plugin_place_is_followed_through_edits() {
+        let (t, g) = (|t| PluginPlace::Track(t), |c, s| PluginPlace::Slot(c, s));
+        let cases = [
+            (t(2), Edit::InsertTrack { index: 2, kind: InstrumentKind::Kick }, Some(t(3))),
+            (t(2), Edit::InsertTrack { index: 3, kind: InstrumentKind::Kick }, Some(t(2))),
+            (t(2), Edit::RemoveTrack(1), Some(t(1))),
+            (t(2), Edit::RemoveTrack(2), None),
+            (t(2), Edit::RemoveTrack(3), Some(t(2))),
+            (t(2), Edit::SetSlot { chain: ChainId::Track(2), slot: 0, kind: None }, Some(t(2))),
+            (
+                g(ChainId::Track(2), 4),
+                Edit::InsertTrack { index: 0, kind: InstrumentKind::Kick },
+                Some(g(ChainId::Track(3), 4)),
+            ),
+            (g(ChainId::Track(2), 4), Edit::RemoveTrack(2), None),
+            (g(ChainId::Group(1), 4), Edit::InsertGroup(1), Some(g(ChainId::Group(2), 4))),
+            (g(ChainId::Group(1), 4), Edit::InsertGroup(2), Some(g(ChainId::Group(1), 4))),
+            (g(ChainId::Group(1), 4), Edit::RemoveGroup(0), Some(g(ChainId::Group(0), 4))),
+            (g(ChainId::Group(1), 4), Edit::RemoveGroup(1), None),
+            (g(ChainId::Group(1), 4), Edit::RemoveTrack(1), Some(g(ChainId::Group(1), 4))),
+            (
+                g(ChainId::Master, 4),
+                Edit::SwapSlots { chain: ChainId::Master, a: 4, b: 6 },
+                Some(g(ChainId::Master, 6)),
+            ),
+            (
+                g(ChainId::Master, 6),
+                Edit::SwapSlots { chain: ChainId::Master, a: 4, b: 6 },
+                Some(g(ChainId::Master, 4)),
+            ),
+            (
+                g(ChainId::Master, 5),
+                Edit::SwapSlots { chain: ChainId::Master, a: 4, b: 6 },
+                Some(g(ChainId::Master, 5)),
+            ),
+            (
+                g(ChainId::Track(0), 4),
+                Edit::SwapSlots { chain: ChainId::Master, a: 4, b: 6 },
+                Some(g(ChainId::Track(0), 4)),
+            ),
+            (g(ChainId::Master, 4), Edit::SetSlot { chain: ChainId::Master, slot: 4, kind: None }, None),
+            (
+                g(ChainId::Master, 4),
+                Edit::SetSlot { chain: ChainId::Master, slot: 5, kind: None },
+                Some(g(ChainId::Master, 4)),
+            ),
+            (g(ChainId::Group(0), 4), Edit::SetSlot { chain: ChainId::Group(0), slot: 4, kind: None }, None),
+        ];
+        for (place, e, after) in cases {
+            assert_eq!(follow_place(place, &e), after, "{place:?} after {e:?}");
+        }
     }
 
     #[test]
