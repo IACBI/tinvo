@@ -2680,6 +2680,10 @@ impl App {
         }
         let Some(value) = p.clamp(value) else { return };
         if let Some((track, lane)) = self.plugin_lane(place, plugin, p.id) {
+            if !lane_holds(p.is_stepped(), value) {
+                self.set_status(format!("{} is past the whole values its lane holds", p.name));
+                return;
+            }
             // A lane with no base yet left the plugin's own value, which
             // undo then sends back.
             let had = match self.project.tracks[track].lanes[lane].base {
