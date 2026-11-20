@@ -1567,11 +1567,12 @@ fn a_plugin_window_is_put_in_a_window_of_tinvo_s_on_windows() {
     // SAFETY: as above.
     unsafe { win32::GetWindowRect(hwnd, &mut now) };
     assert_eq!((now.left, now.top), (suggested.left, suggested.top), "where Windows suggests");
-    // Dragged narrower than the window can be, by a plugin that takes a
-    // size narrower still: both go back to the size they agreed.
-    win32::drag(hwnd, 149, 125);
+    // Dragged, by a plugin that takes a size narrower than the window can
+    // be (it refused 20 above): both go back to the size they agreed.
+    assert!(probe.poke(10, 8, 0));
+    win32::drag(hwnd, 249, 125);
     windows.pump();
-    assert_eq!(probe.log()[probe.log().len() - 2..], ["size 140x120", "size 200x120"]);
+    assert_eq!(probe.log()[probe.log().len() - 2..], ["size 10x120", "size 200x120"]);
     assert_eq!(win32::client(hwnd), (200, 120));
     // In Windows' own loop for a drag: its sizes served as they come, a
     // size TINVO sets no drag of its own, and the plugin's own resize

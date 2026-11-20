@@ -829,9 +829,14 @@ mod sys {
         if let Some(fd) = input {
             polled.push(PollFd { fd, events: POLLIN, revents: 0 });
         }
+        // Each descriptor once: macOS reports only one of two entries for
+        // the same one.
         for &(fd, flags) in &wake.fds {
             let events = if flags & READ != 0 { POLLIN } else { 0 } | if flags & WRITE != 0 { POLLOUT } else { 0 };
-            polled.push(PollFd { fd, events, revents: 0 });
+            match polled.iter_mut().find(|p| p.fd == fd) {
+                Some(p) => p.events |= events,
+                None => polled.push(PollFd { fd, events, revents: 0 }),
+            }
         }
         if polled.is_empty() {
             return Ok(false);
@@ -843,17 +848,21 @@ mod sys {
             // A signal (e.g. SIGWINCH) interrupted the wait.
             return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
         }
-        let theirs = if input.is_some() { &polled[1..] } else { &polled[..] };
-        for p in theirs {
-            let flags = if p.revents & POLLIN != 0 { READ } else { 0 }
-                | if p.revents & POLLOUT != 0 { WRITE } else { 0 }
+        for i in 0..wake.fds.len() {
+            let (fd, asked) = wake.fds[i];
+            let Some(p) = polled.iter().find(|p| p.fd == fd) else { continue };
+            // Only the ways it waits: input shares an entry with it.
+            let flags = (if p.revents & POLLIN != 0 { READ } else { 0 }
+                | if p.revents & POLLOUT != 0 { WRITE } else { 0 })
+                & asked
                 | if p.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 { ERROR } else { 0 };
             if flags != 0 {
-                wake.add_ready(p.fd, flags);
+                wake.add_ready(fd, flags);
             }
         }
-        // Its end or an error is for the read that follows to report.
-        Ok(input.is_some() && polled[0].revents != 0)
+        // Its end or an error is for the read that follows to report; room
+        // to write is a descriptor's sharing its entry.
+        Ok(input.is_some() && polled[0].revents & !POLLOUT != 0)
     }
 
     pub fn check(wake: &mut Wake) -> io::Result<()> {
@@ -1025,6 +1034,11 @@ mod sys {
             assert_eq!(also.ready, [(r, READ)]);
             assert!(!wait_on(&mut polled, None, 0, &mut wake).unwrap());
             assert_eq!(wake.ready, [(w, WRITE), (r, READ)], "kept until emptied, merged");
+            // Input's own descriptor waited on for writing too: input is
+            // what is readable, the descriptor what is writable.
+            let mut both = Wake { fds: vec![(w, WRITE), (r, WRITE)], ..Wake::default() };
+            assert!(wait_on(&mut polled, Some(r), 1000, &mut both).unwrap());
+            assert_eq!(both.ready, [(w, WRITE)], "a read end is never writable");
             // Nothing to wait on: no wait.
             let start = Instant::now();
             assert!(!wait_on(&mut polled, None, 1000, &mut Wake::default()).unwrap());

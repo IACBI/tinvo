@@ -239,7 +239,8 @@ struct Gui {
     /// asks for 777x555 inside the next `set_size`; or 4 unregisters the
     /// timers `poke` kept inside the next timer's call; 5 closes it inside
     /// the next `adjust_size`; 6 asks for 777x555 inside the next `show`;
-    /// 7 closes it inside the next `can_resize`.
+    /// 7 closes it inside the next `can_resize`; 8 takes a width of 10 in
+    /// the next `adjust_size`.
     trap: u32,
     /// Its pipe's read and write ends, the read end registered.
     pipe: Option<(i32, i32)>,
@@ -555,8 +556,10 @@ unsafe extern "C" fn gui_adjust_size(p: *const ClapPlugin, width: *mut u32, heig
     let me = unsafe { me(p) };
     me.on_window();
     me.require(embedded(me));
+    // Trap 8: a width narrower than any window of TINVO's can be.
+    let least = me.sprung(8);
     unsafe {
-        width.write((*width / 10 * 10).max(10));
+        width.write(if least { 10 } else { (*width / 10 * 10).max(10) });
         height.write((*height / 10 * 10).max(10));
     }
     if me.sprung(5) {
