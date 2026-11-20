@@ -40,6 +40,8 @@
 //!   asking for a restart in its first process call as `restart` does;
 //!   `latefail`: the same, failing its second process call as `procerror`
 //!   does;
+//! - `floatgui`: its window can float as well as be embedded, and it
+//!   leaves its timer and descriptor registered for its host to forget;
 //! - `many`: the gain has 300 more parameters (ids 100 to 399, none doing
 //!   anything), more than a host queues for one call;
 //! - `meter`: the gain reports its read-only meter after every call, and
@@ -68,6 +70,13 @@
 //! at first, each voice's). Their state (`clap.state`) is their
 //! parameters' values, read and written a few bytes at a time; loading it
 //! tells the host its values changed.
+//!
+//! Their window (`clap.gui`, embedded with the system's window API) is
+//! no real window: `org.tinvo.test.gui` reads what the host asked of it,
+//! and makes it call the host's `clap.gui`. While it is open it has a
+//! 20 ms timer (`clap.timer-support`) and, on Unix, a pipe with a byte in
+//! it (`clap.posix-fd-support`). Its probe's `poke` also registers and
+//! unregisters further timers and descriptors, from any thread.
 //!
 //! Voices survive deactivation and activation; only `reset` (or a release)
 //! ends them, as CLAP allows.
@@ -113,6 +122,7 @@ enum Mode {
     Relatency,
     LateFail,
     Many,
+    FloatGui,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -124,7 +134,7 @@ static BROKEN: AtomicU32 = AtomicU32::new(0);
 static SAVES: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 28] = [
+    const ALL: [Mode; 29] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -153,6 +163,7 @@ fn mode() -> Mode {
         Mode::Relatency,
         Mode::LateFail,
         Mode::Many,
+        Mode::FloatGui,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -196,6 +207,544 @@ static DESCRIPTORS: Shared<[ClapPluginDescriptor; 3]> = Shared([
     descriptor(c"org.tinvo.test.sine", c"Test Sine", c"A plain sine", SINE_FEATURES.0.as_ptr()),
     descriptor(c"org.tinvo.test.unnamed", c"", c"Has no name", NO_FEATURES.0.as_ptr()),
 ]);
+
+/// The window API of the system it is built for.
+const PLATFORM_API: &CStr = if cfg!(windows) {
+    CLAP_WINDOW_API_WIN32
+} else if cfg!(target_os = "macos") {
+    CLAP_WINDOW_API_COCOA
+} else {
+    CLAP_WINDOW_API_X11
+};
+
+/// Its window: no real one, only what the host asked of it, checked
+/// against `clap.gui`'s rules.
+#[derive(Default)]
+struct Gui {
+    /// Made, and whether floating.
+    made: Option<bool>,
+    parent: usize,
+    size: (u32, u32),
+    /// Every call, as `org.tinvo.test.gui` reports them.
+    log: Vec<String>,
+    timer: Option<ClapId>,
+    /// Timers registered by `poke`, the last last.
+    extra: Vec<ClapId>,
+    /// The last of them `poke` unregistered, which it unregisters again
+    /// when none is left.
+    unregistered: Option<ClapId>,
+    /// Destroyed by the user: nothing but `destroy` may follow.
+    gone: bool,
+    /// Closes it from inside the next call: 1 `show`, 2 `create`; or 3
+    /// asks for 777x555 inside the next `set_size`; or 4 unregisters the
+    /// timers `poke` kept inside the next timer's call; 5 closes it inside
+    /// the next `adjust_size`; 6 asks for 777x555 inside the next `show`;
+    /// 7 closes it inside the next `can_resize`.
+    trap: u32,
+    /// Its pipe's read and write ends, the read end registered.
+    pipe: Option<(i32, i32)>,
+    timer_calls: u32,
+    fd_calls: u32,
+}
+
+/// What `org.tinvo.test.gui` reports; `tests/clap.rs` has the same.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GuiStats {
+    pub timer_calls: u32,
+    pub fd_calls: u32,
+    /// Its pipe's read end, or -1.
+    pub fd: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Rules broken by every instance of this file, those gone too.
+    pub broken: u32,
+}
+
+#[repr(C)]
+struct GuiTestExt {
+    /// Copies the calls logged, a line each, into `out` (at most `cap`
+    /// bytes); returns the bytes copied.
+    log: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut u8, cap: usize) -> usize,
+    stats: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut GuiStats),
+    /// Calls the host's `clap.gui`: 0 `request_resize(a, b)`, 1
+    /// `request_show`, 2 `request_hide`, 3 `closed(a != 0)` (destroying its
+    /// window first when `a != 0`, as a plugin does), 4
+    /// `resize_hints_changed`; and its timer and descriptor support: 5
+    /// `register_timer(a)` (kept), 6 `unregister_timer` of the last kept
+    /// (or, with none left, the one it last unregistered, again), 7
+    /// `register_fd(a, b)`, 8 `modify_fd(a, b)`, 9 `unregister_fd(a)`; 10
+    /// sets a trap (see `Gui::trap`) to `a`. Returns what the host
+    /// answered.
+    poke: unsafe extern "C" fn(plugin: *const ClapPlugin, what: u32, a: u32, b: u32) -> bool,
+}
+
+static GUI_TEST: GuiTestExt = GuiTestExt { log: gui_log, stats: gui_stats, poke: gui_poke };
+
+impl Instance {
+    fn gui(&self) -> std::sync::MutexGuard<'_, Gui> {
+        self.gui.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn logged(&self, line: String) {
+        self.gui().log.push(line);
+    }
+
+    /// A call to its window, which the user has not destroyed.
+    fn on_window(&self) {
+        self.on_main();
+        self.require(!self.gui().gone);
+    }
+
+    /// Fires the trap set for `call`, if it is.
+    fn sprung(&self, call: u32) -> bool {
+        let mut g = self.gui();
+        let sprung = g.trap == call;
+        if sprung {
+            g.trap = 0;
+        }
+        sprung
+    }
+
+    /// Its window destroyed by the user, as by a plugin's own close
+    /// button: the host is told, and its `destroy` only acknowledges it.
+    fn closed_by_user(&self) -> bool {
+        self.unregister();
+        {
+            let mut g = self.gui();
+            g.gone = true;
+            g.log.push("closed by the user".into());
+        }
+        let host = self.host_extension(CLAP_EXT_GUI).cast::<ClapHostGui>();
+        // SAFETY: the host's own extension, callable from any thread.
+        unsafe {
+            host.as_ref().and_then(|h| h.closed).is_some_and(|f| {
+                f(self.host, true);
+                true
+            })
+        }
+    }
+
+    fn host_timers(&self) -> Option<&ClapHostTimerSupport> {
+        // SAFETY: the host's own extension, which lives as long as it.
+        unsafe { self.host_extension(CLAP_EXT_TIMER_SUPPORT).cast::<ClapHostTimerSupport>().as_ref() }
+    }
+
+    fn host_fds(&self) -> Option<&ClapHostPosixFdSupport> {
+        // SAFETY: as above.
+        unsafe { self.host_extension(CLAP_EXT_POSIX_FD_SUPPORT).cast::<ClapHostPosixFdSupport>().as_ref() }
+    }
+
+    /// Takes back its window's timer and descriptor, once, and closes the
+    /// pipe; but in `floatgui`, which leaves them for its host to forget.
+    fn unregister(&self) {
+        if mode() == Mode::FloatGui {
+            return;
+        }
+        let (timer, pipe) = {
+            let mut g = self.gui();
+            (g.timer.take(), g.pipe.take())
+        };
+        // SAFETY: the host's own functions, on the main thread.
+        unsafe {
+            if let (Some(id), Some(f)) = (timer, self.host_timers().and_then(|t| t.unregister_timer)) {
+                self.require(f(self.host, id));
+            }
+            if let (Some((r, _)), Some(f)) = (pipe, self.host_fds().and_then(|t| t.unregister_fd)) {
+                self.require(f(self.host, r));
+            }
+        }
+        if let Some(pipe) = pipe {
+            pipes::shut(pipe);
+        }
+    }
+}
+
+#[cfg(unix)]
+mod pipes {
+    use std::ffi::{c_int, c_void};
+    unsafe extern "C" {
+        fn pipe(fds: *mut c_int) -> c_int;
+        fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
+        fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
+        fn close(fd: c_int) -> c_int;
+    }
+
+    /// A pipe with a byte waiting in it.
+    pub fn ready() -> Option<(i32, i32)> {
+        let mut fds = [0; 2];
+        // SAFETY: room for two descriptors; one byte from a static.
+        unsafe {
+            if pipe(fds.as_mut_ptr()) != 0 {
+                return None;
+            }
+            write(fds[1], b"x".as_ptr().cast(), 1);
+        }
+        Some((fds[0], fds[1]))
+    }
+
+    /// Reads the byte waiting in `fd`.
+    pub fn take(fd: i32) -> bool {
+        let mut b = 0u8;
+        // SAFETY: room for one byte.
+        unsafe { read(fd, (&raw mut b).cast(), 1) == 1 }
+    }
+
+    pub fn shut((r, w): (i32, i32)) {
+        // SAFETY: descriptors this plugin opened, closed once.
+        unsafe {
+            close(r);
+            close(w);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod pipes {
+    pub fn ready() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn take(_: i32) -> bool {
+        false
+    }
+    pub fn shut(_: (i32, i32)) {}
+}
+
+static GUI_EXT: ClapPluginGui = ClapPluginGui {
+    is_api_supported: Some(gui_is_api_supported),
+    get_preferred_api: Some(gui_get_preferred_api),
+    create: Some(gui_create),
+    destroy: Some(gui_destroy),
+    set_scale: Some(gui_set_scale),
+    get_size: Some(gui_get_size),
+    can_resize: Some(gui_can_resize),
+    get_resize_hints: Some(gui_get_resize_hints),
+    adjust_size: Some(gui_adjust_size),
+    set_size: Some(gui_set_size),
+    set_parent: Some(gui_set_parent),
+    set_transient: Some(gui_set_transient),
+    suggest_title: Some(gui_suggest_title),
+    show: Some(gui_show),
+    hide: Some(gui_hide),
+};
+
+static TIMER_EXT: ClapPluginTimerSupport = ClapPluginTimerSupport { on_timer: Some(gui_on_timer) };
+static FD_EXT: ClapPluginPosixFdSupport = ClapPluginPosixFdSupport { on_fd: Some(gui_on_fd) };
+
+fn supported(api: *const c_char, floating: bool) -> bool {
+    // SAFETY: the host passes a NUL-terminated API name.
+    !api.is_null() && unsafe { CStr::from_ptr(api) } == PLATFORM_API && (!floating || mode() == Mode::FloatGui)
+}
+
+unsafe extern "C" fn gui_is_api_supported(p: *const ClapPlugin, api: *const c_char, floating: bool) -> bool {
+    // SAFETY: the host calls with its plugin.
+    let me = unsafe { me(p) };
+    me.on_main();
+    supported(api, floating)
+}
+
+unsafe extern "C" fn gui_get_preferred_api(p: *const ClapPlugin, api: *mut *const c_char, floating: *mut bool) -> bool {
+    // SAFETY: as above, with room for the answers.
+    let me = unsafe { me(p) };
+    me.on_main();
+    unsafe {
+        api.write(PLATFORM_API.as_ptr());
+        floating.write(mode() == Mode::FloatGui);
+    }
+    true
+}
+
+unsafe extern "C" fn gui_create(p: *const ClapPlugin, api: *const c_char, floating: bool) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    me.require(me.gui().made.is_none() && supported(api, floating));
+    {
+        let mut g = me.gui();
+        g.made = Some(floating);
+        g.size = (300, 200);
+        g.log.push(format!("create {}", if floating { "floating" } else { "embedded" }));
+    }
+    // A timer and a descriptor while its window is open, as a plugin's
+    // drawing and its windowing system's connection.
+    // SAFETY: the host's own functions, on the main thread.
+    unsafe {
+        if let Some(f) = me.host_timers().and_then(|t| t.register_timer) {
+            let mut id = 0;
+            if f(me.host, 20, &mut id) {
+                me.gui().timer = Some(id);
+            }
+        }
+        if let (Some(f), Some(pipe)) = (me.host_fds().and_then(|t| t.register_fd), pipes::ready()) {
+            me.require(f(me.host, pipe.0, CLAP_POSIX_FD_READ));
+            me.gui().pipe = Some(pipe);
+        }
+    }
+    if me.sprung(2) {
+        me.closed_by_user();
+    }
+    true
+}
+
+unsafe extern "C" fn gui_destroy(p: *const ClapPlugin) {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    me.require(me.gui().made.is_some());
+    me.unregister();
+    let mut g = me.gui();
+    g.made = None;
+    g.gone = false;
+    g.parent = 0;
+    g.log.push("destroy".into());
+}
+
+/// Whether its window is made, and embedded.
+fn embedded(me: &Instance) -> bool {
+    me.gui().made == Some(false)
+}
+
+unsafe extern "C" fn gui_set_scale(p: *const ClapPlugin, scale: f64) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(embedded(me) && scale > 0.0 && PLATFORM_API != CLAP_WINDOW_API_COCOA);
+    me.logged(format!("scale {scale}"));
+    true
+}
+
+unsafe extern "C" fn gui_get_size(p: *const ClapPlugin, width: *mut u32, height: *mut u32) -> bool {
+    // SAFETY: as above, with room for the size.
+    let me = unsafe { me(p) };
+    me.on_window();
+    let g = me.gui();
+    me.require(g.made.is_some());
+    unsafe {
+        width.write(g.size.0);
+        height.write(g.size.1);
+    }
+    true
+}
+
+unsafe extern "C" fn gui_can_resize(p: *const ClapPlugin) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(embedded(me));
+    if me.sprung(7) {
+        me.closed_by_user();
+    }
+    true
+}
+
+unsafe extern "C" fn gui_get_resize_hints(p: *const ClapPlugin, hints: *mut ClapGuiResizeHints) -> bool {
+    // SAFETY: as above, with room for the hints.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(embedded(me));
+    let both = ClapGuiResizeHints { can_resize_horizontally: true, can_resize_vertically: true, ..Default::default() };
+    unsafe { hints.write(both) };
+    true
+}
+
+/// Sizes it takes: whole tens.
+unsafe extern "C" fn gui_adjust_size(p: *const ClapPlugin, width: *mut u32, height: *mut u32) -> bool {
+    // SAFETY: as above, with the size to adjust.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(embedded(me));
+    unsafe {
+        width.write((*width / 10 * 10).max(10));
+        height.write((*height / 10 * 10).max(10));
+    }
+    if me.sprung(5) {
+        me.closed_by_user();
+    }
+    true
+}
+
+unsafe extern "C" fn gui_set_size(p: *const ClapPlugin, width: u32, height: u32) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(embedded(me) && width > 0 && height > 0);
+    {
+        let mut g = me.gui();
+        g.size = (width, height);
+        g.log.push(format!("size {width}x{height}"));
+    }
+    if me.sprung(3) {
+        // SAFETY: the host's own extension.
+        let host = unsafe { me.host_extension(CLAP_EXT_GUI).cast::<ClapHostGui>().as_ref() };
+        me.require(host.and_then(|h| h.request_resize).is_some_and(|f| unsafe { f(me.host, 777, 555) }));
+    }
+    true
+}
+
+unsafe extern "C" fn gui_set_parent(p: *const ClapPlugin, window: *const ClapWindow) -> bool {
+    // SAFETY: as above, and the host's window.
+    let me = unsafe { me(p) };
+    me.on_window();
+    let w = unsafe { window.as_ref() };
+    me.require(embedded(me) && w.is_some_and(|w| supported(w.api, false) && !w.handle.is_null()));
+    let mut g = me.gui();
+    g.parent = w.map_or(0, |w| w.handle as usize);
+    g.log.push("parent".into());
+    true
+}
+
+unsafe extern "C" fn gui_set_transient(p: *const ClapPlugin, _: *const ClapWindow) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(me.gui().made == Some(true));
+    me.logged("transient".into());
+    false
+}
+
+unsafe extern "C" fn gui_suggest_title(p: *const ClapPlugin, title: *const c_char) {
+    // SAFETY: as above, and a NUL-terminated title.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(me.gui().made == Some(true) && !title.is_null());
+    let title = unsafe { CStr::from_ptr(title) }.to_string_lossy().into_owned();
+    me.logged(format!("title {title}"));
+}
+
+unsafe extern "C" fn gui_show(p: *const ClapPlugin) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    let g = me.gui();
+    // Embedded, only once it has a parent.
+    me.require(g.made.is_some() && (g.made == Some(true) || g.parent != 0));
+    drop(g);
+    me.logged("show".into());
+    if me.sprung(1) {
+        me.closed_by_user();
+    }
+    if me.sprung(6) {
+        // SAFETY: the host's own extension.
+        let host = unsafe { me.host_extension(CLAP_EXT_GUI).cast::<ClapHostGui>().as_ref() };
+        me.require(host.and_then(|h| h.request_resize).is_some_and(|f| unsafe { f(me.host, 777, 555) }));
+    }
+    true
+}
+
+unsafe extern "C" fn gui_hide(p: *const ClapPlugin) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_window();
+    me.require(me.gui().made.is_some());
+    me.logged("hide".into());
+    true
+}
+
+unsafe extern "C" fn gui_on_timer(p: *const ClapPlugin, id: ClapId) {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    let mut g = me.gui();
+    me.require(g.timer == Some(id) || g.extra.contains(&id) || mode() == Mode::FloatGui);
+    g.timer_calls += 1;
+    drop(g);
+    if me.sprung(4) {
+        let extra = std::mem::take(&mut me.gui().extra);
+        if let Some(f) = me.host_timers().and_then(|t| t.unregister_timer) {
+            for id in extra {
+                // SAFETY: the host's own function, on the main thread.
+                me.require(unsafe { f(me.host, id) });
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn gui_on_fd(p: *const ClapPlugin, fd: std::ffi::c_int, flags: u32) {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    me.on_main();
+    let mut g = me.gui();
+    me.require(g.pipe.is_some_and(|(r, _)| r == fd) && flags & CLAP_POSIX_FD_READ != 0);
+    g.fd_calls += 1;
+    if pipes::take(fd) {
+        g.log.push("fd".into());
+    }
+}
+
+unsafe extern "C" fn gui_log(p: *const ClapPlugin, out: *mut u8, cap: usize) -> usize {
+    // SAFETY: the test's instance, and room for `cap` bytes.
+    let me = unsafe { me(p) };
+    let text = me.gui().log.join("\n");
+    let n = text.len().min(cap);
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, n) };
+    n
+}
+
+unsafe extern "C" fn gui_stats(p: *const ClapPlugin, out: *mut GuiStats) {
+    // SAFETY: as above, with room for the stats.
+    let me = unsafe { me(p) };
+    let g = me.gui();
+    let stats = GuiStats {
+        timer_calls: g.timer_calls,
+        fd_calls: g.fd_calls,
+        fd: g.pipe.map_or(-1, |p| p.0),
+        width: g.size.0,
+        height: g.size.1,
+        broken: BROKEN.load(Ordering::Relaxed),
+    };
+    unsafe { out.write(stats) };
+}
+
+unsafe extern "C" fn gui_poke(p: *const ClapPlugin, what: u32, a: u32, b: u32) -> bool {
+    // SAFETY: as above.
+    let me = unsafe { me(p) };
+    let host = me.host_extension(CLAP_EXT_GUI).cast::<ClapHostGui>();
+    // SAFETY: the host's own extension; these calls are thread-safe.
+    let Some(h) = (unsafe { host.as_ref() }) else { return false };
+    unsafe {
+        match what {
+            0 => h.request_resize.is_some_and(|f| f(me.host, a, b)),
+            1 => h.request_show.is_some_and(|f| f(me.host)),
+            2 => h.request_hide.is_some_and(|f| f(me.host)),
+            3 if a != 0 => me.closed_by_user(),
+            3 => h.closed.is_some_and(|f| {
+                f(me.host, false);
+                true
+            }),
+            4 => h.resize_hints_changed.is_some_and(|f| {
+                f(me.host);
+                true
+            }),
+            5 => {
+                let mut id = ClapId::MAX;
+                let ok = me.host_timers().and_then(|t| t.register_timer).is_some_and(|f| f(me.host, a, &mut id));
+                if ok {
+                    me.gui().extra.push(id);
+                }
+                ok
+            }
+            6 => {
+                let id = {
+                    let mut g = me.gui();
+                    g.extra.pop().or(g.unregistered)
+                };
+                let ok = matches!((id, me.host_timers().and_then(|t| t.unregister_timer)), (Some(id), Some(f)) if f(me.host, id));
+                if ok {
+                    me.gui().unregistered = id;
+                }
+                ok
+            }
+            7 => me.host_fds().and_then(|t| t.register_fd).is_some_and(|f| f(me.host, a as i32, b)),
+            8 => me.host_fds().and_then(|t| t.modify_fd).is_some_and(|f| f(me.host, a as i32, b)),
+            9 => me.host_fds().and_then(|t| t.unregister_fd).is_some_and(|f| f(me.host, a as i32)),
+            10 => {
+                me.gui().trap = a;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// What `org.tinvo.test.stats` reports; `tests/clap.rs` has the same.
 #[repr(C)]
@@ -393,6 +942,7 @@ struct Instance {
     latency: AtomicU32,
     /// In `meter`, it renamed its gain and showed its hold.
     renamed: AtomicBool,
+    gui: Mutex<Gui>,
 }
 
 /// # Safety
@@ -548,6 +1098,11 @@ unsafe extern "C" fn plugin_destroy(p: *const ClapPlugin) {
         me.on_main();
     }
     me.require(!me.active.load(Ordering::Relaxed));
+    // Its window destroyed before it is.
+    me.require(me.gui().made.is_none());
+    if let Some(pipe) = me.gui().pipe.take() {
+        pipes::shut(pipe);
+    }
     LIVE.fetch_sub(1, Ordering::Relaxed);
     // SAFETY: made by Box::into_raw in create_plugin, and taken back through
     // that same pointer; nothing uses it now.
@@ -1226,6 +1781,14 @@ unsafe extern "C" fn plugin_extension(p: *const ClapPlugin, id: *const c_char) -
         (&raw const LATENCY_EXT).cast()
     } else if id == c"org.tinvo.test.stats" {
         (&raw const STATS_EXT).cast()
+    } else if id == CLAP_EXT_GUI {
+        (&raw const GUI_EXT).cast()
+    } else if id == CLAP_EXT_TIMER_SUPPORT {
+        (&raw const TIMER_EXT).cast()
+    } else if id == CLAP_EXT_POSIX_FD_SUPPORT {
+        (&raw const FD_EXT).cast()
+    } else if id == c"org.tinvo.test.gui" {
+        (&raw const GUI_TEST).cast()
     } else {
         null()
     }
@@ -1342,6 +1905,7 @@ unsafe extern "C" fn create_plugin(
         start_gain: AtomicU64::new(0),
         latency: AtomicU32::new(0),
         renamed: AtomicBool::new(false),
+        gui: Mutex::new(Gui::default()),
     });
     LIVE.fetch_add(1, Ordering::Relaxed);
     Box::into_raw(instance).cast_const().cast()
@@ -1455,6 +2019,10 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "latefail" => {
             set(Mode::LateFail);
+            true
+        }
+        "floatgui" => {
+            set(Mode::FloatGui);
             true
         }
         "many" => {

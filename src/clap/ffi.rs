@@ -6,7 +6,7 @@
 //! Every function pointer is an `Option`: a null one from the other side
 //! is refused before it is called, never called.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 /// `clap_version_t`.
 #[repr(C)]
@@ -426,6 +426,102 @@ pub struct ClapHostState {
     pub mark_dirty: Option<unsafe extern "C" fn(host: *const ClapHost)>,
 }
 
+/// `CLAP_EXT_GUI`, and the window APIs.
+pub const CLAP_EXT_GUI: &std::ffi::CStr = c"clap.gui";
+pub const CLAP_WINDOW_API_WIN32: &std::ffi::CStr = c"win32";
+pub const CLAP_WINDOW_API_COCOA: &std::ffi::CStr = c"cocoa";
+pub const CLAP_WINDOW_API_X11: &std::ffi::CStr = c"x11";
+
+/// `clap_window_t`: `handle` is the union of a window's `HWND`, `NSView *`
+/// or X11 `Window` (an `unsigned long`, pointer-sized where X11 runs).
+#[repr(C)]
+pub struct ClapWindow {
+    pub api: *const c_char,
+    pub handle: *mut c_void,
+}
+
+/// `clap_gui_resize_hints_t`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct ClapGuiResizeHints {
+    pub can_resize_horizontally: bool,
+    pub can_resize_vertically: bool,
+    pub preserve_aspect_ratio: bool,
+    pub aspect_ratio_width: u32,
+    pub aspect_ratio_height: u32,
+}
+
+/// `clap_plugin_gui_t`.
+#[repr(C)]
+pub struct ClapPluginGui {
+    pub is_api_supported:
+        Option<unsafe extern "C" fn(plugin: *const ClapPlugin, api: *const c_char, is_floating: bool) -> bool>,
+    pub get_preferred_api: Option<
+        unsafe extern "C" fn(plugin: *const ClapPlugin, api: *mut *const c_char, is_floating: *mut bool) -> bool,
+    >,
+    pub create: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, api: *const c_char, is_floating: bool) -> bool>,
+    pub destroy: Option<unsafe extern "C" fn(plugin: *const ClapPlugin)>,
+    pub set_scale: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, scale: f64) -> bool>,
+    pub get_size: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, width: *mut u32, height: *mut u32) -> bool>,
+    pub can_resize: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> bool>,
+    pub get_resize_hints:
+        Option<unsafe extern "C" fn(plugin: *const ClapPlugin, hints: *mut ClapGuiResizeHints) -> bool>,
+    pub adjust_size: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, width: *mut u32, height: *mut u32) -> bool>,
+    pub set_size: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, width: u32, height: u32) -> bool>,
+    pub set_parent: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, window: *const ClapWindow) -> bool>,
+    pub set_transient: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, window: *const ClapWindow) -> bool>,
+    pub suggest_title: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, title: *const c_char)>,
+    pub show: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> bool>,
+    pub hide: Option<unsafe extern "C" fn(plugin: *const ClapPlugin) -> bool>,
+}
+
+/// `clap_host_gui_t`.
+#[repr(C)]
+pub struct ClapHostGui {
+    pub resize_hints_changed: Option<unsafe extern "C" fn(host: *const ClapHost)>,
+    pub request_resize: Option<unsafe extern "C" fn(host: *const ClapHost, width: u32, height: u32) -> bool>,
+    pub request_show: Option<unsafe extern "C" fn(host: *const ClapHost) -> bool>,
+    pub request_hide: Option<unsafe extern "C" fn(host: *const ClapHost) -> bool>,
+    pub closed: Option<unsafe extern "C" fn(host: *const ClapHost, was_destroyed: bool)>,
+}
+
+/// `CLAP_EXT_TIMER_SUPPORT`.
+pub const CLAP_EXT_TIMER_SUPPORT: &std::ffi::CStr = c"clap.timer-support";
+
+/// `clap_plugin_timer_support_t`.
+#[repr(C)]
+pub struct ClapPluginTimerSupport {
+    pub on_timer: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, timer_id: ClapId)>,
+}
+
+/// `clap_host_timer_support_t`.
+#[repr(C)]
+pub struct ClapHostTimerSupport {
+    pub register_timer:
+        Option<unsafe extern "C" fn(host: *const ClapHost, period_ms: u32, timer_id: *mut ClapId) -> bool>,
+    pub unregister_timer: Option<unsafe extern "C" fn(host: *const ClapHost, timer_id: ClapId) -> bool>,
+}
+
+/// `CLAP_EXT_POSIX_FD_SUPPORT`, and its event flags.
+pub const CLAP_EXT_POSIX_FD_SUPPORT: &std::ffi::CStr = c"clap.posix-fd-support";
+pub const CLAP_POSIX_FD_READ: u32 = 1;
+pub const CLAP_POSIX_FD_WRITE: u32 = 1 << 1;
+pub const CLAP_POSIX_FD_ERROR: u32 = 1 << 2;
+
+/// `clap_plugin_posix_fd_support_t`.
+#[repr(C)]
+pub struct ClapPluginPosixFdSupport {
+    pub on_fd: Option<unsafe extern "C" fn(plugin: *const ClapPlugin, fd: c_int, flags: u32)>,
+}
+
+/// `clap_host_posix_fd_support_t`.
+#[repr(C)]
+pub struct ClapHostPosixFdSupport {
+    pub register_fd: Option<unsafe extern "C" fn(host: *const ClapHost, fd: c_int, flags: u32) -> bool>,
+    pub modify_fd: Option<unsafe extern "C" fn(host: *const ClapHost, fd: c_int, flags: u32) -> bool>,
+    pub unregister_fd: Option<unsafe extern "C" fn(host: *const ClapHost, fd: c_int) -> bool>,
+}
+
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
@@ -482,6 +578,17 @@ mod tests {
         assert_eq!(size_of::<ClapOStream>(), 16);
         assert_eq!(size_of::<ClapPluginState>(), 16);
         assert_eq!(size_of::<ClapHostState>(), 8);
+        assert_eq!(size_of::<ClapWindow>(), 16);
+        assert_eq!(size_of::<ClapGuiResizeHints>(), 12);
+        assert_eq!(offset_of!(ClapGuiResizeHints, aspect_ratio_width), 4);
+        assert_eq!(size_of::<ClapPluginGui>(), 120);
+        assert_eq!(offset_of!(ClapPluginGui, set_parent), 80);
+        assert_eq!(offset_of!(ClapPluginGui, hide), 112);
+        assert_eq!(size_of::<ClapHostGui>(), 40);
+        assert_eq!(size_of::<ClapPluginTimerSupport>(), 8);
+        assert_eq!(size_of::<ClapHostTimerSupport>(), 16);
+        assert_eq!(size_of::<ClapPluginPosixFdSupport>(), 8);
+        assert_eq!(size_of::<ClapHostPosixFdSupport>(), 24);
         assert_eq!(size_of::<Option<unsafe extern "C" fn()>>(), 8, "a null pointer is None");
     }
 }

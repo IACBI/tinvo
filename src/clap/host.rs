@@ -45,13 +45,16 @@ use super::PluginRef;
 use super::ffi::*;
 use super::library::Dso;
 use std::cell::Cell;
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+mod gui;
+pub use gui::{GuiMode, GuiSupport, ParentWindow};
 
 /// The most parameters read of a plugin; any beyond are left out.
 pub const MAX_PARAMS: usize = 4096;
@@ -201,6 +204,9 @@ pub enum Request {
     /// changes sent to it ([`Instance::set_param`]) are not reported: the
     /// sender knows of them.
     StateDirty(u64),
+    /// The window of the instance with this token closed: the plugin
+    /// closed it.
+    GuiClosed(u64),
 }
 
 /// One of a plugin's parameters, as `clap.params` describes it.
@@ -295,6 +301,11 @@ struct HostData {
     /// Every parameter change with a serial up to this one has reached the
     /// plugin, or was dropped with its parameter.
     delivered: AtomicU64,
+    /// Made to play in real time: its host serves timers and descriptors
+    /// (an offline render's does not, so it offers neither).
+    reactor: bool,
+    /// Its window, timers and descriptors.
+    gui: gui::GuiData,
 }
 
 /// The extensions an instance has that the host calls, checked complete
@@ -304,6 +315,9 @@ struct Exts {
     params: Option<ParamsFns>,
     state: Option<StateFns>,
     latency: Option<unsafe extern "C" fn(*const ClapPlugin) -> u32>,
+    gui: Option<gui::GuiFns>,
+    on_timer: Option<unsafe extern "C" fn(*const ClapPlugin, ClapId)>,
+    on_fd: Option<unsafe extern "C" fn(*const ClapPlugin, c_int, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -335,6 +349,9 @@ impl Exts {
             let params = get_extension(plugin, CLAP_EXT_PARAMS.as_ptr()).cast::<ClapPluginParams>();
             let state = get_extension(plugin, CLAP_EXT_STATE.as_ptr()).cast::<ClapPluginState>();
             let latency = get_extension(plugin, CLAP_EXT_LATENCY.as_ptr()).cast::<ClapPluginLatency>();
+            let gui = get_extension(plugin, CLAP_EXT_GUI.as_ptr()).cast::<ClapPluginGui>();
+            let timer = get_extension(plugin, CLAP_EXT_TIMER_SUPPORT.as_ptr()).cast::<ClapPluginTimerSupport>();
+            let fd = get_extension(plugin, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()).cast::<ClapPluginPosixFdSupport>();
             Exts {
                 params: params.as_ref().and_then(|p| {
                     Some(ParamsFns {
@@ -348,6 +365,9 @@ impl Exts {
                 }),
                 state: state.as_ref().and_then(|s| Some(StateFns { save: s.save?, load: s.load? })),
                 latency: latency.as_ref().and_then(|l| l.get),
+                gui: gui::GuiFns::of(gui),
+                on_timer: timer.as_ref().and_then(|t| t.on_timer),
+                on_fd: fd.as_ref().and_then(|f| f.on_fd),
             }
         }
     }
@@ -390,12 +410,14 @@ unsafe fn host_data<'a>(host: *const ClapHost) -> Option<&'a HostData> {
     unsafe { host.cast::<HostData>().as_ref() }
 }
 
-unsafe extern "C" fn host_get_extension(_host: *const ClapHost, id: *const c_char) -> *const c_void {
+unsafe extern "C" fn host_get_extension(host: *const ClapHost, id: *const c_char) -> *const c_void {
     if id.is_null() {
         return null();
     }
-    // SAFETY: a plugin passes a NUL-terminated id.
+    // SAFETY: a plugin passes a NUL-terminated id, and the host pointer it
+    // was given.
     let id = unsafe { CStr::from_ptr(id) };
+    let reactor = unsafe { host_data(host) }.is_some_and(|h| h.reactor);
     if id == CLAP_EXT_THREAD_CHECK {
         (&raw const THREAD_CHECK).cast()
     } else if id == CLAP_EXT_PARAMS {
@@ -404,6 +426,12 @@ unsafe extern "C" fn host_get_extension(_host: *const ClapHost, id: *const c_cha
         (&raw const HOST_LATENCY).cast()
     } else if id == CLAP_EXT_STATE {
         (&raw const HOST_STATE).cast()
+    } else if id == CLAP_EXT_GUI {
+        (&raw const gui::HOST_GUI).cast()
+    } else if id == CLAP_EXT_TIMER_SUPPORT && reactor {
+        (&raw const gui::HOST_TIMER).cast()
+    } else if id == CLAP_EXT_POSIX_FD_SUPPORT && reactor && cfg!(unix) {
+        (&raw const gui::HOST_FD).cast()
     } else {
         null()
     }
@@ -616,6 +644,8 @@ impl PluginHost {
             flush: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             delivered: AtomicU64::new(0),
+            reactor: mode == Mode::Realtime,
+            gui: gui::GuiData::default(),
         });
         // SAFETY: the factory's own function, given a host that lives until
         // after `destroy` (the instance holds it) and a NUL-terminated id.
@@ -739,6 +769,10 @@ impl PluginHost {
             requests.extend(cleared.into_iter().map(|(id, flags)| Request::Cleared { token: h.token, id, flags }));
             if h.dirty.swap(false, Ordering::AcqRel) {
                 requests.push(Request::StateDirty(h.token));
+            }
+            let plugin = h.plugin.load(Ordering::Acquire);
+            if !plugin.is_null() {
+                h.serve_gui(plugin, &mut requests);
             }
             true
         });
@@ -1740,6 +1774,8 @@ impl Drop for Instance {
         // An instance the audio thread left processing (its stream ended
         // without stopping it) is stopped here, playing the audio thread.
         self.stop();
+        // Its window goes first, while the plugin is whole.
+        self.host.close_gui();
         // SAFETY: main thread; deactivated if it was active, then destroyed
         // once; the host data and the file outlive it.
         unsafe {
@@ -1748,6 +1784,8 @@ impl Drop for Instance {
             }
             self.host.plugin.store(null_mut(), Ordering::Release);
             (self.fns.destroy)(self.plugin);
+            // What it left registered is nothing to call any more.
+            self.host.gui.forget_registrations();
             ManuallyDrop::drop(&mut self.host);
             ManuallyDrop::drop(&mut self.dso);
         }

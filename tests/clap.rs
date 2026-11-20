@@ -6,15 +6,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tinvo::app::{App, EngineLink, Focus, Mode as EditorMode, Page, PluginFor, PluginPicker};
 use tinvo::clap::ffi::{
     CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS,
-    CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, ClapPlugin,
+    CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE, CLAP_WINDOW_API_COCOA,
+    CLAP_WINDOW_API_WIN32, CLAP_WINDOW_API_X11, ClapGuiResizeHints, ClapPlugin,
 };
 use tinvo::clap::host::{
-    Instance, MAX_EVENTS, MAX_LATENCY_SECONDS, MAX_PARAM_EVENTS, Mode, ParamInfo, PluginHost, Request, Role,
-    max_latency,
+    GuiMode, GuiSupport, Instance, MAX_EVENTS, MAX_LATENCY_SECONDS, MAX_PARAM_EVENTS, Mode, ParamInfo, ParentWindow,
+    PluginHost, Request, Role, max_latency,
 };
 use tinvo::clap::scan::{self, Catalog, Options};
 use tinvo::clap::{PluginRef, Roles};
@@ -999,6 +1000,467 @@ fn a_change_with_no_room_yet_is_not_acknowledged() {
     gain.stop();
     drop(gain);
     drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What `org.tinvo.test.gui` reports; the test plugin has the same.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct GuiStats {
+    timer_calls: u32,
+    fd_calls: u32,
+    fd: i32,
+    width: u32,
+    height: u32,
+    broken: u32,
+}
+
+#[repr(C)]
+struct GuiTestExt {
+    log: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut u8, cap: usize) -> usize,
+    stats: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut GuiStats),
+    poke: unsafe extern "C" fn(plugin: *const ClapPlugin, what: u32, a: u32, b: u32) -> bool,
+}
+
+/// The test plugin's window and the calls to it, through its own test
+/// extension, from any thread.
+#[derive(Clone, Copy)]
+struct GuiProbe {
+    plugin: *const ClapPlugin,
+    ext: *const GuiTestExt,
+}
+
+// SAFETY: the test plugin's probe functions may be called from any thread
+// while its instance lives.
+unsafe impl Send for GuiProbe {}
+unsafe impl Sync for GuiProbe {}
+
+impl GuiProbe {
+    fn of(i: &Instance) -> GuiProbe {
+        let ext = i.extension(c"org.tinvo.test.gui").cast::<GuiTestExt>();
+        assert!(!ext.is_null(), "the test plugin's window probe");
+        GuiProbe { plugin: i.as_ptr(), ext }
+    }
+
+    /// The calls its window had, a line each.
+    fn log(&self) -> Vec<String> {
+        let mut buf = vec![0u8; 1 << 16];
+        // SAFETY: the test plugin's extension, given its own instance and
+        // the buffer's capacity.
+        let n = unsafe { ((*self.ext).log)(self.plugin, buf.as_mut_ptr(), buf.len()) };
+        String::from_utf8_lossy(&buf[..n]).lines().map(str::to_string).collect()
+    }
+
+    fn stats(&self) -> GuiStats {
+        let mut s = GuiStats::default();
+        // SAFETY: as above.
+        unsafe { ((*self.ext).stats)(self.plugin, &mut s) };
+        s
+    }
+
+    /// Makes the plugin call its host's `clap.gui` (see the test plugin).
+    fn poke(&self, what: u32, a: u32, b: u32) -> bool {
+        // SAFETY: as above.
+        unsafe { ((*self.ext).poke)(self.plugin, what, a, b) }
+    }
+}
+
+/// A window of TINVO's that is none: what was asked of it, logged.
+struct InertParent {
+    log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    refuse: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl ParentWindow for InertParent {
+    fn handle(&self) -> *mut std::ffi::c_void {
+        std::ptr::dangling_mut()
+    }
+    fn scale(&self) -> Option<f64> {
+        (!cfg!(target_os = "macos")).then_some(1.5)
+    }
+    fn resize(&mut self, width: u32, height: u32) -> bool {
+        if self.refuse.get() {
+            return false;
+        }
+        self.log.borrow_mut().push(format!("resize {width}x{height}"));
+        true
+    }
+    fn set_resizable(&mut self, hints: Option<ClapGuiResizeHints>) {
+        self.log.borrow_mut().push(format!("resizable {}", hints.is_some()));
+    }
+    fn show(&mut self) {
+        self.log.borrow_mut().push("show".into());
+    }
+    fn hide(&mut self) {
+        self.log.borrow_mut().push("hide".into());
+    }
+}
+
+impl Drop for InertParent {
+    fn drop(&mut self) {
+        self.log.borrow_mut().push("dropped".into());
+    }
+}
+
+/// The window API of the system the tests run on.
+fn platform_api() -> &'static std::ffi::CStr {
+    if cfg!(windows) {
+        CLAP_WINDOW_API_WIN32
+    } else if cfg!(target_os = "macos") {
+        CLAP_WINDOW_API_COCOA
+    } else {
+        CLAP_WINDOW_API_X11
+    }
+}
+
+type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+type Flag = std::rc::Rc<std::cell::Cell<bool>>;
+type MakeParent = Box<dyn FnOnce() -> Result<Box<dyn ParentWindow>, String>>;
+
+/// An inert window for a plugin to be put in: what is asked of it, a switch
+/// to make it refuse sizes, and the maker to hand to `gui_open`.
+fn inert() -> (Log, Flag, MakeParent) {
+    let log = Log::default();
+    let refuse = std::rc::Rc::new(std::cell::Cell::new(false));
+    let parent = InertParent { log: log.clone(), refuse: refuse.clone() };
+    (log, refuse, Box::new(move || Ok(Box::new(parent) as Box<dyn ParentWindow>)))
+}
+
+fn taken(log: &Log) -> Vec<String> {
+    std::mem::take(&mut *log.borrow_mut())
+}
+
+#[test]
+fn a_plugin_window_is_embedded_in_one_of_tinvo_s() {
+    let dir = temp_dir("gui-embedded");
+    let file = install(&dir, "gui");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (handle, probe) = (gain.handle(), GuiProbe::of(&gain));
+    let api = platform_api();
+    assert_eq!(handle.gui_support(api), GuiSupport { floating: false, embedded: true });
+    assert_eq!(handle.gui_support(c"wayland"), GuiSupport::default());
+    assert!(handle.gui_open(c"wayland", "x", || unreachable!()).is_err(), "no API it has");
+    assert_eq!(handle.gui_mode(), None);
+    // No window of TINVO's to put it in: never made. One that cannot take
+    // its size: made, then destroyed again with TINVO's window after it.
+    assert_eq!(handle.gui_open(api, "x", || Err("no display".into())), Err("no display".into()));
+    assert_eq!(probe.log(), Vec::<String>::new());
+    let scaled: &[&str] = if cfg!(target_os = "macos") { &[] } else { &["scale 1.5"] };
+    let (parent, refuse, make) = inert();
+    refuse.set(true);
+    assert_eq!(handle.gui_open(api, "Test Gain", make), Err("could not make a window its size".into()));
+    let expected: Vec<&str> = ["create embedded"].iter().chain(scaled).chain(&["destroy"]).copied().collect();
+    assert_eq!(probe.log(), expected);
+    assert_eq!(taken(&parent), ["resizable true", "dropped"]);
+    assert_eq!(handle.gui_mode(), None);
+    // Made, scaled where the system sizes in pixels, sized, put in TINVO's
+    // window and shown.
+    let (parent, refuse, make) = inert();
+    assert_eq!(handle.gui_open(api, "Test Gain", make), Ok(GuiMode::Embedded));
+    let expected: Vec<&str> = ["create embedded"].iter().chain(scaled).chain(&["parent", "show"]).copied().collect();
+    let before = probe.log().len() - expected.len();
+    assert_eq!(probe.log()[before..], expected);
+    assert_eq!(taken(&parent), ["resizable true", "resize 300x200", "show"]);
+    assert_eq!(handle.gui_open(api, "again", || unreachable!()), Ok(GuiMode::Embedded), "open already");
+    // Dragged, it takes the nearest size it can, and the window follows;
+    // the window's own report of that is no drag.
+    handle.gui_resized(455, 333);
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 450x330"));
+    assert_eq!(taken(&parent), ["resize 450x330"]);
+    handle.gui_resized(450, 330);
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 450x330"));
+    assert_eq!(probe.log().iter().filter(|l| l.starts_with("size")).count(), 1);
+    // Asked on the main thread, the window's answer is the plugin's.
+    assert!(probe.poke(0, 500, 400));
+    assert_eq!(taken(&parent), ["resize 500x400"]);
+    refuse.set(true);
+    assert!(!probe.poke(0, 600, 500));
+    assert!(!probe.poke(0, 0, 500), "no size");
+    // Asked from another thread, it is taken, and served by the next poll:
+    // refused, the plugin goes back to its last size.
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
+    assert_eq!(host.poll(), []);
+    assert_eq!(probe.log().last().map(String::as_str), Some("size 500x400"));
+    refuse.set(false);
+    assert!(!probe.poke(0, 0, 500) && !probe.poke(0, 500, 0), "no size");
+    std::thread::scope(|s| s.spawn(|| assert!(!probe.poke(0, 0, 500))).join().unwrap());
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 700, 500))).join().unwrap());
+    host.poll();
+    assert_eq!(taken(&parent), ["resize 700x500"]);
+    // One taken from another thread gives way to a later one it got on the
+    // main thread.
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
+    assert!(probe.poke(0, 800, 600));
+    host.poll();
+    assert_eq!(taken(&parent), ["resize 800x600"]);
+    // A size it asks for while it takes a drag wins over the drag.
+    assert!(probe.poke(10, 3, 0));
+    handle.gui_resized(455, 333);
+    assert_eq!(taken(&parent), ["resize 777x555"]);
+    // Hidden and shown as it asks, the last it asked winning.
+    assert!(probe.poke(2, 0, 0) && probe.poke(1, 0, 0) && probe.poke(2, 0, 0));
+    host.poll();
+    assert_eq!(probe.log().last().map(String::as_str), Some("hide"));
+    assert_eq!(taken(&parent), ["hide"]);
+    // Shown with a size taken from another thread waiting, and asking for
+    // another while it shows: the later one stands.
+    assert!(probe.poke(10, 6, 0));
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
+    assert!(probe.poke(1, 0, 0));
+    host.poll();
+    assert_eq!(taken(&parent), ["resize 777x555", "show"]);
+    assert!(probe.poke(4, 0, 0));
+    host.poll();
+    assert_eq!(taken(&parent), ["resizable true"]);
+    // Its window's calls run on the main thread while it plays on another.
+    std::thread::scope(|s| {
+        let audio = s.spawn(|| {
+            for _ in 0..200 {
+                processed(&mut gain, 32);
+            }
+        });
+        for _ in 0..20 {
+            handle.gui_resized(320, 240);
+            assert!(handle.gui_support(api).embedded);
+        }
+        audio.join().unwrap();
+    });
+    // Closed: hidden, destroyed, then TINVO's window.
+    taken(&parent);
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
+    let before = probe.log().len();
+    handle.gui_close();
+    assert_eq!(probe.log()[before..], ["hide", "destroy"]);
+    assert_eq!(taken(&parent), ["hide", "dropped"]);
+    assert_eq!(handle.gui_mode(), None);
+    assert!(!probe.poke(1, 0, 0) && !probe.poke(0, 10, 10), "nothing open to show or resize");
+    // What it asked of the window it had is nothing to the next.
+    let (parent, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert_eq!(host.poll(), []);
+    assert_eq!(taken(&parent), ["resizable true", "resize 300x200", "show"]);
+    handle.gui_close();
+    gain.stop();
+    assert_eq!(probe.stats().broken, 0, "every window call by CLAP's rules");
+    drop(gain);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_window_closed_by_its_plugin_or_with_it_is_destroyed_once() {
+    let dir = temp_dir("gui-closed");
+    let file = install(&dir, "gui");
+    let mut host = PluginHost::new();
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (handle, probe) = (gain.handle(), GuiProbe::of(&gain));
+    let api = platform_api();
+    // Closed and destroyed by the user: the host's destroy only
+    // acknowledges it, with no hide first.
+    let (parent, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    let before = probe.log().len();
+    assert!(probe.poke(3, 1, 0) && probe.poke(3, 0, 0), "destroyed, whatever it says after");
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(probe.log()[before..], ["closed by the user", "destroy"]);
+    assert_eq!(parent.borrow().last().map(String::as_str), Some("dropped"));
+    assert_eq!(handle.gui_mode(), None);
+    // Destroyed by the user inside a call: only destroyed after that.
+    let (_, _, make) = inert();
+    assert!(probe.poke(10, 2, 0));
+    let before = probe.log().len();
+    assert_eq!(handle.gui_open(api, "Test Gain", make), Err("closed its window".into()));
+    assert_eq!(probe.log()[before..], ["create embedded", "closed by the user", "destroy"]);
+    assert_eq!((handle.gui_mode(), host.poll()), (None, vec![]));
+    let (parent, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert!(probe.poke(2, 0, 0));
+    host.poll();
+    assert!(probe.poke(10, 1, 0));
+    std::thread::scope(|s| s.spawn(|| assert!(probe.poke(0, 640, 480))).join().unwrap());
+    assert!(probe.poke(1, 0, 0) && probe.poke(4, 0, 0));
+    let before = probe.log().len();
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(probe.log()[before..], ["show", "closed by the user", "destroy"]);
+    assert!(!parent.borrow().iter().any(|l| l == "resize 640x480"), "nothing more asked of it");
+    assert_eq!(parent.borrow().last().map(String::as_str), Some("dropped"));
+    // Destroyed by the user, then closed by TINVO before the poll: not
+    // hidden either.
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    let before = probe.log().len();
+    assert!(probe.poke(3, 1, 0));
+    handle.gui_close();
+    assert_eq!(probe.log()[before..], ["closed by the user", "destroy"]);
+    assert_eq!(host.poll(), [], "closed by TINVO, not reported");
+    // Destroyed by the user while it takes a drag: not sized after.
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert!(probe.poke(10, 5, 0));
+    let before = probe.log().len();
+    handle.gui_resized(455, 333);
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(probe.log()[before..], ["closed by the user", "destroy"]);
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    assert!(probe.poke(10, 7, 0));
+    handle.gui_resized(455, 333);
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    // Closed only: hidden, then destroyed, as TINVO keeps no hidden window.
+    let (_, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    let before = probe.log().len();
+    assert!(probe.poke(3, 0, 0) && probe.poke(1, 0, 0), "closing wins over showing");
+    assert_eq!(host.poll(), [Request::GuiClosed(gain.token())]);
+    assert_eq!(probe.log()[before..], ["hide", "destroy"]);
+    // A maker that opens the window itself, or drops the instance: one
+    // window, and nothing called once the instance is gone.
+    let third = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (h3, p3) = (third.handle(), GuiProbe::of(&third));
+    let (_, _, inner) = inert();
+    let (_, _, outer) = inert();
+    let opened = h3.gui_open(api, "x", || {
+        h3.gui_open(api, "x", inner).unwrap();
+        outer()
+    });
+    assert_eq!(opened, Ok(GuiMode::Embedded));
+    assert_eq!(p3.log().iter().filter(|l| *l == "create embedded").count(), 1);
+    h3.gui_close();
+    let (_, _, make) = inert();
+    let dropped = h3.gui_open(api, "x", move || {
+        drop(third);
+        make()
+    });
+    assert_eq!(dropped, Err("is not playing".into()));
+    // Open as its instance goes, wherever it is dropped: destroyed first.
+    let (parent, _, make) = inert();
+    handle.gui_open(api, "Test Gain", make).unwrap();
+    let other = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    std::thread::scope(|s| s.spawn(move || drop(gain)).join().unwrap());
+    assert!(handle.is_alive(), "home, not yet destroyed");
+    host.poll();
+    assert!(!handle.is_alive());
+    assert_eq!(parent.borrow().last().map(String::as_str), Some("dropped"));
+    assert_eq!(handle.gui_open(api, "x", || unreachable!()), Err("is not playing".into()));
+    assert_eq!(handle.gui_support(api), GuiSupport::default());
+    handle.gui_resized(10, 10);
+    handle.gui_close();
+    assert_eq!(GuiProbe::of(&other).stats().broken, 0, "every instance, destroyed with its window gone first");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_s_timers_and_descriptors_are_served_on_the_main_thread() {
+    let dir = temp_dir("gui-timers");
+    let file = install(&dir, "gui");
+    let mut host = PluginHost::new();
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (handle, probe) = (gain.handle(), GuiProbe::of(&gain));
+    assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
+    let (_, _, make) = inert();
+    handle.gui_open(platform_api(), "Test Gain", make).unwrap();
+    // Its 20 ms timer: due once a period on, a late one run once and due a
+    // period after.
+    let start = Instant::now();
+    let due = host.next_timer().expect("its timer");
+    assert!(due > start && due <= start + Duration::from_millis(21));
+    host.dispatch(due - Duration::from_millis(1), &[]);
+    assert_eq!(probe.stats().timer_calls, 0, "not yet due");
+    host.dispatch(due, &[]);
+    assert_eq!(probe.stats().timer_calls, 1);
+    let late = due + Duration::from_secs(1);
+    host.dispatch(late, &[]);
+    assert_eq!(probe.stats().timer_calls, 2, "once, however late");
+    assert_eq!(host.next_timer(), Some(late + Duration::from_millis(20)));
+    // A descriptor's readiness reaches the plugin with the flags it waits
+    // for; one it does not wait on, nothing.
+    if cfg!(unix) {
+        let fd = probe.stats().fd;
+        assert_eq!(host.fds(), [(fd, CLAP_POSIX_FD_READ)]);
+        host.dispatch(Instant::now(), &[(fd + 100, CLAP_POSIX_FD_READ), (fd, CLAP_POSIX_FD_WRITE)]);
+        assert_eq!(probe.stats().fd_calls, 0, "not ready the way it waits");
+        host.dispatch(Instant::now(), &[(fd, CLAP_POSIX_FD_READ | CLAP_POSIX_FD_WRITE)]);
+        assert_eq!(probe.stats().fd_calls, 1);
+        assert_eq!(probe.log().last().map(String::as_str), Some("fd"));
+    } else {
+        assert_eq!(host.fds(), [], "no descriptors on Windows");
+    }
+    // Closed, it takes them back.
+    handle.gui_close();
+    assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
+    // Registered on the main thread only, a timer at least 15 ms apart, a
+    // descriptor once and with flags CLAP has.
+    std::thread::scope(|s| {
+        s.spawn(|| assert!(!probe.poke(5, 20, 0) && !probe.poke(7, 1000, CLAP_POSIX_FD_READ), "off its main thread"))
+            .join()
+            .unwrap()
+    });
+    assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
+    let start = Instant::now();
+    assert!(probe.poke(5, 1, 0));
+    let due = host.next_timer().unwrap();
+    assert!(due >= start + Duration::from_millis(15) && due <= Instant::now() + Duration::from_millis(15));
+    assert!(probe.poke(6, 0, 0) && !probe.poke(6, 0, 0), "unregistered once");
+    assert_eq!(host.next_timer(), None);
+    // Two due together, the first taking both away: the second not called.
+    assert!(probe.poke(10, 4, 0) && probe.poke(5, 20, 0) && probe.poke(5, 20, 0));
+    let calls = probe.stats().timer_calls;
+    host.dispatch(Instant::now() + Duration::from_secs(1), &[]);
+    assert_eq!((probe.stats().timer_calls, host.next_timer()), (calls + 1, None));
+    if cfg!(unix) {
+        assert!(!probe.poke(7, 1000, 8), "no such flag");
+        assert!(probe.poke(7, 1000, CLAP_POSIX_FD_READ));
+        assert!(!probe.poke(7, 1000, CLAP_POSIX_FD_WRITE), "registered already");
+        assert!(probe.poke(8, 1000, CLAP_POSIX_FD_WRITE) && !probe.poke(8, 1000, 8) && !probe.poke(8, 1001, 1));
+        assert_eq!(host.fds(), [(1000, CLAP_POSIX_FD_WRITE)]);
+        assert!(probe.poke(9, 1000, 0) && !probe.poke(9, 1000, 0));
+        assert_eq!(host.fds(), []);
+        // The readiness of a descriptor it closed reaches none that took
+        // its number since.
+        assert!(probe.poke(7, 1000, CLAP_POSIX_FD_READ));
+        assert_eq!(host.fds(), [(1000, CLAP_POSIX_FD_READ)]);
+        assert!(probe.poke(9, 1000, 0) && probe.poke(7, 1000, CLAP_POSIX_FD_READ));
+        let calls = probe.stats().fd_calls;
+        host.dispatch(Instant::now(), &[(1000, CLAP_POSIX_FD_READ)]);
+        assert_eq!(probe.stats().fd_calls, calls);
+        assert!(probe.poke(9, 1000, 0));
+    } else {
+        assert!(!probe.poke(7, 1000, CLAP_POSIX_FD_READ), "no descriptors on Windows");
+    }
+    assert_eq!(probe.stats().broken, 0);
+    drop(gain);
+    // An instance made for an offline render is offered neither.
+    // SAFETY: the test plugin, loaded only through plugin hosts here.
+    let offline = unsafe { host.create(&file, GAIN, Role::Effect, Mode::Offline, RATE, 64) }.unwrap();
+    let (_, _, make) = inert();
+    offline.handle().gui_open(platform_api(), "Test Gain", make).unwrap();
+    assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_floating_plugin_window_and_what_its_plugin_leaves_registered() {
+    let dir = temp_dir("gui-floating");
+    let file = install(&dir, "floatgui");
+    let mut host = PluginHost::new();
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (handle, probe) = (gain.handle(), GuiProbe::of(&gain));
+    let api = platform_api();
+    assert_eq!(handle.gui_support(api), GuiSupport { floating: true, embedded: true });
+    // Floated by the plugin, with a title and no window of TINVO's.
+    assert_eq!(handle.gui_open(api, "Test Gain", || unreachable!()), Ok(GuiMode::Floating));
+    assert_eq!(probe.log(), ["create floating", "title Test Gain", "show"]);
+    assert!(!probe.poke(0, 500, 400), "it sizes its own window");
+    handle.gui_resized(100, 100);
+    assert_eq!(probe.log().len(), 3, "nor is it sized by TINVO");
+    // Closed, it leaves its timer and descriptor; destroyed, they go.
+    handle.gui_close();
+    assert!(host.next_timer().is_some());
+    let other = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    drop(gain);
+    assert_eq!((host.next_timer(), host.fds()), (None, vec![]));
+    host.dispatch(Instant::now() + Duration::from_secs(1), &[(0, CLAP_POSIX_FD_READ)]);
+    assert_eq!(GuiProbe::of(&other).stats().broken, 0, "every instance");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
