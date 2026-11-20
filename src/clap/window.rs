@@ -17,9 +17,13 @@ use std::ffi::CStr;
 mod win32;
 #[cfg(windows)]
 use win32 as platform;
+#[cfg(target_os = "linux")]
+mod x11;
+#[cfg(target_os = "linux")]
+use x11 as platform;
 
 /// Where TINVO opens no plugin windows yet.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::{Event, GuiMode, PluginHandle};
     use std::ffi::CStr;
@@ -35,23 +39,32 @@ mod platform {
     }
 
     pub(super) fn forget(_: u64) {}
+
+    pub(super) fn descriptor() -> Option<i32> {
+        None
+    }
+
+    pub(super) fn queued() -> bool {
+        false
+    }
 }
 
 /// What a window of TINVO's recorded for the plugin window in it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 enum Event {
     /// The user closed the window of the instance with this token.
     Closed(u64),
     /// Its client area took this size.
     Resized(u64, u32, u32),
     /// It moved to a monitor of this scale.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Scaled(u64, f64),
 }
 
 impl Event {
     /// The token of the instance whose window recorded it.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     fn token(&self) -> u64 {
         match *self {
             Event::Closed(t) | Event::Resized(t, ..) | Event::Scaled(t, _) => t,
@@ -84,8 +97,16 @@ impl Windows {
     pub fn api() -> Option<&'static CStr> {
         #[cfg(windows)]
         return Some(super::ffi::CLAP_WINDOW_API_WIN32);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        return Some(super::ffi::CLAP_WINDOW_API_X11);
+        #[cfg(not(any(windows, target_os = "linux")))]
         None
+    }
+
+    /// The descriptor the main loop waits on for what the windowing
+    /// system sends TINVO's windows, where it has one (X11) and it is open.
+    pub fn descriptor(&self) -> Option<i32> {
+        platform::descriptor()
     }
 
     /// Whether the window of the instance with `token` is open.
@@ -129,6 +150,21 @@ impl Windows {
     /// the tokens of the windows the user closed. Windows whose plugin
     /// closed them, or went, are let go of.
     pub fn pump(&mut self) -> Vec<u64> {
+        let mut closed = Vec::new();
+        // What serving them had the system read meanwhile is served too (X11
+        // reads events while it waits on the server for something else),
+        // in a few rounds at most.
+        for _ in 0..4 {
+            self.serve(&mut closed);
+            if !platform::queued() {
+                break;
+            }
+        }
+        closed
+    }
+
+    /// One round of [`Windows::pump`], adding the tokens closed to `closed`.
+    fn serve(&mut self, closed: &mut Vec<u64>) {
         let mut events = platform::pump(|token| self.is_open(token));
         // Only the last size of each window: the ones before are past.
         let mut i = events.len();
@@ -141,7 +177,6 @@ impl Windows {
                 }
             }
         }
-        let mut closed = Vec::new();
         for event in events {
             match event {
                 Event::Closed(token) => {
@@ -169,7 +204,6 @@ impl Windows {
             }
             open
         });
-        closed
     }
 }
 

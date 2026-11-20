@@ -45,6 +45,14 @@ jobs:
           sleep 3
           cat "$RUNNER_TEMP/jackd.log"
           echo TINVO_REQUIRE_JACK=1 >> "$GITHUB_ENV"
+      - name: Start an X server
+        if: runner.os == 'Linux'
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
+          nohup setsid Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          sleep 2
+          echo DISPLAY=:99 >> "$GITHUB_ENV"
+          echo TINVO_REQUIRE_X11=1 >> "$GITHUB_ENV"
       - name: Install a loopback audio device
         if: runner.os == 'macOS'
         run: |
