@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-20
+
 ### Added
 - Project format 16: CLAP plugins by id, as a track's instrument (`track plugin <id>`) and in insert slots (`insert 0 plugin <id>`). A plugin that is not installed is kept as written. Format 15 files still load.
 - `tinvo render` plays the CLAP plugins a project names, each made for offline rendering. A plugin that is not installed, cannot load or fails while rendering stops the render with its name and the reason, and no file is written; with `--stems`, the mix and the stems are put in place only once all of them rendered.
@@ -464,7 +466,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/IACBI/tinvo/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/IACBI/tinvo/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/IACBI/tinvo/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/IACBI/tinvo/compare/v0.23.0...v0.24.0
