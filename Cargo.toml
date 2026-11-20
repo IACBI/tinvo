@@ -21,6 +21,11 @@ name = "realtime"
 # Its own allocator counts calls on one thread; the harness adds threads.
 harness = false
 
+[[test]]
+name = "cocoa"
+# AppKit makes windows only on the main thread, which the harness keeps.
+harness = false
+
 [[example]]
 name = "clap_fixture"
 # A CLAP plugin file the tests in tests/clap.rs load.

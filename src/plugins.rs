@@ -195,6 +195,12 @@ impl Plugins {
         self.host.poll()
     }
 
+    /// How long the main loop may wait at most for the windows' sake (see
+    /// [`Windows::wake_within`]).
+    pub fn wake_within(&self) -> Option<std::time::Duration> {
+        self.windows.wake_within()
+    }
+
     /// When the next of the instances' timers is due.
     pub fn next_timer(&self) -> Option<Instant> {
         self.host.next_timer()
@@ -221,6 +227,8 @@ impl Plugins {
     /// number), and the windows' messages.
     pub fn serve_main_thread(&mut self, ready: &[(i32, u32)], round: u64) {
         let ready = if round == self.fd_round { ready } else { &[] };
+        // Exports serve them often, within one time round the main loop.
+        let _pool = crate::clap::window::Pool::push();
         self.host.dispatch(Instant::now(), ready);
         self.windows.pump();
     }

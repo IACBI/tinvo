@@ -21,9 +21,13 @@ use win32 as platform;
 mod x11;
 #[cfg(target_os = "linux")]
 use x11 as platform;
+#[cfg(target_os = "macos")]
+mod cocoa;
+#[cfg(target_os = "macos")]
+use cocoa as platform;
 
-/// Where TINVO opens no plugin windows yet.
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Where TINVO opens no plugin windows.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::{Event, GuiMode, PluginHandle};
     use std::ffi::CStr;
@@ -51,7 +55,7 @@ mod platform {
 
 /// What a window of TINVO's recorded for the plugin window in it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
 enum Event {
     /// The user closed the window of the instance with this token.
     Closed(u64),
@@ -64,10 +68,28 @@ enum Event {
 
 impl Event {
     /// The token of the instance whose window recorded it.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
     fn token(&self) -> u64 {
         match *self {
             Event::Closed(t) | Event::Resized(t, ..) | Event::Scaled(t, _) => t,
+        }
+    }
+}
+
+/// An autorelease pool on macOS for as long as it lives, so what plugins
+/// and AppKit autorelease on the main thread is let go of each time round
+/// the main loop; nothing elsewhere.
+pub struct Pool {
+    #[cfg(target_os = "macos")]
+    _pool: platform::Pool,
+}
+
+impl Pool {
+    /// A pool for the scope it is held in.
+    pub fn push() -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            _pool: platform::Pool::push(),
         }
     }
 }
@@ -99,7 +121,19 @@ impl Windows {
         return Some(super::ffi::CLAP_WINDOW_API_WIN32);
         #[cfg(target_os = "linux")]
         return Some(super::ffi::CLAP_WINDOW_API_X11);
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        return Some(super::ffi::CLAP_WINDOW_API_COCOA);
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        None
+    }
+
+    /// How long the main loop may wait at most while windows are open,
+    /// where the windowing system's events wake nothing it waits on
+    /// (macOS); `None` where they do, or nothing is open.
+    pub fn wake_within(&self) -> Option<std::time::Duration> {
+        #[cfg(target_os = "macos")]
+        return (!self.open.is_empty()).then_some(platform::WAKE_WITHIN);
+        #[cfg(not(target_os = "macos"))]
         None
     }
 
