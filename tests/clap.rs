@@ -30,77 +30,8 @@ use tinvo::render::{CatalogPlugins, NoPlugins, PluginSource, RenderOptions, rend
 use tinvo::rt::spsc::{self, Consumer};
 use tinvo::tui::{Key, Screen};
 
-const WORKER: &str = env!("CARGO_BIN_EXE_tinvo");
-
-/// The test plugin `cargo test` built.
-fn fixture() -> PathBuf {
-    let name = if cfg!(windows) {
-        "clap_fixture.dll"
-    } else if cfg!(target_os = "macos") {
-        "libclap_fixture.dylib"
-    } else {
-        "libclap_fixture.so"
-    };
-    let starts = [PathBuf::from(WORKER), std::env::current_exe().unwrap()];
-    starts
-        .iter()
-        .flat_map(|s| s.ancestors().skip(1).take(6))
-        .map(|dir| dir.join("examples").join(name))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("{name} is not built: run cargo test, or cargo build --example clap_fixture"))
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    static SWEEP: std::sync::Once = std::sync::Once::new();
-    SWEEP.call_once(sweep_earlier_runs);
-    let d = std::env::temp_dir().join(format!("tinvo-clap-it-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-/// Removes the folders earlier runs left. A test's plugin file stays loaded
-/// until its process ends, and on Windows that keeps the file, and its
-/// folder, from being removed when the test ends. An hour old, a folder is
-/// no other run's still going.
-fn sweep_earlier_runs() {
-    let own = format!("-{}", std::process::id());
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("tinvo-clap-it-") || name.ends_with(&own) {
-            continue;
-        }
-        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-        if age.is_some_and(|a| a > Duration::from_secs(3600)) {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-/// Puts the test plugin in `dir` as `stem.clap`: a file, or on macOS a
-/// bundle.
-fn install(dir: &Path, stem: &str) -> PathBuf {
-    let path = dir.join(format!("{stem}.clap"));
-    if cfg!(target_os = "macos") {
-        let contents = path.join("Contents");
-        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
-        std::fs::copy(fixture(), contents.join("MacOS").join(stem)).unwrap();
-        let plist = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\"><dict>\n\
-             <key>CFBundleExecutable</key><string>{stem}</string>\n\
-             <key>CFBundleIdentifier</key><string>org.tinvo.test.{stem}</string>\n\
-             <key>CFBundlePackageType</key><string>BNDL</string>\n\
-             </dict></plist>\n"
-        );
-        std::fs::write(contents.join("Info.plist"), plist).unwrap();
-    } else {
-        std::fs::copy(fixture(), &path).unwrap();
-    }
-    path
-}
+mod support;
+use support::*;
 
 fn options(per_file: Duration) -> Options {
     Options { worker: WORKER.into(), per_file, budget: Duration::from_secs(120), rescan: false }
@@ -414,16 +345,7 @@ fn thread_check(i: &Instance) -> (bool, bool) {
     (bits & 1 != 0, bits & 2 != 0)
 }
 
-const GAIN: &str = "org.tinvo.test.gain";
 const SINE: &str = "org.tinvo.test.sine";
-const RATE: f64 = 48_000.0;
-
-/// Creates `id` from `file` for `role`, in real time at 48 kHz in calls of
-/// up to 64 frames.
-fn create(host: &mut PluginHost, file: &Path, id: &str, role: Role) -> Result<Instance, String> {
-    // SAFETY: the test plugin, loaded only through plugin hosts here.
-    unsafe { host.create(file, id, role, Mode::Realtime, RATE, 64) }
-}
 
 /// Interleaved stereo: left a ramp, right its negative, so the channels
 /// cannot be mistaken for each other.
@@ -1001,69 +923,6 @@ fn a_change_with_no_room_yet_is_not_acknowledged() {
     drop(gain);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// What `org.tinvo.test.gui` reports; the test plugin has the same.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct GuiStats {
-    timer_calls: u32,
-    fd_calls: u32,
-    fd: i32,
-    width: u32,
-    height: u32,
-    broken: u32,
-    parent: u64,
-}
-
-#[repr(C)]
-struct GuiTestExt {
-    log: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut u8, cap: usize) -> usize,
-    stats: unsafe extern "C" fn(plugin: *const ClapPlugin, out: *mut GuiStats),
-    poke: unsafe extern "C" fn(plugin: *const ClapPlugin, what: u32, a: u32, b: u32) -> bool,
-}
-
-/// The test plugin's window and the calls to it, through its own test
-/// extension, from any thread.
-#[derive(Clone, Copy)]
-struct GuiProbe {
-    plugin: *const ClapPlugin,
-    ext: *const GuiTestExt,
-}
-
-// SAFETY: the test plugin's probe functions may be called from any thread
-// while its instance lives.
-unsafe impl Send for GuiProbe {}
-unsafe impl Sync for GuiProbe {}
-
-impl GuiProbe {
-    fn of(i: &Instance) -> GuiProbe {
-        let ext = i.extension(c"org.tinvo.test.gui").cast::<GuiTestExt>();
-        assert!(!ext.is_null(), "the test plugin's window probe");
-        GuiProbe { plugin: i.as_ptr(), ext }
-    }
-
-    /// The calls its window had, a line each.
-    fn log(&self) -> Vec<String> {
-        let mut buf = vec![0u8; 1 << 16];
-        // SAFETY: the test plugin's extension, given its own instance and
-        // the buffer's capacity.
-        let n = unsafe { ((*self.ext).log)(self.plugin, buf.as_mut_ptr(), buf.len()) };
-        String::from_utf8_lossy(&buf[..n]).lines().map(str::to_string).collect()
-    }
-
-    fn stats(&self) -> GuiStats {
-        let mut s = GuiStats::default();
-        // SAFETY: as above.
-        unsafe { ((*self.ext).stats)(self.plugin, &mut s) };
-        s
-    }
-
-    /// Makes the plugin call its host's `clap.gui` (see the test plugin).
-    fn poke(&self, what: u32, a: u32, b: u32) -> bool {
-        // SAFETY: as above.
-        unsafe { ((*self.ext).poke)(self.plugin, what, a, b) }
-    }
 }
 
 /// A window of TINVO's that is none: what was asked of it, logged.

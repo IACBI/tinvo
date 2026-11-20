@@ -7111,6 +7111,9 @@ pub unsafe fn run(
             if let Some(due) = app.plugins.next_timer() {
                 timeout = timeout.min(due.saturating_duration_since(Instant::now()));
             }
+            if let Some(within) = app.plugins.wake_within() {
+                timeout = timeout.min(within);
+            }
             let round;
             (wake.fds, round) = app.plugins.fds();
             // From the first event: the wait for it is not work.
