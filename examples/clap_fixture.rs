@@ -259,6 +259,8 @@ pub struct GuiStats {
     pub height: u32,
     /// Rules broken by every instance of this file, those gone too.
     pub broken: u32,
+    /// The handle of the window it was put in, or 0.
+    pub parent: u64,
 }
 
 #[repr(C)]
@@ -691,6 +693,7 @@ unsafe extern "C" fn gui_stats(p: *const ClapPlugin, out: *mut GuiStats) {
         width: g.size.0,
         height: g.size.1,
         broken: BROKEN.load(Ordering::Relaxed),
+        parent: g.parent as u64,
     };
     unsafe { out.write(stats) };
 }
@@ -703,7 +706,14 @@ unsafe extern "C" fn gui_poke(p: *const ClapPlugin, what: u32, a: u32, b: u32) -
     let Some(h) = (unsafe { host.as_ref() }) else { return false };
     unsafe {
         match what {
-            0 => h.request_resize.is_some_and(|f| f(me.host, a, b)),
+            // Taken, it is the plugin's size, as a plugin sizes itself then.
+            0 => {
+                let ok = h.request_resize.is_some_and(|f| f(me.host, a, b));
+                if ok {
+                    me.gui().size = (a, b);
+                }
+                ok
+            }
             1 => h.request_show.is_some_and(|f| f(me.host)),
             2 => h.request_hide.is_some_and(|f| f(me.host)),
             3 if a != 0 => me.closed_by_user(),

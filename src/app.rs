@@ -36,6 +36,7 @@ use crate::sample::{self as sample_mod, Sample};
 use crate::settings::{self as settings_mod, MidiOut, OPTIONS, Recording, Settings};
 use crate::strip::{self, track_param};
 use crate::theme::{self as theme_mod, Role, Theme};
+use crate::tui::term::Wake;
 use crate::tui::{Button, Color, Event, Key, Mouse, MouseKind, Screen, Style, Terminal, screen, term};
 use crate::wav::{self, SampleFormat};
 use std::cell::{Cell, RefCell};
@@ -5225,9 +5226,20 @@ impl App {
         // The plugins playing live are served while it renders: what they
         // ask of the main thread cannot wait for the whole export.
         let (live, mut asked) = (&mut self.plugins, Vec::new());
+        let mut served = Instant::now();
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
             let frames = render::render_into(&self.project, &samples, &opts, &mut *plugins, &mut |b| {
                 asked.extend(live.poll());
+                // Their timers, descriptors and windows too, as often as a
+                // frame is drawn.
+                if served.elapsed() >= FRAME {
+                    served = Instant::now();
+                    let (fds, round) = live.fds();
+                    let mut wake = Wake { fds, ..Wake::default() };
+                    // One that cannot be checked waits for the next frame.
+                    let _ = term::check_descriptors(&mut wake);
+                    live.serve_main_thread(&wake.ready, round);
+                }
                 meter.push(b);
                 file.write(b)
             })?;
@@ -7085,6 +7097,9 @@ pub unsafe fn run(
         // input already waiting after it was given before the user saw
         // what that batch did.
         let mut carried_stale = false;
+        // What the waits for input also wake for: the plugins' windows,
+        // timers and descriptors.
+        let mut wake = Wake { messages: cfg!(windows), ..Wake::default() };
         loop {
             // Idle, the screen is drawn less often: nothing on it moves.
             let idle = last_change.elapsed() > IDLE_AFTER;
@@ -7093,6 +7108,11 @@ pub unsafe fn run(
                 true if app.plugins_playing() => PLUGIN_IDLE_FRAME,
                 true => IDLE_FRAME,
             };
+            if let Some(due) = app.plugins.next_timer() {
+                timeout = timeout.min(due.saturating_duration_since(Instant::now()));
+            }
+            let round;
+            (wake.fds, round) = app.plugins.fds();
             // From the first event: the wait for it is not work.
             let mut batch = None;
             // A click aims at the frame the user sees: after a key or a
@@ -7100,12 +7120,12 @@ pub unsafe fn run(
             let mut stale = false;
             let mut waiting = None;
             if std::mem::take(&mut carried_stale) {
-                waiting = term.poll(Duration::ZERO).map_err(|e| e.to_string())?;
+                waiting = term.poll_waking(Duration::ZERO, &mut wake).map_err(|e| e.to_string())?;
                 stale = waiting.is_some();
             }
             while let Some(ev) = match waiting.take() {
                 Some(ev) => Some(ev),
-                None => term.poll(timeout).map_err(|e| e.to_string())?,
+                None => term.poll_waking(timeout, &mut wake).map_err(|e| e.to_string())?,
             } {
                 let start = *batch.get_or_insert_with(Instant::now);
                 last_change = Instant::now();
@@ -7141,6 +7161,8 @@ pub unsafe fn run(
             if term::end_requested() {
                 return Err("ended by a signal".into());
             }
+            term.check_wake(&mut wake).map_err(|e| e.to_string())?;
+            app.plugins.serve_main_thread(&std::mem::take(&mut wake.ready), round);
             output.poll(&mut app);
             midi.poll(&mut app);
             midi_out.poll(&mut app);

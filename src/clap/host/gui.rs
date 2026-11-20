@@ -40,7 +40,8 @@ pub trait ParentWindow {
     /// that sizes in physical pixels; `None` for one in logical pixels
     /// (Cocoa), whose plugin is given no scale.
     fn scale(&self) -> Option<f64>;
-    /// Gives its client area this size; false if it cannot.
+    /// Gives its client area this size; false if it cannot, keeping the
+    /// size it had.
     fn resize(&mut self, width: u32, height: u32) -> bool;
     /// Lets the user resize it as `hints` say, or not at all with `None`.
     fn set_resizable(&mut self, hints: Option<ClapGuiResizeHints>);
@@ -61,11 +62,9 @@ pub enum GuiMode {
 pub(super) struct Open {
     mode: GuiMode,
     parent: Option<Box<dyn ParentWindow>>,
-    /// The size last agreed on, which a refused resize goes back to.
+    /// The size last agreed on, which a refused resize goes back to; the
+    /// parent's report of it (made however often) is no drag to pass on.
     size: (u32, u32),
-    /// The size TINVO last gave the parent itself: the parent's report of
-    /// it is no drag of the user's to pass on.
-    echo: Option<(u32, u32)>,
     /// Counts the sizes the plugin asked for and got: a drag that one
     /// overtook while the plugin took it leaves the size alone.
     sized: u32,
@@ -228,7 +227,7 @@ unsafe extern "C" fn host_gui_request_resize(host: *const ClapHost, width: u32, 
             if let Some(o) = open.as_mut().filter(|o| o.mode == GuiMode::Embedded) {
                 let ok = o.parent.as_mut().is_some_and(|p| p.resize(width, height));
                 if ok {
-                    (o.size, o.echo) = ((width, height), Some((width, height)));
+                    o.size = (width, height);
                     o.sized = o.sized.wrapping_add(1);
                     lock(&h.gui.asked).resize = None;
                 }
@@ -419,7 +418,7 @@ impl HostData {
                 match open.as_mut().filter(|o| o.mode == GuiMode::Embedded) {
                     Some(o) => {
                         if o.parent.as_mut().is_some_and(|p| p.resize(w, h)) {
-                            (o.size, o.echo) = ((w, h), Some((w, h)));
+                            o.size = (w, h);
                             o.sized = o.sized.wrapping_add(1);
                             None
                         } else {
@@ -530,7 +529,7 @@ impl PluginHandle {
         let support = self.gui_support(api);
         let h = &*self.host;
         let set_open = |mode, parent| {
-            *lock(&h.gui.open) = Some(Open { mode, parent, size: (0, 0), echo: None, sized: 0, shown: false });
+            *lock(&h.gui.open) = Some(Open { mode, parent, size: (0, 0), sized: 0, shown: false });
             h.gui.embedded.store(mode == GuiMode::Embedded, Ordering::Release);
             h.gui.is_open.store(true, Ordering::Release);
         };
@@ -620,7 +619,7 @@ impl PluginHandle {
                 let o = open.as_mut().expect("opened above, closed only on this thread");
                 let p = o.parent.as_mut().expect("embedded");
                 p.set_resizable(hints);
-                (o.size, o.echo) = ((w, hgt), Some((w, hgt)));
+                o.size = (w, hgt);
                 p.resize(w, hgt)
             };
             if !sized {
@@ -657,10 +656,43 @@ impl PluginHandle {
         }
     }
 
+    /// The window an embedded plugin window is in moved to a monitor of
+    /// this scale: the plugin is told, where it takes a scale, and the
+    /// window takes the size it has then (the one they agreed, if it
+    /// cannot say), even the size it had: Windows may have scaled the
+    /// window.
+    pub fn gui_rescaled(&self, scale: f64) {
+        let Some((plugin, gui)) = self.gui() else { return };
+        let gone = || self.host.gui.gone.load(Ordering::Acquire);
+        let embedded = lock(&self.host.gui.open).as_ref().is_some_and(|o| o.mode == GuiMode::Embedded);
+        if !embedded || gone() {
+            return;
+        }
+        let (mut w, mut h) = (0, 0);
+        // SAFETY: main thread, a live plugin, embedded; checked for a
+        // window it destroyed between the calls.
+        let sized = unsafe {
+            if let Some(set_scale) = gui.set_scale {
+                set_scale(plugin, scale);
+            }
+            !gone() && gui.get_size.is_some_and(|get| get(plugin, &mut w, &mut h)) && w > 0 && h > 0
+        };
+        if gone() {
+            return;
+        }
+        let mut open = lock(&self.host.gui.open);
+        let Some(o) = open.as_mut().filter(|o| o.mode == GuiMode::Embedded) else { return };
+        let size = if sized { (w, h) } else { o.size };
+        if o.parent.as_mut().is_some_and(|p| p.resize(size.0, size.1)) && size != o.size {
+            o.size = size;
+            o.sized = o.sized.wrapping_add(1);
+        }
+    }
+
     /// The user resized the window an embedded plugin window is in to this
     /// client size: the plugin's window follows, as near as it can, and
     /// the window is made the plugin's size again where it differs (or
-    /// cannot be resized at all).
+    /// cannot be resized at all). The size it has already is no change.
     pub fn gui_resized(&self, width: u32, height: u32) {
         let Some((plugin, gui)) = self.gui() else { return };
         let gone = || self.host.gui.gone.load(Ordering::Acquire);
@@ -670,7 +702,7 @@ impl PluginHandle {
         let (size, sized) = {
             let mut open = lock(&self.host.gui.open);
             let Some(o) = open.as_mut().filter(|o| o.mode == GuiMode::Embedded) else { return };
-            if o.echo.take() == Some((width, height)) {
+            if o.size == (width, height) {
                 return;
             }
             (o.size, o.sized)
@@ -688,13 +720,25 @@ impl PluginHandle {
             }
         };
         let (w, h) = if fitted { (w, h) } else { size };
+        {
+            let mut open = lock(&self.host.gui.open);
+            // Closed meanwhile, or sized as the plugin asked while it took
+            // this: either wins.
+            let Some(o) = open.as_mut().filter(|o| o.sized == sized && !gone()) else { return };
+            if (w, h) == (width, height) || o.parent.as_mut().is_some_and(|p| p.resize(w, h)) {
+                o.size = (w, h);
+                return;
+            }
+        }
+        // The window cannot take the size the plugin took: the plugin goes
+        // back to the one they had agreed, and the window with it.
+        // SAFETY: as above; the plugin took a size, so it sets one.
+        let back = fitted && !gone() && unsafe { gui.set_size.is_some_and(|set| set(plugin, size.0, size.1)) };
         let mut open = lock(&self.host.gui.open);
-        // Closed meanwhile, or sized as the plugin asked while it took
-        // this: either wins.
-        let Some(o) = open.as_mut().filter(|o| o.sized == sized && !gone()) else { return };
-        o.size = (w, h);
-        if (w, h) != (width, height) && o.parent.as_mut().is_some_and(|p| p.resize(w, h)) {
-            o.echo = Some((w, h));
+        if let Some(o) = open.as_mut().filter(|o| back && o.sized == sized && !gone()) {
+            if let Some(p) = o.parent.as_mut() {
+                p.resize(size.0, size.1);
+            }
         }
     }
 }

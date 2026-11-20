@@ -4,6 +4,7 @@
 
 use crate::clap::host::{Instance, Mode, PluginHost, Request, Role};
 use crate::clap::scan::{self, Catalog};
+use crate::clap::window::Windows;
 use crate::clap::{PluginInfo, PluginRef, Roles};
 use crate::engine::BLOCK;
 use std::collections::{HashMap, HashSet};
@@ -11,11 +12,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// The editor's plugins. Not `Send`: it lives on the thread its host was
 /// made on, which plays CLAP's main thread.
 pub struct Plugins {
+    /// Their windows, closed before the host goes.
+    windows: Windows,
     host: PluginHost,
+    /// How often the descriptors were asked for (see `fds`).
+    fd_round: u64,
     catalog: Option<Catalog>,
     scanning: Option<Receiver<Result<Catalog, String>>>,
     /// The scan's thread, joined when this is dropped, and what calls it
@@ -48,7 +54,9 @@ impl Plugins {
     /// No catalog, so no instances, until a scan or [`Plugins::with_catalog`].
     pub fn new() -> Self {
         Self {
+            windows: Windows::new(),
             host: PluginHost::new(),
+            fd_round: 0,
             catalog: None,
             scanning: None,
             scan_thread: None,
@@ -185,6 +193,30 @@ impl Plugins {
     /// those that came home ([`PluginHost::poll`]).
     pub fn poll(&mut self) -> Vec<Request> {
         self.host.poll()
+    }
+
+    /// When the next of the instances' timers is due.
+    pub fn next_timer(&self) -> Option<Instant> {
+        self.host.next_timer()
+    }
+
+    /// The file descriptors the instances wait on, with the CLAP flags
+    /// they wait for, and the round of waiting they are for: readiness
+    /// found for them is served with that round.
+    pub fn fds(&mut self) -> (Vec<(i32, u32)>, u64) {
+        self.fd_round += 1;
+        (self.host.fds(), self.fd_round)
+    }
+
+    /// Serves what the instances run on the main thread between the
+    /// terminal's waits: their timers due, the descriptors in `ready` (with
+    /// the CLAP flags each is ready with), unless they were asked for again
+    /// since `round` (by an export between, whose plugins may have reused a
+    /// number), and the windows' messages.
+    pub fn serve_main_thread(&mut self, ready: &[(i32, u32)], round: u64) {
+        let ready = if round == self.fd_round { ready } else { &[] };
+        self.host.dispatch(Instant::now(), ready);
+        self.windows.pump();
     }
 
     /// The plugin of the instance with `token`, if it was made here for
