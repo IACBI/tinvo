@@ -527,9 +527,9 @@ For professional instruments and effects: sampled pianos and orchestral librarie
 - A new project format: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
 - Tests: two small CLAP plugins built in the repository (a gain and a sine instrument) for scanning, loading, parameters, state, latency and the thread rules, and the allocation test with a plugin playing.
 
-It comes in four parts, each merged on its own.
+It comes in four parts, each merged on its own. The first three came with 0.26.0, which freezes the project format they share, format 17.
 
-#### 12a: Finding plugins ✅
+#### 12a: Finding plugins ✅ (0.26.0)
 
 - `tinvo plugins [--rescan]`. The folders CLAP's `entry.h` names for the system (`%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\Programs\Common\CLAP`; `~/.clap` and `/usr/lib/clap`; `/Library/Audio/Plug-Ins/CLAP` and `~/Library/Audio/Plug-Ins/CLAP`), then those in `CLAP_PATH`, are searched for `.clap` files (bundles on macOS) without following links to folders, at most 16 deep, through 100,000 entries and up to 10,000 files.
 - Each new or changed file is read by a child process, `tinvo scan-clap`, with its standard streams closed. It loads the file (`LoadLibraryExW` searching the plugin's own folder for its libraries; `dlopen` with `RTLD_NOW | RTLD_LOCAL`; on macOS the bundle's executable as CoreFoundation finds it), calls `init` and `deinit` once each, reads the factory's descriptors (strings read to at most 1 KiB, at most 256 descriptors of at most 64 features, an id and a name required, 1 MiB in all) and writes its result, into a folder of the scan's own in the user's temporary folder (readable by the user alone on Unix), only after the file's `deinit`. A child that crashes, runs past 10 s or leaves no whole result marks the file as not loaded, with the reason. Processes a plugin starts end with its child where the system allows it: on Windows the child puts itself in a job that ends them when it ends (unless a job it is already in forbids that), on Unix the child leads a process group that is ended after it, before it is reaped (on Linux and macOS, where an ended child can be seen without reaping it; elsewhere only a child that runs out of time has its group ended), so the group's id cannot have been reused; a helper that leaves the group survives. A scan's 2 minutes count from before the search, which its own limits bound, and are checked before each child: a child started near the end gets only the time left, and the files it does not finish are read by the next scan, as are those whose child could not start or write its result, or that changed while they were read.
@@ -540,7 +540,7 @@ It comes in four parts, each merged on its own.
 
 Known limits: a cache that would be over 16 MiB is not written, so such an installation is read again by each scan; cached entries under a folder one root could not search to the end are kept even when another root searches that folder fully; and a process a plugin starts outside its child's process group or job outlives the scan.
 
-#### 12b: Playing plugins
+#### 12b: Playing plugins ✅ (0.26.0)
 
 In parts, each merged on its own.
 
@@ -549,7 +549,7 @@ In parts, each merged on its own.
 - **In projects and export** ✅: project format 16 (`track plugin <id>`, `insert <slot> plugin <id>`), an id kept as written whether or not it is installed; `Project::plugin_places`; `SetSlotPlugin`, an instance for the plugin insert a slot holds; renders through offline instances of their own (`render::PluginSource`), made before the first frame, their restarts served between chunks, and a plugin that cannot load or fails named with the reason; `tinvo render` reading the scan's catalog when the project names a plugin and writing no file unless every one, the stems too, rendered.
 - **In the editor** ✅: a background scan; instances at the device's rate after each rebuild and when the catalog arrives; restarts and failures served from the editor's loop; a picker from the catalog, by role, for tracks and insert slots; missing plugins named when the project opens and kept in a list that stays; export from the editor through an offline host of its own.
 
-#### 12c: Parameters, latency and state
+#### 12c: Parameters, latency and state ✅ (0.26.0)
 
 - `clap.params` in the panel and on automation lanes, by stable id; `clap.latency` in the latency compensation; `clap.state` in the project file. A missing plugin: an insert passes its input through and an instrument stays silent; both keep their state and are named when the project opens.
 
