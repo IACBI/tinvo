@@ -520,7 +520,7 @@ For professional instruments and effects: sampled pianos and orchestral librarie
 - Hosting CLAP 1.2 plugins. CLAP is a plain C interface on Windows, Linux and macOS, so it is reached through hand-written FFI like the audio backends. VST3 (C++ COM-style interfaces) and Audio Units (macOS only) stay out.
 - Scanning the standard folders and `CLAP_PATH` for `.clap` files and bundles, away from the audio thread, with a cache.
 - A plugin as a track's instrument or in an insert slot. Its parameters (`clap.params`) appear in the panel and on automation lanes, its latency (`clap.latency`) is compensated, and its state (`clap.state`) is saved inside the project file.
-- The plugin's own window (`clap.gui`) opens as a floating window, since a terminal has no window to place it in.
+- The plugin's own window (`clap.gui`) opens as a floating window where the plugin offers one; otherwise TINVO opens a window of its own and puts the plugin's inside it, since a terminal has no window to place it in.
 - The spec's thread rules: main-thread calls from the UI thread, processing on the audio thread, and the host's callbacks honoured.
 - Export runs plugins through the same engine. A plugin whose output depends on timing or block size can make export differ from playback; TINVO says so instead of hiding it.
 - A plugin plays inside TINVO's process, so a plugin that crashes while playing ends the session (the autosave keeps the project); only the scan reads each file in a child process. Running plugins in a separate process is not planned.
@@ -562,7 +562,13 @@ In parts, each merged on its own.
 
 #### 12d: The plugin's window
 
-- `clap.gui` as a floating window, its platform's event loop running alongside the terminal's.
+- `clap.gui` as a floating window, or embedded in a window TINVO opens for it, its platform's event loop running alongside the terminal's.
+
+In parts, each merged on its own.
+
+- **The host** ✅: `clap::host::gui`. A handle opens an instance's window on the main thread for a window API (`win32`, `x11`, `cocoa`): floating where the plugin offers it (titled, sized by the plugin), otherwise made, scaled where the system sizes in pixels, sized, put in a `ParentWindow` the caller makes and shown, and destroyed again if any step fails. A drag goes through `adjust_size` and `set_size` and the window's own report of it is not sent back. The plugin's `request_resize` is answered by the window on the main thread and queued from elsewhere, a size the window refuses sending the plugin back to its last one; its show, hide and resize-hint requests, the latest winning, and its `closed` are served by the host's poll, a window it destroyed itself only acknowledged, even from inside another call. `clap.timer-support` (at least 15 ms) and, on Unix, `clap.posix-fd-support`, for instances made to play in real time: `next_timer`, `fds` and `dispatch` for the main loop, late timers run once. A window still open is closed before its instance is deactivated, on the host's thread wherever the instance is dropped, and what the plugin left registered goes with it.
+- **Native windows**: the parent windows and their events on Windows, X11 and macOS, waited on together with the terminal's input, and served during an export.
+- **In the editor**: a key on the plugin and instrument pages opening the plugin's window, one for each instance, closed when the plugin is removed, replaced or its device lost and at quit; changes made in the window reaching the panel and the unsaved mark.
 
 ### Phase 13: Sampled instruments (medium)
 
