@@ -392,8 +392,8 @@ impl Screen {
         self.back[usize::from(y) * usize::from(self.width) + usize::from(x)].style
     }
 
-    /// One row of the frame being drawn, as text with its marks (for tests).
-    #[cfg(test)]
+    /// One row of the frame being drawn, as text with its marks (for
+    /// tests, the integration tests' too).
     pub fn row_text(&self, y: u16) -> String {
         let w = usize::from(self.width);
         let start = usize::from(y) * w;

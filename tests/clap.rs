@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tinvo::app::{App, EngineLink, Mode as EditorMode, PluginFor, PluginPicker};
+use tinvo::app::{App, EngineLink, Focus, Mode as EditorMode, Page, PluginFor, PluginPicker};
 use tinvo::clap::ffi::{
     CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS,
     CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, ClapPlugin,
@@ -27,7 +27,7 @@ use tinvo::instrument::InstrumentKind;
 use tinvo::project::Project;
 use tinvo::render::{CatalogPlugins, NoPlugins, PluginSource, RenderOptions, render_into};
 use tinvo::rt::spsc::{self, Consumer};
-use tinvo::tui::Key;
+use tinvo::tui::{Key, Screen};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_tinvo");
 
@@ -905,13 +905,18 @@ fn a_plugin_s_parameters_are_read_and_set_by_id() {
     assert_eq!(gain.params_queued(), 1);
     assert_eq!(processed(&mut gain, 16), scaled(16, 0.75));
     assert_eq!((handle.delivered(), stats(&gain).params_set), (3, 2));
-    // Kept in range, a stepped one whole; refused, nothing queued.
+    // Kept in range, a stepped one whole; refused, nothing queued, but
+    // acknowledged once what came before is delivered.
     assert!(gain.set_param(10, 5.0, 4) && gain.set_param(11, 1.7, 5));
     for (id, value) in [(13, 0.5), (99, 0.5), (10, f64::NAN), (10, f64::INFINITY)] {
         assert!(!gain.set_param(id, value, 6), "{id} {value}");
     }
+    assert_eq!(handle.delivered(), 3);
     processed(&mut gain, 8);
-    assert_eq!((handle.value(10), handle.value(11), handle.delivered()), (Some(1.0), Some(1.0), 5));
+    assert_eq!((handle.value(10), handle.value(11), handle.delivered()), (Some(1.0), Some(1.0), 6));
+    gain.acknowledge(7);
+    processed(&mut gain, 8);
+    assert_eq!(handle.delivered(), 7);
     gain.stop();
     assert_eq!(stats(&gain).broken, 0, "every change in range, whole where stepped, for every note");
     // A stepped one with bounds between whole numbers stays within them.
@@ -970,6 +975,28 @@ fn a_parameter_change_reaches_a_plugin_not_processed_through_a_flush() {
         });
     });
     assert_eq!((gain.params_queued(), handle.delivered(), stats(&gain).broken), (0, 8, 0));
+    drop(gain);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_change_with_no_room_yet_is_not_acknowledged() {
+    let dir = temp_dir("room");
+    let file = install(&dir, "many");
+    let mut host = PluginHost::new();
+    let mut gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let handle = gain.handle();
+    for id in 100..100 + MAX_PARAM_EVENTS as u32 {
+        assert!(gain.set_param(id, 1.0, 1));
+    }
+    assert!(!gain.set_param(10, 0.25, 2), "no room");
+    processed(&mut gain, 8);
+    assert_eq!(handle.delivered(), 1, "for its sender to try again");
+    assert!(gain.set_param(10, 0.25, 2));
+    processed(&mut gain, 8);
+    assert_eq!((handle.delivered(), handle.value(10)), (2, Some(0.25)));
+    gain.stop();
     drop(gain);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1884,16 +1911,16 @@ fn a_plugin_parameter_is_set_unless_a_lane_holds_it() {
     let file = install(&dir, "params");
     let mut host = PluginHost::new();
     let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
-    let (mut e, _rx) = plugin_engine(&held_note(&[
+    let (mut e, mut rx) = plugin_engine(&held_note(&[
         Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false },
         Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 4, value: Some(0.75) },
     ]));
     let (mut dry, _dry_rx) = plugin_engine(&held_note(&[]));
-    e.handle(EngineCommand::SetSlot {
-        chain: ChainId::Track(0),
-        slot: 0,
-        insert: Some(gain_insert(&mut host, &file).0),
-    });
+    let gain = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+    let (handle, token) = (gain.handle(), gain.token());
+    let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+    assert!(insert.attach(Box::new(gain)).unwrap().is_none());
+    e.handle(EngineCommand::SetSlot { chain: ChainId::Track(0), slot: 0, insert: Some(insert) });
     render(&mut e, 1000, 64);
     render(&mut dry, 1000, 64);
     e.handle(EngineCommand::Play);
@@ -1911,9 +1938,10 @@ fn a_plugin_parameter_is_set_unless_a_lane_holds_it() {
     render(&mut dry, 2 * STEP, 64);
     // From step 4 its lane holds it.
     assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "the lane's point");
-    e.handle(set(0.1));
+    e.handle(EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value: 0.1, serial: 9 });
     e.handle(EngineCommand::Edit(Edit::SetLaneBase { track: 0, lane: 0, value: Some(0.2) }));
     assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "held over both");
+    assert_eq!(handle.delivered(), 9, "refused, and said so");
     // Back at step 0, with no point in force, the lane leaves it at its
     // base.
     render(&mut e, 16 * STEP - 5 * STEP, 64);
@@ -1926,6 +1954,16 @@ fn a_plugin_parameter_is_set_unless_a_lane_holds_it() {
     render(&mut e, STEP, 64);
     render(&mut dry, STEP, 64);
     assert!((scaled_by(&mut e, &mut dry, STEP) - 0.75).abs() < 1e-4, "held again");
+    // Refused while lent out, it is acknowledged once the instance is back.
+    e.handle(EngineCommand::Lend(token));
+    let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+    e.handle(EngineCommand::SetPluginParam { place, plugin: gain_ref(), id: 10, value: 0.1, serial: 11 });
+    lent.restart().unwrap();
+    assert_eq!(handle.delivered(), 9);
+    e.handle(EngineCommand::Return(lent));
+    render(&mut e, 256, 64);
+    render(&mut dry, 256, 64);
+    assert_eq!(handle.delivered(), 11);
     // A lane let go of leaves it at its base too.
     e.handle(EngineCommand::Edit(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false }));
     assert!((scaled_by(&mut e, &mut dry, STEP) - 0.3).abs() < 1e-4, "its base once the lane is gone");
@@ -2097,6 +2135,16 @@ fn changes_kept_for_a_lent_instance_wait_for_room_in_its_queue() {
     lend(&mut e, 0.9);
     e.handle(set(0.3, 2));
     assert!((scaled_by(&mut e, &mut dry, 2000) - 0.3).abs() < 1e-4, "the last change");
+    // One for an instance back with no room waits for room too.
+    e.handle(EngineCommand::Lend(token));
+    let mut lent = came_back(&mut rx).pop().unwrap().2.unwrap();
+    lent.restart().unwrap();
+    for id in 100..100 + MAX_PARAM_EVENTS as u32 {
+        assert!(lent.set_param(id, 1.0, 0));
+    }
+    e.handle(EngineCommand::Return(lent));
+    e.handle(set(0.6, 3));
+    assert!((scaled_by(&mut e, &mut dry, 2000) - 0.6).abs() < 1e-4, "not dropped");
     drop(came_back(&mut rx));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2811,6 +2859,378 @@ fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
 }
 
 /// The gain's level in `state`, as an instance loading it says.
+/// What the editor shows, as text.
+fn screen(app: &App) -> String {
+    let mut s = Screen::new(120, 40);
+    app.draw(&mut s);
+    (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n")
+}
+
+/// The value the panel, at the foot of the screen, shows for the
+/// parameter labelled `label`.
+fn shown(app: &App, label: &str) -> Option<String> {
+    let text = screen(app);
+    let row = text.lines().rev().find_map(|l| Some(l[l.find(&format!("{label:<15.15} "))?..].to_string()))?;
+    Some(row.chars().skip(16).take(9).collect::<String>().trim().to_string())
+}
+
+#[test]
+fn the_panel_shows_and_sets_a_plugin_s_parameters() {
+    let dir = temp_dir("editor-panel");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 1, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let none = PluginRef::new("org.tinvo.test.none").unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 2, kind: Some(EffectKind::Plugin(none)) }).unwrap();
+    let mut ed = Editor::new(&dir, "panel", p);
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    let play = |ed: &mut Editor| {
+        ed.pump();
+        render(&mut ed.engine, 256, 64);
+    };
+    // The sine's level on the instrument page, after volume and pan.
+    ed.key(Key::Tab);
+    assert_eq!(ed.app.focus, Focus::Params);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"));
+    ed.key(Key::Down);
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    // Shown before the plugin has it, and an unsaved change.
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("26.0 %"));
+    assert!(ed.app.dirty);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("26.0 %"), "the plugin's own now");
+    // Nudges in a row are one undo step, which sends the value back.
+    ed.key(Key::Right);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"));
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.app.status_text(), Some("Undid plugin parameter"));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"));
+    ed.key(Key::Char('U'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"));
+    ed.key(Key::Char('0'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"), "its default");
+    ed.key(Key::Char('0'));
+    ed.key(Key::Char('u'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"), "a step of its own, and none for no change");
+    // A new change leaves nothing to redo.
+    ed.key(Key::Right);
+    ed.key(Key::Char('U'));
+    assert_eq!(ed.app.status_text(), Some("Nothing to redo"));
+
+    // The gain's on a page of its own, from its slot on the inserts page.
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Inserts, "an empty slot has none");
+    assert_eq!(ed.app.status_text(), Some("Slot 1 holds no plugin: & picks one"));
+    ed.key(Key::Down);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    let text = screen(&ed.app);
+    assert!(text.contains(" Plugin slot 2 · Test Gain "), "{text}");
+    assert!(!text.contains("Hold"), "hidden: {text}");
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("50.0 %"));
+    // A stepped one goes a value at a time; one the plugin sets is its own.
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Mode").as_deref(), Some("hard"));
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    assert_eq!(ed.app.status_text(), Some("Meter is the plugin's to set"));
+    ed.key(Key::Char('A'));
+    assert_eq!(ed.app.status_text(), Some("Meter is not one the plugin lets a lane play"));
+
+    // A lane on the gain: points at its values, a ramp between them in a
+    // straight line, and the panel then sets its base.
+    ed.key(Key::Up);
+    ed.key(Key::Up);
+    ed.key(Key::Char('A'));
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(1), plugin: gain_ref(), id: 10 };
+    let lane = |ed: &Editor| ed.app.project.tracks[0].lanes[0].clone();
+    assert_eq!(lane(&ed).target, Some(target));
+    assert_eq!(lane(&ed).base, Some(0.5), "the gain's value where no point is");
+    ed.key(Key::Enter);
+    assert_eq!(lane(&ed).points[0][0], Some(0.5), "the gain's value");
+    ed.key(Key::Char(']'));
+    assert!((lane(&ed).points[0][0].unwrap() - 0.51).abs() < 1e-6);
+    assert!(screen(&ed.app).contains("Gain at step 1: 51.0 % (point)"));
+    for _ in 0..4 {
+        ed.key(Key::Right);
+    }
+    ed.key(Key::Enter);
+    for _ in 0..4 {
+        ed.key(Key::Char('}'));
+    }
+    assert!((lane(&ed).points[0][4].unwrap() - 0.91).abs() < 1e-6);
+    ed.key(Key::Char('/'));
+    ed.key(Key::Left);
+    ed.key(Key::Left);
+    assert!(screen(&ed.app).contains("Gain at step 3: 71.0 % (ramp)"), "{}", screen(&ed.app));
+    ed.key(Key::Tab);
+    ed.key(Key::Right);
+    assert!((lane(&ed).base.unwrap() - 0.51).abs() < 1e-6, "its base, nudged");
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.key(Key::Char('u'));
+    assert_eq!(lane(&ed).base, Some(0.5));
+    // Back to the inserts page, at its slot.
+    ed.key(Key::Char('f'));
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    // One not playing has a page with nothing on it yet.
+    ed.key(Key::Char('f'));
+    ed.key(Key::Down);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    let said = "org.tinvo.test.none is not playing: its parameters show once it does (f: inserts)";
+    assert_eq!(ed.app.status_text(), Some(said));
+    assert!(screen(&ed.app).contains(" Plugin slot 3 · org.tinvo.test.none · not playing "));
+    // With nothing on it, nothing gets a lane.
+    let lanes = ed.app.project.tracks[0].lanes.clone();
+    ed.key(Key::Char('A'));
+    assert_eq!(ed.app.status_text(), Some("No parameter here to give a lane"));
+    assert_eq!(ed.app.project.tracks[0].lanes, lanes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_page_follows_its_plugin_and_its_values_reach_the_project() {
+    let dir = temp_dir("editor-page");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "page", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    // Saved before the plugin has a value sent to it, the project stays
+    // unsaved until it has.
+    ed.key(Key::Right);
+    let song = dir.join("song.tvo");
+    let slot = PluginPlace::Slot(ChainId::Track(0), 0);
+    let saved = |ed: &mut Editor, host: &mut PluginHost| {
+        ed.app.save_to(song.clone());
+        gain_in(host, &file, Project::load(&song).unwrap().plugin_state(slot).unwrap())
+    };
+    assert_eq!(saved(&mut ed, &mut host), Some(0.5));
+    assert!(ed.app.dirty);
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    // Once it has, the autosave takes it again; an export between is no
+    // save.
+    ed.app.export_to(&dir.join("page.mid"));
+    let revision = ed.app.revision;
+    ed.app.tick();
+    assert!(ed.app.dirty);
+    assert!(ed.app.revision > revision);
+    assert_eq!(saved(&mut ed, &mut host), Some(0.51));
+    assert!(!ed.app.dirty);
+    // Undoing a lane's first base sends back the value the plugin had.
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    assert!(ed.app.edit(Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false }));
+    ed.key(Key::Right);
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(ed.app.project.tracks[0].lanes[0].base, Some(0.52));
+    ed.key(Key::Char('u'));
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(ed.app.project.tracks[0].lanes[0].base, None);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.key(Key::Char('U'));
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("52.0 %"));
+    // Moved, the page goes with it; taken out, the page goes back to the
+    // inserts.
+    assert!(ed.app.edit(Edit::SwapSlots { chain: ChainId::Track(0), a: 0, b: 3 }));
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert!(screen(&ed.app).contains(" Synth slot 4 · Test Gain "), "{}", screen(&ed.app));
+    ed.key(Key::Char('u'));
+    assert!(screen(&ed.app).contains(" Synth slot 1 · Test Gain "), "{}", screen(&ed.app));
+    // (Its lane would keep it there.)
+    assert!(ed.app.edit(Edit::SetLane { track: 0, lane: 0, target: None, ramp: false }));
+    assert!(ed.app.edit(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: None }));
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Char('u'));
+    ed.pump();
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("52.0 %"), "with its state");
+    // With the device gone, nothing plays to set.
+    ed.app.audio_failed("gone".into());
+    ed.engine = Editor::engine(&ed.app).0;
+    ed.app.tick();
+    assert!(screen(&ed.app).contains(" Synth slot 1 · Test Gain · not playing "), "{}", screen(&ed.app));
+    drop(ed);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lane_s_first_base_comes_undone_however_long_the_history() {
+    let dir = temp_dir("editor-long-history");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    p.apply(Edit::SetLane { track: 0, lane: 0, target: Some(target), ramp: false }).unwrap();
+    let mut ed = Editor::new(&dir, "long", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    for i in 0..1000 {
+        assert!(ed.app.edit(Edit::SetTempo(100.0 + (i % 2) as f32)));
+        ed.pump();
+    }
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    ed.key(Key::Right);
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert!((ed.app.project.tracks[0].lanes[0].base.unwrap() - 0.51).abs() < 1e-6);
+    ed.key(Key::Char('u'));
+    ed.pump();
+    render(&mut ed.engine, 256, 64);
+    assert_eq!(ed.app.project.tracks[0].lanes[0].base, None);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("50.0 %"), "the value it had");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_page_stays_on_its_plugin_when_tracks_come_back() {
+    let dir = temp_dir("editor-page-track");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(1), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    p.tracks[1].name = "Bass".into();
+    let mut ed = Editor::new(&dir, "track", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    assert!(ed.app.edit(Edit::RemoveTrack(0)));
+    ed.pump();
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    // The track before it back, it is the second track's.
+    ed.key(Key::Char('u'));
+    ed.pump();
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert!(screen(&ed.app).contains(" Bass slot 1 · Test Gain "), "{}", screen(&ed.app));
+    ed.key(Key::Right);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    // Its lane goes on its track.
+    ed.key(Key::Char('A'));
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id: 10 };
+    assert_eq!(ed.app.project.tracks[1].lanes[0].target, Some(target));
+    assert!(ed.app.project.tracks[0].lanes.iter().all(|l| l.target.is_none()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_value_the_plugin_had_yet_to_get_reaches_a_new_engine() {
+    let dir = temp_dir("editor-carried");
+    let mut host = PluginHost::new();
+    let file = install(&dir, "own");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "carried", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    ed.key(Key::Right);
+    // The device reopened before the engine had it.
+    ed.reconnect();
+    let song = dir.join("song.tvo");
+    ed.app.save_to(song.clone());
+    assert!(ed.app.dirty, "the state saved lacks it");
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.app.save_to(song.clone());
+    assert!(!ed.app.dirty);
+    let slot = PluginPlace::Slot(ChainId::Track(0), 0);
+    assert_eq!(gain_in(&mut host, &file, Project::load(&song).unwrap().plugin_state(slot).unwrap()), Some(0.51));
+    drop(ed);
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_master_plugin_s_page_needs_no_track() {
+    let dir = temp_dir("editor-master-page");
+    let mut p = Project::new();
+    p.apply(Edit::SetSlot { chain: ChainId::Master, slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let mut ed = Editor::new(&dir, "master", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Tab);
+    while ed.app.page != Page::Inserts {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    ed.key(Key::Right);
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lanes_on_a_parameter_its_plugin_clears_go() {
+    let dir = temp_dir("editor-cleared");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let on = |id| Some(LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id });
+    p.apply(Edit::SetLane { track: 0, lane: 1, target: on(10), ramp: false }).unwrap();
+    p.apply(Edit::SetLane { track: 0, lane: 2, target: on(12), ramp: true }).unwrap();
+    // The meter clears its hold once it has played.
+    let mut ed = Editor::new(&dir, "meter", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    ed.key(Key::Char('r'));
+    for c in std::iter::repeat_n(Key::Backspace, 5).chain("Lead".chars().map(Key::Char)) {
+        ed.key(c);
+    }
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.project.tracks[0].name, "Lead");
+    render(&mut ed.engine, 512, 64);
+    ed.app.tick();
+    let targets = |ed: &Editor| ed.app.project.tracks[0].lanes.iter().map(|l| l.target).collect::<Vec<_>>();
+    assert_eq!(targets(&ed), [None, on(10), None, None]);
+    let status = ed.app.status_text().unwrap();
+    assert_eq!(status, "A plugin let go of a parameter: removed lane 3 of Lead (u brings it back)");
+    ed.key(Key::Char('u'));
+    assert_eq!(targets(&ed), [None, on(10), on(12), None]);
+    assert!(ed.app.project.tracks[0].lanes[2].ramp);
+    // The history the clear had nothing to do with stays.
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.app.project.tracks[0].name, "Synth");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn gain_in(host: &mut PluginHost, file: &Path, state: &[u8]) -> Option<f64> {
     // SAFETY: the test plugin, loaded only through plugin hosts here.
     let gain = unsafe { host.create_with_state(file, GAIN, Role::Effect, Mode::Realtime, RATE, 64, Some(state)) };
@@ -2939,6 +3359,16 @@ fn the_editor_keeps_each_plugin_s_state() {
         problems[0].ends_with("Test Gain plays at its defaults: it could not load its saved state; that state is kept"),
         "{problems:?}"
     );
+    // Its stand-in's page says so, and so does a change on it.
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert!(screen(&ed.app).contains(" slot 1 · Test Gain · at its defaults "), "{}", screen(&ed.app));
+    ed.key(Key::Right);
+    let said = "Test Gain plays at its defaults: the state it could not load is what is saved";
+    assert_eq!(ed.app.status_text(), Some(said));
     // Kept for a version that can, however its stand-in is changed.
     let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.9, serial: 1 };
     ed.engine.handle(set);

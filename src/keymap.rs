@@ -154,7 +154,7 @@ actions! {
     Down "down" Nav [Down] "track, pitch, lane, parameter or song row below";
     First "first" Nav [Home] "first step or song entry";
     Last "last" Nav [End] "last step or song entry";
-    Enter "enter" Nav [Enter, c('x')] "toggle the step or note, add a point, repeat a song entry, choose in a list";
+    Enter "enter" Nav [Enter, c('x')] "toggle the step or note, add a point, repeat a song entry, choose in a list, open a plugin insert's parameters";
     Clear "clear" Nav [Delete, Backspace] "clear the step or point, remove the song entry";
     PitchDown "pitch_down" Step [c(',')] "pitch down a semitone";
     PitchUp "pitch_up" Step [c('.')] "pitch up a semitone";

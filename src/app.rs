@@ -8,12 +8,13 @@
 use crate::audio::{self, AudioCallback, Device, Stream, StreamConfig};
 use crate::autosave::{self, Autosave};
 use crate::clap::PluginRef;
-use crate::clap::host::{Instance, PluginHandle, Request, Role as PluginRole};
+use crate::clap::ffi::{CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS};
+use crate::clap::host::{Instance, ParamInfo, PluginHandle, Request, Role as PluginRole};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::engine::{
     ChainId, Command, Division, Edit, Engine, HELD_FOR_GOOD, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET,
-    MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition,
+    MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, PluginAt,
     RETIRE_QUEUE, Retired, Shared, Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
 use crate::group::{MAX_GROUPS, group_param};
@@ -291,6 +292,124 @@ struct Meta {
     states: Vec<(PluginPlace, Arc<[u8]>)>,
 }
 
+/// An instance the engine plays, by where; followed through every edit.
+struct Live {
+    place: PluginPlace,
+    handle: PluginHandle,
+    /// Its state is saved into the project: not for one playing at its
+    /// defaults, whose saved state, which it could not load, is kept.
+    saves: bool,
+    /// The serial of the last value sent to it from the panel.
+    sent: u64,
+}
+
+/// A plugin parameter set from the panel. The project does not hold it,
+/// so undo and redo send back the value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParamChange {
+    place: PluginPlace,
+    plugin: PluginRef,
+    id: u32,
+    before: f64,
+    after: f64,
+}
+
+/// A value sent to a plugin from the panel, shown until the plugin has it
+/// (or refused it), and sent again to the instance a new engine gets.
+struct Pending {
+    token: u64,
+    id: u32,
+    value: f64,
+    serial: u64,
+}
+
+/// What the editor knows of a parameter, to show and change it: a built-in
+/// one's spec, or a plugin's as its playing instance describes it.
+enum Knob<'a> {
+    Spec(&'static ParamSpec),
+    Plugin(ParamInfo, &'a PluginHandle),
+}
+
+impl Knob<'_> {
+    fn label(&self) -> String {
+        match self {
+            Knob::Spec(s) => s.label.to_string(),
+            Knob::Plugin(p, _) => p.name.clone(),
+        }
+    }
+
+    fn format(&self, v: f32) -> String {
+        match self {
+            Knob::Spec(s) => s.format(v),
+            Knob::Plugin(p, h) => h.text(p.id, f64::from(v)).unwrap_or_else(|| format!("{v:.2}")),
+        }
+    }
+
+    /// Where `v` lies in its range, from 0 to 1.
+    fn to_unit(&self, v: f32) -> f32 {
+        match self {
+            Knob::Spec(s) => s.to_unit(v),
+            Knob::Plugin(p, _) if p.max > p.min => (((f64::from(v) - p.min) / (p.max - p.min)) as f32).clamp(0.0, 1.0),
+            Knob::Plugin(..) => 0.0,
+        }
+    }
+
+    fn nudge(&self, v: f32, steps: i32, coarse: bool) -> f32 {
+        match self {
+            Knob::Spec(s) => s.nudge(v, steps, coarse),
+            Knob::Plugin(p, _) => plugin_nudge(p, f64::from(v), steps, coarse) as f32,
+        }
+    }
+
+    fn default(&self) -> f32 {
+        match self {
+            Knob::Spec(s) => s.default,
+            Knob::Plugin(p, _) => p.default as f32,
+        }
+    }
+
+    /// The value `lane` gives at the start of `step` of `pattern` (of
+    /// length `len`), if a point is in force there.
+    fn value_at(&self, lane: &project::LaneData, pattern: usize, len: usize, step: usize) -> Option<f32> {
+        match self {
+            Knob::Spec(s) => lane.value_at(s, pattern, len, step),
+            Knob::Plugin(..) => lane.plain_value_at(pattern, len, step),
+        }
+    }
+}
+
+/// `value` of plugin parameter `p` moved `steps` hundredths of its range
+/// (tenths, `coarse`), or `steps` whole values for a stepped one.
+fn plugin_nudge(p: &ParamInfo, value: f64, steps: i32, coarse: bool) -> f64 {
+    let n = f64::from(steps) * if coarse { 10.0 } else { 1.0 };
+    let step = (p.max - p.min) / 100.0;
+    let v = if p.is_stepped() {
+        value.round() + n
+    } else if step > 0.0 {
+        p.min + (((value - p.min) / step).round() + n) * step
+    } else {
+        value
+    };
+    p.clamp(v).unwrap_or(p.default)
+}
+
+/// Whether a lane, whose values are `f32`, holds a plugin's `value` as it
+/// is: a whole value it would round to another is not given to it.
+fn lane_holds(stepped: bool, value: f64) -> bool {
+    !stepped || f64::from(value as f32) == value
+}
+
+/// Where a plugin at `place` plays, as a lane names it from its track (any
+/// track, for a group's or the master's).
+fn plugin_at(place: PluginPlace) -> PluginAt {
+    match place {
+        PluginPlace::Track(_) => PluginAt::Instrument,
+        PluginPlace::Slot(ChainId::Track(_), slot) => PluginAt::Slot(slot),
+        PluginPlace::Slot(ChainId::Group(group), slot) => PluginAt::GroupSlot { group, slot },
+        PluginPlace::Slot(ChainId::Master, slot) => PluginAt::MasterSlot(slot),
+    }
+}
+
 /// One undoable user action.
 struct Change {
     /// Edits that restore the state before the action, in order.
@@ -305,6 +424,8 @@ struct Change {
     /// Set when later nudges of the same value may merge into this change.
     key: Option<(u8, u8, u8, u8)>,
     at: Instant,
+    /// A plugin parameter it set, besides its edits.
+    param: Option<ParamChange>,
 }
 
 /// The command that hands `edit` to the engine. A new effect is built
@@ -348,6 +469,7 @@ fn coalesce_key(e: &Edit) -> Option<(u8, u8, u8, u8)> {
             };
             (13 + MAX_LANES as u8, c, slot, index)
         }
+        Edit::SetLaneBase { track, lane, .. } => (14 + MAX_LANES as u8, track, lane, 0),
         _ => return None,
     })
 }
@@ -424,6 +546,9 @@ pub enum Page {
     Mix,
     /// An insert chain: the selected track's, its group's or the master's.
     Inserts,
+    /// The parameters of the plugin in the insert slot
+    /// [`App::plugin_page`].
+    Plugin,
 }
 
 /// Which insert chain the inserts page shows.
@@ -454,10 +579,18 @@ const MASTER_SLOT_INDEX: usize = 5 << 10;
 const SLOT_STRIDE: usize = 16;
 const CHAIN_STRIDE: usize = MAX_SLOTS * SLOT_STRIDE;
 
+/// Panel index of the first parameter of the plugin the panel shows (a
+/// plugin track's instrument on the instrument page, an insert's on the
+/// plugin page): its parameter `k`, in the order the plugin lists them, is
+/// `PLUGIN_INDEX + k`.
+const PLUGIN_INDEX: usize = 6 << 10;
+const _: () = assert!(MASTER_SLOT_INDEX + CHAIN_STRIDE <= PLUGIN_INDEX);
+
 /// The chain, slot and effect parameter of panel parameter `i`, if it is an
 /// insert's; `track` is the selected track.
 fn slot_of_param(i: usize, track: u8) -> Option<(ChainId, u8, u8)> {
     let (chain, j) = match i {
+        PLUGIN_INDEX.. => return None,
         MASTER_SLOT_INDEX.. => (ChainId::Master, i - MASTER_SLOT_INDEX),
         GROUP_SLOT_INDEX.. => {
             let j = i - GROUP_SLOT_INDEX;
@@ -479,7 +612,7 @@ fn param_of_slot(chain: ChainId, slot: u8, index: u8) -> usize {
     first + usize::from(slot) * SLOT_STRIDE + usize::from(index)
 }
 
-/// The lane target of panel parameter `i` (not an insert's).
+/// The lane target of panel parameter `i` (not an insert's or a plugin's).
 fn target_of_param(i: usize) -> LaneTarget {
     if i >= GROUP_INDEX {
         let j = i - GROUP_INDEX;
@@ -500,7 +633,7 @@ fn param_of_target(t: LaneTarget) -> usize {
         LaneTarget::Slot { slot, index, .. } => param_of_slot(ChainId::Track(0), slot, index),
         LaneTarget::GroupSlot { group, slot, index, .. } => param_of_slot(ChainId::Group(group), slot, index),
         LaneTarget::MasterSlot { slot, index, .. } => param_of_slot(ChainId::Master, slot, index),
-        // A plugin's parameters are not on the panel.
+        // Not by index: see [`App::target_value`].
         LaneTarget::Plugin { .. } => 0,
     }
 }
@@ -720,6 +853,9 @@ pub struct App {
     /// What the parameter panel shows.
     pub page: Page,
     pub inserts_of: InsertsOf,
+    /// The insert slot whose plugin the plugin page shows, followed
+    /// through every edit.
+    plugin_page: (ChainId, u8),
     pub export_format: SampleFormat,
     pub export_loops: u32,
     /// The prompt's cursor, as the characters after it.
@@ -836,9 +972,23 @@ pub struct App {
     /// An instance made before the edit that needs it, so a plugin that
     /// cannot load leaves the project as it was.
     ready: Option<(PluginRef, Instance)>,
-    /// The engine's instances by where they play, to save their states
-    /// into the project from; followed through every edit.
-    live: Vec<(PluginPlace, PluginHandle)>,
+    /// The engine's instances by where they play, to show and set their
+    /// parameters and save their states into the project.
+    live: Vec<Live>,
+    /// Values sent to plugins from the panel that they may not have yet.
+    pending: Vec<Pending>,
+    /// Values a plugin had yet to get when its engine went: the plugin
+    /// place, the plugin, the parameter and the value, sent again to the
+    /// instance made for that place, until every place has been given one.
+    carried: Vec<(PluginPlace, PluginRef, u32, f64)>,
+    /// The serial of the last value sent to a plugin from the panel.
+    serial: u64,
+    /// The engine's [`Shared::latency_over`] as last seen.
+    late: bool,
+    /// A state was saved into the project before its plugin had every
+    /// value sent to it from the panel: once it has, the project is
+    /// unsaved again.
+    unsettled: bool,
     /// While undo or redo applies its edits: the plugin places they made,
     /// given instances once the states they had are back.
     created: Option<Vec<(PluginPlace, PluginRef)>>,
@@ -951,6 +1101,7 @@ impl App {
             lane: 0,
             page: Page::Instrument,
             inserts_of: InsertsOf::Track,
+            plugin_page: (ChainId::Master, 0),
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
             prompt_back: 0,
@@ -1015,6 +1166,11 @@ impl App {
             plugins: Plugins::new(),
             ready: None,
             live: Vec::new(),
+            pending: Vec::new(),
+            carried: Vec::new(),
+            serial: 0,
+            late: false,
+            unsettled: false,
             created: None,
         }
     }
@@ -1138,9 +1294,18 @@ impl App {
         self.limiter_reduction = 0.0;
         self.loudness = [f32::NAN; 3];
         // A new engine has no instances: the old ones went with the old,
-        // whose states the new start from.
+        // whose states the new start from, and the values they had yet to
+        // get.
         self.sync_states();
+        let (live, plugins) = (&self.live, &self.plugins);
+        let carried = self.pending.iter().filter_map(|p| {
+            let place = live.iter().find(|l| l.handle.token() == p.token)?.place;
+            Some((place, plugins.plugin_of(p.token)?, p.id, p.value))
+        });
+        self.carried = carried.collect();
         self.live.clear();
+        self.pending.clear();
+        self.late = false;
         self.plugins.forget_made();
         self.attach_all();
     }
@@ -1517,6 +1682,7 @@ impl App {
             what: describe(&applied),
             key,
             at: now,
+            param: None,
         });
         true
     }
@@ -1543,7 +1709,16 @@ impl App {
         self.touch();
         self.redo.clear();
         let meta_after = self.meta();
-        self.push_change(Change { undo, redo, meta_before, meta_after, what, key: None, at: Instant::now() });
+        self.push_change(Change {
+            undo,
+            redo,
+            meta_before,
+            meta_after,
+            what,
+            key: None,
+            at: Instant::now(),
+            param: None,
+        });
     }
 
     fn push_change(&mut self, c: Change) {
@@ -1594,13 +1769,29 @@ impl App {
                 if let Some(r) = &mut self.note_rec {
                     r.take.edited(&applied);
                 }
-                self.live.retain_mut(|(place, _)| match project::follow_place(*place, &applied) {
+                self.live.retain_mut(|l| match project::follow_place(l.place, &applied) {
                     Some(p) => {
-                        *place = p;
+                        l.place = p;
                         true
                     }
                     None => false,
                 });
+                self.carried.retain_mut(|c| match project::follow_place(c.0, &applied) {
+                    Some(p) => {
+                        c.0 = p;
+                        true
+                    }
+                    None => false,
+                });
+                // The plugin page follows its plugin, and goes back to the
+                // inserts when it goes.
+                if self.page == Page::Plugin {
+                    let (chain, slot) = self.plugin_page;
+                    match project::follow_place(PluginPlace::Slot(chain, slot), &applied) {
+                        Some(PluginPlace::Slot(chain, slot)) => self.plugin_page = (chain, slot),
+                        _ => self.page = Page::Inserts,
+                    }
+                }
                 if let Some(created) = &mut self.created {
                     created.retain_mut(|(place, _)| match project::follow_place(*place, &applied) {
                         Some(p) => {
@@ -1649,8 +1840,8 @@ impl App {
     /// Returns what could not be saved, a line for each plugin.
     fn sync_states(&mut self) -> Vec<String> {
         let mut failed = Vec::new();
-        for (place, handle) in &self.live {
-            if !handle.is_alive() {
+        for Live { place, handle, saves, .. } in &self.live {
+            if !saves || !handle.is_alive() {
                 continue;
             }
             match handle.save_state() {
@@ -1669,9 +1860,22 @@ impl App {
         failed
     }
 
+    /// [`App::sync_states`] for a save or autosave, noting in
+    /// [`App::unsettled`] whether a plugin had yet to get a value sent to
+    /// it.
+    fn sync_for_save(&mut self) -> Vec<String> {
+        // Taken first: a value delivered while the state is saved may or
+        // may not be in it.
+        let unsent = !self.carried.is_empty()
+            || self.live.iter().any(|l| l.saves && l.handle.is_alive() && l.handle.delivered() < l.sent);
+        let failed = self.sync_states();
+        self.unsettled = unsent;
+        failed
+    }
+
     /// Whether `edits`, in turn, remove a plugin playing in the engine.
     fn removes_live(&self, edits: &[Edit]) -> bool {
-        let mut places: Vec<PluginPlace> = self.live.iter().map(|(p, _)| *p).collect();
+        let mut places: Vec<PluginPlace> = self.live.iter().map(|l| l.place).collect();
         edits.iter().any(|e| {
             places.iter_mut().any(|p| match project::follow_place(*p, e) {
                 Some(q) => {
@@ -1805,6 +2009,7 @@ impl App {
             what: "load sample",
             key: None,
             at: Instant::now(),
+            param: None,
         });
         Ok(())
     }
@@ -1821,6 +2026,9 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.undo.clone(), &c.meta_before.clone(), &mut c.meta_after);
+        if let Some(p) = c.param {
+            self.send_plugin_param(p.place, p.plugin, p.id, p.before);
+        }
         self.after_history_move(&c, "Undid");
         self.redo.push(c);
     }
@@ -1837,6 +2045,10 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.redo.clone(), &c.meta_after.clone(), &mut c.meta_before);
+        // With edits, those (a lane's base) give the value again.
+        if let Some(p) = c.param.filter(|_| c.redo.is_empty()) {
+            self.send_plugin_param(p.place, p.plugin, p.id, p.after);
+        }
         self.after_history_move(&c, "Redid");
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
@@ -2051,7 +2263,7 @@ impl App {
     }
 
     fn write_autosave(&mut self, now: Instant) {
-        self.sync_states();
+        self.sync_for_save();
         match self.autosave.write(&self.project, self.revision, now) {
             Ok(()) => self.autosave_failed = false,
             Err(e) if !self.autosave_failed => {
@@ -2073,7 +2285,7 @@ impl App {
         let Some(path) = self.autosave.path().map(Path::to_path_buf) else {
             return "; the unsaved edits are lost: there is nowhere to autosave them".into();
         };
-        self.sync_states();
+        self.sync_for_save();
         match self.autosave.write(&self.project, self.revision, Instant::now()) {
             Ok(()) => format!("; the unsaved edits were autosaved to {}", path.display()),
             Err(e) => format!("; the unsaved edits could not be autosaved to {}: {e}", path.display()),
@@ -2311,6 +2523,17 @@ impl App {
     /// the sends, and are also automation targets; the bus and master
     /// parameters follow from [`MIX_INDEX`].
     fn page_params(&self) -> Vec<usize> {
+        // The plugin's own, as it lists them, but those it hides.
+        let plugin = || -> Vec<usize> {
+            let Some(l) = self.panel_plugin().and_then(|(place, plugin)| self.live_at(place, plugin)) else {
+                return Vec::new();
+            };
+            let params = l.handle.params();
+            params.iter().enumerate().filter(|(_, p)| !p.is_hidden()).map(|(k, _)| PLUGIN_INDEX + k).collect()
+        };
+        if self.page == Page::Plugin {
+            return plugin();
+        }
         if self.page == Page::Mix {
             return (MIX_INDEX..MIX_INDEX + mix::mp::COUNT).collect();
         }
@@ -2336,7 +2559,205 @@ impl App {
             Page::Strip | Page::Group => 2 + n..2 + strip::track_param_count(t.kind),
             _ => 2..2 + n,
         };
-        [0, 1].into_iter().chain(rest).collect()
+        [0, 1].into_iter().chain(rest).chain(plugin()).collect()
+    }
+
+    /// The plugin whose parameters the panel shows, and where it plays.
+    fn panel_plugin(&self) -> Option<(PluginPlace, PluginRef)> {
+        match self.page {
+            Page::Instrument => {
+                let t = self.project.tracks.get(self.track)?;
+                Some((PluginPlace::Track(self.track as u8), t.kind.plugin()?))
+            }
+            Page::Plugin => {
+                let (chain, slot) = self.plugin_page;
+                let plugin = self.slot_data(chain, slot)?.kind.plugin()?;
+                Some((PluginPlace::Slot(chain, slot), plugin))
+            }
+            _ => None,
+        }
+    }
+
+    /// The instance of `plugin` playing at `place`.
+    fn live_at(&self, place: PluginPlace, plugin: PluginRef) -> Option<&Live> {
+        let playing = |l: &&Live| {
+            let token = l.handle.token();
+            l.handle.is_alive() && !self.plugins.given_up(token) && self.plugins.plugin_of(token) == Some(plugin)
+        };
+        self.live.iter().filter(|l| l.place == place).find(playing)
+    }
+
+    /// The plugin parameter panel parameter `i` is, and where its plugin
+    /// plays.
+    fn panel_param(&self, i: usize) -> Option<(PluginPlace, PluginRef, ParamInfo)> {
+        let k = i.checked_sub(PLUGIN_INDEX)?;
+        let (place, plugin) = self.panel_plugin()?;
+        let p = self.live_at(place, plugin)?.handle.params().get(k)?.clone();
+        Some((place, plugin, p))
+    }
+
+    /// What the editor knows of panel parameter `i`: nothing for a plugin's
+    /// whose plugin is not playing.
+    fn knob(&self, i: usize) -> Option<Knob<'_>> {
+        if i < PLUGIN_INDEX {
+            return Some(Knob::Spec(self.param_spec(i)));
+        }
+        let (place, plugin, p) = self.panel_param(i)?;
+        Some(Knob::Plugin(p, &self.live_at(place, plugin)?.handle))
+    }
+
+    /// What the editor knows of the parameter `target` names on the
+    /// selected track's lanes: nothing for a plugin's whose plugin is not
+    /// playing.
+    fn lane_knob(&self, target: LaneTarget) -> Option<Knob<'_>> {
+        let Some((place, plugin, id)) = target.plugin_param(self.track as u8) else {
+            return target.spec(self.project.tracks.get(self.track)?.kind).map(Knob::Spec);
+        };
+        let l = self.live_at(place, plugin)?;
+        let p = l.handle.params().iter().find(|p| p.id == id)?.clone();
+        Some(Knob::Plugin(p, &l.handle))
+    }
+
+    /// The track and lane holding plugin parameter `id` of `plugin` at
+    /// `place`, if one does.
+    fn plugin_lane(&self, place: PluginPlace, plugin: PluginRef, id: u32) -> Option<(usize, usize)> {
+        self.project.tracks.iter().enumerate().find_map(|(t, track)| {
+            let on =
+                |l: &project::LaneData| l.target.and_then(|x| x.plugin_param(t as u8)) == Some((place, plugin, id));
+            Some((t, track.lanes.iter().position(on)?))
+        })
+    }
+
+    /// The value of plugin parameter `id` of `plugin` at `place`: a lane's
+    /// base where a lane holds it, otherwise its playing instance's (a value
+    /// sent from the panel until the plugin has it).
+    fn plugin_value(&self, place: PluginPlace, plugin: PluginRef, id: u32) -> Option<f64> {
+        if let Some(base) = self.plugin_lane(place, plugin, id).and_then(|(t, k)| self.project.tracks[t].lanes[k].base)
+        {
+            return Some(f64::from(base));
+        }
+        let h = &self.live_at(place, plugin)?.handle;
+        let (token, delivered) = (h.token(), h.delivered());
+        let sent = self.pending.iter().find(|p| p.token == token && p.id == id);
+        match sent.filter(|p| p.serial > delivered) {
+            Some(p) => Some(p.value),
+            None => h.value(id),
+        }
+    }
+
+    /// The value a lane on `target` starts a point at where none is in
+    /// force: the panel's for a built-in parameter, the plugin's for a
+    /// plugin's (if it plays or the lane has a base).
+    fn target_value(&self, target: LaneTarget) -> Option<f32> {
+        match target.plugin_param(self.track as u8) {
+            Some((place, plugin, id)) => self.plugin_value(place, plugin, id).map(|v| v as f32),
+            None => Some(self.param_value(param_of_target(target))),
+        }
+    }
+
+    /// Sends a plugin parameter's value to the engine, shown until the
+    /// plugin has it.
+    fn send_plugin_param(&mut self, place: PluginPlace, plugin: PluginRef, id: u32, value: f64) {
+        self.serial += 1;
+        let serial = self.serial;
+        if let Some(token) = self.live_at(place, plugin).map(|l| l.handle.token()) {
+            self.pending.retain(|p| p.token != token || p.id != id);
+            self.pending.push(Pending { token, id, value, serial });
+            if let Some(l) = self.live.iter_mut().find(|l| l.handle.token() == token) {
+                l.sent = serial;
+            }
+        }
+        self.send(Command::SetPluginParam { place, plugin, id, value, serial });
+    }
+
+    /// Sets plugin parameter `p` of `plugin` at `place` from the panel: the
+    /// base of a lane holding it, or else its instance's value, which undo
+    /// sends back.
+    fn set_plugin_value(&mut self, place: PluginPlace, plugin: PluginRef, p: &ParamInfo, value: f64, coalesce: bool) {
+        if p.is_readonly() {
+            self.set_status(format!("{} is the plugin's to set", p.name));
+            return;
+        }
+        let Some(value) = p.clamp(value) else { return };
+        if let Some((track, lane)) = self.plugin_lane(place, plugin, p.id) {
+            if !lane_holds(p.is_stepped(), value) {
+                self.set_status(format!("{} is past the whole values its lane holds", p.name));
+                return;
+            }
+            // A lane with no base yet left the plugin's own value, which
+            // undo then sends back.
+            let had = match self.project.tracks[track].lanes[lane].base {
+                Some(_) => None,
+                None => self.plugin_value(place, plugin, p.id),
+            };
+            let (track, lane) = (track as u8, lane as u8);
+            let done = self.edit_with(Edit::SetLaneBase { track, lane, value: Some(value as f32) }, coalesce);
+            let here = |c: &&mut Change| {
+                c.param.is_none()
+                    && matches!(c.redo.first(), Some(&Edit::SetLaneBase { track: t, lane: l, .. }) if (t, l) == (track, lane))
+            };
+            if let (Some(before), true, Some(last)) = (had, done, self.undo.back_mut().filter(here)) {
+                last.param = Some(ParamChange { place, plugin, id: p.id, before, after: value });
+            }
+            return;
+        }
+        let Some(before) = self.plugin_value(place, plugin, p.id) else { return };
+        if before == value {
+            return;
+        }
+        self.send_plugin_param(place, plugin, p.id, value);
+        if self.live_at(place, plugin).is_some_and(|l| !l.saves) {
+            let name = self.plugins.name(plugin);
+            self.set_status(format!("{name} plays at its defaults: the state it could not load is what is saved"));
+        }
+        self.touch();
+        self.redo.clear();
+        let now = Instant::now();
+        if let (true, false, Some(last)) = (coalesce, self.sealed, self.undo.back_mut()) {
+            let same = last.param.is_some_and(|c| c.place == place && c.plugin == plugin && c.id == p.id);
+            if same && now.duration_since(last.at) < COALESCE_WINDOW {
+                if let Some(c) = &mut last.param {
+                    c.after = value;
+                }
+                last.at = now;
+                return;
+            }
+        }
+        let meta = self.meta();
+        self.push_change(Change {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            meta_before: meta.clone(),
+            meta_after: meta,
+            what: "plugin parameter",
+            key: None,
+            at: now,
+            param: Some(ParamChange { place, plugin, id: p.id, before, after: value }),
+        });
+    }
+
+    /// Opens the plugin page for the inserts page's selected slot.
+    fn open_plugin_page(&mut self) {
+        let Some((chain, slot, _)) = slot_of_param(self.param, self.track as u8) else { return };
+        let Some(plugin) = self.slot_data(chain, slot).and_then(|d| d.kind.plugin()) else {
+            let status = format!("Slot {} holds no plugin: {} picks one", slot + 1, self.k(Action::Plugins));
+            self.set_status(status);
+            return;
+        };
+        (self.page, self.plugin_page) = (Page::Plugin, (chain, slot));
+        let params = self.page_params();
+        self.param = params.first().copied().unwrap_or(PLUGIN_INDEX);
+        let name = self.plugins.name(plugin);
+        let status = if params.is_empty() {
+            format!("{name} is not playing: its parameters show once it does ({}: inserts)", self.k(Action::Page))
+        } else {
+            format!(
+                "{name}: its parameters ({} gives one a lane, {}: inserts)",
+                self.k(Action::Automate),
+                self.k(Action::Page)
+            )
+        };
+        self.set_status(status);
     }
 
     /// The chain the inserts page shows: the master's when there is no
@@ -2362,6 +2783,12 @@ impl App {
     /// The label and value text of panel parameter `i`. A slot's bypass
     /// stands for the slot, so it shows the slot's number and effect.
     fn param_text(&self, i: usize) -> (String, String) {
+        if i >= PLUGIN_INDEX {
+            let Some((place, plugin, p)) = self.panel_param(i) else { return Default::default() };
+            let v = self.plugin_value(place, plugin, p.id).unwrap_or(p.default);
+            let text = self.live_at(place, plugin).and_then(|l| l.handle.text(p.id, v));
+            return (p.name, text.unwrap_or_else(|| format!("{v:.2}")));
+        }
         if let Some((chain, slot, 0)) = slot_of_param(i, self.track as u8) {
             return match self.slot_data(chain, slot) {
                 Some(d) => {
@@ -2380,7 +2807,7 @@ impl App {
         self.project.chain(chain).ok()?.get(usize::from(slot))?.as_ref()
     }
 
-    /// The lane target of panel parameter `i`.
+    /// The lane target of panel parameter `i` (not a plugin's).
     fn target_of_param(&self, i: usize) -> LaneTarget {
         let Some((chain, slot, index)) = slot_of_param(i, self.track as u8) else { return target_of_param(i) };
         let kind = self.slot_data(chain, slot).map_or(EffectKind::Eq, |d| d.kind);
@@ -2410,6 +2837,10 @@ impl App {
     }
 
     fn param_value(&self, i: usize) -> f32 {
+        if i >= PLUGIN_INDEX {
+            let value = self.panel_param(i).and_then(|(place, plugin, p)| self.plugin_value(place, plugin, p.id));
+            return value.map_or(0.0, |v| v as f32);
+        }
         if let Some((chain, slot, index)) = slot_of_param(i, self.track as u8) {
             return self.slot_data(chain, slot).map_or(0.0, |d| d.params[usize::from(index)]);
         }
@@ -2434,6 +2865,12 @@ impl App {
     }
 
     fn set_param_value(&mut self, i: usize, value: f32, coalesce: bool) {
+        if i >= PLUGIN_INDEX {
+            if let Some((place, plugin, p)) = self.panel_param(i) {
+                self.set_plugin_value(place, plugin, &p, f64::from(value), coalesce);
+            }
+            return;
+        }
         let track = self.track as u8;
         if let Some((chain, slot, index)) = slot_of_param(i, track) {
             if self.slot_data(chain, slot).is_none() {
@@ -3400,22 +3837,27 @@ impl App {
         };
         match made {
             Ok(i) => {
-                self.live.retain(|(p, _)| *p != place);
-                match unloaded {
-                    // Not saved over: the state is kept for a version of
-                    // the plugin that can load it.
-                    Some(e) => {
-                        let (at, name) = (self.place_text(place), self.plugins.name(plugin));
-                        self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}; that state is kept"));
-                    }
-                    None => self.live.push((place, i.handle())),
+                self.live.retain(|l| l.place != place);
+                // Not saved over: the state is kept for a version of the
+                // plugin that can load it.
+                if let Some(e) = &unloaded {
+                    let (at, name) = (self.place_text(place), self.plugins.name(plugin));
+                    self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}; that state is kept"));
                 }
+                self.live.push(Live { place, handle: i.handle(), saves: unloaded.is_none(), sent: 0 });
                 self.send(match place {
                     PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
                     PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
-                })
+                });
+                let ours = |c: &(PluginPlace, PluginRef, u32, f64)| c.0 == place && c.1 == plugin;
+                let (carried, others) = std::mem::take(&mut self.carried).into_iter().partition(ours);
+                self.carried = others;
+                for (_, _, id, value) in carried {
+                    self.send_plugin_param(place, plugin, id, value);
+                }
             }
             Err(e) => {
+                self.carried.retain(|c| c.0 != place);
                 let line = format!("{}: {} cannot load: {e}", self.place_text(place), self.plugins.name(plugin));
                 self.plugin_problem(line);
             }
@@ -3449,6 +3891,8 @@ impl App {
         for (place, plugin) in self.project.plugin_places() {
             self.attach_place(place, plugin);
         }
+        // For a place that has another plugin now, or none.
+        self.carried.clear();
         self.summarize_problems();
     }
 
@@ -3499,6 +3943,71 @@ impl App {
         }
         let requests = self.plugins.poll();
         self.serve_plugins(requests);
+        let live = &self.live;
+        self.pending.retain(|p| live.iter().any(|l| l.handle.token() == p.token && l.handle.delivered() < p.serial));
+        let settled = |l: &Live| !l.saves || !l.handle.is_alive() || l.handle.delivered() >= l.sent;
+        if self.unsettled && self.carried.is_empty() && self.live.iter().all(settled) {
+            self.unsettled = false;
+            self.touch();
+        }
+        let late = self.link.as_ref().is_some_and(|l| l.shared.latency_over.load(Ordering::Relaxed));
+        if late && !self.late {
+            self.plugin_problem(
+                "The plugins on one path come later together than the 500 ms TINVO makes up for: that path is heard early"
+                    .into(),
+            );
+        }
+        self.late = late;
+    }
+
+    /// Removes the lanes on each plugin parameter in `cleared` (an
+    /// instance's token, the parameter's id and whether everything about
+    /// it was cleared) as one undo step. One cleared of everything may be
+    /// another parameter from now on, so the values the history would send
+    /// it go too.
+    fn clear_lanes(&mut self, cleared: &[(u64, u32, bool)]) {
+        let mut edits = Vec::new();
+        let mut names = Vec::new();
+        for &(token, id, all) in cleared {
+            let Some(l) = self.live.iter().find(|l| l.handle.token() == token) else { continue };
+            let Some(plugin) = self.plugins.plugin_of(token) else { continue };
+            self.pending.retain(|p| p.token != token || p.id != id);
+            self.carried.retain(|c| c.1 != plugin || c.2 != id);
+            if all {
+                // For every instance of the plugin: the history's places are
+                // its own, not today's.
+                let gone = |c: &mut Change| {
+                    if !c.param.is_some_and(|p| p.plugin == plugin && p.id == id) {
+                        return true;
+                    }
+                    c.param = None;
+                    // Kept if something is left to do or undo.
+                    !(c.undo.is_empty() && c.redo.is_empty() && c.meta_before == c.meta_after)
+                };
+                self.undo.retain_mut(gone);
+                self.redo.retain_mut(gone);
+            }
+            for (t, track) in self.project.tracks.iter().enumerate() {
+                for (k, lane) in track.lanes.iter().enumerate() {
+                    if lane.target.and_then(|x| x.plugin_param(t as u8)) == Some((l.place, plugin, id)) {
+                        let e = Edit::SetLane { track: t as u8, lane: k as u8, target: None, ramp: false };
+                        if !edits.contains(&e) {
+                            edits.push(e);
+                            names.push(format!("lane {} of {}", k + 1, track.name));
+                        }
+                    }
+                }
+            }
+        }
+        let Some(first) = names.first() else { return };
+        let more = match names.len() {
+            1 => String::new(),
+            n => format!(" and {} more", n - 1),
+        };
+        let status =
+            format!("A plugin let go of a parameter: removed {first}{more} ({} brings it back)", self.k(Action::Undo));
+        self.edit_group(edits, "lanes a plugin let go of");
+        self.set_status(status);
     }
 
     /// Serves what the instances asked for: one restart each, a failure
@@ -3512,11 +4021,18 @@ impl App {
         }
         let mut tokens: Vec<(u64, bool)> = Vec::new();
         let mut changed = false;
+        let mut cleared = Vec::new();
         for request in requests {
             // A playing plugin's changed state is an unsaved change, saved
             // with the project.
             if let Request::StateDirty(token) = request {
-                changed |= self.live.iter().any(|(_, h)| h.token() == token);
+                changed |= self.live.iter().any(|l| l.saves && l.handle.token() == token);
+                continue;
+            }
+            if let Request::Cleared { token, id, flags } = request {
+                if flags & (CLAP_PARAM_CLEAR_ALL | CLAP_PARAM_CLEAR_AUTOMATIONS) != 0 {
+                    cleared.push((token, id, flags & CLAP_PARAM_CLEAR_ALL != 0));
+                }
                 continue;
             }
             let (Request::Restart(token) | Request::Failed(token)) = request else { continue };
@@ -3529,6 +4045,7 @@ impl App {
         if changed {
             self.touch();
         }
+        self.clear_lanes(&cleared);
         for (token, failed) in tokens {
             // Another engine's, or gone.
             let Some(plugin) = self.plugins.plugin_of(token) else { continue };
@@ -3767,6 +4284,7 @@ impl App {
             what: "rename group",
             key: None,
             at: Instant::now(),
+            param: None,
         });
     }
 
@@ -3788,6 +4306,7 @@ impl App {
             what: "rename",
             key: None,
             at: Instant::now(),
+            param: None,
         });
     }
 
@@ -3819,6 +4338,7 @@ impl App {
             what: "marker",
             key: None,
             at: Instant::now(),
+            param: None,
         });
     }
 
@@ -3838,7 +4358,7 @@ impl App {
         if self.track_count() == 0
             && !self.song_view
             && self.focus == Focus::Params
-            && matches!(self.page, Page::Mix | Page::Inserts)
+            && matches!(self.page, Page::Mix | Page::Inserts | Page::Plugin)
         {
             self.key_params(key);
             return;
@@ -3923,14 +4443,19 @@ impl App {
                     Page::Strip | Page::Group => {
                         (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)"))
                     }
-                    Page::Mix => (Page::Inserts, self.inserts_page_status()),
+                    Page::Mix | Page::Plugin => (Page::Inserts, self.inserts_page_status()),
                     Page::Inserts => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
                 };
+                let back = self.page == Page::Plugin;
                 self.page = page;
                 // Volume and pan stay put from page to page; anything else
-                // goes to the page's first setting.
+                // goes to the page's first setting, and back from a plugin
+                // to its slot.
                 let params = self.page_params();
                 self.param = match Self::fader_slot(self.param) {
+                    _ if back && self.plugin_page.0 == self.insert_chain() => {
+                        param_of_slot(self.plugin_page.0, self.plugin_page.1, 0)
+                    }
                     Some(k) if params.get(k).is_some_and(|&p| Self::fader_slot(p) == Some(k)) => params[k],
                     _ => self.first_setting(&params),
                 };
@@ -4122,8 +4647,25 @@ impl App {
     /// Opens the lane for panel parameter `target`, giving it a free lane if
     /// it has none.
     fn automate_param(&mut self, param: usize) {
-        let label = self.param_spec(param).label;
-        let target = self.target_of_param(param);
+        if !self.page_params().contains(&param) {
+            self.set_status("No parameter here to give a lane");
+            return;
+        }
+        let (label, target, stepped) = if param >= PLUGIN_INDEX {
+            let Some((place, plugin, p)) = self.panel_param(param) else { return };
+            if !p.is_automatable() || p.is_readonly() {
+                self.set_status(format!("{} is not one the plugin lets a lane play", p.name));
+                return;
+            }
+            let stepped = p.is_stepped();
+            // A track's insert has its lane on that track.
+            if let PluginPlace::Slot(ChainId::Track(t), _) = place {
+                self.track = usize::from(t);
+            }
+            (p.name, LaneTarget::Plugin { at: plugin_at(place), plugin, id: p.id }, stepped)
+        } else {
+            (self.param_spec(param).label.to_string(), self.target_of_param(param), false)
+        };
         let Some(t) = self.project.tracks.get(self.track) else {
             let status =
                 format!("Automation lives on a track's lanes: add a track first ({})", self.k(Action::AddTrack));
@@ -4145,8 +4687,17 @@ impl App {
         if let Some(k) = t.lanes.iter().position(|l| l.target == Some(target)) {
             self.lane = k;
         } else if let Some(k) = t.lanes.iter().position(|l| l.target.is_none()) {
-            let track = self.track as u8;
-            if !self.edit(Edit::SetLane { track, lane: k as u8, target: Some(target), ramp: false }) {
+            let (track, lane) = (self.track as u8, k as u8);
+            let set = Edit::SetLane { track, lane, target: Some(target), ramp: false };
+            // A plugin's lane starts with its value now as its base, which
+            // it leaves the plugin at where no point is.
+            let base = target.plugin_param(track).and_then(|(place, plugin, id)| self.plugin_value(place, plugin, id));
+            match base.filter(|&v| lane_holds(stepped, v)) {
+                Some(v) => self.edit_group(vec![set, Edit::SetLaneBase { track, lane, value: Some(v as f32) }], "lane"),
+                None if !self.edit(set) => return,
+                None => {}
+            }
+            if self.project.tracks[self.track].lanes[k].target != Some(target) {
                 return;
             }
             self.lane = k;
@@ -4200,10 +4751,16 @@ impl App {
                 // A new point starts at the value already in force there.
                 let value = match point {
                     Some(_) => None,
-                    None => Some(
-                        self.lane_value(self.lane, self.step)
-                            .unwrap_or(self.param_value(param_of_target(target.unwrap_or(LaneTarget::Track(0))))),
-                    ),
+                    None => {
+                        let here = self.lane_value(self.lane, self.step);
+                        match here.or_else(|| target.and_then(|t| self.target_value(t))) {
+                            Some(v) => Some(v),
+                            None => {
+                                self.set_status("Its plugin is not playing, so there is no value to start from");
+                                return;
+                            }
+                        }
+                    }
                 };
                 self.edit(Edit::SetPoint { track, lane, pattern, step, value });
             }
@@ -4213,9 +4770,13 @@ impl App {
             Some(a @ (Action::PointDown | Action::PointUp | Action::PointCoarseDown | Action::PointCoarseUp)) => {
                 match point {
                     Some(v) => {
-                        let spec = self.param_spec(param_of_target(target.unwrap_or(LaneTarget::Track(0))));
                         let dir = if matches!(a, Action::PointDown | Action::PointCoarseDown) { -1 } else { 1 };
-                        let value = spec.nudge(v, dir, matches!(a, Action::PointCoarseDown | Action::PointCoarseUp));
+                        let coarse = matches!(a, Action::PointCoarseDown | Action::PointCoarseUp);
+                        let Some(value) = target.and_then(|t| self.lane_knob(t)).map(|k| k.nudge(v, dir, coarse))
+                        else {
+                            self.set_status("Its plugin is not playing, so its range is not known");
+                            return;
+                        };
                         self.edit_with(Edit::SetPoint { track, lane, pattern, step, value: Some(value) }, true);
                     }
                     None => {
@@ -4245,8 +4806,10 @@ impl App {
     fn lane_value(&self, k: usize, step: usize) -> Option<f32> {
         let t = &self.project.tracks[self.track];
         let l = &t.lanes[k];
-        let spec = l.target?.spec(t.kind)?;
-        l.value_at(spec, self.pattern, self.pattern_len(), step)
+        match l.target? {
+            LaneTarget::Plugin { .. } => l.plain_value_at(self.pattern, self.pattern_len(), step),
+            x => l.value_at(x.spec(t.kind)?, self.pattern, self.pattern_len(), step),
+        }
     }
 
     /// Song view actions. Returns whether the action was used.
@@ -4491,8 +5054,11 @@ impl App {
         if page.is_empty() {
             return;
         }
-        // Another track's group chain, say, is not this page's.
-        if self.page == Page::Inserts && !page.contains(&self.param) {
+        // Another track's group chain, say, or a plugin's parameter it now
+        // hides, is not this page's.
+        if !page.contains(&self.param)
+            && (matches!(self.page, Page::Inserts | Page::Plugin) || self.param >= PLUGIN_INDEX)
+        {
             self.param = page[0];
         }
         let i = self.param;
@@ -4524,20 +5090,29 @@ impl App {
             Some(a @ (Action::Left | Action::Right | Action::CoarseUp | Action::CoarseDown)) => {
                 let dir = if matches!(a, Action::Left | Action::CoarseDown) { -1 } else { 1 };
                 let coarse = matches!(a, Action::CoarseUp | Action::CoarseDown);
-                let spec = self.param_spec(i);
-                let v = spec.nudge(self.param_value(i), dir, coarse);
+                if let Some((place, plugin, p)) = self.panel_param(i) {
+                    let Some(v) = self.plugin_value(place, plugin, p.id) else { return };
+                    self.set_plugin_value(place, plugin, &p, plugin_nudge(&p, v, dir, coarse), true);
+                    return;
+                }
+                let Some(v) = self.knob(i).map(|k| k.nudge(self.param_value(i), dir, coarse)) else { return };
                 self.set_param_value(i, v, true);
             }
             Some(Action::Default) => {
-                let d = self.param_spec(i).default;
+                if let Some((place, plugin, p)) = self.panel_param(i) {
+                    self.set_plugin_value(place, plugin, &p, p.default, false);
+                    return;
+                }
+                let Some(d) = self.knob(i).map(|k| k.default()) else { return };
                 self.set_param_value(i, d, false);
             }
+            Some(Action::Enter) if self.page == Page::Inserts => self.open_plugin_page(),
             _ => {}
         }
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
-        let failed = self.sync_states();
+        let failed = self.sync_for_save();
         // Saving to another file moves the session there, lock and all; a
         // file another session has open is refused.
         let moving = self.lock.as_ref().is_none_or(|l| !l.is_for(&path));
@@ -4556,8 +5131,9 @@ impl App {
         }
         match self.project.save(&path) {
             Ok(()) => {
-                // A state that could not be saved is still unsaved.
-                self.dirty = !failed.is_empty();
+                // A state that could not be saved, or saved before its
+                // plugin had a value sent to it, is still unsaved.
+                self.dirty = !failed.is_empty() || self.unsettled;
                 self.autosave.saved(&path, self.revision);
                 self.set_status(match (unlocked, failed.first()) {
                     (_, Some(f)) => format!("Saved {}, but {f}; its last saved state was kept", path.display()),
@@ -4967,21 +5543,27 @@ impl App {
             let y = 2 + (k - top) as u16;
             let selected = k == self.lane;
             s.put(0, y, if selected { "▸" } else { " " }, self.style(Role::Selected));
-            let spec = l.target.and_then(|x| x.spec(t.kind));
-            let label = match spec {
-                Some(sp) => format!("{} {} {}", k + 1, screen::pad(sp.label, 16), if l.ramp { "ramp" } else { "hold" }),
-                None => format!("{} (free)", k + 1),
+            let knob = l.target.and_then(|x| self.lane_knob(x));
+            let how = if l.ramp { "ramp" } else { "hold" };
+            let label = match (&knob, l.target) {
+                (Some(kn), _) => format!("{} {} {how}", k + 1, screen::pad(&kn.label(), 16)),
+                (None, Some(LaneTarget::Plugin { id, .. })) => {
+                    format!("{} {} {how}", k + 1, screen::pad(&format!("parameter {id}"), 16))
+                }
+                (None, _) => format!("{} (free)", k + 1),
             };
             s.put(1, y, &label, self.style(if selected { Role::SelectedName } else { Role::Text }));
             s.put(LEFT - 1, y, "│", dim);
             self.hit(0, y, LEFT, Target::Lane(k));
             for (col, i) in (first..last).enumerate() {
                 let x = LEFT + col as u16 * CELL;
-                let value = spec.and_then(|sp| l.value_at(sp, self.pattern, self.pattern_len(), i).map(|v| (sp, v)));
-                let glyph = |sp: &ParamSpec, v: f32| GLYPHS[(sp.to_unit(v) * 7.0).round() as usize];
+                let value = knob.as_ref().and_then(|kn| kn.value_at(l, self.pattern, self.pattern_len(), i));
+                let glyph = |v: f32| GLYPHS[(knob.as_ref().map_or(0.0, |kn| kn.to_unit(v)) * 7.0).round() as usize];
                 let (text, mut st) = match (l.points[self.pattern][i], value) {
-                    (Some(_), Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Point)),
-                    (None, Some((sp, v))) => (format!(" {} ", glyph(sp, v)), self.style(Role::Value)),
+                    (Some(_), Some(v)) => (format!(" {} ", glyph(v)), self.style(Role::Point)),
+                    (None, Some(v)) => (format!(" {} ", glyph(v)), self.style(Role::Value)),
+                    // A plugin's not playing: where its points are.
+                    (Some(_), None) => (" • ".to_string(), self.style(Role::Point)),
                     _ if self.beat_at(i).is_some() => (" · ".to_string(), self.style(Role::Beat)),
                     _ => (" · ".to_string(), dim),
                 };
@@ -4998,21 +5580,24 @@ impl App {
         let info_y = 2 + MAX_LANES as u16 + 1;
         if info_y < 2 + rows {
             let l = &t.lanes[self.lane];
-            let info = match l.target.and_then(|x| x.spec(t.kind)) {
-                None => format!(
+            let info = match (l.target, l.target.and_then(|x| self.lane_knob(x))) {
+                (None, _) => format!(
                     "Free lane. In the parameter panel ({}), {} gives the selected parameter a lane.",
                     self.k(Action::Focus),
                     self.k(Action::Automate)
                 ),
-                Some(sp) => {
-                    let at = format!("{} at step {}: ", sp.label, self.step + 1);
+                (Some(_), None) => {
+                    "A plugin's parameter: its plugin is not playing, so only its points show".to_string()
+                }
+                (Some(target), Some(kn)) => {
+                    let at = format!("{} at step {}: ", kn.label(), self.step + 1);
                     match (l.points[self.pattern][self.step], self.lane_value(self.lane, self.step)) {
-                        (Some(v), _) => format!("{at}{} (point)", sp.format(v)),
-                        (None, Some(v)) => format!("{at}{} ({})", sp.format(v), if l.ramp { "ramp" } else { "held" }),
-                        (None, None) => format!(
-                            "{at}knob value {}",
-                            sp.format(self.param_value(param_of_target(l.target.unwrap_or(LaneTarget::Track(0)))))
-                        ),
+                        (Some(v), _) => format!("{at}{} (point)", kn.format(v)),
+                        (None, Some(v)) => format!("{at}{} ({})", kn.format(v), if l.ramp { "ramp" } else { "held" }),
+                        (None, None) => match self.target_value(target) {
+                            Some(v) => format!("{at}knob value {}", kn.format(v)),
+                            None => format!("{at}no point"),
+                        },
                     }
                 }
             };
@@ -5353,6 +5938,20 @@ impl App {
                     lufs(st),
                     lufs(i)
                 )
+            }
+            (Page::Plugin, _) => {
+                let (chain, slot) = (self.plugin_page.0, self.plugin_page.1 + 1);
+                match self.panel_plugin() {
+                    Some((place, plugin)) => {
+                        let how = match self.live_at(place, plugin) {
+                            None => " · not playing",
+                            Some(l) if !l.saves => " · at its defaults",
+                            Some(_) => "",
+                        };
+                        format!(" {} slot {slot} · {}{how} ", self.chain_name(chain), self.plugins.name(plugin))
+                    }
+                    None => format!(" {} slot {slot} · no plugin ", self.chain_name(chain)),
+                }
             }
             (_, None) => return,
             (Page::Group, Some(t)) if t.group.is_some() => {
@@ -7282,6 +7881,63 @@ mod tests {
         a.finish_note_recording();
         assert_eq!(a.project.tracks[1].steps[0][1], None);
         assert!(a.status_text().unwrap().contains("not written"), "{:?}", a.status_text());
+    }
+
+    #[test]
+    fn plugins_later_than_the_engine_makes_up_for_are_named_once() {
+        let (tx, _rx) = spsc::channel(256);
+        let shared = Arc::new(Shared::new());
+        let mut a = App::new(Project::demo(), None, Some(EngineLink::new(tx, shared.clone())), 48_000, "t".into());
+        a.tick();
+        assert!(a.plugin_problems().is_empty());
+        shared.latency_over.store(true, Ordering::Relaxed);
+        a.tick();
+        a.tick();
+        let late =
+            "The plugins on one path come later together than the 500 ms TINVO makes up for: that path is heard early";
+        assert_eq!(a.plugin_problems(), [late]);
+        assert_eq!(a.status_text(), Some(late));
+        // In time again, then late again: named again.
+        shared.latency_over.store(false, Ordering::Relaxed);
+        a.tick();
+        shared.latency_over.store(true, Ordering::Relaxed);
+        a.tick();
+        assert_eq!(a.plugin_problems().len(), 2);
+    }
+
+    #[test]
+    fn a_lane_gets_no_whole_value_it_would_round() {
+        assert!(lane_holds(true, 16_777_216.0));
+        assert!(!lane_holds(true, 16_777_217.0));
+        assert!(lane_holds(false, 0.51), "a continuous value rounds within what is heard");
+    }
+
+    #[test]
+    fn a_plugin_parameter_moves_by_hundredths_of_its_range() {
+        let p = |flags, min, max| ParamInfo {
+            id: 1,
+            flags,
+            name: "P".into(),
+            module: String::new(),
+            min,
+            max,
+            default: 0.5,
+        };
+        let plain = p(0, -1.0, 1.0);
+        assert!((plugin_nudge(&plain, 0.0, 1, false) - 0.02).abs() < 1e-12);
+        assert!((plugin_nudge(&plain, 0.0, -1, true) + 0.2).abs() < 1e-12);
+        assert!((plugin_nudge(&plain, 0.013, 1, false) - 0.04).abs() < 1e-12, "onto its steps");
+        assert_eq!(plugin_nudge(&plain, 0.99, 1, true), 1.0);
+        let stepped = p(crate::clap::ffi::CLAP_PARAM_IS_STEPPED, 0.0, 4.0);
+        assert_eq!(plugin_nudge(&stepped, 1.0, 1, false), 2.0);
+        assert_eq!(plugin_nudge(&stepped, 1.0, 1, true), 4.0);
+        assert_eq!(plugin_nudge(&stepped, 1.0, -1, false), 0.0);
+        let point = p(0, 0.3, 0.3);
+        assert_eq!(plugin_nudge(&point, 0.3, 1, false), 0.3);
+        assert_eq!(plugin_at(PluginPlace::Track(3)), PluginAt::Instrument);
+        assert_eq!(plugin_at(PluginPlace::Slot(ChainId::Track(3), 2)), PluginAt::Slot(2));
+        assert_eq!(plugin_at(PluginPlace::Slot(ChainId::Group(1), 2)), PluginAt::GroupSlot { group: 1, slot: 2 });
+        assert_eq!(plugin_at(PluginPlace::Slot(ChainId::Master, 4)), PluginAt::MasterSlot(4));
     }
 
     #[test]
