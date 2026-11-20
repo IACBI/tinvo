@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tinvo::app::{App, EngineLink, Mode as EditorMode, PluginFor, PluginPicker};
+use tinvo::app::{App, EngineLink, Focus, Mode as EditorMode, Page, PluginFor, PluginPicker};
 use tinvo::clap::ffi::{
     CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_REQUIRES_PROCESS,
     CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_VALUES, ClapPlugin,
@@ -27,7 +27,7 @@ use tinvo::instrument::InstrumentKind;
 use tinvo::project::Project;
 use tinvo::render::{CatalogPlugins, NoPlugins, PluginSource, RenderOptions, render_into};
 use tinvo::rt::spsc::{self, Consumer};
-use tinvo::tui::Key;
+use tinvo::tui::{Key, Screen};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_tinvo");
 
@@ -2811,6 +2811,167 @@ fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
 }
 
 /// The gain's level in `state`, as an instance loading it says.
+/// What the editor shows, as text.
+fn screen(app: &App) -> String {
+    let mut s = Screen::new(120, 40);
+    app.draw(&mut s);
+    (0..40).map(|y| s.row_text(y)).collect::<Vec<_>>().join("\n")
+}
+
+/// The value the panel, at the foot of the screen, shows for the
+/// parameter labelled `label`.
+fn shown(app: &App, label: &str) -> Option<String> {
+    let text = screen(app);
+    let row = text.lines().rev().find_map(|l| Some(l[l.find(&format!("{label:<15.15} "))?..].to_string()))?;
+    Some(row.chars().skip(16).take(9).collect::<String>().trim().to_string())
+}
+
+#[test]
+fn the_panel_shows_and_sets_a_plugin_s_parameters() {
+    let dir = temp_dir("editor-panel");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 1, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let none = PluginRef::new("org.tinvo.test.none").unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 2, kind: Some(EffectKind::Plugin(none)) }).unwrap();
+    let mut ed = Editor::new(&dir, "panel", p);
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    let play = |ed: &mut Editor| {
+        ed.pump();
+        render(&mut ed.engine, 256, 64);
+    };
+    // The sine's level on the instrument page, after volume and pan.
+    ed.key(Key::Tab);
+    assert_eq!(ed.app.focus, Focus::Params);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"));
+    ed.key(Key::Down);
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    // Shown before the plugin has it, and an unsaved change.
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("26.0 %"));
+    assert!(ed.app.dirty);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("26.0 %"), "the plugin's own now");
+    // Nudges in a row are one undo step, which sends the value back.
+    ed.key(Key::Right);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"));
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.app.status_text(), Some("Undid plugin parameter"));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"));
+    ed.key(Key::Char('U'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"));
+    ed.key(Key::Char('0'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"), "its default");
+    ed.key(Key::Char('0'));
+    ed.key(Key::Char('u'));
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("27.0 %"), "a step of its own, and none for no change");
+    // A new change leaves nothing to redo.
+    ed.key(Key::Right);
+    ed.key(Key::Char('U'));
+    assert_eq!(ed.app.status_text(), Some("Nothing to redo"));
+
+    // The gain's on a page of its own, from its slot on the inserts page.
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Inserts, "an empty slot has none");
+    assert_eq!(ed.app.status_text(), Some("Slot 1 holds no plugin: & picks one"));
+    ed.key(Key::Down);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    let text = screen(&ed.app);
+    assert!(text.contains(" Plugin slot 2 · Test Gain "), "{text}");
+    assert!(!text.contains("Hold"), "hidden: {text}");
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("50.0 %"));
+    // A stepped one goes a value at a time; one the plugin sets is its own.
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    play(&mut ed);
+    assert_eq!(shown(&ed.app, "Mode").as_deref(), Some("hard"));
+    ed.key(Key::Down);
+    ed.key(Key::Right);
+    assert_eq!(ed.app.status_text(), Some("Meter is the plugin's to set"));
+    ed.key(Key::Char('A'));
+    assert_eq!(ed.app.status_text(), Some("Meter is not one the plugin lets a lane play"));
+
+    // A lane on the gain: points at its values, a ramp between them in a
+    // straight line, and the panel then sets its base.
+    ed.key(Key::Up);
+    ed.key(Key::Up);
+    ed.key(Key::Char('A'));
+    let target = LaneTarget::Plugin { at: PluginAt::Slot(1), plugin: gain_ref(), id: 10 };
+    let lane = |ed: &Editor| ed.app.project.tracks[0].lanes[0].clone();
+    assert_eq!(lane(&ed).target, Some(target));
+    ed.key(Key::Enter);
+    assert_eq!(lane(&ed).points[0][0], Some(0.5), "the gain's value");
+    ed.key(Key::Char(']'));
+    assert!((lane(&ed).points[0][0].unwrap() - 0.51).abs() < 1e-6);
+    assert!(screen(&ed.app).contains("Gain at step 1: 51.0 % (point)"));
+    for _ in 0..4 {
+        ed.key(Key::Right);
+    }
+    ed.key(Key::Enter);
+    for _ in 0..4 {
+        ed.key(Key::Char('}'));
+    }
+    assert!((lane(&ed).points[0][4].unwrap() - 0.91).abs() < 1e-6);
+    ed.key(Key::Char('/'));
+    ed.key(Key::Left);
+    ed.key(Key::Left);
+    assert!(screen(&ed.app).contains("Gain at step 3: 71.0 % (ramp)"), "{}", screen(&ed.app));
+    ed.key(Key::Tab);
+    ed.key(Key::Right);
+    assert!((lane(&ed).base.unwrap() - 0.51).abs() < 1e-6, "the plugin's value, nudged");
+    assert_eq!(shown(&ed.app, "Gain").as_deref(), Some("51.0 %"));
+    ed.key(Key::Char('u'));
+    assert_eq!(lane(&ed).base, None);
+    // Back to the inserts page, at its slot.
+    ed.key(Key::Char('f'));
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    // One not playing has a page with nothing on it yet.
+    ed.key(Key::Char('f'));
+    ed.key(Key::Down);
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    let said = "org.tinvo.test.none is not playing: its parameters show once it does (f: inserts)";
+    assert_eq!(ed.app.status_text(), Some(said));
+    assert!(screen(&ed.app).contains(" Plugin slot 3 · org.tinvo.test.none · not playing "));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lanes_on_a_parameter_its_plugin_clears_go() {
+    let dir = temp_dir("editor-cleared");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 0, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let on = |id| Some(LaneTarget::Plugin { at: PluginAt::Slot(0), plugin: gain_ref(), id });
+    p.apply(Edit::SetLane { track: 0, lane: 1, target: on(10), ramp: false }).unwrap();
+    p.apply(Edit::SetLane { track: 0, lane: 2, target: on(12), ramp: true }).unwrap();
+    // The meter clears its hold once it has played.
+    let mut ed = Editor::new(&dir, "meter", p);
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    render(&mut ed.engine, 512, 64);
+    ed.app.tick();
+    let targets = |ed: &Editor| ed.app.project.tracks[0].lanes.iter().map(|l| l.target).collect::<Vec<_>>();
+    assert_eq!(targets(&ed), [None, on(10), None, None]);
+    let status = ed.app.status_text().unwrap();
+    assert_eq!(status, "A plugin let go of a parameter: removed lane 3 of Synth (u brings it back)");
+    ed.key(Key::Char('u'));
+    assert_eq!(targets(&ed), [None, on(10), on(12), None]);
+    assert!(ed.app.project.tracks[0].lanes[2].ramp);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn gain_in(host: &mut PluginHost, file: &Path, state: &[u8]) -> Option<f64> {
     // SAFETY: the test plugin, loaded only through plugin hosts here.
     let gain = unsafe { host.create_with_state(file, GAIN, Role::Effect, Mode::Realtime, RATE, 64, Some(state)) };
@@ -2939,6 +3100,16 @@ fn the_editor_keeps_each_plugin_s_state() {
         problems[0].ends_with("Test Gain plays at its defaults: it could not load its saved state; that state is kept"),
         "{problems:?}"
     );
+    // Its stand-in's page says so, and so does a change on it.
+    ed.key(Key::Tab);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    ed.key(Key::Enter);
+    assert!(screen(&ed.app).contains(" slot 1 · Test Gain · at its defaults "), "{}", screen(&ed.app));
+    ed.key(Key::Right);
+    let said = "Test Gain plays at its defaults: the state it could not load is what is saved";
+    assert_eq!(ed.app.status_text(), Some(said));
     // Kept for a version that can, however its stand-in is changed.
     let set = EngineCommand::SetPluginParam { place: slot, plugin: gain_ref(), id: 10, value: 0.9, serial: 1 };
     ed.engine.handle(set);

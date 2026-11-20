@@ -109,7 +109,7 @@ A MIDI file (format 0 or 1) opens as a new, unsaved project: each MIDI track and
 
 `tinvo plugins` lists the CLAP plugins in CLAP's standard folders and in the folders `CLAP_PATH` names: each one's name, version, vendor, what it is (instrument, effect…), id and file. Each file is read in a short-lived process of its own, so a plugin that crashes or hangs while it starts is listed as not loaded, with the reason, and TINVO carries on. What was read is kept in a cache until the file changes. `tinvo render` plays the plugins a project file names (`track plugin <id>`, `insert 0 plugin <id>`), each made for offline rendering; a plugin that is not installed or cannot load stops it with the plugin's name.
 
-In the editor, `a` `8` adds a track playing a CLAP instrument chosen from a list, and `&` on the inserts page puts a CLAP effect in the selected slot. The editor reads the installed plugins in the background when it starts; until then, and for plugins that are not installed, the project keeps them as written and they stay silent. `&` also lists what could not play and why, and export plays the plugins as `tinvo render` does. A plugin's own parameters, state and window come in later releases.
+In the editor, `a` `8` adds a track playing a CLAP instrument chosen from a list, and `&` on the inserts page puts a CLAP effect in the selected slot. The editor reads the installed plugins in the background when it starts; until then, and for plugins that are not installed, the project keeps them as written and they stay silent. `&` also lists what could not play and why, and export plays the plugins as `tinvo render` does. A plugin's parameters are on the panel: a plugin track's on the instrument page, an insert's on a page of its own (`Enter` on its slot on the inserts page, `f` goes back). `←` `→` change one, `A` gives it a lane and undo takes a change back. Each plugin's state is saved with the project. Its own window comes in a later release.
 
 The main keys in the editor, as they are by default (press `?` for the full list, which shows your own keys):
 
@@ -135,6 +135,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `f` | parameter panel: instrument, channel strip and sends, the track's group, buses and master, insert effects |
 | `,` `.` `<` `>` `-` `;` | on the inserts page: the slot's previous / next effect, move it a slot earlier / later, empty the slot, show the track's, its group's or the master's chain |
 | `&` | CLAP plugins: on the inserts page, an effect for the slot; elsewhere, a new track playing an instrument; and what could not play |
+| `Enter` | on the inserts page: the parameters of the plugin in the slot |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
 | `a` `D` `r` `m` `s` | add (`1`-`7` built-in, `8` a CLAP plugin), delete, rename, mute, solo a track |
@@ -290,7 +291,7 @@ Bir MIDI dosyası (format 0 ya da 1) kaydedilmemiş yeni bir proje olarak açıl
 
 `tinvo plugins`, CLAP'in standart klasörlerinde ve `CLAP_PATH` ile verilen klasörlerde kurulu CLAP eklentilerini listeler: her birinin adını, sürümünü, üreticisini, ne olduğunu (instrument, effect…), id'sini ve dosyasını. Her dosya kısa ömürlü, ayrı bir süreçte okunur; açılırken çöken ya da takılan bir eklenti nedeniyle birlikte "yüklenemedi" diye listelenir, TINVO işine devam eder. Okunanlar, dosya değişene kadar önbellekte kalır. `tinvo render`, proje dosyasının adını verdiği eklentileri (`track plugin <id>`, `insert 0 plugin <id>`) çevrimdışı render için açarak çalar; kurulu olmayan ya da açılamayan bir eklenti, adıyla birlikte render'ı durdurur.
 
-Editörde `a` `8`, listeden seçilen bir CLAP enstrümanını çalan bir kanal ekler; insert sayfasında `&`, seçili slota bir CLAP efekti koyar. Editör açılırken kurulu eklentileri arka planda okur; o bitene kadar ve kurulu olmayan eklentiler için proje onları yazıldığı gibi tutar, sesleri çıkmaz. `&` ayrıca neyin çalamadığını ve nedenini listeler; export da eklentileri `tinvo render` gibi çalar. Eklentinin kendi parametreleri, durumu ve penceresi sonraki sürümlerde geliyor.
+Editörde `a` `8`, listeden seçilen bir CLAP enstrümanını çalan bir kanal ekler; insert sayfasında `&`, seçili slota bir CLAP efekti koyar. Editör açılırken kurulu eklentileri arka planda okur; o bitene kadar ve kurulu olmayan eklentiler için proje onları yazıldığı gibi tutar, sesleri çıkmaz. `&` ayrıca neyin çalamadığını ve nedenini listeler; export da eklentileri `tinvo render` gibi çalar. Eklentinin parametreleri paneldedir: eklenti çalan bir kanalınkiler enstrüman sayfasında, bir insert'ünkiler kendi sayfasında (insert sayfasında slotunun üstünde `Enter`, geri dönmek için `f`). `←` `→` değeri değiştirir, `A` ona bir şerit verir, undo değişikliği geri alır. Her eklentinin durumu projeyle birlikte kaydedilir. Eklentinin kendi penceresi sonraki bir sürümde geliyor.
 
 Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada senin tuşların görünür):
 
@@ -316,6 +317,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `f` | parametre paneli: enstrüman, kanal şeridi ve send'ler, kanalın grubu, buslar ve master, insert efektleri |
 | `,` `.` `<` `>` `-` `;` | insert sayfasında: slottaki önceki / sonraki efekt, efekti bir slot öne / arkaya taşı, slotu boşalt, kanalın, grubunun ya da master'ın zincirini göster |
 | `&` | CLAP eklentileri: insert sayfasında slot için bir efekt; başka yerde, bir enstrüman çalan yeni bir kanal; ve neyin çalamadığı |
+| `Enter` | insert sayfasında: slottaki eklentinin parametreleri |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
 | `a` `D` `r` `m` `s` | kanal ekle (`1`-`7` hazır enstrümanlar, `8` bir CLAP eklentisi), sil, yeniden adlandır, mute, solo |

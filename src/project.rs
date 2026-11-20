@@ -185,14 +185,34 @@ impl LaneData {
     /// point. The engine ramps over time, so with swing its values between
     /// points differ slightly from these step-based ones.
     pub fn value_at(&self, spec: &ParamSpec, pattern: usize, len: usize, step: usize) -> Option<f32> {
+        self.value_by(|v| spec.to_unit(v), |u| spec.from_unit(u), pattern, len, step)
+    }
+
+    /// [`LaneData::value_at`] for a plugin's parameter, whose curve TINVO
+    /// does not know: a ramp runs in a straight line, as the engine plays
+    /// it.
+    pub fn plain_value_at(&self, pattern: usize, len: usize, step: usize) -> Option<f32> {
+        self.value_by(|v| v, |u| u, pattern, len, step)
+    }
+
+    /// [`LaneData::value_at`], a ramp running straight from `to(v)` to
+    /// `to(w)` and read back through `from`.
+    fn value_by(
+        &self,
+        to: impl Fn(f32) -> f32,
+        from: impl Fn(f32) -> f32,
+        pattern: usize,
+        len: usize,
+        step: usize,
+    ) -> Option<f32> {
         let pts = &self.points[pattern];
         let i = (0..=step.min(MAX_STEPS - 1)).rev().find(|&i| pts[i].is_some())?;
         let v0 = pts[i]?;
         let next = (step + 1..len.min(MAX_STEPS)).find(|&j| pts[j].is_some()).filter(|_| self.ramp && i < step);
         Some(match next {
             Some(j) => {
-                let (u0, u1) = (spec.to_unit(v0), spec.to_unit(pts[j]?));
-                spec.from_unit(u0 + (u1 - u0) * (step - i) as f32 / (j - i) as f32)
+                let (u0, u1) = (to(v0), to(pts[j]?));
+                from(u0 + (u1 - u0) * (step - i) as f32 / (j - i) as f32)
             }
             None => v0,
         })
