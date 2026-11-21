@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-21
+
 ### Added
 - A CLAP plugin's own window in the editor. `c` on a plugin track's instrument page, on a plugin's page or on its slot on the inserts page opens it: floating where the plugin floats one, otherwise inside a window TINVO opens for it (on Windows; on Linux through X11, with Xlib loaded at run time; on macOS through AppKit). `c` again closes it, as does the window's own close button. Each instance has one window, which closes when its plugin is removed, replaced or given up on after failing twice, when the audio device is lost, and at quit. The title of the plugin's page, or of a plugin track's instrument page, says while its window is open. A change made in the window marks the project unsaved and shows on the panel, unless an automation lane holds that parameter.
 
@@ -477,7 +479,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/IACBI/tinvo/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/IACBI/tinvo/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/IACBI/tinvo/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/IACBI/tinvo/compare/v0.24.0...v0.24.1
