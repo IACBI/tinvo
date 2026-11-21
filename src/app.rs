@@ -1792,25 +1792,26 @@ impl App {
     /// Reads again the files the tracks play that are not loaded (let go to
     /// keep the history small, or missing until now), as far as the
     /// project's budget allows, and sends the tracks that play them.
-    fn reload_missing(&mut self) {
+    /// Returns those that did not load, each with why.
+    fn reload_missing(&mut self) -> Vec<(String, String)> {
         let mut paths: Vec<&str> = self.project.tracks.iter().flat_map(TrackData::sample_paths).collect();
         paths.sort_unstable();
         paths.dedup();
         let (loaded, wanted): (Vec<&str>, Vec<&str>) = paths.into_iter().partition(|p| self.bank.contains_key(*p));
-        if wanted.is_empty() {
-            return;
-        }
         let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.frames()).sum();
-        let mut got = Vec::new();
+        let (mut got, mut failed) = (Vec::new(), Vec::new());
         for p in wanted {
             let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
-            if let Ok(s) = sample_mod::load_within(Path::new(p), left) {
-                used += s.frames();
-                got.push((p.to_string(), Arc::new(s)));
+            match sample_mod::load_within(Path::new(p), left) {
+                Ok(s) => {
+                    used += s.frames();
+                    got.push((p.to_string(), Arc::new(s)));
+                }
+                Err(e) => failed.push((p.to_string(), e)),
             }
         }
         if got.is_empty() {
-            return;
+            return failed;
         }
         let tracks: Vec<usize> = (0..self.track_count())
             .filter(|&i| self.project.tracks[i].sample_paths().any(|p| got.iter().any(|(k, _)| k == p)))
@@ -1819,6 +1820,20 @@ impl App {
         for i in tracks {
             self.send_sample(i);
         }
+        failed
+    }
+
+    /// After an undo or redo, says which files its tracks play that did
+    /// not load, so a silent track is not taken for a restored one.
+    fn say_unloaded(&mut self, verb: &str, what: &str, failed: &[(String, String)]) {
+        let Some((path, why)) = failed.first() else { return };
+        // The loader's errors begin with the path.
+        let why = why.strip_prefix(&format!("{path}: ")).unwrap_or(why);
+        let more = match failed.len() {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
+        self.set_status(format!("{verb} {what}, but {path} did not load{more}: {why}"));
     }
 
     /// Applies an edit to the project and mirrors it to the engine, without
@@ -2060,7 +2075,14 @@ impl App {
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
         let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
-        self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
+        // A zoned track goes on playing its zones: say so, as after an SFZ
+        // or the slicer the file is a layer over all of them.
+        let zones = match self.project.tracks[track].zones.len() {
+            0 => String::new(),
+            1 => " · played over the whole keyboard, with the track's zone".to_string(),
+            n => format!(" · played over the whole keyboard, with the track's {n} zones"),
+        };
+        self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}{zones}", loaded.sample_rate));
         self.bank.insert(key.clone(), loaded);
         let meta_before = self.meta();
         self.project.tracks[track].sample = Some(key.clone());
@@ -2098,6 +2120,9 @@ impl App {
     fn import_sfz(&mut self, track: usize, text: &str) -> Result<(), String> {
         let path = sample_mod::absolute(text);
         let name = path.file_name().map_or_else(|| text.to_string(), |n| n.to_string_lossy().into_owned());
+        if let Some(lane) = self.trim_lane(track) {
+            return Err(format!("Cannot import {name}: the {lane} lane would trim every zone; clear its points first"));
+        }
         let inst = crate::sfz::read_file(&path).map_err(|e| format!("Cannot import {name}: {e}"))?;
         let dir = path.parent().unwrap_or(Path::new(""));
         // The other tracks' files count against the budget, each once.
@@ -2201,6 +2226,9 @@ impl App {
             ("decay", envelope.decay),
             ("sustain", envelope.sustain),
             ("release", envelope.release),
+            // The regions' own offsets and ends say where they play.
+            ("start", 0.0),
+            ("end", 1.0),
         ];
         self.replace_zones(track, zones, &set, "import SFZ");
         // Other tracks that play a file only now loaded (it was missing).
@@ -2292,12 +2320,8 @@ impl App {
         let frames = sample.frames();
         let specs = InstrumentKind::Sampler.params();
         let index = |id: &str| specs.iter().position(|s| s.id == id).unwrap_or(0);
-        // Their lanes would go on moving the points into every slice.
-        for (id, name) in [("start", "Start"), ("end", "End")] {
-            let target = Some(LaneTarget::Track(2 + index(id) as u8));
-            if t.lanes.iter().any(|l| l.target == target && l.points.iter().flatten().any(Option::is_some)) {
-                return Err(format!("Cannot slice: the {name} lane would trim every slice; clear its points first"));
-            }
+        if let Some(name) = self.trim_lane(track) {
+            return Err(format!("Cannot slice: the {name} lane would trim every slice; clear its points first"));
         }
         // To the frame as the sampler plays them.
         let (from, to) = if part {
@@ -2335,6 +2359,19 @@ impl App {
         Ok(())
     }
 
+    /// The name of sampler track `track`'s Start or End lane if it has a
+    /// point, which would go on moving that point into every zone.
+    fn trim_lane(&self, track: usize) -> Option<&'static str> {
+        let specs = InstrumentKind::Sampler.params();
+        let t = &self.project.tracks[track];
+        [("start", "Start"), ("end", "End")].into_iter().find_map(|(id, name)| {
+            let index = specs.iter().position(|s| s.id == id)?;
+            let target = Some(LaneTarget::Track(2 + index as u8));
+            let moves = t.lanes.iter().any(|l| l.target == target && l.points.iter().flatten().any(Option::is_some));
+            moves.then_some(name)
+        })
+    }
+
     pub fn undo(&mut self) {
         let Some(c) = self.undo.pop_back() else {
             self.set_status("Nothing to undo");
@@ -2347,11 +2384,12 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.undo.clone(), &c.meta_before.clone(), &mut c.meta_after);
-        self.reload_missing();
+        let failed = self.reload_missing();
         if let Some(p) = c.param {
             self.send_plugin_param(p.place, p.plugin, p.id, p.before);
         }
         self.after_history_move(&c, "Undid");
+        self.say_unloaded("Undid", c.what, &failed);
         self.redo.push(c);
         // What the step walked away from may be more than the budget keeps.
         self.prune_bank();
@@ -2369,12 +2407,13 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.redo.clone(), &c.meta_after.clone(), &mut c.meta_before);
-        self.reload_missing();
+        let failed = self.reload_missing();
         // With edits, those (a lane's base) give the value again.
         if let Some(p) = c.param.filter(|_| c.redo.is_empty()) {
             self.send_plugin_param(p.place, p.plugin, p.id, p.after);
         }
         self.after_history_move(&c, "Redid");
+        self.say_unloaded("Redid", c.what, &failed);
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
         self.prune_bank();
@@ -9235,7 +9274,23 @@ mod tests {
         let link = EngineLink::new(tx, Arc::new(Shared::new()));
         let mut a = App::new(p, None, Some(link), 48_000, "test".into()).with_bank(bank);
         a.track = t;
-        let release = InstrumentKind::Sampler.params().iter().position(|s| s.id == "release").unwrap();
+        let specs = InstrumentKind::Sampler.params();
+        let id = |name: &str| specs.iter().position(|s| s.id == name).unwrap();
+        let (release, start, end) = (id("release"), id("start"), id("end"));
+        // Trimmed so that nothing would play: the instrument's regions say
+        // where they play instead.
+        assert!(a.edit(Edit::SetParam { track: t as u8, index: start as u8, value: 0.6 }));
+        assert!(a.edit(Edit::SetParam { track: t as u8, index: end as u8, value: 0.5 }));
+        // Not while a lane moves the start point.
+        a.project.tracks[t].lanes[0] = crate::project::LaneData::new(Some(LaneTarget::Track(2 + start as u8)), false);
+        a.project.tracks[t].lanes[0].points[0][0] = Some(0.5);
+        a.mode = Mode::Prompt(PromptKind::LoadSample, sfz.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some("Cannot import piano.sfz: the Start lane would trim every zone; clear its points first")
+        );
+        a.project.tracks[t].lanes[0] = crate::project::LaneData::new(None, false);
         let before = (a.project.tracks[t].clone(), a.project.tracks[t].params[release]);
         while rx.pop().is_some() {}
         a.mode = Mode::Prompt(PromptKind::LoadSample, sfz.display().to_string());
@@ -9264,6 +9319,7 @@ mod tests {
         );
         assert_eq!(z[1], (hi_key, (60, 127), Some(60), ZoneMode::NoLoop), "a file with no loop of its own plays once");
         assert_eq!(tr.params[release], 0.5, "the envelope of the first zone that plays");
+        assert_eq!((tr.params[start], tr.params[end]), (0.0, 1.0), "untrimmed");
         let mut sent = Vec::new();
         while let Some(cmd) = rx.pop() {
             if let Command::SetSamples { track, map } = cmd {
@@ -9276,6 +9332,29 @@ mod tests {
         assert_eq!((a.project.tracks[t].clone(), a.project.tracks[t].params[release]), before);
         a.redo();
         assert_eq!((a.project.tracks[t].zones.len(), a.project.tracks[t].sample.clone()), (3, None));
+        // A file loaded now plays with the zones, and says so.
+        a.mode = Mode::Prompt(PromptKind::LoadSample, old.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some("Loaded old.wav: 0.00 s at 48000 Hz · played over the whole keyboard, with the track's 3 zones")
+        );
+        // A file the history let go of and that is gone since: the undo
+        // says it, rather than leave the track silent unsaid.
+        let old_key = old.display().to_string();
+        a.bank.remove(&old_key);
+        std::fs::remove_file(&old).unwrap();
+        a.undo();
+        assert_eq!(a.project.tracks[t].sample, None);
+        a.undo();
+        assert_eq!(a.project.tracks[t].sample.as_deref(), Some(old_key.as_str()));
+        let said = a.status_text().unwrap();
+        assert!(said.starts_with(&format!("Undid import SFZ, but {old_key} did not load: ")), "{said}");
+        a.redo();
+        assert_eq!(a.status_text(), Some("Redid import SFZ"));
+        a.redo();
+        assert!(a.status_text().unwrap().starts_with(&format!("Redid load sample, but {old_key} did not load")));
+        a.undo();
         // An instrument with nothing to play changes nothing.
         std::fs::write(dir.join("empty.sfz"), "<region> sample=gone.wav").unwrap();
         let zones = a.project.tracks[t].zones.clone();

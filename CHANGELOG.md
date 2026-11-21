@@ -8,6 +8,9 @@ Author: 𝓐.𝓒.𝓑
 
 ### Fixed
 - Save As kept any extension it was given, so a name such as `kick.wav` wrote the project over a sample it played. Save As now writes `.tvo` files (or the file the project was opened from), and no save writes over a sample the project plays, however its path is spelled.
+- Importing an SFZ instrument kept the track's start and end points, so a track trimmed until nothing played stayed silent with its new zones. The import now resets them in the same undo step (the regions' own offsets and ends say where they play), and is refused while a lane has a point for the start or end point, as slicing is.
+- An undo or redo that brought back a file no longer there, or too large for what the project has left, said only "Undid" and left the track silent. It now names the file and why it did not load.
+- Loading a WAV on a track with zones (after an SFZ import or slicing, say) says that the file plays over the whole keyboard together with them.
 - A project file with many `parts` lines for one track, or with markers past the longest song, could take gigabytes of memory or minutes of work before it was refused. Such lines are now refused where they stand.
 
 ## [0.28.0] - 2026-11-21
