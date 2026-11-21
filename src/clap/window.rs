@@ -148,6 +148,23 @@ impl Windows {
         self.open.iter().any(|h| h.token() == token)
     }
 
+    /// How the window of the instance with `token` is shown, while it is
+    /// open: not once its plugin has closed it, though the next pump has
+    /// yet to let go of it.
+    pub fn mode(&self, token: u64) -> Option<GuiMode> {
+        self.open.iter().find(|h| h.token() == token)?.gui_mode()
+    }
+
+    /// Whether any window is open.
+    pub fn any(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// The tokens of the instances whose windows are open.
+    pub fn tokens(&self) -> Vec<u64> {
+        self.open.iter().map(PluginHandle::token).collect()
+    }
+
     /// Opens the window of `handle`'s plugin, titled `title`, floating if
     /// it can float one itself and otherwise in a window of TINVO's; a
     /// window open already stays as it is.

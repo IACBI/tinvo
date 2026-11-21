@@ -6,6 +6,17 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- A CLAP plugin's own window in the editor. `c` on a plugin track's instrument page, on a plugin's page or on its slot on the inserts page opens it: floating where the plugin floats one, otherwise inside a window TINVO opens for it (on Windows; on Linux through X11, with Xlib loaded at run time; on macOS through AppKit). `c` again closes it, as does the window's own close button. Each instance has one window, which closes when its plugin is removed, replaced or given up on after failing twice, when the audio device is lost, and at quit. The title of the plugin's page, or of a plugin track's instrument page, says while its window is open. A change made in the window marks the project unsaved and shows on the panel, unless an automation lane holds that parameter.
+
+### Changed
+- A plugin asking for its window to be shown, hidden or resized, or saying it closed it, no longer takes a lock, from whichever thread it asks.
+- A settings file that gives `c` to another action of the panel still loads: the new plugin window key is left unbound there instead of the file being refused.
+
+### Fixed
+- A plugin's change of its own state just before the audio device was lost or switched, such as a knob turned in its window, was saved with the project's next save but not marked unsaved, so quitting did not ask. It is now an unsaved change.
+- An output device that failed to open after a switch dropped the plugins' latest states; they are now kept, as when a device is lost.
+
 ## [0.26.0] - 2026-11-20
 
 ### Added

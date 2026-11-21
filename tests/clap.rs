@@ -3404,6 +3404,9 @@ struct Editor {
     app: App,
     engine: Box<Engine>,
     commands: Consumer<EngineCommand>,
+    /// The window probe of each instance the editor gave the engine, by
+    /// token, the latest last; one is only used while its instance lives.
+    probes: Vec<(u64, GuiProbe)>,
 }
 
 impl Editor {
@@ -3416,7 +3419,7 @@ impl Editor {
         // which takes the thread that made its host as main.
         let app = unsafe { App::new(project, None, None, RATE as u32, "t".into()).with_plugin_catalog(catalog) };
         let (engine, commands) = Editor::engine(&app);
-        let mut ed = Editor { app, engine, commands };
+        let mut ed = Editor { app, engine, commands, probes: Vec::new() };
         ed.reconnect();
         ed
     }
@@ -3442,10 +3445,29 @@ impl Editor {
         self.engine = engine;
     }
 
+    /// A new engine as a reopened device gives one: the old engine's stream
+    /// ends first, so its instances go home from the audio thread, and only
+    /// then does the editor take the new.
+    fn reopen(&mut self) {
+        let old = std::mem::replace(&mut self.engine, Editor::engine(&self.app).0);
+        std::thread::spawn(move || drop(old)).join().unwrap();
+        self.reconnect();
+    }
+
+    /// The old engine's stream ended, as when the device is lost.
+    fn lose_device(&mut self) {
+        let old = std::mem::replace(&mut self.engine, Editor::engine(&self.app).0);
+        std::thread::spawn(move || drop(old)).join().unwrap();
+        self.app.audio_failed("unplugged".into());
+    }
+
     /// Hands the engine what the editor sent: the plugin commands, by name.
     fn pump(&mut self) -> Vec<&'static str> {
         let mut seen = Vec::new();
         while let Some(c) = self.commands.pop() {
+            if let EngineCommand::SetPlugin { instance, .. } | EngineCommand::SetSlotPlugin { instance, .. } = &c {
+                self.probes.push((instance.token(), GuiProbe::of(instance)));
+            }
             seen.extend(match &c {
                 EngineCommand::SetPlugin { .. } => Some("set_plugin"),
                 EngineCommand::SetSlotPlugin { .. } => Some("set_slot_plugin"),
@@ -3668,6 +3690,190 @@ fn the_editor_restarts_a_plugin_that_asks_and_one_that_fails() {
         ed.app.plugin_problems(),
         ["Test Sine failed while playing; restarting it", "Test Sine failed again and stays silent"]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The window probe of the latest instance the editor gave the engine
+/// `back` instances before the last.
+fn probe(ed: &Editor, back: usize) -> GuiProbe {
+    ed.probes[ed.probes.len() - 1 - back].1
+}
+
+#[test]
+fn the_editor_opens_and_closes_a_plugin_s_window() {
+    let dir = temp_dir("editor-window");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 1, kind: Some(EffectKind::Plugin(gain_ref())) }).unwrap();
+    let none = PluginRef::new("org.tinvo.test.none").unwrap();
+    p.apply(Edit::SetSlot { chain: ChainId::Track(0), slot: 2, kind: Some(EffectKind::Plugin(none)) }).unwrap();
+    let mut ed = Editor::new(&dir, "window", p);
+    assert_eq!(ed.pump(), ["set_plugin", "set_slot_plugin"]);
+    let status = |ed: &Editor| ed.app.status_text().unwrap_or_default().to_string();
+    ed.key(Key::Tab);
+    assert_eq!((ed.app.focus, ed.app.page), (Focus::Params, Page::Instrument));
+    // Where no plugin is, the key says where it works.
+    ed.key(Key::Char('f'));
+    ed.key(Key::Char('c'));
+    assert!(
+        status(&ed).starts_with("c opens a plugin's window from a plugin track's instrument page"),
+        "{}",
+        status(&ed)
+    );
+    // A slot whose plugin is not playing has no window to open.
+    ed.key(Key::Char('f'));
+    ed.key(Key::Char('f'));
+    assert_eq!(ed.app.page, Page::Inserts);
+    for _ in 0..2 {
+        ed.key(Key::Down);
+    }
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "org.tinvo.test.none is not playing: its window opens once it does");
+    ed.key(Key::Char('f'));
+    assert_eq!(ed.app.page, Page::Instrument);
+
+    // Opened from a plugin track's instrument page. A test's thread is not
+    // macOS's main thread, where AppKit makes windows; on Linux, an X
+    // server without a window manager is needed, which CI starts.
+    if cfg!(target_os = "macos") {
+        ed.key(Key::Char('c'));
+        assert_eq!(
+            status(&ed),
+            "Test Sine's window did not open: plugin windows open only on the main thread on macOS"
+        );
+        assert!(!screen(&ed.app).contains("window open"));
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    if cfg!(target_os = "linux") && std::env::var_os("TINVO_REQUIRE_X11").is_none() {
+        eprintln!("skipped the windows: set TINVO_REQUIRE_X11, with DISPLAY on an X server without a window manager");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let sine = probe(&ed, 1);
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "Test Sine's window is open (c closes it)");
+    assert!(sine.stats().parent != 0 && sine.log().iter().any(|l| l == "show"), "{:?}", sine.log());
+    let text = screen(&ed.app);
+    assert!(text.contains(" Plugin · Test Sine · window open "), "{text}");
+    // A knob turned in it reaches the panel and is an unsaved change, once
+    // the plugin has played and told the editor.
+    assert!(!ed.app.dirty);
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("25.0 %"));
+    assert!(sine.poke(11, 20, 500), "flush asked for");
+    assert_eq!(shown(&ed.app, "Level").as_deref(), Some("50.0 %"));
+    render(&mut ed.engine, 256, 64);
+    ed.app.tick();
+    assert!(ed.app.dirty, "the plugin's state changed");
+    // Pressed again, it closes; and again, opens.
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "Closed Test Sine's window");
+    assert_eq!(sine.log().last().map(String::as_str), Some("destroy"));
+    assert!(!screen(&ed.app).contains("window open"));
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "Test Sine's window is open (c closes it)");
+
+    // An insert's from its slot on the inserts page, and from its page.
+    let gain = probe(&ed, 0);
+    for _ in 0..3 {
+        ed.key(Key::Char('f'));
+    }
+    assert_eq!(ed.app.page, Page::Inserts);
+    ed.key(Key::Down);
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "Test Gain's window is open (c closes it)");
+    ed.key(Key::Enter);
+    assert_eq!(ed.app.page, Page::Plugin);
+    assert!(screen(&ed.app).contains(" Plugin slot 2 · Test Gain · window open "), "{}", screen(&ed.app));
+    ed.key(Key::Char('c'));
+    assert_eq!(status(&ed), "Closed Test Gain's window");
+    ed.key(Key::Char('c'));
+    // Removed, its window closes with it, while the engine still has it.
+    ed.key(Key::Char('f'));
+    ed.key(Key::Char('-'));
+    assert!(ed.app.project.chain(ChainId::Track(0)).unwrap()[1].is_none());
+    assert_eq!(gain.log().last().map(String::as_str), Some("destroy"));
+    assert!(sine.log().last().map(String::as_str) != Some("destroy"), "the track's stays open");
+    // Brought back, its new instance's window is not opened for it.
+    ed.key(Key::Char('u'));
+    assert_eq!(ed.pump(), ["set_slot_plugin"]);
+    assert!(probe(&ed, 0).stats().parent == 0);
+    // Replaced by another instance (picked again), the old one's closes.
+    ed.key(Key::Char('c'));
+    let gain = probe(&ed, 0);
+    assert!(gain.stats().parent != 0);
+    ed.app.mode = EditorMode::Plugins(PluginPicker { target: PluginFor::Slot(ChainId::Track(0), 1), cursor: 0 });
+    ed.key(Key::Enter);
+    assert_eq!(status(&ed), "Plugin slot 2: Test Gain, loaded again");
+    assert_eq!(gain.log().last().map(String::as_str), Some("destroy"));
+
+    // The device lost: every window closes, before its instance goes.
+    ed.app.audio_failed("unplugged".into());
+    assert_eq!(sine.log().last().map(String::as_str), Some("destroy"));
+    assert_eq!(sine.stats().broken, 0, "every window call by CLAP's rules");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_change_a_plugin_made_just_before_its_engine_went_is_unsaved() {
+    let dir = temp_dir("editor-leaving");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    // A new engine, and the device lost, each before the editor's next tick.
+    for lost in [false, true] {
+        let mut ed = Editor::new(&dir, if lost { "leavinglost" } else { "leaving" }, p.clone());
+        ed.pump();
+        assert!(probe(&ed, 0).poke(11, 20, 500), "a knob turned in its window");
+        render(&mut ed.engine, 256, 64);
+        assert!(!ed.app.dirty);
+        if lost {
+            ed.lose_device();
+        } else {
+            ed.reopen();
+        }
+        assert!(ed.app.dirty, "lost: {lost}");
+        // And the state the plugin had then is what its next instance has.
+        if lost {
+            ed.reconnect();
+        }
+        ed.pump();
+        ed.key(Key::Tab);
+        assert_eq!(shown(&ed.app, "Level").as_deref(), Some("50.0 %"), "lost: {lost}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_s_window_closes_when_the_editor_gives_up_on_it() {
+    // Where a test can open windows (see the test above).
+    if cfg!(target_os = "macos") || cfg!(target_os = "linux") && std::env::var_os("TINVO_REQUIRE_X11").is_none() {
+        eprintln!("skipped: no plugin windows open in this test here");
+        return;
+    }
+    let dir = temp_dir("editor-window-given-up");
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Plugin(sine_ref()))).unwrap();
+    let mut ed = Editor::new(&dir, "procerrors", p);
+    assert_eq!(ed.pump(), ["set_plugin"]);
+    let sine = probe(&ed, 0);
+    ed.key(Key::Tab);
+    ed.key(Key::Char('c'));
+    assert_eq!(ed.app.status_text(), Some("Test Sine's window is open (c closes it)"));
+    // Failing, restarted with its window kept open...
+    render(&mut ed.engine, 128, 64);
+    for _ in 0..4 {
+        ed.app.tick();
+        ed.pump();
+    }
+    assert!(sine.log().last().map(String::as_str) != Some("destroy"), "{:?}", sine.log());
+    // ...then given up on, which closes it.
+    for _ in 0..3 {
+        render(&mut ed.engine, 128, 64);
+        ed.app.tick();
+        ed.pump();
+    }
+    assert_eq!(ed.app.plugin_problems().last().map(String::as_str), Some("Test Sine failed again and stays silent"));
+    assert_eq!(sine.log().last().map(String::as_str), Some("destroy"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

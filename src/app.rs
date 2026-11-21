@@ -1266,7 +1266,9 @@ impl App {
     pub fn audio_failed(&mut self, err: String) {
         self.finish_note_recording();
         // Before the instances it played come home and are destroyed.
+        self.keep_leaving_changes();
         self.sync_states();
+        self.plugins.close_windows();
         if self.link.take().is_some() {
             self.audio_label = "audio offline".into();
             self.playing = false;
@@ -1279,6 +1281,7 @@ impl App {
     /// stops: the new engine starts from the project, at its start.
     pub fn reconnect(&mut self, link: EngineLink, sample_rate: u32, label: String) {
         self.finish_note_recording();
+        self.keep_leaving_changes();
         self.link = Some(link);
         self.send(Command::SetMidiClock(self.midi_out.clock));
         self.count_in = None;
@@ -1777,6 +1780,7 @@ impl App {
                     }
                     None => false,
                 });
+                self.close_stray_windows();
                 self.carried.retain_mut(|c| match project::follow_place(c.0, &applied) {
                     Some(p) => {
                         c.0 = p;
@@ -3846,6 +3850,8 @@ impl App {
                     self.plugin_problem(format!("{at}: {name} plays at its defaults: it {e}; that state is kept"));
                 }
                 self.live.push(Live { place, handle: i.handle(), saves: unloaded.is_none(), sent: 0 });
+                // The window of the instance it replaces goes with it.
+                self.close_stray_windows();
                 self.send(match place {
                     PluginPlace::Track(track) => Command::SetPlugin { track, instance: Box::new(i) },
                     PluginPlace::Slot(chain, slot) => Command::SetSlotPlugin { chain, slot, instance: Box::new(i) },
@@ -3959,6 +3965,82 @@ impl App {
             );
         }
         self.late = late;
+        // An instance gone some other way, a restart it did not survive.
+        self.close_stray_windows();
+    }
+
+    /// Closes the windows of the instances the engine no longer plays for
+    /// a place: replaced, removed, or gone.
+    fn close_stray_windows(&mut self) {
+        if !self.plugins.any_window() {
+            return;
+        }
+        // One given up on plays no more, and the panel no longer reaches it.
+        let playing = |l: &&Live| l.handle.is_alive() && !self.plugins.given_up(l.handle.token());
+        let keep: Vec<u64> = self.live.iter().filter(playing).map(|l| l.handle.token()).collect();
+        self.plugins.close_windows_but(|t| keep.contains(&t));
+    }
+
+    /// Before the instances of the engine going are destroyed: a change of
+    /// state they made that no poll has reported yet (a knob turned in a
+    /// plugin's window just before, say) is still an unsaved change. Read
+    /// from their handles, since polling would destroy those that came home
+    /// first.
+    fn keep_leaving_changes(&mut self) {
+        let dirty = self.live.iter().filter(|l| l.saves).fold(false, |d, l| l.handle.take_state_dirty() | d);
+        if dirty {
+            self.touch();
+        }
+    }
+
+    /// The plugin whose window the panel's page opens, and where it plays:
+    /// the one whose parameters it shows, or on the inserts page the
+    /// selected slot's.
+    fn window_plugin(&self) -> Option<(PluginPlace, PluginRef)> {
+        if self.page != Page::Inserts {
+            return self.panel_plugin();
+        }
+        if !self.page_params().contains(&self.param) {
+            return None;
+        }
+        let (chain, slot, _) = slot_of_param(self.param, self.track as u8)?;
+        Some((PluginPlace::Slot(chain, slot), self.slot_data(chain, slot)?.kind.plugin()?))
+    }
+
+    /// Opens the window of the plugin the panel's page is on, or closes it
+    /// if it is open.
+    fn toggle_plugin_window(&mut self) {
+        let Some((place, plugin)) = self.window_plugin() else {
+            let k = self.k(Action::PluginWindow);
+            let status = format!(
+                "{k} opens a plugin's window from a plugin track's instrument page, a plugin's page or its slot on the inserts page"
+            );
+            return self.set_status(status);
+        };
+        let name = self.plugins.name(plugin);
+        let Some(handle) = self.live_at(place, plugin).map(|l| l.handle.clone()) else {
+            return self.set_status(format!("{name} is not playing: its window opens once it does"));
+        };
+        let token = handle.token();
+        if self.plugins.window_open(token) {
+            self.plugins.close_window(token);
+            return self.set_status(format!("Closed {name}'s window"));
+        }
+        let title = format!("{name} · {} · TINVO", self.place_text(place));
+        let status = match self.plugins.open_window(handle, &title) {
+            Ok(_) => format!("{name}'s window is open ({} closes it)", self.k(Action::PluginWindow)),
+            Err(e) => format!("{name}'s window did not open: {e}"),
+        };
+        self.set_status(status);
+    }
+
+    /// " · window open" while the window of `plugin` at `place` is, for
+    /// the panel's title.
+    fn window_mark(&self, place: PluginPlace, plugin: PluginRef) -> &'static str {
+        match self.live_at(place, plugin) {
+            Some(l) if self.plugins.window_open(l.handle.token()) => " · window open",
+            _ => "",
+        }
     }
 
     /// Removes the lanes on each plugin parameter in `cleared` (an
@@ -5051,6 +5133,11 @@ impl App {
     }
 
     fn params_action(&mut self, a: Option<Action>) {
+        // Also on a page with nothing to select, such as a plugin's with no
+        // parameters, which may still have a window.
+        if a == Some(Action::PluginWindow) {
+            return self.toggle_plugin_window();
+        }
         let page = self.page_params();
         if page.is_empty() {
             return;
@@ -5960,7 +6047,9 @@ impl App {
                             Some(l) if !l.saves => " · at its defaults",
                             Some(_) => "",
                         };
-                        format!(" {} slot {slot} · {}{how} ", self.chain_name(chain), self.plugins.name(plugin))
+                        let window = self.window_mark(place, plugin);
+                        let name = self.plugins.name(plugin);
+                        format!(" {} slot {slot} · {name}{how}{window} ", self.chain_name(chain))
                     }
                     None => format!(" {} slot {slot} · no plugin ", self.chain_name(chain)),
                 }
@@ -5993,7 +6082,15 @@ impl App {
                     (None, InstrumentKind::Sampler) => {
                         format!(" {} · Sampler · no sample, press {}{page} ", t.name, self.k(Action::LoadSample))
                     }
-                    (None, kind) => format!(" {} · {}{page} ", t.name, self.kind_label(kind)),
+                    (None, kind) => {
+                        let window = match kind.plugin() {
+                            Some(r) if self.page == Page::Instrument => {
+                                self.window_mark(PluginPlace::Track(self.track as u8), r)
+                            }
+                            _ => "",
+                        };
+                        format!(" {} · {}{window}{page} ", t.name, self.kind_label(kind))
+                    }
                 }
             }
         };
@@ -6068,22 +6165,29 @@ impl App {
                 two(&[Action::EffectEarlier, Action::EffectLater], "move"),
                 one(Action::RemoveEffect, "remove"),
                 one(Action::InsertChain, "chain"),
+                one(Action::PluginWindow, "plugin window"),
                 one(Action::Default, "default"),
                 one(Action::Page, "page"),
                 one(Action::Automate, "automate"),
                 one(Action::Focus, "grid"),
             ],
-            Focus::Params => vec![
-                two(&[Action::Up, Action::Down], "select"),
-                two(&[Action::Left, Action::Right], "adjust"),
-                two(&[Action::CoarseUp, Action::CoarseDown], "coarse"),
-                one(Action::Default, "default"),
-                one(Action::Page, "page"),
-                one(Action::Automate, "automate"),
-                one(Action::Mute, "mute"),
-                one(Action::Solo, "solo"),
-                one(Action::Focus, "grid"),
-            ],
+            Focus::Params => {
+                let mut hints = vec![
+                    two(&[Action::Up, Action::Down], "select"),
+                    two(&[Action::Left, Action::Right], "adjust"),
+                    two(&[Action::CoarseUp, Action::CoarseDown], "coarse"),
+                    one(Action::Default, "default"),
+                    one(Action::Page, "page"),
+                    one(Action::Automate, "automate"),
+                    one(Action::Mute, "mute"),
+                    one(Action::Solo, "solo"),
+                    one(Action::Focus, "grid"),
+                ];
+                if self.panel_plugin().is_some() {
+                    hints.insert(2, one(Action::PluginWindow, "window"));
+                }
+                hints
+            }
         }
     }
 
@@ -6721,10 +6825,10 @@ impl Output {
             match start_audio(&app.project, &samples, &config, self.live.as_ref(), self.midi_out.as_ref()) {
                 Ok(v) => v,
                 Err(e) => {
-                    app.link = None;
+                    // The old engine's instances are home: their states are
+                    // kept before they go, as for a device lost.
+                    app.audio_failed(e.clone());
                     app.audio_label = "audio offline".into();
-                    app.playing = false;
-                    app.play_pos = None;
                     return Err(e);
                 }
             };
@@ -10642,6 +10746,23 @@ mod tests {
         a.focus = Focus::Params;
         a.draw(&mut s);
         assert!(s.row_text(39).contains("PgUp PgDn coarse  0 default"), "{}", s.row_text(39));
+    }
+
+    #[test]
+    fn the_panel_hints_a_plugin_s_window_key() {
+        let mut a = app();
+        a.focus = Focus::Params;
+        let mut s = Screen::new(160, 40);
+        a.draw(&mut s);
+        assert!(!s.row_text(39).contains("c window"), "{}", s.row_text(39));
+        let r = PluginRef::new("org.tinvo.test.hint").unwrap();
+        assert!(a.edit(Edit::AddTrack(InstrumentKind::Plugin(r))));
+        a.track = a.project.tracks.len() - 1;
+        a.draw(&mut s);
+        assert!(s.row_text(39).contains("c window"), "{}", s.row_text(39));
+        a.page = Page::Inserts;
+        a.draw(&mut s);
+        assert!(s.row_text(39).contains("c plugin window"), "{}", s.row_text(39));
     }
 
     #[test]
