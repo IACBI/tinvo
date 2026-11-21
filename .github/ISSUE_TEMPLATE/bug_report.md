@@ -18,4 +18,4 @@ labels: bug
 - `tinvo --version`:
 - Output of `tinvo probe 2` (for audio problems):
 
-Attach the `.tvo` file if the problem depends on a project.
+Attach the file the problem depends on, if any: the `.tvo` project, or the WAV, MIDI or SFZ file it reads.

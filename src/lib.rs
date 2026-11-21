@@ -48,6 +48,7 @@ pub mod render;
 pub mod rt;
 pub mod sample;
 pub mod settings;
+pub mod sfz;
 pub mod smf;
 pub mod strip;
 pub mod theme;

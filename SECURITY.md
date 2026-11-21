@@ -16,6 +16,6 @@ Only the latest release gets fixes. TINVO is before 1.0, so a fix is not backpor
 
 ## What counts
 
-TINVO reads input it did not write: `.tvo` project files, WAV files, the settings file, MIDI bytes and terminal input. Anything one of these can do beyond being refused with an error is a security problem: a crash, a hang, unbounded memory use, reading or writing files it should not, or running code. The project and WAV readers and the edit model are fuzzed in CI (`tinvo fuzz`), and a reproducing input is the most helpful thing a report can carry.
+TINVO reads input it did not write: `.tvo` project files, WAV files, Standard MIDI Files, SFZ instruments and the files they include, the settings file, MIDI bytes and terminal input. Anything one of these can do beyond being refused with an error is a security problem: a crash, a hang, unbounded memory use, reading or writing files it should not, or running code. The project, WAV, MIDI file and SFZ readers and the edit model are fuzzed in CI (`tinvo fuzz`), and a reproducing input is the most helpful thing a report can carry.
 
-TINVO has no network code. The only program it starts is `valgrind`, and only for `tinvo bench --instructions`. It calls operating-system audio, MIDI and terminal APIs through its own FFI; a memory-safety bug in that code counts too.
+TINVO has no network code. The programs it starts are itself, as `tinvo scan-clap`, to read each CLAP plugin file apart from the editor, and `valgrind`, only for `tinvo bench --instructions`. A CLAP plugin is code that runs inside TINVO by design; what a plugin you install does is not TINVO's to contain. It calls operating-system audio, MIDI and terminal APIs through its own FFI; a memory-safety bug in that code counts too.

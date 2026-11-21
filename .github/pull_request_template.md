@@ -4,6 +4,8 @@
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test` and `cargo test --release`
+- [ ] `tinvo bench --check` in release mode if the engine changed
+- [ ] `tinvo fuzz <target>` for a few minutes if a reader or the edit model changed
 - [ ] Ran on real hardware (say which OS) if audio or terminal code changed
 
 **Checklist**

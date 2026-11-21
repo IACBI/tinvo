@@ -25,7 +25,7 @@ use tinvo::engine::{
 };
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use tinvo::insert::{EffectKind, Insert, MAX_INSERTS, MAX_SLOTS};
-use tinvo::instrument::zone::{Placement, Trigger};
+use tinvo::instrument::zone::{Mode as ZoneMode, Placement, Trigger};
 use tinvo::instrument::{InstrumentKind, SampleMap};
 use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
@@ -135,7 +135,8 @@ impl Rig {
 }
 
 /// A sampler's samples: the whole sample over the keyboard, and layered
-/// over it zones of parts of it that take turns and sound on release.
+/// over it zones of parts of it that take turns in order and at random,
+/// loop in each mode and sound on release.
 fn sample(frames: usize, seed: u64) -> Arc<SampleMap> {
     let mut rng = Rng::new(seed);
     let audio: Vec<f32> = (0..frames).map(|_| rng.bipolar() * 0.5).collect();
@@ -147,6 +148,13 @@ fn sample(frames: usize, seed: u64) -> Arc<SampleMap> {
         tune: f32::from(k) * 10.0,
         start: u32::from(k) * 100,
         end: Some(u32::from(k) * 100 + 2000),
+        rand: if k == 1 { (0.0, 0.5) } else { (0.0, 1.0) },
+        mode: [
+            ZoneMode::Sustain(Some((u32::from(k) * 100 + 500, u32::from(k) * 100 + 900))),
+            ZoneMode::Continuous(Some((300, 700))),
+            ZoneMode::OneShot,
+            ZoneMode::NoLoop,
+        ][usize::from(k)],
         ..Placement::WHOLE
     };
     let zones = (0..4).map(|k| (part(k, if k == 3 { Trigger::Release } else { Trigger::Attack }), s.clone()));

@@ -17,7 +17,7 @@ A keyboard-driven digital audio workstation for the terminal: zero dependencies,
 
 ### Overview
 
-TINVO is a step-sequencer DAW that runs in a terminal window. Everything is written in Rust on top of the standard library alone: the synthesizer and drums, the real-time engine, the WAV writer, and the audio backends (WASAPI, ALSA, JACK, CoreAudio) are called through hand-written FFI. There are no crates to download, so it builds offline. The release binary is about 0.5 MB.
+TINVO is a step-sequencer DAW that runs in a terminal window. Everything is written in Rust on top of the standard library alone: the synthesizer and drums, the real-time engine, the WAV writer, and the audio backends (WASAPI, ALSA, JACK, CoreAudio) are called through hand-written FFI. There are no crates to download, so it builds offline. The release binary is a few megabytes (about 3 MB on Windows).
 
 The audio thread never allocates, locks or blocks. WAV export runs the same engine as playback, so what you hear is what you export.
 
@@ -40,7 +40,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
-- A 16-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter. Besides its sample, a sampler track can lay files over the keyboard as zones (`zone` lines in the project file): key ranges, velocity layers, round robin and release samples.
+- A 16-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter. Besides its sample, a sampler track can lay files over the keyboard as zones, written as `zone` lines in the project file or imported from an SFZ instrument with `o`: key ranges, velocity layers, round robin in turn or at random, release samples, and a loop mode of each zone's own. A WAV file's own loop and root key (its `smpl` chunk) are read.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
@@ -97,6 +97,7 @@ tinvo plugins             # list the CLAP plugins installed (--rescan reads ever
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
+tinvo sfz piano.sfz       # what the sampler plays of an SFZ instrument, and what it leaves out
 tinvo settings            # check the settings file and print every key and colour
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
@@ -143,7 +144,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `i` `d` | send the track to the next group (from the last, back to the master); a new group for it |
 | `E` `Q` `F` | rename, mute or delete the track's group (its tracks go to the master) |
 | `H` | the MIDI channel (1–16) that plays the track whichever is selected; empty for none |
-| `o` | load a WAV file into a sampler track (`a` `7` adds one) |
+| `o` | load a WAV file, or import an SFZ instrument, into a sampler track (`a` `7` adds one) |
 | `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
 | `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
 | `M` | choose the MIDI input |
@@ -200,7 +201,7 @@ MIT. See [LICENSE](LICENSE). Author: 𝓐.𝓒.𝓑
 
 ### Genel Bakış
 
-TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, JACK, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si yaklaşık 0,5 MB.
+TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, JACK, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si birkaç megabayt (Windows'ta yaklaşık 3 MB).
 
 Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa aktarma çalmayla aynı motoru kullanır: ne duyuyorsan dosyaya o yazılır.
 
@@ -223,7 +224,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
-- WAV dosyalarını windowed-sinc interpolasyonla çalan 16 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre. Bir sampler kanalı kendi sample'ının yanında dosyaları klavyeye bölge olarak da yayabilir (proje dosyasındaki `zone` satırları): tuş aralıkları, velocity katmanları, round robin ve release sample'ları.
+- WAV dosyalarını windowed-sinc interpolasyonla çalan 16 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre. Bir sampler kanalı kendi sample'ının yanında dosyaları klavyeye bölge olarak da yayabilir; bölgeler proje dosyasında `zone` satırlarıdır ya da `o` ile bir SFZ enstrümanından alınır: tuş aralıkları, velocity katmanları, sırayla ya da rastgele round robin, release sample'ları ve her bölgenin kendi loop modu. WAV dosyasının kendi loop noktaları ve kök notası (`smpl` chunk'ı) da okunur.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
@@ -280,6 +281,7 @@ tinvo plugins             # list the CLAP plugins installed (--rescan reads ever
 tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
+tinvo sfz piano.sfz       # what the sampler plays of an SFZ instrument, and what it leaves out
 tinvo settings            # check the settings file and print every key and colour
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
@@ -326,7 +328,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `i` `d` | kanalı sıradaki gruba gönder (sonuncudan sonra master'a döner); kanal için yeni grup aç |
 | `E` `Q` `F` | kanalın grubunu yeniden adlandır, mute et ya da sil (kanalları master'a gider) |
 | `H` | kanalı, seçili olmasa da çalan MIDI kanalı (1–16); boş bırakılırsa yok |
-| `o` | sampler kanalına WAV dosyası yükle (`a` `7` sampler kanalı ekler) |
+| `o` | sampler kanalına WAV dosyası yükle ya da SFZ enstrümanı al (`a` `7` sampler kanalı ekler) |
 | `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |
 | `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |
 | `M` | MIDI girişini seç |

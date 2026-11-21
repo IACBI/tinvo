@@ -114,9 +114,9 @@ jobs:
       - run: cargo build --release
       # The run's id as the seed: each run explores new inputs, and the log
       # names the seed, so a failure can be repeated.
-      - name: Fuzz projects, WAV files, edit scripts and MIDI files (60 s each)
+      - name: Fuzz projects, WAV files, edit scripts, MIDI files and SFZ instruments (60 s each)
         run: |
-          for target in project wav edits midi; do
+          for target in project wav edits midi sfz; do
             ./target/release/tinvo fuzz "$target" --seconds 60 --seed "${{ github.run_id }}"
           done
       - name: Keep a failing input

@@ -38,6 +38,9 @@ USAGE:
                                         unless --loops, at most 32)
     tinvo import SONG.mid OUT.tvo       read a MIDI file (format 0 or 1) into a new project;
                                         `tinvo SONG.mid` opens it in the editor unsaved
+    tinvo sfz INSTRUMENT.sfz            check an SFZ instrument: what the sampler plays of
+                                        it and what it leaves out (o on a sampler track
+                                        imports it)
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
     tinvo midi                          list the MIDI inputs and outputs
@@ -54,7 +57,7 @@ USAGE:
                                         fails when one is over its time budget
     tinvo bench --instructions FILE     count instructions per scenario with Valgrind
                                         (x86-64 Linux) against the budgets in FILE
-    tinvo fuzz project|wav|edits|midi [--seconds N | --runs N] [--seed N] [--render-every N]
+    tinvo fuzz project|wav|edits|midi|sfz [--seconds N | --runs N] [--seed N] [--render-every N]
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
     tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
@@ -120,6 +123,7 @@ fn main() -> ExitCode {
         Some("fuzz") => cmd_fuzz(&args[1..]),
         Some("settings") => cmd_settings(&args[1..]),
         Some("import") => cmd_import(&args[1..]),
+        Some("sfz") => cmd_sfz(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
     match result {
@@ -322,6 +326,70 @@ fn cmd_import(args: &[String]) -> Result<(), String> {
         });
     }
     println!("Imported {} to {}: {}", shown(input), shown(out), imported.summary());
+    Ok(())
+}
+
+fn cmd_sfz(args: &[String]) -> Result<(), String> {
+    let [input] = args else { return Err(format!("sfz needs one INSTRUMENT.sfz{SEE_HELP}")) };
+    let path = std::path::Path::new(input);
+    let inst = tinvo::sfz::read_file(path).map_err(|e| format!("{}: {e}", shown(input)))?;
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    // Each file once, by the name the editor gives it, and its header as
+    // the editor reads it.
+    let key = |r: &tinvo::sfz::Region| tinvo::sample::absolute(&dir.join(&r.path).to_string_lossy());
+    let mut files = std::collections::BTreeMap::new();
+    for r in &inst.regions {
+        files.entry(key(r)).or_insert_with_key(|k| tinvo::sfz::FileInfo::read(k));
+    }
+    let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
+    let mut playing = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+    for r in &inst.regions {
+        let k = key(r);
+        if let Ok(info) = &files[&k] {
+            match r.resolve(info) {
+                Ok(place) => {
+                    playing.push((r, place));
+                    used.insert(k);
+                }
+                Err(why) => *skipped.entry(why).or_default() += 1,
+            }
+        }
+    }
+    let (n, total) = (playing.len(), inst.regions.len());
+    let good = files.values().filter(|f| f.is_ok()).count();
+    let keys = playing.iter().fold(None, |k: Option<(u8, u8)>, (_, p)| {
+        Some(k.map_or(p.keys, |(lo, hi)| (lo.min(p.keys.0), hi.max(p.keys.1))))
+    });
+    let over = keys.map_or_else(String::new, |(lo, hi)| format!(" over keys {lo} to {hi}"));
+    println!("{}: {n} of {total} regions play{over}, from {good} of {} files", shown(input), files.len());
+    for (f, e) in files.iter().filter_map(|(f, r)| r.as_ref().err().map(|e| (f, e))) {
+        println!("- not loaded: {}: {}", tinvo::tui::printable(&f.display().to_string()), tinvo::tui::printable(e));
+    }
+    for (why, n) in skipped {
+        println!("- {n} {} skipped: {why}", if n == 1 { "region" } else { "regions" });
+    }
+    // What the editor would load: the files a region plays.
+    let frames: u64 = used.iter().filter_map(|k| files[k].as_ref().ok()).map(|f| f.frames).sum();
+    if frames > tinvo::sample::PROJECT_FRAMES as u64 {
+        println!(
+            "- {frames} frames in all, more than a project holds ({}): the editor loads files in order until they fill it",
+            tinvo::sample::PROJECT_FRAMES
+        );
+    }
+    if let Some((r, _)) = playing.first() {
+        let e = r.envelope;
+        println!(
+            "- envelope: attack {} s, decay {} s, sustain {}%, release {} s",
+            e.attack,
+            e.decay,
+            e.sustain * 100.0,
+            e.release
+        );
+    }
+    for note in &inst.notes {
+        println!("- {}", tinvo::tui::printable(note));
+    }
     Ok(())
 }
 

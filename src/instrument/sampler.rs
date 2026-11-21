@@ -2,18 +2,28 @@
 //! pitched by note, with start/end/loop points, an amplitude envelope and a
 //! filter. A note plays every attack zone it reaches (velocity layers are
 //! zones of one key range), in turn where zones take turns (round robin),
-//! and its release zones when the key comes up.
+//! or at random, and its release zones when the key comes up. A zone may
+//! loop on its own terms, its key held or not.
 //!
 //! The sampler never allocates and never frees: the map arrives as an
 //! `Arc` and leaves through [`Sampler::set_samples`]'s return value, which
 //! the engine hands back to the UI thread.
 
-use super::zone::{MAP_ZONES, SampleMap, Trigger, Zone};
+use super::zone::{MAP_ZONES, Mode, SampleMap, Trigger, Zone};
 use super::{ParamSpec, Unit, VoiceId};
 use crate::dsp::env::{Adsr, AdsrParams};
 use crate::dsp::filter::{FilterMode, Svf};
+use crate::dsp::noise::Rng;
 use crate::dsp::{semitones_to_ratio, velocity_to_gain};
 use std::sync::Arc;
+
+/// Where the draws for zones that take turns at random start, so a song
+/// plays and exports the same each time.
+const RNG_SEED: u64 = 0x5A3D_17C0_9E4B_2F61;
+
+/// How far before a loop's end interpolation reads past it: the sinc
+/// kernel's taps after the frame.
+const SEAM: f64 = (crate::sample::SINC_TAPS / 2) as f64;
 
 pub const SAMPLER_VOICES: usize = 16;
 const VOICE_GAIN: f32 = 0.5;
@@ -87,6 +97,11 @@ struct Voice {
     /// A release zone's: it plays to its end whatever the mode, and never
     /// loops.
     once: bool,
+    /// Its zone's mode.
+    mode: Mode,
+    /// Whether it has come round its loop: the frames before the loop's
+    /// start are then read from its end.
+    wrapped: bool,
 }
 
 impl Voice {
@@ -103,6 +118,8 @@ impl Voice {
             filter: Svf::new(),
             zone: 0,
             once: false,
+            mode: Mode::Track,
+            wrapped: false,
         }
     }
 }
@@ -120,10 +137,12 @@ struct Down {
     id: u32,
     key: u8,
     velocity: u8,
+    /// The note's random number, which its release zones draw by too.
+    draw: f32,
 }
 
 impl Down {
-    const UP: Down = Down { id: 0, key: 0, velocity: 0 };
+    const UP: Down = Down { id: 0, key: 0, velocity: 0, draw: 0.0 };
 }
 
 /// Play region in frames, derived from the parameters and the sample length.
@@ -132,7 +151,10 @@ struct Region {
     start: f64,
     end: f64,
     loop_start: f64,
+    loop_end: f64,
     looping: bool,
+    /// It loops only while the key is down.
+    sustain: bool,
 }
 
 pub struct Sampler {
@@ -152,6 +174,8 @@ pub struct Sampler {
     filter_on: bool,
     /// The pitch bend wheel, −1 to 1.
     bend: f32,
+    /// Draws each note's number for zones that take turns at random.
+    rng: Rng,
 }
 
 impl Sampler {
@@ -169,6 +193,7 @@ impl Sampler {
             sinc: true,
             filter_on: false,
             bend: 0.0,
+            rng: Rng::new(RNG_SEED),
         };
         for (v, spec) in s.params.iter_mut().zip(PARAMS.iter()) {
             *v = spec.default;
@@ -189,6 +214,7 @@ impl Sampler {
         }
         self.turns.fill(0);
         self.down.fill(Down::UP);
+        self.rng = Rng::new(RNG_SEED);
         std::mem::replace(&mut self.map, map)
     }
 
@@ -213,8 +239,9 @@ impl Sampler {
         let was = self.one_shot;
         self.one_shot = pr[p::MODE] >= 0.5;
         if was && !self.one_shot {
-            // Keys let go while it played one-shot end their notes now.
-            for v in self.voices.iter_mut().filter(|v| v.playing && !v.held && !v.once) {
+            // Keys let go while it played one-shot end their notes now, in
+            // the zones that follow the track's mode.
+            for v in self.voices.iter_mut().filter(|v| v.playing && !v.held && !v.once && v.mode == Mode::Track) {
                 v.amp.gate_off();
             }
         }
@@ -237,12 +264,40 @@ impl Sampler {
         let (lo, n) = (lo as f64, (hi - lo) as f64);
         let start = lo + (f64::from(params[p::START]) * n).floor();
         let end = lo + (f64::from(params[p::END]) * n).floor().min(n);
-        // The points are separate knobs, so the end can be set before the
-        // start: no note starts then, and playing voices stop at the end.
-        let loop_start = (lo + (f64::from(params[p::LOOP_START]) * n).floor()).clamp(start.min(end), end);
-        // One-shot plays through once; a loop needs at least one frame.
-        let looping = params[p::LOOP] >= 0.5 && !one_shot && !once && end - loop_start >= 1.0;
-        Region { start, end, loop_start, looping }
+        let within = |x: f64| x.clamp(start.min(end), end);
+        match zone.place.mode {
+            Mode::Track => {
+                // The points are separate knobs, so the end can be set before
+                // the start: no note starts then, and playing voices stop at
+                // the end.
+                let loop_start = within(lo + (f64::from(params[p::LOOP_START]) * n).floor());
+                // One-shot plays through once; a loop needs at least one frame.
+                let looping = params[p::LOOP] >= 0.5 && !one_shot && !once && end - loop_start >= 1.0;
+                Region { start, end, loop_start, loop_end: end, looping, sustain: false }
+            }
+            Mode::NoLoop | Mode::OneShot => {
+                Region { start, end, loop_start: end, loop_end: end, looping: false, sustain: false }
+            }
+            Mode::Continuous(points) | Mode::Sustain(points) => {
+                let (s, e) =
+                    points.or(zone.sample.loop_points).map_or((end, end), |(s, e)| (f64::from(s), f64::from(e)));
+                let (loop_start, loop_end) = (within(s), within(e));
+                let sustain = matches!(zone.place.mode, Mode::Sustain(_));
+                // A release zone plays once whatever its mode: nothing would
+                // end its loop.
+                let looping = !once && loop_end - loop_start >= 1.0;
+                Region { start, end, loop_start, loop_end, looping, sustain }
+            }
+        }
+    }
+
+    /// Whether a voice of a zone in `mode` plays on once its key is up.
+    fn plays_on(one_shot: bool, mode: Mode) -> bool {
+        match mode {
+            Mode::Track => one_shot,
+            Mode::OneShot => true,
+            _ => false,
+        }
     }
 
     /// A voice for the event under way: a silent one, or the oldest of
@@ -254,18 +309,20 @@ impl Sampler {
         // The event under way starts its voices at the current clock, so
         // its layers never take one another's voice.
         let now = self.clock;
-        let oldest = |held: Option<bool>| {
+        let oldest = |pick: &dyn Fn(&Voice) -> bool| {
             self.voices
                 .iter()
                 .enumerate()
-                .filter(|(_, v)| v.age < now && held.is_none_or(|h| v.held == h))
+                .filter(|(_, v)| v.age < now && pick(v))
                 .min_by_key(|(_, v)| v.age)
                 .map(|(i, _)| i)
         };
-        // One-shot notes all play to their end, let go or not: the oldest
-        // goes first.
-        let free = if self.one_shot { None } else { oldest(Some(false)) };
-        free.or_else(|| oldest(None))
+        // A voice let go that is ending goes before the rest; notes that
+        // play to their end (release zones too), let go or not, go oldest
+        // first.
+        let one_shot = self.one_shot;
+        oldest(&|v: &Voice| !v.held && !v.once && !Self::plays_on(one_shot, v.mode))
+            .or_else(|| oldest(&|_: &Voice| true))
     }
 
     pub fn note_on(&mut self, note: u8, velocity: u8) -> VoiceId {
@@ -273,11 +330,12 @@ impl Sampler {
         let note = note.min(127);
         let id = self.next_id.wrapping_add(1).max(1);
         let (mut started, mut release) = (0, false);
+        let draw = self.rng.next_f32();
         for &i in map.on_key(note) {
             let (i, z) = (usize::from(i), &map.zones()[usize::from(i)]);
             match z.place.trigger {
                 // Counted past the voices too, so turns stay in step.
-                Trigger::Attack if self.take_turn(i, z, note, velocity) && started < SAMPLER_VOICES => {
+                Trigger::Attack if self.take_turn(i, z, note, velocity, draw) && started < SAMPLER_VOICES => {
                     started += usize::from(self.start_voice(i, z, id, note, velocity, false));
                 }
                 Trigger::Attack => {}
@@ -303,22 +361,22 @@ impl Sampler {
                 .iter()
                 .position(|d| d.id == 0)
                 .unwrap_or_else(|| (0..HELD_NOTES).max_by_key(|&k| id.wrapping_sub(self.down[k].id)).unwrap_or(0));
-            self.down[at] = Down { id, key: note, velocity };
+            self.down[at] = Down { id, key: note, velocity, draw };
         }
         self.clock += 1;
         VoiceId(id)
     }
 
     /// Counts a note reaching zone `i` and says whether it is the zone's
-    /// turn to play it.
-    fn take_turn(&mut self, i: usize, z: &Zone, note: u8, velocity: u8) -> bool {
+    /// turn to play it, in its cycle and by the note's random `draw`.
+    fn take_turn(&mut self, i: usize, z: &Zone, note: u8, velocity: u8, draw: f32) -> bool {
         if !z.place.covers(note, velocity) {
             return false;
         }
         let (pos, len) = z.place.seq;
         let turn = self.turns[i];
         self.turns[i] = (turn + 1) % len;
-        turn + 1 == pos
+        turn + 1 == pos && z.place.draws(draw)
     }
 
     /// Starts a voice of zone `i` for note `id`; false if its region is
@@ -341,6 +399,8 @@ impl Sampler {
         v.held = !once;
         v.playing = true;
         v.once = once;
+        v.mode = z.place.mode;
+        v.wrapped = false;
         v.zone = i as u16;
         v.age = self.clock;
         v.pos = r.start;
@@ -360,7 +420,7 @@ impl Sampler {
         for v in self.voices.iter_mut().filter(|v| v.id == id.0 && v.held) {
             v.held = false;
             // One-shot plays on; the key is up if the mode turns back.
-            if !one_shot {
+            if !Self::plays_on(one_shot, v.mode) {
                 v.amp.gate_off();
             }
         }
@@ -368,17 +428,27 @@ impl Sampler {
             return;
         }
         let Some(at) = self.down.iter().position(|d| d.id == id.0) else { return };
-        let Down { key, velocity, .. } = std::mem::replace(&mut self.down[at], Down::UP);
+        let Down { key, velocity, draw, .. } = std::mem::replace(&mut self.down[at], Down::UP);
         let Some(map) = self.map.take() else { return };
         let mut started = 0;
         for &i in map.on_key(key) {
             let (i, z) = (usize::from(i), &map.zones()[usize::from(i)]);
-            if z.place.trigger == Trigger::Release && self.take_turn(i, z, key, velocity) && started < SAMPLER_VOICES {
+            if z.place.trigger == Trigger::Release
+                && self.take_turn(i, z, key, velocity, draw)
+                && started < SAMPLER_VOICES
+            {
                 started += usize::from(self.start_voice(i, z, id.0, key, velocity, true));
             }
         }
         self.map = Some(map);
         self.clock += 1;
+    }
+
+    /// Playback starts: turns and random draws start over, so a song plays
+    /// as its export does.
+    pub fn start(&mut self) {
+        self.turns.fill(0);
+        self.rng = Rng::new(RNG_SEED);
     }
 
     pub fn release_all(&mut self) {
@@ -404,20 +474,33 @@ impl Sampler {
                 continue;
             };
             let (sample, r) = (&z.sample, Self::region(&self.params, self.one_shot, z, v.once));
-            let loop_len = r.end - r.loop_start;
+            // A sustain loop lets the voice go on to the end once its key is up.
+            let looping = r.looping && (v.held || !r.sustain);
+            let loop_len = r.loop_end - r.loop_start;
             for o in out.iter_mut() {
-                if v.pos >= r.end {
-                    if r.looping {
-                        // Wraps by whole loops so a high pitch cannot skip past.
-                        v.pos = r.loop_start + (v.pos - r.loop_start) % loop_len;
-                    } else {
-                        v.playing = false;
-                        v.amp.reset();
-                        break;
-                    }
+                if looping && v.pos >= r.loop_end {
+                    // Wraps by whole loops so a high pitch cannot skip past.
+                    v.pos = r.loop_start + (v.pos - r.loop_start) % loop_len;
+                    v.wrapped = true;
+                } else if v.pos >= r.end {
+                    v.playing = false;
+                    v.amp.reset();
+                    break;
                 }
-                let x = if sinc { sample.sinc(v.pos) } else { sample.linear(v.pos) };
-                let fade = if r.looping { 1.0 } else { ((r.end - v.pos) / END_FADE).min(1.0) as f32 };
+                // Near the loop's end, the frames after it are read from its
+                // start; once round, near its start those before from its end.
+                // (Also just let go of a sustain loop, until it is past them.)
+                let seam = (looping && v.pos + SEAM >= r.loop_end)
+                    || (v.wrapped && v.pos >= r.loop_start && v.pos < r.loop_start + SEAM);
+                let x = if seam {
+                    let (s, e) = (r.loop_start as usize, r.loop_end as usize);
+                    if sinc { sample.sinc_looped(v.pos, s, e, v.wrapped) } else { sample.linear_looped(v.pos, s, e) }
+                } else if sinc {
+                    sample.sinc(v.pos)
+                } else {
+                    sample.linear(v.pos)
+                };
+                let fade = if looping { 1.0 } else { ((r.end - v.pos) / END_FADE).min(1.0) as f32 };
                 let y = if filter_on { v.filter.process(x, mode) } else { x };
                 *o += y * v.amp.tick() * v.gain * fade;
                 v.pos += v.inc * ratio;
@@ -614,6 +697,194 @@ mod tests {
     /// The zones the voices of note `id` play, in voice order.
     fn zones_of(s: &Sampler, id: VoiceId) -> Vec<u16> {
         s.voices.iter().filter(|v| v.playing && v.id == id.0).map(|v| v.zone).collect()
+    }
+
+    fn with_mode(mode: Mode, file_loop: Option<(u32, u32)>) -> Sampler {
+        let s = Arc::new(Sample::from_mono(&[0.5; 4800], 48_000).unwrap().with_loop(file_loop));
+        let mut sampler = Sampler::new(SR);
+        let place = Placement { mode, ..Placement::WHOLE };
+        drop(sampler.set_samples(Some(Arc::new(SampleMap::new([(place, s)])))));
+        // A long release, so a voice that stops has reached its end.
+        sampler.set_param(p::R, 5.0);
+        sampler
+    }
+
+    fn run(s: &mut Sampler, frames: usize) {
+        let mut buf = vec![0.0f32; frames];
+        s.render(&mut buf);
+    }
+
+    #[test]
+    fn a_zone_s_own_mode_sets_aside_the_track_s() {
+        // No loop: once to its end, though the track loops.
+        let mut s = with_mode(Mode::NoLoop, None);
+        s.set_param(p::LOOP, 1.0);
+        s.note_on(60, 100);
+        run(&mut s, 9600);
+        assert_eq!(s.active_voices(), 0);
+        // One-shot: on to its end with the key up, though the track's mode is not.
+        let mut s = with_mode(Mode::OneShot, None);
+        s.set_param(p::R, 0.001);
+        let id = s.note_on(60, 100);
+        s.note_off(id);
+        run(&mut s, 2400);
+        assert_eq!(s.active_voices(), 1, "the key's release does not end it");
+        run(&mut s, 4800);
+        assert_eq!(s.active_voices(), 0);
+        // Let go while the track plays one-shot, it plays on when the track's mode turns back.
+        let mut s = with_mode(Mode::OneShot, None);
+        s.set_param(p::R, 0.001);
+        s.set_param(p::MODE, 1.0);
+        let id = s.note_on(60, 100);
+        s.note_off(id);
+        s.set_param(p::MODE, 0.0);
+        run(&mut s, 2400);
+        assert_eq!(s.active_voices(), 1, "the track's mode is not its own");
+        // Continuous: round the loop, held and let go.
+        let mut s = with_mode(Mode::Continuous(Some((1000, 2000))), None);
+        let id = s.note_on(60, 100);
+        run(&mut s, 48_000);
+        assert!(s.voices[0].playing && (1000.0..=2000.0).contains(&s.voices[0].pos));
+        s.note_off(id);
+        run(&mut s, 9600);
+        assert_eq!(s.active_voices(), 1, "its release goes round the loop too");
+        // Sustain: round the loop while held, then on to the end.
+        let mut s = with_mode(Mode::Sustain(Some((1000, 2000))), None);
+        let id = s.note_on(60, 100);
+        run(&mut s, 48_000);
+        assert!(s.voices[0].playing && (1000.0..=2000.0).contains(&s.voices[0].pos));
+        s.note_off(id);
+        run(&mut s, 4800);
+        assert_eq!(s.active_voices(), 0, "let go, it plays out its end");
+    }
+
+    #[test]
+    fn a_looping_zone_without_points_takes_the_file_s_loop() {
+        let mut s = with_mode(Mode::Continuous(None), Some((3000, 3500)));
+        s.note_on(60, 100);
+        run(&mut s, 48_000);
+        assert!(s.voices[0].playing && (3000.0..=3500.0).contains(&s.voices[0].pos));
+        // Points of its own win over the file's.
+        let mut s = with_mode(Mode::Sustain(Some((100, 600))), Some((3000, 3500)));
+        s.note_on(60, 100);
+        run(&mut s, 48_000);
+        assert!((100.0..=600.0).contains(&s.voices[0].pos));
+        // Without either it plays once.
+        let mut s = with_mode(Mode::Continuous(None), None);
+        s.note_on(60, 100);
+        run(&mut s, 9600);
+        assert_eq!(s.active_voices(), 0);
+        // A release zone plays once to its end whatever its mode.
+        let s4 = Arc::new(Sample::from_mono(&[0.5; 4800], 48_000).unwrap());
+        let mut s = Sampler::new(SR);
+        let rel = Placement { trigger: Trigger::Release, mode: Mode::Continuous(Some((0, 4800))), ..Placement::WHOLE };
+        drop(s.set_samples(Some(Arc::new(SampleMap::new([(rel, s4)])))));
+        let id = s.note_on(60, 100);
+        s.note_off(id);
+        run(&mut s, 9600);
+        assert_eq!(s.active_voices(), 0);
+    }
+
+    #[test]
+    fn a_loop_s_seam_reads_its_start_not_what_follows_it() {
+        // A quiet loop with a loud tail after it: a read past the loop's
+        // end would spike on every wrap.
+        // And a loud lead-in before it, which a read back from the loop's
+        // start would take in after each wrap.
+        let mut audio = vec![0.1f32; 1000];
+        audio[..200].fill(1.0);
+        audio[600..].fill(1.0);
+        let s = Arc::new(Sample::from_mono(&audio, 48_000).unwrap());
+        for interp in [0.0, 1.0] {
+            let mut sampler = Sampler::new(SR);
+            let place = Placement { mode: Mode::Sustain(Some((200, 600))), tune: 7.0, ..Placement::WHOLE };
+            drop(sampler.set_samples(Some(Arc::new(SampleMap::new([(place, Arc::clone(&s))])))));
+            sampler.set_param(p::INTERP, interp);
+            sampler.note_on(60, 127);
+            let mut buf = vec![0.0f32; 24_000];
+            sampler.render(&mut buf);
+            let tail = &buf[4800..];
+            let (lo, hi) = tail.iter().fold((f32::MAX, 0.0f32), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+            assert!(hi - lo < 0.01 * hi, "interp {interp}: {lo} to {hi}");
+        }
+        // Frames before the end, and a loop shorter than the kernel.
+        assert_eq!(s.linear_looped(599.5, 200, 600), 0.1);
+        assert!((s.sinc_looped(599.5, 598, 600, false) - 0.1).abs() < 1e-3);
+        assert!((s.sinc_looped(200.5, 200, 600, true) - 0.1).abs() < 1e-3, "after a wrap");
+        assert!((s.sinc_looped(200.5, 200, 600, false) - 0.1).abs() > 0.01, "the first time, the lead-in");
+        assert_eq!(s.linear(599.5), 0.55, "the plain read crosses into the tail");
+    }
+
+    #[test]
+    fn random_turns_start_over_with_playback_and_releases_follow_their_attack() {
+        let half = |lo: f32, hi: f32, trigger| Placement { rand: (lo, hi), trigger, ..Placement::WHOLE };
+        let zones =
+            [half(0.0, 0.5, Trigger::Attack), half(0.5, 1.0, Trigger::Attack), half(0.0, 0.5, Trigger::Release)];
+        let mut s = mapped(&zones);
+        let play = |s: &mut Sampler| -> Vec<(u16, bool)> {
+            (0..40)
+                .map(|_| {
+                    let id = s.note_on(60, 100);
+                    let attack = zones_of(s, id)[0];
+                    s.note_off(id);
+                    let released = zones_of(s, id).contains(&2);
+                    s.release_all();
+                    run(s, 4800);
+                    (attack, released)
+                })
+                .collect()
+        };
+        let first = play(&mut s);
+        assert!(first.iter().all(|&(a, r)| r == (a == 0)), "a release draws as its attack did: {first:?}");
+        s.start();
+        assert_eq!(play(&mut s), first, "playback starting again draws the same");
+    }
+
+    #[test]
+    fn a_voice_that_plays_on_is_not_the_first_to_give_way() {
+        let low = Placement { keys: (0, 59), mode: Mode::OneShot, ..Placement::WHOLE };
+        let released = Placement { keys: (0, 59), trigger: Trigger::Release, mode: Mode::NoLoop, ..Placement::WHOLE };
+        let high = Placement { keys: (60, 127), ..Placement::WHOLE };
+        let mut s = mapped(&[low, released, high]);
+        s.set_param(p::R, 5.0);
+        let shot = s.note_on(30, 100);
+        s.note_off(shot);
+        let ending = s.note_on(60, 100);
+        s.note_off(ending);
+        for k in 0..SAMPLER_VOICES - 3 {
+            s.note_on(61 + k as u8, 100);
+        }
+        // Every voice busy: the one let go and ending gives way, not the
+        // older one-shot or release sample that play on.
+        s.note_on(100, 100);
+        assert_eq!((zones_of(&s, shot), zones_of(&s, ending).len()), (vec![0, 1], 0));
+    }
+
+    #[test]
+    fn zones_that_take_turns_at_random_share_the_notes() {
+        let third = |lo: f32, hi: f32| Placement { rand: (lo, hi), ..Placement::WHOLE };
+        let zones = [third(0.0, 1.0 / 3.0), third(1.0 / 3.0, 2.0 / 3.0), third(2.0 / 3.0, 1.0)];
+        let mut s = mapped(&zones);
+        let played = |s: &mut Sampler| -> Vec<u16> {
+            (0..300)
+                .map(|_| {
+                    let id = s.note_on(60, 100);
+                    let z = zones_of(s, id);
+                    assert_eq!(z.len(), 1, "each note plays one of them");
+                    s.release_all();
+                    run(s, 4800);
+                    z[0]
+                })
+                .collect()
+        };
+        let first = played(&mut s);
+        for z in 0..3 {
+            let n = first.iter().filter(|&&x| x == z).count();
+            assert!((70..=130).contains(&n), "zone {z} played {n} of 300");
+        }
+        // The same notes draw the same zones once the samples are set again.
+        let mut again = mapped(&zones);
+        assert_eq!(played(&mut again), first);
     }
 
     #[test]

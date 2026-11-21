@@ -595,7 +595,14 @@ It comes in three parts, each merged on its own, and ships whole.
 - The engine gets each track's zones in one `Arc`, built on the UI thread from the loaded files and handed back to it to free, as the sample was.
 - Project format 18: `zone` lines in a sampler track, paths relative to the project as the sample's. Each file a track plays loads once and counts once against the project's budget; a zone whose file is missing is left out, the panel's title counts the zones and the missing files, and a WAV export waits for every file.
 
-#### 13b: SFZ import
+#### 13b: SFZ import ✅
+
+- `o` on a sampler track takes an `.sfz` file: its regions become the track's zones, in place of its sample and zones, and its amplitude envelope sets the track's attack, decay, sustain and release, all as one undo step. Each file loads once and counts against the project's budget; a region whose file does not load is left out and named.
+- The reader takes the headers (`<control>` with `default_path`, `note_offset` and `octave_offset`, `<global>`, `<master>`, `<group>`, `<region>`, each region taking the opcodes above it), `#define` and `#include`, comments, values with spaces, note names, and the opcodes a zone plays: keys, velocities, root key, round robin in turn (`seq_length`/`seq_position`) and at random (`lorand`/`hirand`), release triggers, tuning, gain, the part of the file, the loop mode and its points, and the envelope. A keyswitched instrument keeps one articulation (`sw_default`'s, or the first region's, among the keys from `sw_lokey` to `sw_hikey`). It never fails on what it does not know: unused opcodes and other headers are listed, skipped regions counted with the reason, and `tinvo sfz` prints it all.
+- Zones gained what SFZ needs: a random range, drawn by a seeded generator that starts over with playback (a key's release zones draw as its attack did), and a loop mode of their own (no loop, one-shot, continuous, or sustained while the key is held) with loop points or the loop the file gives; a loop asked for by name with no points in the SFZ or the file loops the whole file, and a region whose loop points cannot play plays once. WAV files' `smpl` chunks give their forward loop and root key. A loop's interpolation reads its start past its end, and once round its end before its start.
+- Project format 19: a zone line ends with its random range and mode, before the path.
+- `tinvo fuzz sfz`: the reader's result is the same each time, every region can play as read, and against a file it settles or starts past the file's end; the settled zones save and load back equal, and the first 32 play without a non-finite sample. CI runs it with the other targets.
+- The undo history keeps the samples no track plays only up to the project's budget, and reads the rest again when an undo or redo needs them, as an import can replace hundreds of megabytes at once.
 
 #### 13c: The slicer
 

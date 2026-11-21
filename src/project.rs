@@ -68,12 +68,15 @@
 //! line, a sample over the whole keyboard, and zones:
 //!
 //! ```text
-//! zone 36-47 40 1-64 1/2 attack 0 0 0 - piano/C3 soft.wav
+//! zone 36-47 40 1-64 1/2 attack 0 0 0 - 0-1 sustain:100-200 piano/C3 soft.wav
 //! ```
 //!
 //! keys, root key (`-`: the track's root note), velocities, round-robin
-//! position/cycle, `attack` or `release`, tuning in cents, gain in dB, and
-//! the frames played, start and end (`-`: the sample's end), then the file.
+//! position/cycle, `attack` or `release`, tuning in cents, gain in dB, the
+//! frames played, start and end (`-`: the sample's end), the random range
+//! it plays in (`0-1`: every note), its mode (`track`: the track's mode and
+//! loop; `noloop`, `oneshot`, or `continuous` or `sustain` with loop
+//! points or none for the file's loop), then the file.
 //! Relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
@@ -81,7 +84,8 @@
 //! 10 (every track plays the entry's pattern), 11 (16th-note steps, up
 //! to 4 ratchets), 12 (no MIDI channels, bend ranges or mod wheel), 13
 //! (no MIDI output), 14 (no groups, up to 16 tracks), 15 (no plugins) and
-//! 16 and 17 (no zones) are still read. A plugin is kept by its id whether or not it is
+//! 16 and 17 (no zones) and 18 (zones without a random range or a mode)
+//! are still read. A plugin is kept by its id whether or not it is
 //! installed, so a project that names one missing saves as it was read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
@@ -94,7 +98,7 @@ use crate::engine::{
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_INSERTS, MAX_SLOTS};
-use crate::instrument::zone::{MAX_ZONES, Placement, Trigger};
+use crate::instrument::zone::{MAX_ZONES, Mode, Placement, Trigger};
 use crate::instrument::{InstrumentKind, ParamSpec, SampleMap};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
 use crate::sample::Bank;
@@ -103,7 +107,7 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 18;
+pub const FORMAT_VERSION: u32 = 19;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -1703,7 +1707,7 @@ impl Project {
                         if zones.len() >= MAX_ZONES {
                             return Err(err(format!("more than {MAX_ZONES} zones in a track")));
                         }
-                        zones.push(parse_zone(rest).map_err(err)?);
+                        zones.push(parse_zone(rest, ver).map_err(err)?);
                     }
                     "gain_db" => t.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
@@ -2409,27 +2413,63 @@ fn zone_text(z: &Placement) -> String {
         Trigger::Attack => "attack",
         Trigger::Release => "release",
     };
-    let ((lk, hk), (lv, hv), (pos, len)) = (z.keys, z.vels, z.seq);
-    format!("{lk}-{hk} {root} {lv}-{hv} {pos}/{len} {trigger} {} {} {} {end}", z.tune, z.gain_db, z.start)
+    // Adding zero writes -0 as 0, as a sign would split the range wrongly.
+    let ((lk, hk), (lv, hv), (pos, len), (rlo, rhi)) = (z.keys, z.vels, z.seq, (z.rand.0 + 0.0, z.rand.1 + 0.0));
+    let points = |p: Option<(u32, u32)>| p.map_or_else(String::new, |(s, e)| format!(":{s}-{e}"));
+    let mode = match z.mode {
+        Mode::Track => "track".to_string(),
+        Mode::NoLoop => "noloop".to_string(),
+        Mode::OneShot => "oneshot".to_string(),
+        Mode::Continuous(p) => format!("continuous{}", points(p)),
+        Mode::Sustain(p) => format!("sustain{}", points(p)),
+    };
+    format!(
+        "{lk}-{hk} {root} {lv}-{hv} {pos}/{len} {trigger} {} {} {} {end} {rlo}-{rhi} {mode}",
+        z.tune, z.gain_db, z.start
+    )
 }
 
-/// A `zone` line's words and path.
-fn parse_zone(rest: &str) -> Result<ZoneData, String> {
-    const USAGE: &str = "expected 'zone <keys> <root> <velocities> <position>/<cycle> <attack|release> <cents> <dB> <start> <end> <path>'";
-    let mut words = [""; 9];
+/// A zone's mode word: `track`, `noloop`, `oneshot`, or `continuous` or
+/// `sustain` with `:<start>-<end>` loop points or none (the file's loop).
+fn parse_mode(w: &str) -> Result<Mode, String> {
+    let (name, points) = w.split_once(':').map_or((w, None), |(n, p)| (n, Some(p)));
+    let points = points
+        .map(|p| -> Result<(u32, u32), String> {
+            let (s, e) = p.split_once('-').ok_or_else(|| format!("expected loop points '<start>-<end>', got '{p}'"))?;
+            Ok((parse_num(s)?, parse_num(e)?))
+        })
+        .transpose()?;
+    match (name, points) {
+        ("track", None) => Ok(Mode::Track),
+        ("noloop", None) => Ok(Mode::NoLoop),
+        ("oneshot", None) => Ok(Mode::OneShot),
+        ("continuous", p) => Ok(Mode::Continuous(p)),
+        ("sustain", p) => Ok(Mode::Sustain(p)),
+        _ => Err(format!("expected track, noloop, oneshot, continuous or sustain, got '{w}'")),
+    }
+}
+
+/// A `zone` line's words and path; format 19 added the random range and
+/// the mode.
+fn parse_zone(rest: &str, ver: u32) -> Result<ZoneData, String> {
+    const USAGE: &str = "expected 'zone <keys> <root> <velocities> <position>/<cycle> <attack|release> <cents> <dB> <start> <end> <random> <mode> <path>'";
+    const USAGE_18: &str = "expected 'zone <keys> <root> <velocities> <position>/<cycle> <attack|release> <cents> <dB> <start> <end> <path>'";
+    let usage = if ver >= 19 { USAGE } else { USAGE_18 };
+    let mut words = [""; 11];
+    let n = if ver >= 19 { 11 } else { 9 };
     let mut left = rest;
-    for w in &mut words {
-        let (word, more) = left.split_once(char::is_whitespace).ok_or(USAGE)?;
+    for w in &mut words[..n] {
+        let (word, more) = left.split_once(char::is_whitespace).ok_or(usage)?;
         *w = word;
         left = more.trim_start();
     }
     if left.is_empty() {
-        return Err(USAGE.into());
+        return Err(usage.into());
     }
     if left.len() > crate::sample::MAX_PATH_BYTES {
         return Err(format!("a sample path is at most {} bytes long", crate::sample::MAX_PATH_BYTES));
     }
-    let [keys, root, vels, seq, trigger, tune, gain, start, end] = words;
+    let [keys, root, vels, seq, trigger, tune, gain, start, end, rand, mode] = words;
     let pair = |w: &str, sep: char| -> Result<(u8, u8), String> {
         let (a, b) = w.split_once(sep).ok_or_else(|| format!("expected two numbers apart by '{sep}', got '{w}'"))?;
         Ok((parse_num(a)?, parse_num(b)?))
@@ -2448,6 +2488,14 @@ fn parse_zone(rest: &str) -> Result<ZoneData, String> {
         gain_db: parse_num(gain)?,
         start: parse_num(start)?,
         end: if end == "-" { None } else { Some(parse_num(end)?) },
+        rand: if ver >= 19 {
+            let (lo, hi) =
+                rand.split_once('-').ok_or_else(|| format!("expected a random range '<low>-<high>', got '{rand}'"))?;
+            (parse_num(lo)?, parse_num(hi)?)
+        } else {
+            Placement::WHOLE.rand
+        },
+        mode: if ver >= 19 { parse_mode(mode)? } else { Mode::Track },
     };
     place.check()?;
     Ok(ZoneData { place, path: left.to_string() })
@@ -3786,9 +3834,24 @@ mod tests {
         let outside = crate::sample::absolute("elsewhere/hit.wav").to_string_lossy().into_owned();
         let mut p = Project::new();
         p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
-        let soft = Placement { keys: (36, 47), vels: (1, 64), root: Some(40), seq: (2, 3), ..Placement::WHOLE };
-        let release =
-            Placement { trigger: Trigger::Release, tune: -12.5, gain_db: -3.25, start: 10, end: Some(4800), ..soft };
+        let soft = Placement {
+            keys: (36, 47),
+            vels: (1, 64),
+            root: Some(40),
+            seq: (2, 3),
+            rand: (0.25, 0.75),
+            mode: Mode::Sustain(Some((100, 200))),
+            ..Placement::WHOLE
+        };
+        let release = Placement {
+            trigger: Trigger::Release,
+            tune: -12.5,
+            gain_db: -3.25,
+            start: 10,
+            end: Some(4800),
+            mode: Mode::Continuous(None),
+            ..soft
+        };
         let t = p.tracks.last_mut().unwrap();
         t.sample = Some(outside.clone());
         t.zones = vec![
@@ -3798,9 +3861,22 @@ mod tests {
         ]
         .into();
         let text = p.to_text_in(Some(&dir));
-        assert!(text.contains("\nzone 36-47 40 1-64 2/3 attack 0 0 0 - piano/C 3.wav\n"), "{text}");
-        assert!(text.contains(&format!("\nzone 36-47 40 1-64 2/3 release -12.5 -3.25 10 4800 {outside}\n")), "{text}");
-        assert!(text.contains("\nzone 0-127 - 0-127 1/1 attack 0 0 0 - piano/C 3.wav\n"), "{text}");
+        assert!(
+            text.contains("\nzone 36-47 40 1-64 2/3 attack 0 0 0 - 0.25-0.75 sustain:100-200 piano/C 3.wav\n"),
+            "{text}"
+        );
+        let rel = format!("\nzone 36-47 40 1-64 2/3 release -12.5 -3.25 10 4800 0.25-0.75 continuous {outside}\n");
+        assert!(text.contains(&rel), "{text}");
+        assert!(text.contains("\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 track piano/C 3.wav\n"), "{text}");
+        let modes = Project::from_text(
+            "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 oneshot a.wav\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0.5-1 noloop b c.wav\nend\n",
+        )
+        .unwrap();
+        let z = &modes.tracks[0].zones;
+        assert_eq!(
+            (z[0].place.mode, z[1].place.mode, z[1].place.rand, z[1].path.as_str()),
+            (Mode::OneShot, Mode::NoLoop, (0.5, 1.0), "b c.wav")
+        );
         // A path that would start with a space relative to the project stays
         // whole, as a line loses the space.
         let spaced = dir.join(" soft.wav").to_string_lossy().into_owned();
@@ -4246,6 +4322,33 @@ pattern_division A 1/8
             ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack NaN 0 0 - a.wav\nend", 3, "tuning"),
             ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 30 0 - a.wav\nend", 3, "gain"),
             ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 10 5 a.wav\nend", 3, "ends after"),
+            ("tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "<random> <mode>"),
+            (
+                "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0.5 track a.wav\nend",
+                3,
+                "random range '",
+            ),
+            (
+                "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0.5-0.5 track a.wav\nend",
+                3,
+                "random range runs",
+            ),
+            ("tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 hold a.wav\nend", 3, "expected track"),
+            (
+                "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 noloop:1-2 a.wav\nend",
+                3,
+                "expected track",
+            ),
+            (
+                "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 sustain:5 a.wav\nend",
+                3,
+                "loop points",
+            ),
+            (
+                "tinvo 19\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - 0-1 sustain:5-5 a.wav\nend",
+                3,
+                "loop ends after",
+            ),
             ("tinvo 0", 1, "version"),
             ("tinvo 2\nswing 90", 2, "swing"),
             ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 5\nend", 3, "out of range"),

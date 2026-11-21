@@ -49,6 +49,11 @@ pub struct Sample {
     pub sample_rate: u32,
     /// Channels in the source file (they are mixed down to mono).
     pub source_channels: u16,
+    /// The loop the file's `smpl` chunk gives, inside the audio: frames
+    /// from its start up to its end (exclusive).
+    pub loop_points: Option<(u32, u32)>,
+    /// The key the file's `smpl` chunk says plays it at its own pitch.
+    pub unity_note: Option<u8>,
 }
 
 impl Sample {
@@ -67,7 +72,15 @@ impl Sample {
         for (d, &s) in data[PAD..].iter_mut().zip(audio) {
             *d = clean(s);
         }
-        Ok(Self { data: data.into_boxed_slice(), sample_rate, source_channels: 1 })
+        Ok(Self { data: data.into_boxed_slice(), sample_rate, source_channels: 1, loop_points: None, unity_note: None })
+    }
+
+    /// The sample with loop points `(start, end)`, kept if they lie
+    /// inside its audio and the end comes after the start.
+    pub fn with_loop(mut self, points: Option<(u32, u32)>) -> Self {
+        let frames = self.frames() as u64;
+        self.loop_points = points.filter(|&(s, e)| s < e && u64::from(e) <= frames);
+        self
     }
 
     /// Length in frames.
@@ -106,6 +119,51 @@ impl Sample {
         }
         acc
     }
+
+    /// The data index of frame `at - PAD` as a loop from `start` to `end`
+    /// plays it: frames from `end` on come round from its start, and once
+    /// it has `wrapped`, frames before `start` from its end.
+    #[inline]
+    fn looped(at: usize, start: usize, end: usize, wrapped: bool) -> usize {
+        if end <= start {
+            at
+        } else if at >= end + PAD {
+            start + (at - PAD - end) % (end - start) + PAD
+        } else if wrapped && at < start + PAD {
+            end + PAD - 1 - (start + PAD - at - 1) % (end - start)
+        } else {
+            at
+        }
+    }
+
+    /// [`Sample::linear`] inside a loop from `start` to `end` (frames,
+    /// `start < end <= frames`), reading past its end from its start.
+    #[inline]
+    pub fn linear_looped(&self, pos: f64, start: usize, end: usize) -> f32 {
+        let i = pos as usize;
+        let f = (pos - i as f64) as f32;
+        let at = |n| self.data[Self::looped(n, start, end, false)];
+        let (a, b) = (at(i + PAD), at(i + 1 + PAD));
+        a + (b - a) * f
+    }
+
+    /// [`Sample::sinc`] inside a loop, as [`Sample::linear_looped`]; once
+    /// the loop has `wrapped`, the frames before its start are read from
+    /// its end too.
+    #[inline]
+    pub fn sinc_looped(&self, pos: f64, start: usize, end: usize, wrapped: bool) -> f32 {
+        let i = pos as usize;
+        let phase = (pos - i as f64) * SINC_PHASES as f64;
+        let p = (phase as usize).min(SINC_PHASES - 1);
+        let t = (phase - p as f64) as f32;
+        let table = sinc_table();
+        let (a, b) = (&table[p], &table[p + 1]);
+        let mut acc = 0.0;
+        for k in 0..SINC_TAPS {
+            acc += self.data[Self::looped(i + 1 + k, start, end, wrapped)] * (a[k] + (b[k] - a[k]) * t);
+        }
+        acc
+    }
 }
 
 /// Reads a WAV file into a mono [`Sample`]. The length is checked against
@@ -119,17 +177,38 @@ pub fn load(path: &Path) -> Result<Sample, String> {
 /// left of the project's [`PROJECT_FRAMES`].
 pub fn load_within(path: &Path, max_frames: usize) -> Result<Sample, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    // Opening a named pipe or a device would wait for it, with the editor
-    // stopped until it gave in. Checked by name first, and again on what
-    // was opened, in case the name changed in between.
-    if !std::fs::metadata(path).map_err(|e| fail(&e))?.is_file() {
-        return Err(fail(&"not a file"));
-    }
-    let file = crate::fsutil::open_without_waiting(path).map_err(|e| fail(&e))?;
-    if !file.metadata().map_err(|e| fail(&e))?.is_file() {
-        return Err(fail(&"not a file"));
-    }
+    let file = open(path).map_err(|e| fail(&e))?;
     read_limited(&mut std::io::BufReader::new(file), max_frames).map_err(|e| fail(&e))
+}
+
+/// Opens the plain file `path` for reading. Opening a named pipe or a
+/// device would wait for it, with the editor stopped until it gave in:
+/// checked by name first, and again on what was opened, in case the name
+/// changed in between.
+fn open(path: &Path) -> Result<std::fs::File, String> {
+    if !std::fs::metadata(path).map_err(|e| e.to_string())?.is_file() {
+        return Err("not a file".into());
+    }
+    let file = crate::fsutil::open_without_waiting(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("not a file".into());
+    }
+    Ok(file)
+}
+
+/// The header of the WAV file at `path`, if [`load`] would take the file:
+/// what it holds can be known before it is read.
+/// The error does not name the file.
+pub fn header(path: &Path) -> Result<wav::Info, String> {
+    let mut file = std::io::BufReader::new(open(path)?);
+    let info = wav::read_info(&mut file).map_err(|e| e.to_string())?;
+    if info.frames == 0 {
+        return Err("the file contains no audio".into());
+    }
+    if info.frames > MAX_FRAMES as u64 {
+        return Err(format!("longer than {MAX_FRAMES} frames"));
+    }
+    Ok(info)
 }
 
 /// Reads a WAV stream into a mono [`Sample`], like [`load`].
@@ -159,7 +238,14 @@ fn read_limited<R: Read + Seek>(file: &mut R, max_frames: usize) -> Result<Sampl
     })
     .map_err(|e| fail(&e))?;
     data.resize(data.len() + PAD, 0.0);
-    Ok(Sample { data: data.into_boxed_slice(), sample_rate: info.sample_rate, source_channels: info.channels })
+    let s = Sample {
+        data: data.into_boxed_slice(),
+        sample_rate: info.sample_rate,
+        source_channels: info.channels,
+        loop_points: None,
+        unity_note: info.unity_note,
+    };
+    Ok(s.with_loop(info.loop_points))
 }
 
 /// The polyphase sinc table; built once, on first use. The engine calls
@@ -269,6 +355,18 @@ mod tests {
 
     fn sine(freq: f64, sr: u32, frames: usize) -> Vec<f32> {
         (0..frames).map(|i| (std::f64::consts::TAU * freq * i as f64 / f64::from(sr)).sin() as f32 * 0.5).collect()
+    }
+
+    #[test]
+    fn a_file_s_loop_and_root_key_come_with_it() {
+        let read_back = |b: Vec<u8>| read(&mut std::io::Cursor::new(b)).unwrap();
+        let s = read_back(wav::tests::with_smpl(100, 57, Some((10, 49))));
+        assert_eq!((s.loop_points, s.unity_note), (Some((10, 50)), Some(57)));
+        assert_eq!(read_back(wav::tests::with_smpl(100, 57, Some((10, 100)))).loop_points, None, "past the audio");
+        assert_eq!(read_back(wav::tests::with_smpl(100, 57, Some((10, 99)))).loop_points, Some((10, 100)));
+        let plain = Sample::from_mono(&[0.0; 8], 48_000).unwrap();
+        assert_eq!((plain.loop_points, plain.unity_note), (None, None));
+        assert_eq!(plain.with_loop(Some((2, 9))).loop_points, None);
     }
 
     #[test]

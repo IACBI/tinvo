@@ -359,6 +359,11 @@ pub struct Info {
     pub data_offset: u64,
     /// Whole frames in the data chunk.
     pub frames: u64,
+    /// The first loop a `smpl` chunk gives, as frames from its start up to
+    /// its end (exclusive), if it is a forward loop that ends after it starts.
+    pub loop_points: Option<(u32, u32)>,
+    /// The key a `smpl` chunk says plays the file at its own pitch.
+    pub unity_note: Option<u8>,
 }
 
 impl Info {
@@ -388,6 +393,7 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
     let mut pos = 12u64;
     let mut fmt: Option<(u16, u16, u32, u16, u16)> = None; // tag, ch, rate, align, bits
     let mut data: Option<(u64, u64)> = None;
+    let (mut loop_points, mut unity_note) = (None, None);
     while pos + 8 <= file_len {
         let mut ch = [0u8; 8];
         r.seek(SeekFrom::Start(pos)).map_err(io_error)?;
@@ -417,6 +423,18 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
                 fmt = Some((tag, u16_at(&c, 2), u32_at(&c, 4), u16_at(&c, 12), u16_at(&c, 14)));
             }
             b"data" => data = Some((body, len)),
+            // A sampler's chunk: its header, then 24 bytes for each loop.
+            b"smpl" if len >= 36 => {
+                let mut c = vec![0u8; len.min(60) as usize];
+                r.read_exact(&mut c).map_err(io_error)?;
+                unity_note = u8::try_from(u32_at(&c, 12)).ok().filter(|&n| n <= 127);
+                // Only a forward loop (type 0): the sampler plays no other kind.
+                if u32_at(&c, 28) > 0 && c.len() >= 60 && u32_at(&c, 40) == 0 {
+                    let (start, last) = (u32_at(&c, 44), u32_at(&c, 48));
+                    // The end the chunk gives is the loop's last frame.
+                    loop_points = last.checked_add(1).filter(|&end| end > start).map(|end| (start, end));
+                }
+            }
             _ => {}
         }
         pos = end + (len & 1);
@@ -436,7 +454,7 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
         _ => return Err(WavError::Unsupported(format!("format tag {tag} with {bits} bits"))),
     };
     let frames = data_len / u64::from(block_align);
-    Ok(Info { sample_rate, channels, bits, is_float, data_offset, frames })
+    Ok(Info { sample_rate, channels, bits, is_float, data_offset, frames, loop_points, unity_note })
 }
 
 /// Reads the `info.frames` frames of audio from `r`, a block at a time, and
@@ -505,7 +523,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, WavError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn test_signal() -> Vec<f32> {
@@ -708,6 +726,44 @@ mod tests {
         let mut big = b.clone();
         big[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(read_info(&mut Cursor::new(&big)), Err(WavError::Malformed("chunk extends past end of file")));
+    }
+
+    /// A WAV file of `frames` with a `smpl` chunk after its audio.
+    pub(crate) fn with_smpl(frames: usize, unity: u32, first_loop: Option<(u32, u32)>) -> Vec<u8> {
+        let (mut b, _) = encode(&vec![0.25; frames], 1, 48_000, SampleFormat::Pcm16, 0).unwrap();
+        let mut c = vec![0u8; 36];
+        c[12..16].copy_from_slice(&unity.to_le_bytes());
+        if let Some((start, last)) = first_loop {
+            c[28..32].copy_from_slice(&1u32.to_le_bytes());
+            c.extend_from_slice(&[0u8; 24]);
+            c[44..48].copy_from_slice(&start.to_le_bytes());
+            c[48..52].copy_from_slice(&last.to_le_bytes());
+        }
+        b.extend_from_slice(b"smpl");
+        b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        b.extend_from_slice(&c);
+        b
+    }
+
+    #[test]
+    fn a_sampler_chunk_gives_the_loop_and_the_root_key() {
+        let info = |b: Vec<u8>| read_info(&mut Cursor::new(&b)).unwrap();
+        // The chunk gives a loop's last frame; the loop runs up to the one after.
+        let i = info(with_smpl(100, 57, Some((10, 49))));
+        assert_eq!((i.loop_points, i.unity_note, i.frames), (Some((10, 50)), Some(57), 100));
+        assert_eq!(info(with_smpl(100, 128, None)).unity_note, None, "not a key");
+        assert_eq!(info(with_smpl(100, 60, None)).loop_points, None);
+        assert_eq!(info(with_smpl(100, 60, Some((40, 20)))).loop_points, None, "it ends before it starts");
+        assert_eq!(info(with_smpl(100, 60, Some((0, u32::MAX)))).loop_points, None);
+        let mut back_and_forth = with_smpl(100, 60, Some((10, 49)));
+        let at = back_and_forth.len() - 60 + 40;
+        back_and_forth[at] = 1;
+        assert_eq!(info(back_and_forth).loop_points, None, "not a forward loop");
+        // A chunk that counts a loop but stops short gives only its header.
+        let mut short = with_smpl(100, 60, None);
+        let at = short.len() - 36 + 28;
+        short[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!((info(short.clone()).loop_points, info(short).unity_note), (None, Some(60)));
     }
 
     #[test]

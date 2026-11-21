@@ -138,6 +138,11 @@ pub fn open_without_waiting(path: &Path) -> io::Result<File> {
 /// memory; anything else (a folder, a FIFO, a device) is refused, opened
 /// without waiting for it where the platform allows.
 pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    // Checked by name before opening too: where a pipe cannot be opened
+    // without waiting, and for a device, opening it could wait.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
     let mut file = open_without_waiting(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));

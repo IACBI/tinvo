@@ -140,7 +140,7 @@ actions! {
     MidiChannel "midi_channel" Track [c('H')] "the MIDI channel that plays the track whichever is selected (shown after its type)";
     MidiOut "midi_out" Track [c('V')] "send the track's notes to the MIDI output instead of sounding them (→ before the channel they go on)";
     Preview "preview" Track [c('p')] "preview the track's note";
-    LoadSample "load_sample" Track [c('o')] "load a WAV file into a sampler track";
+    LoadSample "load_sample" Track [c('o')] "load a WAV file or an SFZ instrument into a sampler track";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";
     PianoRoll "piano_roll" Track [c('v')] "piano roll for a melodic track / back to the grid";
     TrackGroup "track_group" Track [c('i')] "send the track to the next group, or from the last back to the master";
