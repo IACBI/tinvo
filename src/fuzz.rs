@@ -41,11 +41,12 @@ use crate::engine::{
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_SLOTS};
-use crate::instrument::InstrumentKind;
+use crate::instrument::zone::{Placement, Trigger};
+use crate::instrument::{InstrumentKind, SampleMap};
 use crate::mix::{MIX_PARAMS, mp, send};
-use crate::project::{GroupData, LaneData, Project, SlotData, TrackData, sanitize_group_name, sanitize_name};
+use crate::project::{self, GroupData, LaneData, Project, SlotData, TrackData, sanitize_group_name, sanitize_name};
 use crate::render::Source;
-use crate::sample::{self, Sample};
+use crate::sample;
 use crate::smf;
 use crate::strip::{sp, track_param, track_param_count};
 use crate::wav::{self, SampleFormat};
@@ -633,6 +634,13 @@ fn project_seeds() -> Vec<Vec<u8>> {
     let mut sampler = TrackData::new(InstrumentKind::Sampler);
     sampler.name = "Loop é".into();
     sampler.sample = Some("drums/loop one.wav".into());
+    let layer = Placement { keys: (36, 48), vels: (64, 127), root: Some(40), seq: (2, 3), ..Placement::WHOLE };
+    let tail = Placement { trigger: Trigger::Release, gain_db: -9.5, start: 100, end: Some(9000), ..layer };
+    sampler.zones = vec![
+        project::ZoneData { place: layer, path: "kit/hard 2.wav".into() },
+        project::ZoneData { place: tail, path: "/abs/tail.wav".into() },
+    ]
+    .into();
     sampler.steps[15][63] = Some(Step::new(127, 127, 64));
     rich.tracks.push(sampler);
     let mut texts = vec![Project::new().to_text(), Project::demo().to_text(), rich.to_text()];
@@ -760,6 +768,7 @@ fn without_meta(p: &Project) -> Project {
     for t in &mut p.tracks {
         t.name.clear();
         t.sample = None;
+        t.zones = Arc::new([]);
     }
     for g in &mut p.groups {
         g.name.clear();
@@ -835,12 +844,37 @@ fn check_midi(input: &[u8], render: bool) -> Result<Outcome, String> {
     Ok(Outcome { accepted: true, features })
 }
 
+/// Zones over `sample` drawn from `seed`: parts of it, some past its end,
+/// layered, taking turns, and sounding on release.
+fn fuzz_zones(sample: Arc<sample::Sample>, seed: u64) -> SampleMap {
+    let mut rng = Rng::new(seed | 1);
+    let frames = sample.frames() as u32;
+    SampleMap::new((0..8).map(|_| {
+        let mut word = || rng.next_u64() as u32;
+        let (a, b) = ((word() % 128) as u8, (word() % 128) as u8);
+        let start = word() % frames.saturating_mul(2).max(1);
+        let len = word() % 4;
+        let place = Placement {
+            keys: (a.min(b), a.max(b)),
+            vels: (0, 127),
+            root: (word() % 2 == 0).then_some((word() % 128) as u8),
+            seq: (1 + (len % 2) as u8, 2),
+            trigger: if word() % 3 == 0 { Trigger::Release } else { Trigger::Attack },
+            tune: (word() % 9600) as f32 - 4800.0,
+            gain_db: -((word() % 96) as f32),
+            start,
+            end: (len > 0).then(|| start + 1 + word() % frames.max(1)),
+        };
+        (place, Arc::clone(&sample))
+    }))
+}
+
 /// Plays `p` from its start and checks every output sample is finite.
-fn render_check(p: &Project, samples: &[Option<Arc<Sample>>]) -> Result<(), String> {
+fn render_check(p: &Project, samples: &[Option<Arc<SampleMap>>]) -> Result<(), String> {
     const BLOCK: usize = 1000;
     let mut engine = Engine::with_edits(48_000.0, &p.to_edits(), Arc::new(Shared::new()), None);
     for (track, s) in samples.iter().enumerate() {
-        engine.set_sample(track, s.clone());
+        engine.set_samples(track, s.clone());
     }
     engine.handle(if p.song.is_empty() { Command::Play } else { Command::PlaySong { entry: 0 } });
     let mut buf = vec![0.0f32; 2 * BLOCK];
@@ -1104,8 +1138,10 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
     };
     if render {
         if let Some(s) = loaded {
-            render_check(&sampler_project(false, 0), &[Some(s.clone())])?;
-            render_check(&sampler_project(true, hash_of(input)), &[Some(s)])?;
+            let single = Arc::new(SampleMap::single(s.clone()));
+            render_check(&sampler_project(false, 0), &[Some(single.clone())])?;
+            render_check(&sampler_project(true, hash_of(input)), &[Some(single)])?;
+            render_check(&sampler_project(true, hash_of(input)), &[Some(Arc::new(fuzz_zones(s, hash_of(input))))])?;
         }
     }
     let chunks = chunk_offsets(input);
@@ -1430,6 +1466,18 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
             Action::Sample(t, path) => {
                 if let Some(t) = p.tracks.get_mut(t).filter(|t| t.kind == InstrumentKind::Sampler) {
                     if !path.is_empty() && sample::unstorable(&path).is_none() {
+                        // A zone of the same file, placed by the path's length.
+                        let n = path.len();
+                        let place = Placement {
+                            keys: (0, (n % 128) as u8),
+                            root: (n % 3 > 0).then_some((n % 128) as u8),
+                            seq: (1, 1 + (n % 4) as u8),
+                            trigger: if n % 2 == 0 { Trigger::Attack } else { Trigger::Release },
+                            tune: n as f32 * 0.5,
+                            end: (n % 5 > 0).then_some(n as u32),
+                            ..Placement::WHOLE
+                        };
+                        t.zones = vec![project::ZoneData { place, path: path.clone() }].into();
                         t.sample = Some(path);
                     }
                 }

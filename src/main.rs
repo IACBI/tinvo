@@ -230,7 +230,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         println!("Wrote {what}{passes} as a MIDI file to {}", shown(out));
         return Ok(());
     }
-    let (track_samples, errors) = project.load_samples();
+    let (bank, errors) = project.load_samples();
+    let track_samples = project.sample_maps(&bank);
     if !errors.is_empty() {
         return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
     }

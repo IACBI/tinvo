@@ -65,14 +65,23 @@
 //! Steps and points before any `pattern` line belong to pattern A. `chord` is `-` or
 //! the extra notes as comma-separated semitones above `note`, ascending
 //! (`4,7` is a major triad). A sampler track may have a `sample <path>`
-//! line; relative paths are relative to the project file. Versions 1 (no
+//! line, a sample over the whole keyboard, and zones:
+//!
+//! ```text
+//! zone 36-47 40 1-64 1/2 attack 0 0 0 - piano/C3 soft.wav
+//! ```
+//!
+//! keys, root key (`-`: the track's root note), velocities, round-robin
+//! position/cycle, `attack` or `release`, tuning in cents, gain in dB, and
+//! the frames played, start and end (`-`: the sample's end), then the file.
+//! Relative paths are relative to the project file. Versions 1 (no
 //! swing, `index note velocity length`), 2 (`... chance ratchet`), 3 (no
 //! samples), 4 (one pattern, `pattern_length <n>`), 5 (no automation) and
 //! 6 (no channel strip), 7 (no sends or buses), 8 and 9 (no markers),
 //! 10 (every track plays the entry's pattern), 11 (16th-note steps, up
 //! to 4 ratchets), 12 (no MIDI channels, bend ranges or mod wheel), 13
-//! (no MIDI output), 14 (no groups, up to 16 tracks) and 15 (no plugins)
-//! are still read. A plugin is kept by its id whether or not it is
+//! (no MIDI output), 14 (no groups, up to 16 tracks), 15 (no plugins) and
+//! 16 and 17 (no zones) are still read. A plugin is kept by its id whether or not it is
 //! installed, so a project that names one missing saves as it was read.
 //! Floats are written with Rust's shortest round-trip formatting, so saving
 //! and loading is lossless.
@@ -85,20 +94,23 @@ use crate::engine::{
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_INSERTS, MAX_SLOTS};
-use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::instrument::zone::{MAX_ZONES, Placement, Trigger};
+use crate::instrument::{InstrumentKind, ParamSpec, SampleMap};
 use crate::mix::{MIX_PARAMS, mix_param_since, mp, send};
+use crate::sample::Bank;
 use crate::strip::{sp, track_param, track_param_count, track_param_since};
 use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 18;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
 const MAX_NAME_CHARS: usize = 32;
 /// The largest project file read. The largest project TINVO writes is a
-/// few MiB.
+/// few MiB, unless its zones have long paths: 32 sampler tracks of 1024
+/// zones, each path 4 KiB long, come to about 140 MiB.
 pub const MAX_FILE_BYTES: u64 = 256 << 20;
 
 /// Mixer parameters presented alongside instrument parameters.
@@ -125,6 +137,9 @@ pub struct TrackData {
     /// Sampler tracks: the sample file. Absolute in memory; written relative
     /// to the project file when it sits inside the project's directory.
     pub sample: Option<String>,
+    /// Sampler tracks: their zones, paths kept as `sample`'s. Shared, as
+    /// the history keeps them.
+    pub zones: Arc<[ZoneData]>,
     pub lanes: [LaneData; MAX_LANES],
     /// What the track plays in each song entry; `Follow` past the song's end.
     pub parts: Box<[Part; MAX_SONG]>,
@@ -136,6 +151,13 @@ pub struct TrackData {
 }
 
 pub use crate::engine::PluginPlace;
+
+/// A sampler track's zone: a sample file and where it plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneData {
+    pub place: Placement,
+    pub path: String,
+}
 
 /// An effect in an insert slot and its settings.
 #[derive(Clone, Debug, PartialEq)]
@@ -220,6 +242,22 @@ impl LaneData {
 }
 
 impl TrackData {
+    /// The sample files a sampler track plays: its sample's, then its
+    /// zones'.
+    pub fn sample_paths(&self) -> impl Iterator<Item = &str> {
+        self.sample.as_deref().into_iter().chain(self.zones.iter().map(|z| z.path.as_str()))
+    }
+
+    /// What the track plays of the samples in `bank`: its sample over the
+    /// whole keyboard, then its zones, each whose file is there. `None` if
+    /// none is.
+    pub fn sample_map(&self, bank: &Bank) -> Option<Arc<SampleMap>> {
+        let whole = self.sample.as_ref().and_then(|p| bank.get(p)).map(|s| (Placement::WHOLE, Arc::clone(s)));
+        let zones = self.zones.iter().filter_map(|z| Some((z.place, Arc::clone(bank.get(&z.path)?))));
+        let map = SampleMap::new(whole.into_iter().chain(zones));
+        (!map.is_empty()).then(|| Arc::new(map))
+    }
+
     pub fn new(kind: InstrumentKind) -> Self {
         Self {
             name: kind.label().to_string(),
@@ -234,6 +272,7 @@ impl TrackData {
             group: None,
             steps: Box::new([[None; MAX_STEPS]; MAX_PATTERNS]),
             sample: None,
+            zones: Arc::new([]),
             lanes: std::array::from_fn(|_| LaneData::new(None, false)),
             parts: Box::new([Part::Follow; MAX_SONG]),
             chain: [const { None }; MAX_SLOTS],
@@ -1498,6 +1537,9 @@ impl Project {
             if let Some(path) = &t.sample {
                 let _ = writeln!(s, "sample {}", crate::sample::relativize(path, dir));
             }
+            for z in t.zones.iter() {
+                let _ = writeln!(s, "zone {} {}", zone_text(&z.place), crate::sample::relativize(&z.path, dir));
+            }
             let _ = writeln!(s, "gain_db {}", t.gain_db);
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
@@ -1586,6 +1628,8 @@ impl Project {
         let mut tempo_lines = Vec::new();
         // Effects in all chains read so far.
         let mut inserts = 0usize;
+        // The current track's zones.
+        let mut zones: Vec<ZoneData> = Vec::new();
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -1651,6 +1695,15 @@ impl Project {
                             return Err(err(format!("a sample path is at most {max} bytes long")));
                         }
                         t.sample = Some(rest.to_string());
+                    }
+                    "zone" if ver >= 18 => {
+                        if t.kind != InstrumentKind::Sampler {
+                            return Err(err(format!("a {} track has no zones", t.kind.id())));
+                        }
+                        if zones.len() >= MAX_ZONES {
+                            return Err(err(format!("more than {MAX_ZONES} zones in a track")));
+                        }
+                        zones.push(parse_zone(rest).map_err(err)?);
                     }
                     "gain_db" => t.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
@@ -1843,7 +1896,9 @@ impl Project {
                         if p.tracks.len() >= MAX_TRACKS {
                             return Err(err(format!("more than {MAX_TRACKS} tracks")));
                         }
-                        p.tracks.push(current.take().expect("inside a track block"));
+                        let mut t = current.take().expect("inside a track block");
+                        t.zones = std::mem::take(&mut zones).into();
+                        p.tracks.push(t);
                     }
                     _ => return Err(err(format!("unknown track key '{key}'"))),
                 }
@@ -2056,35 +2111,35 @@ impl Project {
         crate::fsutil::write_atomic(path, text.as_bytes())
     }
 
-    /// Loads every track's sample file. Returns one entry per track (`None`
-    /// for tracks without a sample or whose file failed) and the errors.
-    pub fn load_samples(&self) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
+    /// Loads every sample file the tracks play, each once. Returns those
+    /// that loaded, by path, and why the others did not.
+    pub fn load_samples(&self) -> (Bank, Vec<String>) {
         self.load_samples_within(crate::sample::PROJECT_FRAMES)
     }
 
     /// [`Project::load_samples`], holding at most `budget` frames together.
-    fn load_samples_within(&self, budget: usize) -> (Vec<Option<std::sync::Arc<crate::sample::Sample>>>, Vec<String>) {
-        let mut errors = Vec::new();
-        // Tracks playing one file share it, read once.
-        let mut loaded = std::collections::HashMap::new();
+    fn load_samples_within(&self, budget: usize) -> (Bank, Vec<String>) {
+        let (mut bank, mut errors, mut tried) = (Bank::new(), Vec::new(), std::collections::HashSet::new());
         let mut left = budget;
-        let samples = self
-            .tracks
-            .iter()
-            .map(|t| {
-                let path = t.sample.as_deref()?;
-                loaded
-                    .entry(path)
-                    .or_insert_with(|| {
-                        let s = crate::sample::load_within(Path::new(path), left.min(crate::sample::MAX_FRAMES));
-                        let s = s.map_err(|e| errors.push(e)).ok()?;
-                        left -= s.frames();
-                        Some(std::sync::Arc::new(s))
-                    })
-                    .clone()
-            })
-            .collect();
-        (samples, errors)
+        for path in self.tracks.iter().flat_map(TrackData::sample_paths) {
+            if !tried.insert(path) {
+                continue;
+            }
+            match crate::sample::load_within(Path::new(path), left.min(crate::sample::MAX_FRAMES)) {
+                Ok(s) => {
+                    left -= s.frames();
+                    bank.insert(path.to_string(), Arc::new(s));
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        (bank, errors)
+    }
+
+    /// What each track plays of the samples in `bank`
+    /// ([`TrackData::sample_map`]).
+    pub fn sample_maps(&self, bank: &Bank) -> Vec<Option<Arc<SampleMap>>> {
+        self.tracks.iter().map(|t| t.sample_map(bank)).collect()
     }
 
     /// Loads a project file; sample paths come back absolute.
@@ -2092,9 +2147,13 @@ impl Project {
         let text = crate::fsutil::read_text(path, MAX_FILE_BYTES).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut p = Self::from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let dir = project_dir(path);
+        let resolve = |s: &str| crate::sample::resolve(s, dir.as_deref()).to_string_lossy().into_owned();
         for t in &mut p.tracks {
             if let Some(s) = &mut t.sample {
-                *s = crate::sample::resolve(s, dir.as_deref()).to_string_lossy().into_owned();
+                *s = resolve(s);
+            }
+            if !t.zones.is_empty() {
+                t.zones = t.zones.iter().map(|z| ZoneData { path: resolve(&z.path), ..z.clone() }).collect();
             }
         }
         Ok(p)
@@ -2340,6 +2399,58 @@ fn check_pattern(p: u8) -> Result<(), EditError> {
 /// The absolute directory holding a project file.
 fn project_dir(path: &Path) -> Option<std::path::PathBuf> {
     crate::sample::absolute(&path.to_string_lossy()).parent().map(Path::to_path_buf)
+}
+
+/// A zone's line in the file, but for its path.
+fn zone_text(z: &Placement) -> String {
+    let root = z.root.map_or_else(|| "-".to_string(), |r| r.to_string());
+    let end = z.end.map_or_else(|| "-".to_string(), |e| e.to_string());
+    let trigger = match z.trigger {
+        Trigger::Attack => "attack",
+        Trigger::Release => "release",
+    };
+    let ((lk, hk), (lv, hv), (pos, len)) = (z.keys, z.vels, z.seq);
+    format!("{lk}-{hk} {root} {lv}-{hv} {pos}/{len} {trigger} {} {} {} {end}", z.tune, z.gain_db, z.start)
+}
+
+/// A `zone` line's words and path.
+fn parse_zone(rest: &str) -> Result<ZoneData, String> {
+    const USAGE: &str = "expected 'zone <keys> <root> <velocities> <position>/<cycle> <attack|release> <cents> <dB> <start> <end> <path>'";
+    let mut words = [""; 9];
+    let mut left = rest;
+    for w in &mut words {
+        let (word, more) = left.split_once(char::is_whitespace).ok_or(USAGE)?;
+        *w = word;
+        left = more.trim_start();
+    }
+    if left.is_empty() {
+        return Err(USAGE.into());
+    }
+    if left.len() > crate::sample::MAX_PATH_BYTES {
+        return Err(format!("a sample path is at most {} bytes long", crate::sample::MAX_PATH_BYTES));
+    }
+    let [keys, root, vels, seq, trigger, tune, gain, start, end] = words;
+    let pair = |w: &str, sep: char| -> Result<(u8, u8), String> {
+        let (a, b) = w.split_once(sep).ok_or_else(|| format!("expected two numbers apart by '{sep}', got '{w}'"))?;
+        Ok((parse_num(a)?, parse_num(b)?))
+    };
+    let place = Placement {
+        keys: pair(keys, '-')?,
+        root: if root == "-" { None } else { Some(parse_num(root)?) },
+        vels: pair(vels, '-')?,
+        seq: pair(seq, '/')?,
+        trigger: match trigger {
+            "attack" => Trigger::Attack,
+            "release" => Trigger::Release,
+            _ => return Err(format!("expected attack or release, got '{trigger}'")),
+        },
+        tune: parse_num(tune)?,
+        gain_db: parse_num(gain)?,
+        start: parse_num(start)?,
+        end: if end == "-" { None } else { Some(parse_num(end)?) },
+    };
+    place.check()?;
+    Ok(ZoneData { place, path: left.to_string() })
 }
 
 fn chord_text(st: &Step) -> String {
@@ -3669,6 +3780,84 @@ mod tests {
     }
 
     #[test]
+    fn zones_round_trip_with_their_paths_relative_to_the_project() {
+        let dir = std::env::temp_dir().join(format!("tinvo-zones-{}", std::process::id()));
+        let inside = dir.join("piano").join("C 3.wav").to_string_lossy().into_owned();
+        let outside = crate::sample::absolute("elsewhere/hit.wav").to_string_lossy().into_owned();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let soft = Placement { keys: (36, 47), vels: (1, 64), root: Some(40), seq: (2, 3), ..Placement::WHOLE };
+        let release =
+            Placement { trigger: Trigger::Release, tune: -12.5, gain_db: -3.25, start: 10, end: Some(4800), ..soft };
+        let t = p.tracks.last_mut().unwrap();
+        t.sample = Some(outside.clone());
+        t.zones = vec![
+            ZoneData { place: soft, path: inside.clone() },
+            ZoneData { place: release, path: outside.clone() },
+            ZoneData { place: Placement::WHOLE, path: inside.clone() },
+        ]
+        .into();
+        let text = p.to_text_in(Some(&dir));
+        assert!(text.contains("\nzone 36-47 40 1-64 2/3 attack 0 0 0 - piano/C 3.wav\n"), "{text}");
+        assert!(text.contains(&format!("\nzone 36-47 40 1-64 2/3 release -12.5 -3.25 10 4800 {outside}\n")), "{text}");
+        assert!(text.contains("\nzone 0-127 - 0-127 1/1 attack 0 0 0 - piano/C 3.wav\n"), "{text}");
+        // A path that would start with a space relative to the project stays
+        // whole, as a line loses the space.
+        let spaced = dir.join(" soft.wav").to_string_lossy().into_owned();
+        let mut z = p.tracks[0].zones.to_vec();
+        z.push(ZoneData { place: Placement::WHOLE, path: spaced.clone() });
+        p.tracks[0].zones = z.into();
+        assert!(p.to_text_in(Some(&dir)).contains(&format!(" {spaced}\n")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("song.tvo");
+        p.save(&file).unwrap();
+        let back = Project::load(&file).unwrap();
+        assert_eq!(back.tracks, p.tracks, "paths come back absolute");
+        assert_eq!(back.tracks[0].sample_paths().collect::<Vec<_>>(), [&outside, &inside, &outside, &inside, &spaced]);
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
+        // At most so many zones in a track.
+        let zones = |n: usize| {
+            let line = "zone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\n";
+            format!("tinvo 18\ntrack sampler\n{}end\n", line.repeat(n))
+        };
+        assert_eq!(Project::from_text(&zones(MAX_ZONES)).unwrap().tracks[0].zones.len(), MAX_ZONES);
+        // With a sample too, every one of them plays.
+        let full = Project::from_text(&zones(MAX_ZONES).replace("sampler\n", "sampler\nsample a.wav\n")).unwrap();
+        let bank =
+            Bank::from([("a.wav".to_string(), Arc::new(crate::sample::Sample::from_mono(&[0.5; 8], 48_000).unwrap()))]);
+        assert_eq!(full.tracks[0].sample_map(&bank).unwrap().zones().len(), MAX_ZONES + 1);
+        let e = Project::from_text(&zones(MAX_ZONES + 1)).unwrap_err();
+        assert_eq!((e.line, e.message.contains("more than")), (MAX_ZONES + 3, true), "{e}");
+        let long = format!("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - {}\nend", "a".repeat(4097));
+        assert!(Project::from_text(&long).unwrap_err().message.contains("at most 4096 bytes"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_track_plays_its_zones_whose_files_loaded() {
+        let dir = std::env::temp_dir().join(format!("tinvo-zone-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, gone) = (dir.join("a.wav"), dir.join("gone.wav"));
+        crate::wav::write_file(&a, &[0.5; 64], 1, 48_000, crate::wav::SampleFormat::Float32).unwrap();
+        let line = |path: &Path, rr: &str| format!("zone 0-127 60 0-127 {rr} attack 0 0 0 - {}\n", path.display());
+        let text = format!(
+            "tinvo 18\ntrack sampler\n{}{}{}end\ntrack sampler\n{}end\ntrack sampler\nend\n",
+            line(&a, "1/2"),
+            line(&gone, "2/2"),
+            line(&a, "2/2"),
+            line(&gone, "1/1")
+        );
+        let p = Project::from_text(&text).unwrap();
+        let (bank, errors) = p.load_samples();
+        assert_eq!((bank.len(), errors.len()), (1, 1), "each file once: {errors:?}");
+        let maps = p.sample_maps(&bank);
+        let zones: Vec<(u8, u8)> = maps[0].as_ref().unwrap().zones().iter().map(|z| z.place.seq).collect();
+        assert_eq!(zones, [(1, 2), (2, 2)], "the missing file's zone is left out");
+        assert!(maps[1].is_none() && maps[2].is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn midi_out_round_trips_from_format_14() {
         let mut p = Project::new();
         p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
@@ -4043,6 +4232,20 @@ pattern_division A 1/8
             ("tinvo 4\ntrack kick\nsample a.wav\nend", 3, "has no sample"),
             ("tinvo 3\ntrack sampler\nsample a.wav\nend", 3, "unknown track key"),
             ("tinvo 4\ntrack sampler\nsample\nend", 3, "expected 'sample"),
+            ("tinvo 17\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "unknown track key"),
+            ("tinvo 18\ntrack kick\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "has no zones"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 -\nend", 3, "expected 'zone"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - \nend", 3, "expected 'zone"),
+            ("tinvo 18\ntrack sampler\nzone 0 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "two numbers"),
+            ("tinvo 18\ntrack sampler\nzone 9-3 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "keys run"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 128 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "root key"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-200 1/1 attack 0 0 0 - a.wav\nend", 3, "velocities run"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-300 1/1 attack 0 0 0 - a.wav\nend", 3, "invalid number"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 3/2 attack 0 0 0 - a.wav\nend", 3, "round-robin"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 hold 0 0 0 - a.wav\nend", 3, "attack or release"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack NaN 0 0 - a.wav\nend", 3, "tuning"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 30 0 - a.wav\nend", 3, "gain"),
+            ("tinvo 18\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 10 5 a.wav\nend", 3, "ends after"),
             ("tinvo 0", 1, "version"),
             ("tinvo 2\nswing 90", 2, "swing"),
             ("tinvo 2\ntrack kick\nstep 0 60 100 1 100 5\nend", 3, "out of range"),
@@ -4087,18 +4290,22 @@ pattern_division A 1/8
         let track = |path: &Path| format!("track sampler\nsample {}\nend\n", path.display());
         let gone = dir.join("gone.wav");
         let text = format!("tinvo 4\n{}{}{}{}", track(&wav), track(&gone), track(&wav), track(&gone));
-        let (samples, errors) = Project::from_text(&text).unwrap().load_samples();
-        let (a, b) = (samples[0].as_ref().unwrap(), samples[2].as_ref().unwrap());
+        let p = Project::from_text(&text).unwrap();
+        let (bank, errors) = p.load_samples();
+        let maps = p.sample_maps(&bank);
+        let (a, b) = (&maps[0].as_ref().unwrap().zones()[0].sample, &maps[2].as_ref().unwrap().zones()[0].sample);
         assert!(std::sync::Arc::ptr_eq(a, b));
-        assert!(samples[1].is_none() && samples[3].is_none());
-        assert_eq!(errors.len(), 1, "a missing file is reported once: {errors:?}");
+        assert!(maps[1].is_none() && maps[3].is_none());
+        assert_eq!((bank.len(), errors.len()), (1, 1), "a missing file is reported once: {errors:?}");
         // A file shared counts once against the project's budget; one more
         // that does not fit in what is left is refused.
         let other = dir.join("other.wav");
         crate::wav::write_file(&other, &[0.5; 64], 1, 48_000, crate::wav::SampleFormat::Float32).unwrap();
         let text = format!("tinvo 4\n{}{}{}", track(&wav), track(&wav), track(&other));
-        let (samples, errors) = Project::from_text(&text).unwrap().load_samples_within(100);
-        assert!(samples[0].is_some() && samples[1].is_some() && samples[2].is_none());
+        let p = Project::from_text(&text).unwrap();
+        let (bank, errors) = p.load_samples_within(100);
+        let maps = p.sample_maps(&bank);
+        assert!(maps[0].is_some() && maps[1].is_some() && maps[2].is_none());
         assert!(errors[0].contains("other.wav") && errors[0].contains("36 frames left"), "{errors:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

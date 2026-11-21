@@ -6,6 +6,15 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- Zones in a sampler track: sample files laid over the keyboard by key and velocity range, each with its own root key, tuning, gain and part of its file. Zones of one range layer, zones can take turns (round robin), and release zones sound when a key comes up, at the velocity it went down with. The track's tune, start, end and loop settings apply to each zone. A zone whose file is missing is left out; the panel's title counts the zones and the missing files, and a WAV export waits for every file.
+- Project format 18: `zone` lines in sampler tracks. Format 17 files still load.
+
+### Changed
+- A sampler plays 16 voices instead of 8. The sampler scenario of `tinvo bench` keeps all 16 sounding.
+- A WAV export refused for a missing sample names the track whose sample it is, as loading it again goes into the selected track.
+- A sample path that would start with whitespace relative to the project is saved whole, so it loads back unchanged.
+
 ## [0.27.0] - 2026-11-21
 
 ### Added

@@ -2056,7 +2056,7 @@ fn came_back(rx: &mut Consumer<Retired>) -> Vec<Back> {
                 let inst = i.take_instance();
                 ("insert", inst.as_ref().map(|i| i.token()), inst)
             }
-            Retired::Sample(_) => ("sample", None, None),
+            Retired::Samples(_) => ("sample", None, None),
         })
         .collect()
 }
@@ -2392,8 +2392,9 @@ fn the_link_counts_an_insert_with_an_instance_as_two() {
     let mut link = EngineLink::new(tx, Arc::new(Shared::new())).with_retirement(retired, tinvo::engine::HELD_FOR_GOOD);
     // Samples on their way, till two of the queue's places are left.
     let sample = Arc::new(tinvo::sample::Sample::from_mono(&[0.5; 16], 48_000).unwrap());
+    let sample = Arc::new(tinvo::instrument::SampleMap::single(sample));
     for _ in tinvo::engine::HELD_FOR_GOOD..RETIRE_QUEUE - 2 {
-        link.send(EngineCommand::SetSample { track: 0, sample: Some(sample.clone()) });
+        link.send(EngineCommand::SetSamples { track: 0, map: Some(sample.clone()) });
     }
     let sent = |c: &mut Consumer<EngineCommand>| std::iter::from_fn(|| c.pop()).collect::<Vec<_>>();
     assert_eq!(sent(&mut commands).len(), RETIRE_QUEUE - 2 - tinvo::engine::HELD_FOR_GOOD);
