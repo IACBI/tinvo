@@ -30,6 +30,14 @@ pub fn check_destination(project: &Project, project_path: Option<&Path>, out: &P
     if !["wav", "mid", "midi"].iter().any(|e| ext.eq_ignore_ascii_case(e)) {
         return Err("is not a .wav or .mid file".into());
     }
+    check_overwrite(project, project_path, out)
+}
+
+/// Checks that writing `out` destroys nothing `project` needs: that it is
+/// not a folder, a sample the project plays, nor (if given) the project at
+/// `project_path`. A project's save passes no `project_path`, as it may
+/// write over itself. The error follows the path.
+pub fn check_overwrite(project: &Project, project_path: Option<&Path>, out: &Path) -> Result<(), String> {
     let out = match std::fs::canonicalize(out) {
         Ok(p) => p,
         // Nothing at the name: a new file.

@@ -6,6 +6,10 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Fixed
+- Save As kept any extension it was given, so a name such as `kick.wav` wrote the project over a sample it played. Save As now writes `.tvo` files (or the file the project was opened from), and no save writes over a sample the project plays, however its path is spelled.
+- A project file with many `parts` lines for one track, or with markers past the longest song, could take gigabytes of memory or minutes of work before it was refused. Such lines are now refused where they stand.
+
 ## [0.28.0] - 2026-11-21
 
 ### Added
