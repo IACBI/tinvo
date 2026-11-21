@@ -1887,6 +1887,9 @@ impl Project {
                         t.steps[pattern][i] = Some(st);
                     }
                     "parts" if ver >= 11 => {
+                        if part_lines.last().is_some_and(|&(track, _, _)| track == p.tracks.len()) {
+                            return Err(err("a track has one 'parts' line".into()));
+                        }
                         let words = fields(rest, MAX_SONG);
                         if words.len() > MAX_SONG {
                             return Err(err(format!("a song has at most {MAX_SONG} entries")));
@@ -1998,6 +2001,11 @@ impl Project {
                         .split_once(char::is_whitespace)
                         .ok_or_else(|| err("expected 'marker <entry> <name>'".into()))?;
                     let entry: u16 = parse_num(entry).map_err(err)?;
+                    // Checked against the song once it is read; here only
+                    // against the longest, so the markers stay few.
+                    if usize::from(entry) >= MAX_SONG {
+                        return Err(err(format!("a song has at most {MAX_SONG} entries")));
+                    }
                     let name = name.trim();
                     if clean_marker_name(name) != name {
                         return Err(err(format!("a marker name is at most {MAX_NAME_CHARS} printable characters")));
@@ -3152,6 +3160,28 @@ mod tests {
         let long = Project::from_text("tinvo 11\nsong A\n\ntrack kick\nparts . -\nend").unwrap_err();
         assert_eq!(long.line, 5, "{long:?}");
         assert!(long.message.contains("parts for 2 song entries"), "{long:?}");
+        // A second line is refused where it is, not kept to check later.
+        let twice = Project::from_text(
+            "tinvo 11
+track kick
+parts .
+parts .
+end
+song A",
+        )
+        .unwrap_err();
+        assert_eq!((twice.line, twice.message.as_str()), (4, "a track has one 'parts' line"));
+        let next = Project::from_text(
+            "tinvo 11
+track kick
+parts .
+end
+track snare
+parts B
+end
+song A",
+        );
+        assert!(next.is_ok(), "{next:?}");
     }
 
     #[test]
@@ -3173,6 +3203,11 @@ mod tests {
         ] {
             assert!(Project::from_text(bad).is_err(), "{bad}");
         }
+        // Past the longest song, refused where it is, before the song.
+        let far = Project::from_text(&format!("tinvo 10\nmarker {MAX_SONG} a\nsong A")).unwrap_err();
+        assert_eq!((far.line, far.message), (2, format!("a song has at most {MAX_SONG} entries")));
+        let last = Project::from_text(&format!("tinvo 10\nmarker {} a\nsong {}", MAX_SONG - 1, "A ".repeat(MAX_SONG)));
+        assert!(last.is_ok(), "{last:?}");
         let past = Project::from_text("tinvo 10\nsong A A\n\nmarker 0 a\nmarker 5 b").unwrap_err();
         assert_eq!(past.line, 5, "{past:?}");
     }

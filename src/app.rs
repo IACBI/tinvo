@@ -3665,7 +3665,19 @@ impl App {
                     return;
                 }
                 match kind {
-                    PromptKind::SaveAs => self.save_to(with_extension(&text, FILE_EXTENSION)),
+                    PromptKind::SaveAs => {
+                        let path = with_extension(&text, FILE_EXTENSION);
+                        let tvo = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
+                        // A project opened under another name may be saved
+                        // there again; a new name is a .tvo file.
+                        let ours = self.path.as_deref() == Some(path.as_path())
+                            || self.lock.as_ref().is_some_and(|l| l.is_for(&path));
+                        if tvo || ours {
+                            self.save_to(path);
+                        } else {
+                            self.set_status(format!("Not saved: {} is not a .{FILE_EXTENSION} file", path.display()));
+                        }
+                    }
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => {
@@ -5540,6 +5552,9 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
+        if let Err(e) = render::check_overwrite(&self.project, None, &path) {
+            return self.set_status(format!("Not saved: {} {e}", path.display()));
+        }
         let failed = self.sync_for_save();
         // Saving to another file moves the session there, lock and all; a
         // file another session has open is refused.
@@ -10332,6 +10347,49 @@ mod tests {
         let saved = dir.join("song.tvo");
         assert_eq!(a.path.as_deref(), Some(saved.as_path()));
         assert_eq!(Project::load(&saved).unwrap(), a.project);
+        drop(a);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_never_writes_over_a_sample_the_project_plays() {
+        let dir = std::env::temp_dir().join(format!("tinvo-save-sample-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let kick = dir.join("kick.wav");
+        wav::write_file(&kick, &[0.5; 480], 1, 48_000, SampleFormat::Float32).unwrap();
+        let before = std::fs::read(&kick).unwrap();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let mut a = App::new(p, None, None, 48_000, "test".into());
+        a.track = a.project.tracks.len() - 1;
+        a.mode = Mode::Prompt(PromptKind::LoadSample, kick.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.project.tracks[a.track].sample.is_some(), "{:?}", a.status_text());
+        // Named as it is, or spelled another way.
+        for name in [kick.clone(), dir.join(".").join("kick.wav")] {
+            a.save_to(name.clone());
+            assert_eq!(
+                a.status_text(),
+                Some(format!("Not saved: {} is a sample the project plays", name.display()).as_str())
+            );
+        }
+        // Save As keeps to .tvo files.
+        a.mode = Mode::Prompt(PromptKind::SaveAs, dir.join("song.txt").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some(format!("Not saved: {} is not a .tvo file", dir.join("song.txt").display()).as_str())
+        );
+        assert!(!dir.join("song.txt").exists() && a.path.is_none());
+        assert_eq!(std::fs::read(&kick).unwrap(), before, "the sample is untouched");
+        // A project opened under another name saves there again.
+        let other = dir.join("song.txt");
+        a.save_to(other.clone());
+        assert_eq!(a.path.as_deref(), Some(other.as_path()));
+        a.mode = Mode::Prompt(PromptKind::SaveAs, other.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some(format!("Saved {}", other.display()).as_str()));
         drop(a);
         std::fs::remove_dir_all(&dir).unwrap();
     }
