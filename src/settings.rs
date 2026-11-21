@@ -705,6 +705,14 @@ mod tests {
         merged.keys.check().unwrap();
         assert_eq!(merged.keys.keys(Action::InsertChain), [Key::Char('c')]);
         assert!(merged.keys.keys(Action::PluginWindow).is_empty());
+        // A key of its own another session gave it is kept, and clashes.
+        let mut theirs = Settings::default();
+        theirs.keys.bind(Action::PluginWindow, vec![Key::F(11)]);
+        let mut ours = Settings::default();
+        ours.keys.bind(Action::Undo, vec![Key::F(11)]);
+        let merged = merge(&Settings::default(), &ours, &theirs);
+        assert_eq!(merged.keys.keys(Action::PluginWindow), [Key::F(11)]);
+        assert!(merged.keys.check().unwrap_err().contains("f11 is bound to both undo and plugin_window"));
     }
 
     #[test]

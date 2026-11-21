@@ -284,9 +284,13 @@ impl Keymap {
 
     /// Takes from each action of [`LATE`] that `bound` (the actions a
     /// settings file gives keys) leaves at its defaults the keys an action
-    /// in `bound` has where the two are active together.
+    /// in `bound` has where the two are active together. One given keys of
+    /// its own keeps them, to clash as any other would.
     pub fn yield_late_defaults(&mut self, bound: &[Action]) {
-        for &a in LATE.iter().filter(|a| !bound.contains(a)) {
+        for &a in LATE {
+            if bound.contains(&a) || !self.at_default(a) {
+                continue;
+            }
             let taken = |k: &Key| bound.iter().any(|&b| together(a, b) && self.keys(b).contains(k));
             let kept: Vec<Key> = self.keys(a).iter().copied().filter(|k| !taken(k)).collect();
             self.bind(a, kept);
