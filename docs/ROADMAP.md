@@ -514,7 +514,7 @@ A review of the whole project before the release, the terminal front end as clos
 
 Known limits: the main loop's stale-click and idle handling, signal delivery, Windows key-repeat delivery and the CoreAudio stop failure have no unit tests, since they need a real terminal or device. A screen cell keeps one combining mark.
 
-### Phase 12: CLAP plugins (large)
+### Phase 12: CLAP plugins (large) ✅ (0.27.0)
 
 For professional instruments and effects: sampled pianos and orchestral libraries, amp models, mastering tools.
 - Hosting CLAP 1.2 plugins. CLAP is a plain C interface on Windows, Linux and macOS, so it is reached through hand-written FFI like the audio backends. VST3 (C++ COM-style interfaces) and Audio Units (macOS only) stay out.
@@ -527,7 +527,7 @@ For professional instruments and effects: sampled pianos and orchestral librarie
 - A new project format: the plugin's id, version and state. A missing plugin keeps its state, stays silent and is named when the project opens.
 - Tests: two small CLAP plugins built in the repository (a gain and a sine instrument) for scanning, loading, parameters, state, latency and the thread rules, and the allocation test with a plugin playing.
 
-It comes in four parts, each merged on its own. The first three came with 0.26.0, which freezes the project format they share, format 17.
+It comes in four parts, each merged on its own. The first three came with 0.26.0, which freezes the project format they share, format 17; the fourth came with 0.27.0.
 
 #### 12a: Finding plugins ✅ (0.26.0)
 
@@ -560,7 +560,7 @@ In parts, each merged on its own.
 - **State in projects** ✅: project format 17 with each plugin's state (base64, at most 16 MiB), plugin lanes and their base; the editor saves its instances' states into the project before a save, an autosave, an export, a new engine and an edit that may remove a plugin, keeps them through undo and redo, starts each instance from its state (at its defaults, said, if it cannot load it) and marks a changed state unsaved; renders start from the states too.
 - **In the editor** ✅: a plugin's parameters in the panel (a plugin track's on the instrument page, an insert's on a plugin page from its slot), by the instance's handle: names, text and ranges from the plugin, hidden ones left out, read-only ones not set; a change sent by stable id with a serial, shown until the plugin has it, an undo step of its own and an unsaved change, or a lane's base where a lane holds it; lanes on them made from the panel, played in a straight line and shown in the plugin's words; lanes on a parameter the plugin clears removed as an undo step; plugins later together than the engine makes up for named.
 
-#### 12d: The plugin's window
+#### 12d: The plugin's window ✅ (0.27.0)
 
 - `clap.gui` as a floating window, or embedded in a window TINVO opens for it, its platform's event loop running alongside the terminal's.
 
@@ -571,7 +571,7 @@ In parts, each merged on its own.
 - **X11** ✅: `clap::window` on Linux: a window of TINVO's for each embedded plugin window through Xlib loaded at run time, closed through `WM_DELETE_WINDOW`, its sizes offered to the plugin, the axes the plugin cannot resize held by size hints, the plugin told `Xft.dpi`'s scale, and its connection waited on with the terminal. Tested under Xvfb in CI.
 - **macOS** ✅: `clap::window` on macOS: an `NSWindow` of TINVO's for each embedded plugin window through the Objective-C runtime, AppKit loaded with the first, on the main thread as an accessory application; closed through the plugin's window first, sized in points, live resizes served as they come, and AppKit's events handed out at least once a frame while a window is open. Tested on the main thread in CI.
 
-Known limits so far: on Windows and macOS, while the user moves or sizes a plugin's window, the system runs its own loop, so the terminal and the plugins' timers wait until it ends (the drag's sizes reach the plugin as they come, and audio plays on); on Windows, a plugin window narrower than a captioned window's least width cannot be embedded, and a plugin that handles its window's paint without validating it keeps the main thread busy; on X11, losing the connection to the display ends TINVO, as Xlib does for any client.
+Known limits: on Windows and macOS, while the user moves or sizes a plugin's window, the system runs its own loop, so the terminal and the plugins' timers wait until it ends (the drag's sizes reach the plugin as they come, and audio plays on); on Windows, a plugin window narrower than a captioned window's least width cannot be embedded, and a plugin that handles its window's paint without validating it keeps the main thread busy; on X11, losing the connection to the display ends TINVO, as Xlib does for any client.
 - **In the editor** ✅: `c` (`plugin_window`) on a plugin track's instrument page, a plugin's page or its slot on the inserts page opens the playing instance's window, titled with the plugin and its place, and closes it again; one window for each instance. It closes when its instance no longer plays for its place (the plugin removed, replaced or picked again, an instance gone, or one given up on after failing twice), when the device is lost or a new engine comes, and at quit. Before a lost, switched or failed device's instances are destroyed, a change of state no poll has reported yet is read from their handles, so it is still an unsaved change, and their states are kept. The title of the plugin's page, and of a plugin track's instrument page, says `window open`; the bottom line names the key there and on the inserts page. A change made in the window reaches the panel, which reads the plugin's values, and the unsaved mark, through the plugin's output events and its dirty state. The plugin's requests of its window are kept in atomics, so it may make them from the audio thread without waiting, and a close it asks for during a poll still wins over a show. A settings file that gave `c` to another action of the panel still loads, with the new key left unbound (`keymap::LATE`). Tests: the editor opening and closing the test plugin's window from each page (on Windows, and on X11 under Xvfb; on macOS, where a test's thread is not the main one, the refusal said), a page with no plugin or one not playing saying so, a knob turned in the window shown on the panel and marking the project unsaved once the plugin has played, the window closed with its plugin removed or picked again, given up on and with the device lost (mutation-checked), a change of state just before a new engine or a lost device kept as unsaved (mutation-checked), and a settings file from before the key loading.
 
 Known limits of the editor's windows: a change made in a plugin's window is the plugin's, saved with its state, and not an undo step; where a lane holds the parameter, the panel shows the lane's base and the lane's points play over the change; and the windows open when the device was lost or another engine came are not opened again for the new instances.
