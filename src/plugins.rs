@@ -1,8 +1,8 @@
 //! The editor's CLAP plugins: the scan of what is installed, run in the
-//! background; the host the editor's instances come from; and what could
-//! not play, kept for the plugin list until the next try.
+//! background; the host the editor's instances come from; their windows;
+//! and what could not play, kept for the plugin list until the next try.
 
-use crate::clap::host::{Instance, Mode, PluginHost, Request, Role};
+use crate::clap::host::{GuiMode, Instance, Mode, PluginHandle, PluginHost, Request, Role};
 use crate::clap::scan::{self, Catalog};
 use crate::clap::window::Windows;
 use crate::clap::{PluginInfo, PluginRef, Roles};
@@ -220,6 +220,41 @@ impl Plugins {
         (fds, self.fd_round)
     }
 
+    /// Opens the window of `handle`'s plugin, titled `title` (see
+    /// [`Windows::open`]); one open already stays as it is.
+    pub fn open_window(&mut self, handle: PluginHandle, title: &str) -> Result<GuiMode, String> {
+        self.windows.open(handle, title)
+    }
+
+    /// Whether any window is open.
+    pub fn any_window(&self) -> bool {
+        self.windows.any()
+    }
+
+    /// Whether the window of the instance with `token` is open.
+    pub fn window_open(&self, token: u64) -> bool {
+        self.windows.mode(token).is_some()
+    }
+
+    /// Closes the window of the instance with `token`, if open.
+    pub fn close_window(&mut self, token: u64) {
+        self.windows.close(token);
+    }
+
+    /// Closes the windows of the instances `keep` does not want kept.
+    pub fn close_windows_but(&mut self, keep: impl Fn(u64) -> bool) {
+        for token in self.windows.tokens() {
+            if !keep(token) {
+                self.windows.close(token);
+            }
+        }
+    }
+
+    /// Closes every window.
+    pub fn close_windows(&mut self) {
+        self.windows.close_all();
+    }
+
     /// Serves what the instances run on the main thread between the
     /// terminal's waits: their timers due, the descriptors in `ready` (with
     /// the CLAP flags each is ready with), unless they were asked for again
@@ -239,8 +274,10 @@ impl Plugins {
         self.made.get(&token).copied()
     }
 
-    /// Forgets the instance with `token`, destroyed.
+    /// Forgets the instance with `token`, destroyed, and closes its
+    /// window.
     pub fn forget(&mut self, token: u64) {
+        self.windows.close(token);
         self.made.remove(&token);
         self.restarted.remove(&token);
         self.given_up.remove(&token);
@@ -268,8 +305,10 @@ impl Plugins {
         !self.made.is_empty()
     }
 
-    /// Forgets the instances made: a new engine starts with none.
+    /// Forgets the instances made, closing their windows: a new engine
+    /// starts with none.
     pub fn forget_made(&mut self) {
+        self.windows.close_all();
         self.made.clear();
         self.restarted.clear();
         self.given_up.clear();

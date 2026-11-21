@@ -246,6 +246,9 @@ struct Gui {
     pipe: Option<(i32, i32)>,
     timer_calls: u32,
     fd_calls: u32,
+    /// Parameters changed in its window (`poke` 11), by id, for the host
+    /// to hear of in its next process or flush call.
+    told: Vec<(u32, f64)>,
 }
 
 /// What `org.tinvo.test.gui` reports; `tests/clap.rs` has the same.
@@ -277,8 +280,10 @@ struct GuiTestExt {
     /// `register_timer(a)` (kept), 6 `unregister_timer` of the last kept
     /// (or, with none left, the one it last unregistered, again), 7
     /// `register_fd(a, b)`, 8 `modify_fd(a, b)`, 9 `unregister_fd(a)`; 10
-    /// sets a trap (see `Gui::trap`) to `a`. Returns what the host
-    /// answered.
+    /// sets a trap (see `Gui::trap`) to `a`; 11 sets parameter `a` to `b`
+    /// thousandths, as a knob in its window would, telling the host in its
+    /// next process or flush call, which it asks for (`request_flush`).
+    /// Returns what the host answered.
     poke: unsafe extern "C" fn(plugin: *const ClapPlugin, what: u32, a: u32, b: u32) -> bool,
 }
 
@@ -754,6 +759,15 @@ unsafe extern "C" fn gui_poke(p: *const ClapPlugin, what: u32, a: u32, b: u32) -
                 me.gui().trap = a;
                 true
             }
+            11 => {
+                let value = f64::from(b) / 1000.0;
+                me.set_value(a, value);
+                me.gui().told.push((a, value));
+                me.host_params().and_then(|p| p.request_flush).is_some_and(|f| {
+                    f(me.host);
+                    true
+                })
+            }
             _ => false,
         }
     }
@@ -1044,6 +1058,41 @@ impl Instance {
         self.params_set.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Tells the host, through `out`, of the parameters changed in its
+    /// window; left for the next call if the window holds them now.
+    fn tell_told(&self, out: &ClapOutputEvents) {
+        let Ok(mut g) = self.gui.try_lock() else {
+            // Asked for again from the main thread (`request_flush` is not
+            // the audio thread's to call), so a call comes for them even to
+            // a plugin its host only flushes.
+            self.ask_callback();
+            return;
+        };
+        g.told.retain(|&(param_id, value)| {
+            let e = ClapEventParamValue {
+                header: ClapEventHeader {
+                    size: size_of::<ClapEventParamValue>() as u32,
+                    time: 0,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    kind: CLAP_EVENT_PARAM_VALUE,
+                    flags: 0,
+                },
+                param_id,
+                cookie: null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value,
+            };
+            // SAFETY: the host's list, given an event it may copy.
+            let pushed = out.try_push.is_some_and(|f| unsafe { f(out, (&raw const e).cast()) });
+            self.require(pushed);
+            // One the host refused is told next time.
+            !pushed
+        });
+    }
+
     fn ask_callback(&self) {
         // SAFETY: the host's thread-safe callback.
         unsafe {
@@ -1053,7 +1102,8 @@ impl Instance {
         }
     }
 
-    /// The host's `clap.params`, on the main thread.
+    /// The host's `clap.params`, whose `request_flush` may be called from
+    /// any thread.
     fn host_params(&self) -> Option<&ClapHostParams> {
         // SAFETY: the host's own extension, valid while the plugin lives.
         unsafe { self.host_extension(CLAP_EXT_PARAMS).cast::<ClapHostParams>().as_ref() }
@@ -1246,6 +1296,8 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
         me.ask_restart_and_callback();
         return CLAP_PROCESS_ERROR;
     }
+    // SAFETY: the host's output list for this call.
+    me.tell_told(unsafe { &*pr.out_events });
     let (inputs, outputs) = ports(me.sine);
     if pr.audio_inputs_count as usize != inputs.len() || pr.audio_outputs_count as usize != outputs.len() {
         me.broke();
@@ -1651,7 +1703,7 @@ unsafe extern "C" fn params_from_text(p: *const ClapPlugin, id: ClapId, text: *c
     true
 }
 
-unsafe extern "C" fn params_flush(p: *const ClapPlugin, input: *const ClapInputEvents, _out: *const ClapOutputEvents) {
+unsafe extern "C" fn params_flush(p: *const ClapPlugin, input: *const ClapInputEvents, out: *const ClapOutputEvents) {
     // SAFETY: as above.
     let me = unsafe { me(p) };
     // An active plugin flushes on the audio thread, not while it processes.
@@ -1679,6 +1731,10 @@ unsafe extern "C" fn params_flush(p: *const ClapPlugin, input: *const ClapInputE
             me.require(!(processed && me.active.load(Ordering::Relaxed)));
             me.take_param(e);
         }
+    }
+    // SAFETY: the host's list, valid during this call.
+    if let Some(out) = unsafe { out.as_ref() } {
+        me.tell_told(out);
     }
 }
 
@@ -1812,6 +1868,13 @@ unsafe extern "C" fn plugin_on_main_thread(p: *const ClapPlugin) {
     let me = unsafe { me(p) };
     me.on_main();
     me.callbacks.fetch_add(1, Ordering::Relaxed);
+    // What its window changed and a call could not take yet.
+    if !me.gui().told.is_empty() {
+        if let Some(f) = me.host_params().and_then(|p| p.request_flush) {
+            // SAFETY: the host's own function, on the main thread.
+            unsafe { f(me.host) };
+        }
+    }
     if mode() == Mode::ProcessErrors {
         me.ask_restart_and_callback();
     }

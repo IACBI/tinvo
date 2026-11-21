@@ -200,12 +200,25 @@ actions! {
     EffectLater "effect_later" Params [c('>')] "inserts page: move the effect a slot later";
     RemoveEffect "remove_effect" Params [c('-')] "inserts page: empty the slot";
     InsertChain "insert_chain" Params [c(';')] "inserts page: the track's chain, its group's or the master's";
+    PluginWindow "plugin_window" Params [c('c')] "the plugin's own window, from a plugin track's instrument page, a plugin's page or its slot on the inserts page; again closes it";
 }
 
 impl Action {
     pub fn from_id(id: &str) -> Option<Action> {
         Action::ALL.iter().copied().find(|a| a.id() == id)
     }
+}
+
+/// Actions whose default keys came after settings files could give those
+/// keys to other actions. A key a file gives another action, where both are
+/// active together, is taken from one of these instead of being refused, so
+/// a file written for an earlier TINVO still loads.
+const LATE: &[Action] = &[Action::PluginWindow];
+
+/// Whether `a` and `b` are active at the same time somewhere, so cannot
+/// share a key.
+fn together(a: Action, b: Action) -> bool {
+    a == b || TOGETHER.iter().any(|set| set.contains(&a.context()) && set.contains(&b.context()))
 }
 
 /// The keys of every action.
@@ -269,6 +282,34 @@ impl Keymap {
         keys.iter().map(|&k| key_label(k)).collect::<Vec<_>>().join(" ")
     }
 
+    /// Takes from each action of [`LATE`] that `bound` (the actions a
+    /// settings file gives keys) leaves at its defaults the keys an action
+    /// in `bound` has where the two are active together. One given keys of
+    /// its own keeps them, to clash as any other would.
+    pub fn yield_late_defaults(&mut self, bound: &[Action]) {
+        for &a in LATE {
+            if bound.contains(&a) || !self.at_default(a) {
+                continue;
+            }
+            let taken = |k: &Key| bound.iter().any(|&b| together(a, b) && self.keys(b).contains(k));
+            let kept: Vec<Key> = self.keys(a).iter().copied().filter(|k| !taken(k)).collect();
+            self.bind(a, kept);
+        }
+    }
+
+    /// Whether `a` has the keys it has by default: its defaults, or for one
+    /// of [`LATE`] those of them no action active with it has.
+    pub fn at_default(&self, a: Action) -> bool {
+        if self.keys(a) == a.defaults() {
+            return true;
+        }
+        let held = |k: &Key| Action::ALL.iter().any(|&b| b != a && together(a, b) && self.keys(b).contains(k));
+        LATE.contains(&a) && {
+            let free: Vec<Key> = a.defaults().iter().copied().filter(|k| !held(k)).collect();
+            self.keys(a) == free.as_slice()
+        }
+    }
+
     /// Fails if a key is given twice where the actions it would start are
     /// active together.
     pub fn check(&self) -> Result<(), String> {
@@ -279,9 +320,7 @@ impl Keymap {
         let mut clashes = Vec::new();
         for (i, &a) in Action::ALL.iter().enumerate() {
             for &b in &Action::ALL[i + 1..] {
-                let together =
-                    a == b || TOGETHER.iter().any(|set| set.contains(&a.context()) && set.contains(&b.context()));
-                if !together {
+                if !together(a, b) {
                     continue;
                 }
                 for &k in self.keys(a) {
@@ -430,6 +469,27 @@ mod tests {
         k.check().unwrap();
         k.bind(Action::Undo, vec![Key::Char('u'), Key::Char('u')]);
         assert!(k.check().unwrap_err().contains("u is given twice to undo"));
+    }
+
+    #[test]
+    fn a_key_bound_in_settings_wins_over_a_later_default() {
+        let mut k = Keymap::default();
+        k.bind(Action::Default, vec![c('c')]);
+        assert!(k.check().is_err(), "a clash before yielding");
+        k.yield_late_defaults(&[Action::Default]);
+        k.check().unwrap();
+        assert!(k.keys(Action::PluginWindow).is_empty());
+        // Only where both are active, and only for a late action left at its
+        // defaults.
+        let mut k = Keymap::default();
+        k.bind(Action::Chord, vec![c('c'), c('q')]);
+        k.bind(Action::Quit, vec![c('Q')]);
+        k.yield_late_defaults(&[Action::Chord, Action::Quit]);
+        assert_eq!(k.keys(Action::PluginWindow), [c('c')], "the step's chord is never active with the panel");
+        let mut k = Keymap::default();
+        k.bind(Action::Default, vec![c('c')]);
+        k.yield_late_defaults(&[Action::Default, Action::PluginWindow]);
+        assert!(k.check().is_err(), "both given by the file");
     }
 
     #[test]

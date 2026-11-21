@@ -16,6 +16,7 @@
 //! for while a call into the plugin runs is kept, and served after it.
 
 use super::*;
+use std::sync::atomic::AtomicU8;
 use std::time::{Duration, Instant};
 
 /// The shortest period a timer runs at: CLAP lets a host lengthen shorter
@@ -71,16 +72,56 @@ pub(super) struct Open {
     shown: bool,
 }
 
-/// What a plugin asked of its window since it was last served.
+/// What a plugin asked of its window since it was last served, in
+/// atomics: CLAP lets it ask from any thread, the audio thread among them,
+/// which must not wait on a lock the main thread holds.
 #[derive(Default)]
 pub(super) struct Asked {
-    /// Shown (true) or hidden (false): the last it asked for.
-    show: Option<bool>,
-    resize: Option<(u32, u32)>,
-    hints: bool,
+    /// [`Asked::SHOW`] or [`Asked::HIDE`], the last it asked for, or 0.
+    show: AtomicU8,
+    /// The size asked for, its width in the high half, or 0 for none (no
+    /// size asked for is 0 wide or high).
+    resize: AtomicU64,
+    hints: AtomicBool,
     /// It closed its window (whether it destroyed it too is
     /// `GuiData::gone`).
-    closed: bool,
+    closed: AtomicBool,
+}
+
+impl Asked {
+    const SHOW: u8 = 1;
+    const HIDE: u8 = 2;
+
+    fn ask_show(&self, show: bool) {
+        self.show.store(if show { Self::SHOW } else { Self::HIDE }, Ordering::Release);
+    }
+
+    fn take_show(&self) -> Option<bool> {
+        match self.show.swap(0, Ordering::AcqRel) {
+            Self::SHOW => Some(true),
+            Self::HIDE => Some(false),
+            _ => None,
+        }
+    }
+
+    fn ask_resize(&self, width: u32, height: u32) {
+        self.resize.store(u64::from(width) << 32 | u64::from(height), Ordering::Release);
+    }
+
+    fn take_resize(&self) -> Option<(u32, u32)> {
+        match self.resize.swap(0, Ordering::AcqRel) {
+            0 => None,
+            v => Some(((v >> 32) as u32, v as u32)),
+        }
+    }
+
+    /// Forgets everything asked.
+    fn clear(&self) {
+        self.show.store(0, Ordering::Release);
+        self.resize.store(0, Ordering::Release);
+        self.hints.store(false, Ordering::Release);
+        self.closed.store(false, Ordering::Release);
+    }
 }
 
 /// One of a plugin's timers.
@@ -104,7 +145,7 @@ pub(super) struct GuiData {
     /// The plugin destroyed its window itself (`closed(true)`): nothing but
     /// `destroy` is called from then on, set the moment it says so.
     gone: AtomicBool,
-    pub(super) asked: Mutex<Asked>,
+    pub(super) asked: Asked,
     pub(super) timers: Mutex<Vec<Timer>>,
     next_timer: AtomicU32,
     /// Its file descriptors, with the CLAP flags it waits for and a serial
@@ -208,7 +249,7 @@ unsafe fn on_main<'a>(host: *const ClapHost) -> Option<&'a HostData> {
 unsafe extern "C" fn host_gui_hints_changed(host: *const ClapHost) {
     // SAFETY: the pointer this instance was given.
     if let Some(h) = unsafe { host_data(host) } {
-        lock(&h.gui.asked).hints = true;
+        h.gui.asked.hints.store(true, Ordering::Release);
     }
 }
 
@@ -229,13 +270,13 @@ unsafe extern "C" fn host_gui_request_resize(host: *const ClapHost, width: u32, 
                 if ok {
                     o.size = (width, height);
                     o.sized = o.sized.wrapping_add(1);
-                    lock(&h.gui.asked).resize = None;
+                    h.gui.asked.resize.store(0, Ordering::Release);
                 }
                 return ok;
             }
         }
     }
-    lock(&h.gui.asked).resize = Some((width, height));
+    h.gui.asked.ask_resize(width, height);
     true
 }
 
@@ -244,7 +285,7 @@ unsafe extern "C" fn host_gui_request_show(host: *const ClapHost) -> bool {
     let Some(h) = (unsafe { host_data(host) }) else { return false };
     let open = h.gui.is_open.load(Ordering::Acquire);
     if open {
-        lock(&h.gui.asked).show = Some(true);
+        h.gui.asked.ask_show(true);
     }
     open
 }
@@ -254,7 +295,7 @@ unsafe extern "C" fn host_gui_request_hide(host: *const ClapHost) -> bool {
     let Some(h) = (unsafe { host_data(host) }) else { return false };
     let open = h.gui.is_open.load(Ordering::Acquire);
     if open {
-        lock(&h.gui.asked).show = Some(false);
+        h.gui.asked.ask_show(false);
     }
     open
 }
@@ -265,7 +306,7 @@ unsafe extern "C" fn host_gui_closed(host: *const ClapHost, was_destroyed: bool)
         if was_destroyed {
             h.gui.gone.store(true, Ordering::Release);
         }
-        lock(&h.gui.asked).closed = true;
+        h.gui.asked.closed.store(true, Ordering::Release);
     }
 }
 
@@ -363,7 +404,7 @@ pub(super) unsafe fn close(h: &HostData, plugin: *const ClapPlugin, gui: GuiFns)
     }
     drop(open);
     // What it asked of the window it had is nothing to the next.
-    *lock(&h.gui.asked) = Asked::default();
+    h.gui.asked.clear();
 }
 
 impl HostData {
@@ -385,13 +426,9 @@ impl HostData {
         let Some(gui) = self.exts.get().and_then(|e| e.gui) else { return };
         // A resize stays asked for until it is served, so one the plugin
         // gets on the main thread meanwhile (inside `show`, say) cancels it.
-        let asked = {
-            let mut a = lock(&self.gui.asked);
-            let resize = a.resize.take();
-            let asked = std::mem::take(&mut *a);
-            a.resize = resize;
-            asked
-        };
+        let a = &self.gui.asked;
+        let (was_closed, show, hints) =
+            (a.closed.swap(false, Ordering::AcqRel), a.take_show(), a.hints.swap(false, Ordering::AcqRel));
         if !self.gui.is_open.load(Ordering::Acquire) {
             return;
         }
@@ -402,17 +439,17 @@ impl HostData {
             unsafe { close(self, plugin, gui) };
             requests.push(Request::GuiClosed(self.token));
         };
-        if asked.closed {
+        if was_closed {
             return closed(requests);
         }
-        if let Some(show) = asked.show {
+        if let Some(show) = show {
             self.set_shown(plugin, gui, show);
         }
-        if self.gui.gone.load(Ordering::Acquire) {
+        // A close asked for since, from another thread, wins over the rest.
+        if self.gui.gone.load(Ordering::Acquire) || a.closed.swap(false, Ordering::AcqRel) {
             return closed(requests);
         }
-        let resize = lock(&self.gui.asked).resize.take();
-        if let Some((w, h)) = resize {
+        if let Some((w, h)) = self.gui.asked.take_resize() {
             let refused = {
                 let mut open = lock(&self.gui.open);
                 match open.as_mut().filter(|o| o.mode == GuiMode::Embedded) {
@@ -436,7 +473,7 @@ impl HostData {
                 return closed(requests);
             }
         }
-        if asked.hints {
+        if hints {
             // SAFETY: as above.
             let hints = unsafe { resize_hints(self, plugin, gui) };
             if let Some(p) = lock(&self.gui.open).as_mut().and_then(|o| o.parent.as_mut()) {

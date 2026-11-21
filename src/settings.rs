@@ -266,6 +266,7 @@ pub fn parse(text: &str) -> Result<Settings, String> {
             }
         }
     }
+    keys.yield_late_defaults(&bound);
     keys.check()?;
     let base = base.unwrap_or(theme::BUILT_IN[0]);
     let mut theme = Theme::built_in(base).unwrap_or_default();
@@ -346,11 +347,16 @@ pub fn merge(base: &Settings, ours: &Settings, theirs: &Settings) -> Settings {
         out.set_base(ours.base);
         rebased.set_base(ours.base);
     }
+    let mut changed = Vec::new();
     for &a in Action::ALL.iter() {
         if ours.keys.keys(a) != base.keys.keys(a) {
             out.keys.bind(a, ours.keys.keys(a).to_vec());
+            changed.push(a);
         }
     }
+    // A later action's default gives way to a key this session gave, as
+    // when the file is read.
+    out.keys.yield_late_defaults(&changed);
     for &r in Role::ALL.iter() {
         if ours.theme.get(r) != rebased.theme.get(r) {
             out.theme.set(r, ours.theme.get(r));
@@ -446,7 +452,7 @@ pub fn update_text(old: &str, new: &Settings) -> Result<String, String> {
     // Lines for settings without one that now differ from their default.
     let mut add: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for &a in Action::ALL {
-        if !has_key[a as usize] && new.keys.keys(a) != a.defaults() {
+        if !has_key[a as usize] && !new.keys.at_default(a) {
             let v = keys_value(&new.keys, a);
             add[0].push(if v.is_empty() { format!("{} =", a.id()) } else { format!("{} = {v}", a.id()) });
         }
@@ -670,6 +676,43 @@ mod tests {
             let err = parse(text).unwrap_err();
             assert!(err.contains(want), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_file_from_before_a_new_key_still_loads() {
+        // Written when `c` was free in the panel: the new default gives way.
+        let s = parse("[keys]\ndefault = c\n").unwrap();
+        assert_eq!(s.keys.keys(Action::Default), [Key::Char('c')]);
+        assert!(s.keys.keys(Action::PluginWindow).is_empty());
+        let err = parse("[keys]\ndefault = c\nplugin_window = c\n").unwrap_err();
+        assert!(err.contains("c is bound to both default and plugin_window"), "{err}");
+    }
+
+    #[test]
+    fn a_new_key_given_way_stays_implicit_when_saved_and_merged() {
+        let base = parse("[keys]\ndefault = c\n").unwrap();
+        let mut new = base.clone();
+        new.mouse = !new.mouse;
+        let text = update_text("[keys]\ndefault = c\n", &new).unwrap();
+        assert!(!text.contains("plugin_window"), "{text}");
+        assert_eq!(parse(&text).unwrap(), new);
+        // `c` moved to another action here while another session put
+        // `default` back: the window's default still gives way.
+        let mut ours = base.clone();
+        ours.keys.bind(Action::Default, vec![Key::Char('0')]);
+        ours.keys.bind(Action::InsertChain, vec![Key::Char('c')]);
+        let merged = merge(&base, &ours, &Settings::default());
+        merged.keys.check().unwrap();
+        assert_eq!(merged.keys.keys(Action::InsertChain), [Key::Char('c')]);
+        assert!(merged.keys.keys(Action::PluginWindow).is_empty());
+        // A key of its own another session gave it is kept, and clashes.
+        let mut theirs = Settings::default();
+        theirs.keys.bind(Action::PluginWindow, vec![Key::F(11)]);
+        let mut ours = Settings::default();
+        ours.keys.bind(Action::Undo, vec![Key::F(11)]);
+        let merged = merge(&Settings::default(), &ours, &theirs);
+        assert_eq!(merged.keys.keys(Action::PluginWindow), [Key::F(11)]);
+        assert!(merged.keys.check().unwrap_err().contains("f11 is bound to both undo and plugin_window"));
     }
 
     #[test]

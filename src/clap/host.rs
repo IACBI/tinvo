@@ -2116,4 +2116,13 @@ impl PluginHandle {
     pub fn delivered(&self) -> u64 {
         self.host.delivered.load(Ordering::Acquire)
     }
+
+    /// Whether its state changed since the host's last poll said so
+    /// ([`Request::StateDirty`]), which the next poll then does not: for an
+    /// owner whose instances go before it can poll, such as when their
+    /// engine's stream ends (the poll destroys the instances that came
+    /// home first).
+    pub fn take_state_dirty(&self) -> bool {
+        self.host.dirty.swap(false, Ordering::AcqRel)
+    }
 }
