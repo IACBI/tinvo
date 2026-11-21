@@ -1747,23 +1747,73 @@ impl App {
     /// Drops loaded samples nothing can bring back: no track uses them and
     /// no step of the undo or redo history refers to them.
     fn prune_bank(&mut self) {
+        self.prune_bank_within(sample_mod::PROJECT_FRAMES);
+    }
+
+    /// [`App::prune_bank`], keeping the history's samples that no track plays
+    /// only while they add up to at most `budget` frames, the steps nearest
+    /// the present first, undo and redo alike; an undo or redo reads the
+    /// rest again from disk.
+    fn prune_bank_within(&mut self, budget: usize) {
         let Self { bank, project, undo, redo, .. } = self;
         if bank.is_empty() {
             return;
         }
-        let history =
-            undo.iter().chain(redo.iter()).flat_map(|c| c.meta_before.tracks.iter().chain(&c.meta_after.tracks));
-        let mut used: std::collections::HashSet<&str> =
+        let mut keep: std::collections::HashSet<&str> =
             project.tracks.iter().flat_map(TrackData::sample_paths).collect();
         // Steps share a track's zones until they change: each list is read once.
         let mut lists = std::collections::HashSet::new();
+        let mut spent = 0;
+        // Nearest first, undo and redo alike.
+        let (u, r) = (undo.len(), redo.len());
+        let steps =
+            (1..=u.max(r)).flat_map(|n| [u.checked_sub(n).map(|i| &undo[i]), r.checked_sub(n).map(|i| &redo[i])]);
+        let history = steps.flatten().flat_map(|c| c.meta_before.tracks.iter().chain(&c.meta_after.tracks));
         for m in history {
-            used.extend(m.sample.as_deref());
-            if lists.insert(Arc::as_ptr(&m.zones).cast::<ZoneData>()) {
-                used.extend(m.zones.iter().map(|z| z.path.as_str()));
+            let zones =
+                lists.insert(Arc::as_ptr(&m.zones).cast::<ZoneData>()).then(|| m.zones.iter().map(|z| z.path.as_str()));
+            for path in m.sample.as_deref().into_iter().chain(zones.into_iter().flatten()) {
+                if let (false, Some(s)) = (keep.contains(path), bank.get(path)) {
+                    if spent + s.frames() <= budget {
+                        spent += s.frames();
+                        keep.insert(path);
+                    }
+                }
             }
         }
-        bank.retain(|path, _| used.contains(path.as_str()));
+        bank.retain(|path, _| keep.contains(path.as_str()));
+    }
+
+    /// Reads again the files the tracks play that are not loaded (let go to
+    /// keep the history small, or missing until now), as far as the
+    /// project's budget allows, and sends the tracks that play them.
+    fn reload_missing(&mut self) {
+        let mut paths: Vec<&str> = self.project.tracks.iter().flat_map(TrackData::sample_paths).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let (loaded, wanted): (Vec<&str>, Vec<&str>) = paths.into_iter().partition(|p| self.bank.contains_key(*p));
+        if wanted.is_empty() {
+            return;
+        }
+        let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.frames()).sum();
+        let mut got = Vec::new();
+        for p in wanted {
+            let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
+            if let Ok(s) = sample_mod::load_within(Path::new(p), left) {
+                used += s.frames();
+                got.push((p.to_string(), Arc::new(s)));
+            }
+        }
+        if got.is_empty() {
+            return;
+        }
+        let tracks: Vec<usize> = (0..self.track_count())
+            .filter(|&i| self.project.tracks[i].sample_paths().any(|p| got.iter().any(|(k, _)| k == p)))
+            .collect();
+        self.bank.extend(got);
+        for i in tracks {
+            self.send_sample(i);
+        }
     }
 
     /// Applies an edit to the project and mirrors it to the engine, without
@@ -2035,6 +2085,176 @@ impl App {
         Ok(())
     }
 
+    /// Imports an SFZ instrument into sampler track `track`, as one undo
+    /// step: its regions become the track's zones, in place of its sample
+    /// and zones, and its first zone's envelope sets the track's. A file
+    /// already loaded is used as it is; a region whose file does not load
+    /// is left out and named.
+    fn import_sfz(&mut self, track: usize, text: &str) -> Result<(), String> {
+        let path = sample_mod::absolute(text);
+        let name = path.file_name().map_or_else(|| text.to_string(), |n| n.to_string_lossy().into_owned());
+        let inst = crate::sfz::read_file(&path).map_err(|e| format!("Cannot import {name}: {e}"))?;
+        let dir = path.parent().unwrap_or(Path::new(""));
+        // The other tracks' files count against the budget, each once.
+        let mut others: Vec<&str> = (0..self.track_count())
+            .filter(|&i| i != track)
+            .flat_map(|i| self.project.tracks[i].sample_paths())
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let mut failed = std::collections::BTreeMap::<String, String>::new();
+        let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
+        // First what each file holds, from what is loaded or the file's
+        // header, so a file none of whose regions play costs nothing.
+        let mut infos = HashMap::<String, crate::sfz::FileInfo>::new();
+        let mut playable = Vec::new();
+        for r in &inst.regions {
+            let key = sample_mod::absolute(&dir.join(&r.path).to_string_lossy()).to_string_lossy().into_owned();
+            if failed.contains_key(&key) {
+                continue;
+            }
+            if !infos.contains_key(&key) {
+                let info = match (self.bank.get(&key), sample_mod::unstorable(&key)) {
+                    (Some(s), _) => Ok(crate::sfz::FileInfo::from(&**s)),
+                    (None, Some(why)) => Err(why.to_string()),
+                    (None, None) => crate::sfz::FileInfo::read(Path::new(&key)),
+                };
+                match info {
+                    Ok(info) => infos.insert(key.clone(), info),
+                    Err(e) => {
+                        failed.insert(key, e);
+                        continue;
+                    }
+                };
+            }
+            match r.resolve(&infos[&key]) {
+                Ok(_) => playable.push((r, key)),
+                Err(why) => *skipped.entry(why).or_default() += 1,
+            }
+        }
+        let mut loaded = HashMap::<String, Arc<Sample>>::new();
+        let mut read_now = Vec::new();
+        let (mut zones, mut envelope) = (Vec::new(), None);
+        for (r, key) in playable {
+            if failed.contains_key(&key) {
+                continue;
+            }
+            let sample = if let Some(s) = loaded.get(&key) {
+                Arc::clone(s)
+            } else {
+                let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
+                // Only what the other tracks have loaded is in `used`.
+                let counted = others.binary_search(&key.as_str()).is_ok() && self.bank.contains_key(&key);
+                let read = match self.bank.get(&key) {
+                    Some(s) if counted || s.frames() <= left => Ok(Arc::clone(s)),
+                    Some(s) => Err(format!("{} frames, more than the {left} left of the project's", s.frames())),
+                    None => sample_mod::load_within(Path::new(&key), left)
+                        .map(Arc::new)
+                        .map_err(|e| e.strip_prefix(&format!("{key}: ")).map_or(e.clone(), str::to_string)),
+                };
+                match read {
+                    Ok(s) => {
+                        if !counted {
+                            used += s.frames();
+                        }
+                        if !self.bank.contains_key(&key) {
+                            read_now.push(key.clone());
+                        }
+                        loaded.insert(key.clone(), Arc::clone(&s));
+                        s
+                    }
+                    Err(e) => {
+                        failed.insert(key, e);
+                        continue;
+                    }
+                }
+            };
+            // Against what was read, in case the file changed since its
+            // header was.
+            match r.resolve(&crate::sfz::FileInfo::from(&*sample)) {
+                Ok(place) => {
+                    envelope.get_or_insert(r.envelope);
+                    zones.push(ZoneData { place, path: key });
+                }
+                Err(why) => *skipped.entry(why).or_default() += 1,
+            }
+        }
+        let Some(envelope) = envelope else {
+            let first = match (failed.iter().next(), skipped.iter().next()) {
+                (Some((k, e)), _) => format!(" ({k}: {e})"),
+                (None, Some((why, n))) => format!(" ({n} {}: {why})", if *n == 1 { "region" } else { "regions" }),
+                (None, None) => String::new(),
+            };
+            return Err(format!("Cannot import {name}: no region's file loads and plays{first}"));
+        };
+        let files = loaded.len();
+        self.bank.extend(loaded);
+        let meta_before = self.meta();
+        let t = &mut self.project.tracks[track];
+        t.sample = None;
+        t.zones = zones.into();
+        let count = t.zones.len();
+        self.send_sample(track);
+        // Other tracks that play a file only now loaded (it was missing).
+        for i in (0..self.track_count()).filter(|&i| i != track) {
+            if self.project.tracks[i].sample_paths().any(|p| read_now.iter().any(|k| k == p)) {
+                self.send_sample(i);
+            }
+        }
+        let set = [
+            ("attack", envelope.attack),
+            ("decay", envelope.decay),
+            ("sustain", envelope.sustain),
+            ("release", envelope.release),
+        ];
+        let specs = InstrumentKind::Sampler.params();
+        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
+        for (id, value) in set {
+            let Some(index) = specs.iter().position(|s| s.id == id) else { continue };
+            let e = Edit::SetParam { track: track as u8, index: index as u8, value: specs[index].clamp(value) };
+            let Ok(inverse) = self.project.inverse(&e) else { continue };
+            if let Some(applied) = self.apply_raw(e) {
+                inverses.push(inverse);
+                redo.push(applied);
+            }
+        }
+        self.touch();
+        self.redo.clear();
+        let meta_after = self.meta();
+        self.push_change(Change {
+            undo: inverses.into_iter().rev().flatten().collect(),
+            redo,
+            meta_before,
+            meta_after,
+            what: "import SFZ",
+            key: None,
+            at: Instant::now(),
+            param: None,
+        });
+        let mut notes = Vec::new();
+        if let Some((k, e)) = failed.iter().next() {
+            let n = failed.len();
+            notes.push(format!("{n} {} not loaded: {k}: {e}", if n == 1 { "file" } else { "files" }));
+        }
+        for (why, n) in skipped {
+            notes.push(format!("{n} {} skipped: {why}", if n == 1 { "region" } else { "regions" }));
+        }
+        notes.extend(inst.notes);
+        let zones = if count == 1 { "1 zone".to_string() } else { format!("{count} zones") };
+        let from = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
+        let mut msg = format!("Imported {name}: {zones} from {from}");
+        for n in &notes {
+            msg.push_str(" · ");
+            msg.push_str(n);
+        }
+        if !notes.is_empty() {
+            msg.push_str(&format!(" · tinvo sfz {} lists it all", path.display()));
+        }
+        self.set_status(msg);
+        Ok(())
+    }
+
     pub fn undo(&mut self) {
         let Some(c) = self.undo.pop_back() else {
             self.set_status("Nothing to undo");
@@ -2047,11 +2267,14 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.undo.clone(), &c.meta_before.clone(), &mut c.meta_after);
+        self.reload_missing();
         if let Some(p) = c.param {
             self.send_plugin_param(p.place, p.plugin, p.id, p.before);
         }
         self.after_history_move(&c, "Undid");
         self.redo.push(c);
+        // What the step walked away from may be more than the budget keeps.
+        self.prune_bank();
     }
 
     pub fn redo(&mut self) {
@@ -2066,6 +2289,7 @@ impl App {
         }
         let mut c = c;
         self.apply_history(&c.redo.clone(), &c.meta_after.clone(), &mut c.meta_before);
+        self.reload_missing();
         // With edits, those (a lane's base) give the value again.
         if let Some(p) = c.param.filter(|_| c.redo.is_empty()) {
             self.send_plugin_param(p.place, p.plugin, p.id, p.after);
@@ -2073,6 +2297,7 @@ impl App {
         self.after_history_move(&c, "Redid");
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
+        self.prune_bank();
     }
 
     /// Whether the samples the tracks of `meta` play, as loaded now, hold
@@ -3364,7 +3589,12 @@ impl App {
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => {
-                        if let Err(e) = self.load_sample(self.track, &text) {
+                        let done = if crate::sfz::is_sfz(&text) {
+                            self.import_sfz(self.track, &text)
+                        } else {
+                            self.load_sample(self.track, &text)
+                        };
+                        if let Err(e) = done {
                             self.set_status(e);
                         }
                     }
@@ -6282,7 +6512,7 @@ impl App {
                     PromptKind::SaveAs => "Save as: ".to_string(),
                     PromptKind::Rename => "Track name: ".to_string(),
                     PromptKind::RenameGroup => "Group name: ".to_string(),
-                    PromptKind::LoadSample => "Load WAV sample: ".to_string(),
+                    PromptKind::LoadSample => "Load WAV sample or SFZ instrument: ".to_string(),
                     PromptKind::Marker => {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
                     }
@@ -8708,6 +8938,141 @@ mod tests {
     }
 
     #[test]
+    fn the_history_keeps_its_samples_within_a_budget_and_reads_the_rest_again() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(format!("{n}.wav"));
+                wav::write_file(&p, &[0.5; 100], 1, 48_000, SampleFormat::Float32).unwrap();
+                p.display().to_string()
+            })
+            .collect();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let t = p.tracks.len() - 1;
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a = App::new(p, None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "test".into());
+        a.track = t;
+        for path in &paths {
+            a.mode = Mode::Prompt(PromptKind::LoadSample, path.clone());
+            keys(&mut a, &[Key::Enter]);
+        }
+        assert_eq!(a.bank.len(), 3, "the history keeps what fits");
+        // Room for one sample no track plays: the nearest step's.
+        a.prune_bank_within(150);
+        assert!(!a.bank.contains_key(&paths[0]) && a.bank.contains_key(&paths[1]) && a.bank.contains_key(&paths[2]));
+        a.undo();
+        a.undo();
+        assert_eq!(a.project.tracks[t].sample.as_deref(), Some(paths[0].as_str()));
+        assert!(a.bank.contains_key(&paths[0]), "read again from disk");
+        let mut last = None;
+        while let Some(cmd) = rx.pop() {
+            if let Command::SetSamples { track, map } = cmd {
+                last = Some((usize::from(track), map.is_some()));
+            }
+        }
+        assert_eq!(last, Some((t, true)), "and sent");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_sfz_instrument_imports_as_zones_in_one_undo_step() {
+        use crate::instrument::zone::Mode as ZoneMode;
+        let dir = std::env::temp_dir().join(format!("tinvo-app-sfz-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("samples")).unwrap();
+        let (lo, hi, old) =
+            (dir.join("samples").join("lo.wav"), dir.join("samples").join("hi.wav"), dir.join("old.wav"));
+        std::fs::write(&lo, wav::tests::with_smpl(480, 50, None)).unwrap();
+        wav::write_file(&hi, &[0.5; 960], 1, 48_000, SampleFormat::Float32).unwrap();
+        wav::write_file(&old, &[0.5; 100], 1, 48_000, SampleFormat::Float32).unwrap();
+        let far = dir.join("samples").join("far.wav");
+        wav::write_file(&far, &[0.5; 100], 1, 48_000, SampleFormat::Float32).unwrap();
+        let sfz = dir.join("piano.sfz");
+        std::fs::write(
+            &sfz,
+            "<control> default_path=samples\\\n<global> ampeg_attack=0.01 ampeg_release=0.5\n\
+             <region> sample=gone.wav key=100 ampeg_release=2\n\
+             <region> sample=lo.wav lokey=0 hikey=59 pitch_keycenter=sample loop_mode=loop_sustain\n\
+             <region> sample=hi.wav lokey=60 hikey=127 cutoff=100\n<region> sample=hi.wav key=60 trigger=release\n\
+             <region> sample=far.wav key=61 offset=5000\n",
+        )
+        .unwrap();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let t = p.tracks.len() - 1;
+        p.tracks[t].sample = Some(old.display().to_string());
+        // Another track plays a file the instrument shares, not loaded yet.
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let other = p.tracks.len() - 1;
+        p.tracks[other].sample = Some(hi.display().to_string());
+        let (mut bank, errors) = p.load_samples();
+        assert!(errors.is_empty(), "{errors:?}");
+        bank.remove(&hi.display().to_string());
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(p, None, Some(link), 48_000, "test".into()).with_bank(bank);
+        a.track = t;
+        let release = InstrumentKind::Sampler.params().iter().position(|s| s.id == "release").unwrap();
+        let before = (a.project.tracks[t].clone(), a.project.tracks[t].params[release]);
+        while rx.pop().is_some() {}
+        a.mode = Mode::Prompt(PromptKind::LoadSample, sfz.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        let said = a.status_text().unwrap().to_string();
+        for want in [
+            "Imported piano.sfz: 3 zones from 2 files",
+            "1 file not loaded: ",
+            "gone.wav",
+            "1 region skipped: starts past its file's end",
+            "not used: cutoff",
+            "tinvo sfz ",
+        ] {
+            assert!(said.contains(want), "{want} in {said}");
+        }
+        assert_eq!(said.matches("gone.wav").count(), 1, "named once: {said}");
+        assert!(!a.bank.contains_key(&far.display().to_string()), "a file none of whose regions play is not kept");
+        let tr = &a.project.tracks[t];
+        assert_eq!(tr.sample, None, "the instrument takes the sample's place");
+        let z: Vec<_> = tr.zones.iter().map(|z| (z.path.clone(), z.place.keys, z.place.root, z.place.mode)).collect();
+        let (lo_key, hi_key) = (lo.display().to_string(), hi.display().to_string());
+        assert_eq!(
+            z[0],
+            (lo_key, (0, 59), Some(50), ZoneMode::Sustain(Some((0, 480)))),
+            "the root key from the file, the whole file looped"
+        );
+        assert_eq!(z[1], (hi_key, (60, 127), Some(60), ZoneMode::NoLoop), "a file with no loop of its own plays once");
+        assert_eq!(tr.params[release], 0.5, "the envelope of the first zone that plays");
+        let mut sent = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            if let Command::SetSamples { track, map } = cmd {
+                sent.push((usize::from(track), map.map(|m| m.zones().len())));
+            }
+        }
+        assert_eq!(sent, [(t, Some(3)), (other, Some(1))], "the other track plays the file now loaded too");
+        // One step takes it all back, and brings it again.
+        a.undo();
+        assert_eq!((a.project.tracks[t].clone(), a.project.tracks[t].params[release]), before);
+        a.redo();
+        assert_eq!((a.project.tracks[t].zones.len(), a.project.tracks[t].sample.clone()), (3, None));
+        // An instrument with nothing to play changes nothing.
+        std::fs::write(dir.join("empty.sfz"), "<region> sample=gone.wav").unwrap();
+        let zones = a.project.tracks[t].zones.clone();
+        a.mode = Mode::Prompt(PromptKind::LoadSample, dir.join("empty.sfz").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(
+            a.status_text().unwrap().starts_with("Cannot import empty.sfz: no region's file loads"),
+            "{:?}",
+            a.status_text()
+        );
+        a.mode = Mode::Prompt(PromptKind::LoadSample, dir.join("nope.SFZ").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Cannot import nope.SFZ: "), "{:?}", a.status_text());
+        assert_eq!(a.project.tracks[t].zones, zones);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_sampler_track_s_zones_play_show_and_come_back() {
         use crate::instrument::zone::{Placement, Trigger};
         let dir = std::env::temp_dir().join(format!("tinvo-app-zones-{}", std::process::id()));
@@ -10126,7 +10491,7 @@ mod tests {
         // At the start, the start of the text shows.
         keys(&mut a, &[Key::Home]);
         a.draw(&mut s);
-        assert!(s.row_text(19).contains("Load WAV sample: 钢琴钢"), "{}", s.row_text(19));
+        assert!(s.row_text(19).contains("Load WAV sample or SFZ instrument: 钢琴钢"), "{}", s.row_text(19));
     }
 
     #[test]

@@ -7,13 +7,22 @@ Author: 𝓐.𝓒.𝓑
 ## [Unreleased]
 
 ### Added
-- Zones in a sampler track: sample files laid over the keyboard by key and velocity range, each with its own root key, tuning, gain and part of its file. Zones of one range layer, zones can take turns (round robin), and release zones sound when a key comes up, at the velocity it went down with. The track's tune, start, end and loop settings apply to each zone. A zone whose file is missing is left out; the panel's title counts the zones and the missing files, and a WAV export waits for every file.
-- Project format 18: `zone` lines in sampler tracks. Format 17 files still load.
+- Zones in a sampler track: sample files laid over the keyboard by key and velocity range, each with its own root key, tuning, gain and part of its file. Zones of one range layer, zones can take turns (round robin), and release zones sound when a key comes up, at the velocity it went down with. The track's tune, start and end settings apply to each zone, and its mode and loop settings to the zones that follow the track's mode. Turns start over when playback starts, so a song plays as it exports. A zone whose file is missing is left out; the panel's title counts the zones and the missing files, and a WAV export waits for every file.
+- SFZ import: `o` on a sampler track takes an `.sfz` file as well as a WAV file. Its regions become the track's zones, in place of its sample and zones, and its amplitude envelope sets the track's, as one undo step. The reader takes `<control>`, `<global>`, `<master>`, `<group>` and `<region>` headers, `#define` and `#include`, and the opcodes a zone can play: `sample` with `default_path`, `key`, `lokey`/`hikey` (numbers or note names, with `note_offset` and `octave_offset`), `pitch_keycenter` (`sample` takes the file's own), `lovel`/`hivel`, `seq_length`/`seq_position`, `lorand`/`hirand`, `trigger`, `tune`, `transpose`, `volume` and `amplitude`, `offset`/`end`, `loop_mode` (a loop asked for by name, with no points in the SFZ or the WAV file, loops the whole file; a region whose loop points cannot play, reversed or past its file, plays once), `loop_start`/`loop_end` (either alone keeps the file's other point) and the `ampeg_` attack, decay, sustain and release (SFZ's defaults where left out). A keyswitched instrument keeps one articulation: `sw_default`'s, or the first region's, among the keys from `sw_lokey` to `sw_hikey`. `trigger=release_key` plays as `release`, after the sustain pedal. A file already loaded is used as it is, and a file is read only if one of its regions plays. A negative key switches a keyswitch condition off, and `amplitude=0` silences a region. A `//` comment straight after an `=` stays a comment unless a UNC path follows (`//server/share`). What it leaves out is named in the status line: opcodes it does not use, regions it skips and why, files that do not load.
+- `tinvo sfz INSTRUMENT.sfz` prints what the sampler would play of an instrument and everything it leaves out.
+- Zones that take turns at random (`lorand`/`hirand`), drawn the same way each time playback starts and in an export; a key's release zones draw as its attack did.
+- A loop mode of each zone's own: no loop, one-shot, a continuous loop or a loop while the key is held, with loop points of its own or the file's. A zone in the track's mode follows the track's settings as before.
+- WAV files' `smpl` chunk: a sample's own forward loop and root key are read.
+- `tinvo fuzz sfz` fuzzes the SFZ reader; CI runs it with the other targets.
+- Project format 19: `zone` lines in sampler tracks, with their random range and mode. Files of format 18 (a development format that was never released) and older still load.
 
 ### Changed
 - A sampler plays 16 voices instead of 8. The sampler scenario of `tinvo bench` keeps all 16 sounding.
 - A WAV export refused for a missing sample names the track whose sample it is, as loading it again goes into the selected track.
 - A sample path that would start with whitespace relative to the project is saved whole, so it loads back unchanged.
+- A loop's interpolation reads its start past its end and, once round, its end before its start, so a loop no longer clicks where the file goes on after it or before it.
+- At full polyphony, a release sample playing to its end is no longer the first voice to give way.
+- The undo history keeps the samples no track plays only up to the project's sample budget, the steps nearest the present first, undo and redo alike, also after an undo or redo; an undo or redo reads the rest from disk again.
 
 ## [0.27.0] - 2026-11-21
 

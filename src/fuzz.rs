@@ -1,6 +1,6 @@
 //! Dependency-free fuzzing of what TINVO reads and keeps.
 //!
-//! Four targets, each with invariants checked on every input:
+//! Five targets, each with invariants checked on every input:
 //!
 //! - `project`: `.tvo` text. A file is either rejected with an error that
 //!   points at one of its lines, or accepted; an accepted project saves to
@@ -23,6 +23,11 @@
 //!   limits) that saves and loads back equal; its own export reads back,
 //!   and exporting that again gives the same project with nothing dropped;
 //!   and it renders without a non-finite sample.
+//! - `sfz`: SFZ instruments, includes and defines too. One is either
+//!   refused with an error or read, the same each time, into at most
+//!   [`MAX_ZONES`](crate::instrument::zone::MAX_ZONES) regions that each
+//!   can play; their zones save into a project that loads back equal, and
+//!   play without a non-finite sample.
 //!
 //! [`run`] mutates inputs from a corpus that starts as the seeds. It is not
 //! coverage-guided: that needs compiler instrumentation and a fuzzing
@@ -41,7 +46,7 @@ use crate::engine::{
 };
 use crate::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use crate::insert::{EffectKind, MAX_INSERT_PARAMS, MAX_SLOTS};
-use crate::instrument::zone::{Placement, Trigger};
+use crate::instrument::zone::{Mode, Placement, Trigger};
 use crate::instrument::{InstrumentKind, SampleMap};
 use crate::mix::{MIX_PARAMS, mp, send};
 use crate::project::{self, GroupData, LaneData, Project, SlotData, TrackData, sanitize_group_name, sanitize_name};
@@ -75,6 +80,7 @@ pub enum Target {
     Wav,
     Edits,
     Midi,
+    Sfz,
 }
 
 /// How a checked input ended, when no invariant broke.
@@ -87,7 +93,7 @@ struct Outcome {
 }
 
 impl Target {
-    pub const ALL: [Self; 4] = [Self::Project, Self::Wav, Self::Edits, Self::Midi];
+    pub const ALL: [Self; 5] = [Self::Project, Self::Wav, Self::Edits, Self::Midi, Self::Sfz];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -95,6 +101,7 @@ impl Target {
             Self::Wav => "wav",
             Self::Edits => "edits",
             Self::Midi => "midi",
+            Self::Sfz => "sfz",
         }
     }
 
@@ -113,6 +120,7 @@ impl Target {
             Self::Wav => wav_seeds(),
             Self::Edits => edit_seeds(),
             Self::Midi => midi_seeds(),
+            Self::Sfz => sfz_seeds(),
         }
     }
 
@@ -122,6 +130,7 @@ impl Target {
             Self::Wav => check_wav(input, render),
             Self::Edits => check_edits(input, render),
             Self::Midi => check_midi(input, render),
+            Self::Sfz => check_sfz(input, render),
         }
     }
 
@@ -130,6 +139,7 @@ impl Target {
             Self::Project => mutate_project(rng, input, corpus),
             Self::Wav => mutate_wav(rng, input, corpus),
             Self::Edits | Self::Midi => mutate_bytes(rng, input, corpus),
+            Self::Sfz => mutate_sfz(rng, input, corpus),
         }
     }
 }
@@ -845,7 +855,8 @@ fn check_midi(input: &[u8], render: bool) -> Result<Outcome, String> {
 }
 
 /// Zones over `sample` drawn from `seed`: parts of it, some past its end,
-/// layered, taking turns, and sounding on release.
+/// layered, taking turns in order or at random, sounding on release, and
+/// looping in their own ways.
 fn fuzz_zones(sample: Arc<sample::Sample>, seed: u64) -> SampleMap {
     let mut rng = Rng::new(seed | 1);
     let frames = sample.frames() as u32;
@@ -864,6 +875,22 @@ fn fuzz_zones(sample: Arc<sample::Sample>, seed: u64) -> SampleMap {
             gain_db: -((word() % 96) as f32),
             start,
             end: (len > 0).then(|| start + 1 + word() % frames.max(1)),
+            rand: match word() % 3 {
+                0 => (0.0, 1.0),
+                1 => (0.0, 0.5),
+                _ => (0.5, 1.0),
+            },
+            mode: {
+                let (s, e) = (word() % frames.saturating_mul(2).max(1), word() % frames.saturating_mul(2).max(1));
+                let points = (s < e && word() % 2 == 0).then_some((s, e));
+                match word() % 5 {
+                    0 => Mode::Track,
+                    1 => Mode::NoLoop,
+                    2 => Mode::OneShot,
+                    3 => Mode::Continuous(points),
+                    _ => Mode::Sustain(points),
+                }
+            },
         };
         (place, Arc::clone(&sample))
     }))
@@ -982,6 +1009,155 @@ fn put(b: &mut [u8], at: usize, value: &[u8]) {
             *x = v;
         }
     }
+}
+
+fn sfz_seeds() -> Vec<Vec<u8>> {
+    [
+        "<control> default_path=Piano/ note_offset=0\n<global> ampeg_release=0.3\n<group> lovel=1 hivel=64 seq_length=2\n<region> sample=C4 soft.wav key=60 seq_position=1\n<region> sample=C4 soft 2.wav key=c4 seq_position=2\n<group> lovel=65\n<region> sample=C4 loud.wav lokey=58 hikey=61 pitch_keycenter=60 tune=-10 transpose=1\n",
+        "<region> sample=a.wav loop_mode=loop_sustain loop_start=100 loop_end=199 offset=10 end=999\n<region> sample=b.wav loopmode=one_shot trigger=release lorand=0.5 hirand=1\n<region> sample=c.wav loop_mode=loop_continuous amplitude=50 volume=-6\n<region> sample=d.wav loop_mode=no_loop pitch_keycenter=sample\n",
+        "// comment\n#define $KEY 48 /* block\ncomment */\n<global> sw_lokey=24 sw_hikey=25 sw_default=25\n<group> sw_last=24 <region> sample=legato.wav lokey=$KEY\n<group> sw_last=25 <region> sample=staccato.wav\n#include \"inc.sfz\"\n<curve> v000=0\n<region> sample=*sine\n<region> sample=e.wav cutoff=500 trigger=first\n",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .collect()
+}
+
+/// Opcodes, headers and values the SFZ mutator inserts.
+const SFZ_TOKENS: [&str; 40] = [
+    "<region>",
+    "<group>",
+    "<global>",
+    "<master>",
+    "<control>",
+    "<curve>",
+    "sample=x y.wav",
+    "sample=*saw",
+    "key=c#4",
+    "lokey=-1",
+    "hikey=127",
+    "hikey=g9",
+    "pitch_keycenter=sample",
+    "lovel=0",
+    "hivel=127",
+    "seq_length=100",
+    "seq_position=101",
+    "lorand=0.999",
+    "hirand=0",
+    "trigger=release",
+    "trigger=legato",
+    "tune=99999",
+    "transpose=-48",
+    "volume=-1e9",
+    "amplitude=0",
+    "offset=4294967295",
+    "end=-1",
+    "end=0",
+    "loop_mode=loop_sustain",
+    "loop_mode=one_shot",
+    "loop_start=5",
+    "loop_end=4",
+    "ampeg_sustain=1e30",
+    "default_path=..\\",
+    "note_offset=127",
+    "octave_offset=-11",
+    "#define $X key=",
+    "$X60",
+    "#include \"inc.sfz\"",
+    "#include \"self.sfz\"",
+];
+
+fn mutate_sfz(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
+    if one_in(rng, 2) {
+        mutate_bytes(rng, b, corpus);
+        return;
+    }
+    let token = SFZ_TOKENS[below(rng, SFZ_TOKENS.len())];
+    let sep = [" ", "\n", ""][below(rng, 3)];
+    let i = below(rng, b.len() + 1);
+    b.splice(i..i, format!("{sep}{token} ").into_bytes());
+}
+
+/// `sfz`: the reader's result holds, repeats, saves and plays.
+fn check_sfz(input: &[u8], render: bool) -> Result<Outcome, String> {
+    let text = String::from_utf8_lossy(input);
+    let include = |name: &str| match name {
+        "inc.sfz" => Ok("<region> sample=inc.wav key=60 loop_mode=loop_continuous".to_string()),
+        "self.sfz" => Ok(text.to_string()),
+        _ => Err("no such file".to_string()),
+    };
+    let read = crate::sfz::parse(&text, include);
+    if read != crate::sfz::parse(&text, include) {
+        return Err("the same text read twice differs".into());
+    }
+    let inst = match read {
+        Err(e) if e.is_empty() => return Err("an empty error".into()),
+        Err(e) => return Ok(Outcome { accepted: false, features: vec![hash_of(("sfz error", message_shape(&e)))] }),
+        Ok(i) => i,
+    };
+    if inst.regions.is_empty() || inst.regions.len() > crate::instrument::zone::MAX_ZONES {
+        return Err(format!("{} regions", inst.regions.len()));
+    }
+    let file = crate::sfz::FileInfo { frames: 4000, loop_points: Some((1000, 3000)), unity_note: Some(50) };
+    // What is saved and played: each region as it settles against the file.
+    let mut places = Vec::with_capacity(inst.regions.len());
+    for r in &inst.regions {
+        r.place.check().map_err(|e| format!("a region that cannot play: {e}"))?;
+        match r.resolve(&file) {
+            Ok(place) => {
+                place.check().map_err(|e| format!("a resolved region that cannot play: {e}"))?;
+                places.push(place);
+            }
+            Err(_) if u64::from(r.place.start) >= file.frames => {}
+            Err(e) => return Err(format!("a region inside its file not resolved: {e}")),
+        }
+        if r.path.is_empty() || r.path.len() > sample::MAX_PATH_BYTES {
+            return Err(format!("a path of {} bytes", r.path.len()));
+        }
+    }
+    if inst.notes.iter().any(|n| n.is_empty() || n.contains('\n')) {
+        return Err(format!("a note not on one line: {:?}", inst.notes));
+    }
+    let mut p = Project::new();
+    p.apply(Edit::AddTrack(InstrumentKind::Sampler)).map_err(|e| e.to_string())?;
+    p.tracks[0].zones = places.iter().map(|&place| project::ZoneData { place, path: "a.wav".into() }).collect();
+    let back = Project::from_text(&p.to_text()).map_err(|e| format!("its zones do not load back: {e}"))?;
+    if back != p {
+        return Err("its zones load back different".into());
+    }
+    if render {
+        let s = Arc::new(
+            sample::Sample::from_mono(&[0.25; 4000], 48_000).map_err(|e| e.to_string())?.with_loop(Some((1000, 3000))),
+        );
+        let map = Arc::new(SampleMap::new(places.iter().map(|&p| (p, Arc::clone(&s)))));
+        let mut sampler = crate::instrument::Sampler::new(48_000.0);
+        drop(sampler.set_samples(Some(Arc::clone(&map))));
+        let mut buf = vec![0.0f32; 512];
+        for p in places.iter().take(32) {
+            let id = sampler.note_on(p.keys.0, p.vels.1);
+            sampler.render(&mut buf);
+            sampler.note_off(id);
+            sampler.render(&mut buf);
+        }
+        if buf.iter().any(|x| !x.is_finite()) {
+            return Err("a non-finite sample".into());
+        }
+    }
+    let modes: Vec<u64> = inst
+        .regions
+        .iter()
+        .zip(&places)
+        .map(|(r, p)| {
+            hash_of((
+                format!("{:?}", r.place.mode).len(),
+                format!("{:?}", p.mode).len(),
+                r.place.trigger == Trigger::Release,
+            ))
+        })
+        .collect();
+    let mut features = vec![hash_of(("sfz", inst.regions.len().min(4), inst.notes.len().min(4)))];
+    features.extend(modes);
+    features.extend(inst.notes.iter().map(|n| hash_of(("note", message_shape(n.split(':').next().unwrap_or(n))))));
+    Ok(Outcome { accepted: true, features })
 }
 
 fn mutate_wav(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
@@ -1550,7 +1726,13 @@ mod tests {
     fn a_short_run_of_every_target_finds_nothing() {
         // Long runs are `tinvo fuzz <target>`; this keeps the invariants
         // and the mutators exercised on every test run.
-        for (target, runs) in [(Target::Project, 3000), (Target::Wav, 3000), (Target::Edits, 300)] {
+        for (target, runs) in [
+            (Target::Project, 3000),
+            (Target::Wav, 3000),
+            (Target::Edits, 300),
+            (Target::Midi, 300),
+            (Target::Sfz, 3000),
+        ] {
             let opts = Options { seed: 7, runs, time: None, render_every: 100 };
             match run(target, &opts, &mut |_| {}) {
                 Ok(report) => assert!(report.accepted > 0 && report.corpus > target.seeds().len(), "{report:?}"),

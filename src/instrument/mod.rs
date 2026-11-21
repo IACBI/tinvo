@@ -412,8 +412,10 @@ impl Instrument {
 
     /// Playback starts.
     pub fn start(&mut self) {
-        if let Instrument::Synth(s) = self {
-            s.start();
+        match self {
+            Instrument::Synth(s) => s.start(),
+            Instrument::Sampler(s) => s.start(),
+            Instrument::Drum(_) | Instrument::Plugin(_) => {}
         }
     }
 

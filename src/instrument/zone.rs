@@ -1,5 +1,6 @@
 //! A sampler's samples laid over the keyboard: key zones, velocity layers,
-//! round robin and release samples.
+//! round robin (in turn or at random), release samples, and each zone's
+//! own way of looping.
 //!
 //! A [`SampleMap`] is built on the UI thread and reaches the engine in an
 //! `Arc`; the sampler only reads it.
@@ -29,6 +30,34 @@ pub enum Trigger {
     Release,
 }
 
+/// How a zone plays through its frames. Every mode but `Track` leaves the
+/// track's mode and loop settings aside. Loop points are frames of the
+/// file, from the loop's start up to its end (exclusive); `None` takes the
+/// loop the file itself gives, if it gives one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// As the track's mode and loop settings say.
+    Track,
+    /// Once to its end, or until its key comes up.
+    NoLoop,
+    /// Once to its end, whatever its key does.
+    OneShot,
+    /// Round its loop for as long as it sounds, its release too.
+    Continuous(Option<(u32, u32)>),
+    /// Round its loop while its key is down, then on to its end.
+    Sustain(Option<(u32, u32)>),
+}
+
+impl Mode {
+    /// Its loop points, for the modes that loop.
+    pub fn loop_points(self) -> Option<Option<(u32, u32)>> {
+        match self {
+            Mode::Continuous(p) | Mode::Sustain(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 /// Where a zone sits and how it plays, apart from its sample.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
@@ -42,6 +71,10 @@ pub struct Placement {
     /// Round robin: it plays the `.0`th (1-based) of every `.1` notes that
     /// reach it.
     pub seq: (u8, u8),
+    /// Round robin at random: it plays a note whose random number, drawn
+    /// in `[0, 1)` for each note, falls in `[.0, .1)` (`.1` of 1 takes
+    /// every number from `.0` up).
+    pub rand: (f32, f32),
     pub trigger: Trigger,
     /// Its own tuning, in cents.
     pub tune: f32,
@@ -50,6 +83,7 @@ pub struct Placement {
     /// (exclusive), `None` being the sample's end.
     pub start: u32,
     pub end: Option<u32>,
+    pub mode: Mode,
 }
 
 impl Placement {
@@ -60,11 +94,13 @@ impl Placement {
         vels: (0, 127),
         root: None,
         seq: (1, 1),
+        rand: (0.0, 1.0),
         trigger: Trigger::Attack,
         tune: 0.0,
         gain_db: 0.0,
         start: 0,
         end: None,
+        mode: Mode::Track,
     };
 
     /// Why the placement cannot be played, if it cannot.
@@ -91,7 +127,19 @@ impl Placement {
         if self.end.is_some_and(|e| e <= self.start) {
             return Err("a zone ends after it starts".into());
         }
+        let (lo, hi) = self.rand;
+        if !(0.0 <= lo && lo < hi && hi <= 1.0) {
+            return Err("a random range runs from 0 to 1, low below high".into());
+        }
+        if self.mode.loop_points().flatten().is_some_and(|(s, e)| e <= s) {
+            return Err("a loop ends after it starts".into());
+        }
         Ok(())
+    }
+
+    /// Whether a note whose random number is `r` reaches it.
+    pub fn draws(&self, r: f32) -> bool {
+        self.rand.0 <= r && (r < self.rand.1 || self.rand.1 >= 1.0)
     }
 
     /// Whether a note of `key` at `vel` reaches it.
@@ -179,6 +227,11 @@ mod tests {
         assert_eq!(ok.check(), Ok(()));
         assert!(ok.covers(36, 1) && ok.covers(48, 64));
         assert!(!ok.covers(35, 10) && !ok.covers(49, 10) && !ok.covers(40, 0) && !ok.covers(40, 65));
+        let third = Placement { rand: (1.0 / 3.0, 2.0 / 3.0), ..ok };
+        assert!(third.draws(0.5) && !third.draws(0.2) && !third.draws(2.0 / 3.0));
+        let last = Placement { rand: (2.0 / 3.0, 1.0), ..ok };
+        assert!(last.draws(0.999_999) && last.draws(1.0) && !last.draws(0.5));
+        assert_eq!(Placement { mode: Mode::Continuous(Some((0, 10))), ..ok }.check(), Ok(()));
         let bad = [
             Placement { keys: (50, 49), ..ok },
             Placement { keys: (0, 128), ..ok },
@@ -191,6 +244,11 @@ mod tests {
             Placement { tune: f32::NAN, ..ok },
             Placement { gain_db: MAX_GAIN_DB + 1.0, ..ok },
             Placement { start: 10, end: Some(10), ..ok },
+            Placement { rand: (0.5, 0.5), ..ok },
+            Placement { rand: (-0.1, 0.5), ..ok },
+            Placement { rand: (0.5, 1.5), ..ok },
+            Placement { rand: (f32::NAN, 1.0), ..ok },
+            Placement { mode: Mode::Sustain(Some((100, 100))), ..ok },
         ];
         for p in bad {
             assert!(p.check().is_err(), "{p:?}");
