@@ -576,7 +576,7 @@ Known limits: on Windows and macOS, while the user moves or sizes a plugin's win
 
 Known limits of the editor's windows: a change made in a plugin's window is the plugin's, saved with its state, and not an undo step; where a lane holds the parameter, the panel shows the lane's base and the lane's points play over the change; and the windows open when the device was lost or another engine came are not opened again for the new instances.
 
-### Phase 13: Sampled instruments (medium)
+### Phase 13: Sampled instruments (medium) ✅ (0.28.0)
 
 For realistic instruments without plugins, and for chopping breaks (drum and bass, jungle, hip-hop).
 - Key zones and velocity layers in a sampler track, round robin and release samples.
@@ -585,9 +585,9 @@ For realistic instruments without plugins, and for chopping breaks (drum and bas
 - 16 voices per sampler. Samples stay in memory as today.
 - Tests: zone and layer choice, round-robin order, the SFZ reader fuzzed, slice points on a synthetic signal.
 
-It comes in three parts, each merged on its own, and ships whole.
+It comes in three parts, each merged on its own, and ships whole with 0.28.0, which freezes project format 19 (format 18 was never released).
 
-#### 13a: Zones ✅
+#### 13a: Zones ✅ (0.28.0)
 
 - A sampler track plays its sample over the whole keyboard, as before, and zones: a sample file each, with a key range, a velocity range, a root key (or the track's root note), a round-robin position and cycle, attack or release, its own tuning in cents and gain in dB, and the frames of the file it plays. A note plays every attack zone it reaches, so zones of one range layer, and a zone that takes turns plays the notes that reach it in its turn, counted per zone as SFZ does. A key coming up plays its release zones, at the velocity it went down with, once to their end whatever the mode; stopping lets keys go without them.
 - The track's parameters apply to every zone: tune and fine on top of each zone's tuning, and the start, end and loop points as fractions of each zone's part of its file.
@@ -595,7 +595,7 @@ It comes in three parts, each merged on its own, and ships whole.
 - The engine gets each track's zones in one `Arc`, built on the UI thread from the loaded files and handed back to it to free, as the sample was.
 - Project format 18: `zone` lines in a sampler track, paths relative to the project as the sample's. Each file a track plays loads once and counts once against the project's budget; a zone whose file is missing is left out, the panel's title counts the zones and the missing files, and a WAV export waits for every file.
 
-#### 13b: SFZ import ✅
+#### 13b: SFZ import ✅ (0.28.0)
 
 - `o` on a sampler track takes an `.sfz` file: its regions become the track's zones, in place of its sample and zones, and its amplitude envelope sets the track's attack, decay, sustain and release, all as one undo step. Each file loads once and counts against the project's budget; a region whose file does not load is left out and named.
 - The reader takes the headers (`<control>` with `default_path`, `note_offset` and `octave_offset`, `<global>`, `<master>`, `<group>`, `<region>`, each region taking the opcodes above it), `#define` and `#include`, comments, values with spaces, note names, and the opcodes a zone plays: keys, velocities, root key, round robin in turn (`seq_length`/`seq_position`) and at random (`lorand`/`hirand`), release triggers, tuning, gain, the part of the file, the loop mode and its points, and the envelope. A keyswitched instrument keeps one articulation (`sw_default`'s, or the first region's, among the keys from `sw_lokey` to `sw_hikey`). It never fails on what it does not know: unused opcodes and other headers are listed, skipped regions counted with the reason, and `tinvo sfz` prints it all.
@@ -604,7 +604,7 @@ It comes in three parts, each merged on its own, and ships whole.
 - `tinvo fuzz sfz`: the reader's result is the same each time, every region can play as read, and against a file it settles or starts past the file's end; the settled zones save and load back equal, and the first 32 play without a non-finite sample. CI runs it with the other targets.
 - The undo history keeps the samples no track plays only up to the project's budget, and reads the rest again when an undo or redo needs them, as an import can replace hundreds of megabytes at once.
 
-#### 13c: The slicer ✅
+#### 13c: The slicer ✅ (0.28.0)
 
 - `%` on a sampler track cuts its sample into slices, in place of its sample and zones, each a zone on its own key from C2 up, played at the pitch it was recorded at (the track's tune, fine tune and bend still apply) and in the track's mode (gate or one-shot, the envelope, the filter), as one undo step. Of a sample, the part between the track's start and end points is cut, and the points then take in each whole slice; zones all of one file, as slicing leaves them, are cut again from the whole file, so a different cut is a keystroke away. It is refused while a lane has a point for the start or end point, in any pattern, as it would trim every slice. A settings file that gave `%` to another action keeps it.
 - At its transients (`t`, or `t` and a whole-number sensitivity from 0 to 100): the energy of the signal's first difference, in hops of 5 ms, rising 18 dB (sensitivity 0) down to 3 dB (100) over the loudest hop of the 50 ms before (a whole cycle of a 20 Hz tone, so a low note's waveform is no attack), at a level against the loudest hop from -12 dB down to -40 dB. A cut is added only 40 ms or more from every other cut and from the ends of what is cut (so a part shorter than that stays one slice): the loudest candidates are taken first. Each starts where its changes begin, looking back from the hop's largest change, then at a zero crossing if one is within a millisecond before, on the side nearer zero; past 64, the rest are left out. The analysis keeps only the last 50 ms and a bounded list of candidates, so any length or rate takes little memory; on a 6-minute file it adds about 30 ms to the load.

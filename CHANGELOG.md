@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-21
+
 ### Added
 - Zones in a sampler track: sample files laid over the keyboard by key and velocity range, each with its own root key, tuning, gain and part of its file. Zones of one range layer, zones can take turns (round robin), and release zones sound when a key comes up, at the velocity it went down with. The track's tune, start and end settings apply to each zone, and its mode and loop settings to the zones that follow the track's mode. Turns start over when playback starts, so a song plays as it exports. A zone whose file is missing is left out; the panel's title counts the zones and the missing files, and a WAV export waits for every file.
 - SFZ import: `o` on a sampler track takes an `.sfz` file as well as a WAV file. Its regions become the track's zones, in place of its sample and zones, and its amplitude envelope sets the track's, as one undo step. The reader takes `<control>`, `<global>`, `<master>`, `<group>` and `<region>` headers, `#define` and `#include`, and the opcodes a zone can play: `sample` with `default_path`, `key`, `lokey`/`hikey` (numbers or note names, with `note_offset` and `octave_offset`), `pitch_keycenter` (`sample` takes the file's own), `lovel`/`hivel`, `seq_length`/`seq_position`, `lorand`/`hirand`, `trigger`, `tune`, `transpose`, `volume` and `amplitude`, `offset`/`end`, `loop_mode` (a loop asked for by name, with no points in the SFZ or the WAV file, loops the whole file; a region whose loop points cannot play, reversed or past its file, plays once), `loop_start`/`loop_end` (either alone keeps the file's other point) and the `ampeg_` attack, decay, sustain and release (SFZ's defaults where left out). A keyswitched instrument keeps one articulation: `sw_default`'s, or the first region's, among the keys from `sw_lokey` to `sw_hikey`. `trigger=release_key` plays as `release`, after the sustain pedal. A file already loaded is used as it is, and a file is read only if one of its regions plays. A negative key switches a keyswitch condition off, and `amplitude=0` silences a region. A `//` comment straight after an `=` stays a comment unless a UNC path follows (`//server/share`). What it leaves out is named in the status line: opcodes it does not use, regions it skips and why, files that do not load.
@@ -499,7 +501,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/IACBI/tinvo/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/IACBI/tinvo/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/IACBI/tinvo/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/IACBI/tinvo/compare/v0.24.1...v0.25.0
