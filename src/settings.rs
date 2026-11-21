@@ -686,6 +686,10 @@ mod tests {
         assert!(s.keys.keys(Action::PluginWindow).is_empty());
         let err = parse("[keys]\ndefault = c\nplugin_window = c\n").unwrap_err();
         assert!(err.contains("c is bound to both default and plugin_window"), "{err}");
+        // Written when `%` was free: the slicer gives way.
+        let s = parse("[keys]\nundo = %\n").unwrap();
+        assert_eq!(s.keys.keys(Action::Undo), [Key::Char('%')]);
+        assert!(s.keys.keys(Action::Slice).is_empty());
     }
 
     #[test]

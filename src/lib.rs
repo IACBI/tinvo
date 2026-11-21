@@ -14,6 +14,7 @@
 //!   engine     real-time audio graph: transport, tracks, mixer
 //!   instrument synthesizers, sampler and drum voices
 //!   sample     loaded audio samples and their interpolation
+//!   sfz, slice SFZ instruments and sliced samples, as sampler zones
 //!   dsp        allocation-free signal-processing primitives
 //!   rt         lock-free primitives for crossing the real-time boundary
 //!   wav        WAV encoding/decoding
@@ -49,6 +50,7 @@ pub mod rt;
 pub mod sample;
 pub mod settings;
 pub mod sfz;
+pub mod slice;
 pub mod smf;
 pub mod strip;
 pub mod theme;

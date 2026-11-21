@@ -40,7 +40,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
-- A 16-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter. Besides its sample, a sampler track can lay files over the keyboard as zones, written as `zone` lines in the project file or imported from an SFZ instrument with `o`: key ranges, velocity layers, round robin in turn or at random, release samples, and a loop mode of each zone's own. A WAV file's own loop and root key (its `smpl` chunk) are read.
+- A 16-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter. Besides its sample, a sampler track can lay files over the keyboard as zones, written as `zone` lines in the project file or imported from an SFZ instrument with `o`: key ranges, velocity layers, round robin in turn or at random, release samples, and a loop mode of each zone's own. A WAV file's own loop and root key (its `smpl` chunk) are read. `%` slices a track's sample, at its transients or into equal parts, into zones of one slice per key from C2 that take the place of its sample and zones: a break to play from the keyboard or the grid. Zones that all play one file, as slicing leaves them, are cut again from the whole file.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
 - Undo/redo with a 1000-step history.
 - Text `.tvo` project files that survive a save/load round trip exactly. Saves are atomic, and older format versions still load.
@@ -98,6 +98,7 @@ tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 tinvo sfz piano.sfz       # what the sampler plays of an SFZ instrument, and what it leaves out
+tinvo slice break.wav     # where the slicer cuts a sample (t 80 for fainter hits, 16 for equal parts)
 tinvo settings            # check the settings file and print every key and colour
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
@@ -145,6 +146,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `E` `Q` `F` | rename, mute or delete the track's group (its tracks go to the master) |
 | `H` | the MIDI channel (1–16) that plays the track whichever is selected; empty for none |
 | `o` | load a WAV file, or import an SFZ instrument, into a sampler track (`a` `7` adds one) |
+| `%` | slice the sampler track's sample: `t` at its transients (`t 80` finds fainter ones), or a number of equal parts |
 | `O` | choose the audio output and input devices (`←` `→` switch pages, `Tab` toggles low-latency output) |
 | `I` | record from the audio input into the sampler track; `I` again stops and loads the take |
 | `M` | choose the MIDI input |
@@ -224,7 +226,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
-- WAV dosyalarını windowed-sinc interpolasyonla çalan 16 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre. Bir sampler kanalı kendi sample'ının yanında dosyaları klavyeye bölge olarak da yayabilir; bölgeler proje dosyasında `zone` satırlarıdır ya da `o` ile bir SFZ enstrümanından alınır: tuş aralıkları, velocity katmanları, sırayla ya da rastgele round robin, release sample'ları ve her bölgenin kendi loop modu. WAV dosyasının kendi loop noktaları ve kök notası (`smpl` chunk'ı) da okunur.
+- WAV dosyalarını windowed-sinc interpolasyonla çalan 16 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre. Bir sampler kanalı kendi sample'ının yanında dosyaları klavyeye bölge olarak da yayabilir; bölgeler proje dosyasında `zone` satırlarıdır ya da `o` ile bir SFZ enstrümanından alınır: tuş aralıkları, velocity katmanları, sırayla ya da rastgele round robin, release sample'ları ve her bölgenin kendi loop modu. WAV dosyasının kendi loop noktaları ve kök notası (`smpl` chunk'ı) da okunur. `%` kanalın sample'ını transient'lerinden ya da eşit parçalara böler; dilimler kanalın sample'ının ve bölgelerinin yerini alır ve her biri C2'den başlayarak bir tuşa düşer, böylece bir break klavyeden ya da grid'den çalınır. Hepsi tek bir dosyayı çalan bölgeler (dilimlemenin bıraktığı gibi) yeniden dosyanın tamamından kesilir.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
 - 1000 adımlık geri al / yinele.
 - Kaydet/aç döngüsünde hiçbir değeri değiştirmeyen metin tabanlı `.tvo` proje dosyaları. Kayıtlar atomik, eski format sürümleri de açılıyor.
@@ -282,6 +284,7 @@ tinvo bench               # measure rendering speed
 tinvo bench --check       # fail if a scenario is over its time budget
 tinvo fuzz wav --seconds 600       # fuzz the WAV reader for 10 minutes
 tinvo sfz piano.sfz       # what the sampler plays of an SFZ instrument, and what it leaves out
+tinvo slice break.wav     # where the slicer cuts a sample (t 80 for fainter hits, 16 for equal parts)
 tinvo settings            # check the settings file and print every key and colour
 tinvo --settings my.conf song.tvo  # use the keys and colours in my.conf
 ```
@@ -329,6 +332,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `E` `Q` `F` | kanalın grubunu yeniden adlandır, mute et ya da sil (kanalları master'a gider) |
 | `H` | kanalı, seçili olmasa da çalan MIDI kanalı (1–16); boş bırakılırsa yok |
 | `o` | sampler kanalına WAV dosyası yükle ya da SFZ enstrümanı al (`a` `7` sampler kanalı ekler) |
+| `%` | sampler kanalının sample'ını dilimle: `t` transient'lerinden (`t 80` daha zayıflarını da bulur) ya da sayı kadar eşit parçaya |
 | `O` | ses çıkış ve giriş cihazlarını seç (`←` `→` sayfa değiştirir, `Tab` düşük gecikmeli çıkışı açıp kapatır) |
 | `I` | ses girişinden sampler kanalına kayıt al; tekrar `I` kaydı durdurup kanala yükler |
 | `M` | MIDI girişini seç |

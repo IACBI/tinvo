@@ -604,7 +604,13 @@ It comes in three parts, each merged on its own, and ships whole.
 - `tinvo fuzz sfz`: the reader's result is the same each time, every region can play as read, and against a file it settles or starts past the file's end; the settled zones save and load back equal, and the first 32 play without a non-finite sample. CI runs it with the other targets.
 - The undo history keeps the samples no track plays only up to the project's budget, and reads the rest again when an undo or redo needs them, as an import can replace hundreds of megabytes at once.
 
-#### 13c: The slicer
+#### 13c: The slicer ✅
+
+- `%` on a sampler track cuts its sample into slices, in place of its sample and zones, each a zone on its own key from C2 up, played at the pitch it was recorded at (the track's tune, fine tune and bend still apply) and in the track's mode (gate or one-shot, the envelope, the filter), as one undo step. Of a sample, the part between the track's start and end points is cut, and the points then take in each whole slice; zones all of one file, as slicing leaves them, are cut again from the whole file, so a different cut is a keystroke away. It is refused while a lane has a point for the start or end point, in any pattern, as it would trim every slice. A settings file that gave `%` to another action keeps it.
+- At its transients (`t`, or `t` and a whole-number sensitivity from 0 to 100): the energy of the signal's first difference, in hops of 5 ms, rising 18 dB (sensitivity 0) down to 3 dB (100) over the loudest hop of the 50 ms before (a whole cycle of a 20 Hz tone, so a low note's waveform is no attack), at a level against the loudest hop from -12 dB down to -40 dB. A cut is added only 40 ms or more from every other cut and from the ends of what is cut (so a part shorter than that stays one slice): the loudest candidates are taken first. Each starts where its changes begin, looking back from the hop's largest change, then at a zero crossing if one is within a millisecond before, on the side nearer zero; past 64, the rest are left out. The analysis keeps only the last 50 ms and a bounded list of candidates, so any length or rate takes little memory; on a 6-minute file it adds about 30 ms to the load.
+- Into 2 to 64 equal parts, exact to the frame.
+- `tinvo slice SAMPLE.wav [N | t [S]]` prints the cut: each slice's key, start, length and time.
+- Tests: slice points on synthetic hits, a drum loop with ghost notes, decaying, held and low tones, a faint hit over a tail, a faint change before an attack, zero crossings, frames that are not numbers, a very low rate, too many hits, and the editor's slicing, its refusals and its undo. `tinvo fuzz wav` slices every sample that loads over a part of it, both ways.
 
 ### Phase 14: Synth engines (small to medium)
 

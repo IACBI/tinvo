@@ -667,6 +667,8 @@ pub enum PromptKind {
     Export,
     Rename,
     LoadSample,
+    /// How to slice the selected sampler track's sample.
+    Slice,
     /// The name of the marker on the song entry under the cursor.
     Marker,
     /// A colour role's style, on the settings page.
@@ -869,6 +871,8 @@ pub struct App {
     plugin_page: (ChainId, u8),
     pub export_format: SampleFormat,
     pub export_loops: u32,
+    /// What the slice prompt last took, offered again.
+    slice_text: String,
     /// The prompt's cursor, as the characters after it.
     prompt_back: usize,
     /// Whether the last paste into the prompt was cut, until the next key:
@@ -1115,6 +1119,7 @@ impl App {
             plugin_page: (ChainId::Master, 0),
             export_format: SampleFormat::Pcm24,
             export_loops: 4,
+            slice_text: crate::slice::How::Transients(crate::slice::DEFAULT_SENSITIVITY).text(),
             prompt_back: 0,
             paste_cut: false,
             export_source: Source::Auto,
@@ -2190,48 +2195,20 @@ impl App {
         };
         let files = loaded.len();
         self.bank.extend(loaded);
-        let meta_before = self.meta();
-        let t = &mut self.project.tracks[track];
-        t.sample = None;
-        t.zones = zones.into();
-        let count = t.zones.len();
-        self.send_sample(track);
-        // Other tracks that play a file only now loaded (it was missing).
-        for i in (0..self.track_count()).filter(|&i| i != track) {
-            if self.project.tracks[i].sample_paths().any(|p| read_now.iter().any(|k| k == p)) {
-                self.send_sample(i);
-            }
-        }
+        let count = zones.len();
         let set = [
             ("attack", envelope.attack),
             ("decay", envelope.decay),
             ("sustain", envelope.sustain),
             ("release", envelope.release),
         ];
-        let specs = InstrumentKind::Sampler.params();
-        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
-        for (id, value) in set {
-            let Some(index) = specs.iter().position(|s| s.id == id) else { continue };
-            let e = Edit::SetParam { track: track as u8, index: index as u8, value: specs[index].clamp(value) };
-            let Ok(inverse) = self.project.inverse(&e) else { continue };
-            if let Some(applied) = self.apply_raw(e) {
-                inverses.push(inverse);
-                redo.push(applied);
+        self.replace_zones(track, zones, &set, "import SFZ");
+        // Other tracks that play a file only now loaded (it was missing).
+        for i in (0..self.track_count()).filter(|&i| i != track) {
+            if self.project.tracks[i].sample_paths().any(|p| read_now.iter().any(|k| k == p)) {
+                self.send_sample(i);
             }
         }
-        self.touch();
-        self.redo.clear();
-        let meta_after = self.meta();
-        self.push_change(Change {
-            undo: inverses.into_iter().rev().flatten().collect(),
-            redo,
-            meta_before,
-            meta_after,
-            what: "import SFZ",
-            key: None,
-            at: Instant::now(),
-            param: None,
-        });
         let mut notes = Vec::new();
         if let Some((k, e)) = failed.iter().next() {
             let n = failed.len();
@@ -2252,6 +2229,109 @@ impl App {
             msg.push_str(&format!(" · tinvo sfz {} lists it all", path.display()));
         }
         self.set_status(msg);
+        Ok(())
+    }
+
+    /// Puts `zones` in place of sampler track `track`'s sample and zones,
+    /// and sets its parameters `set` (by id), as one undo step.
+    fn replace_zones(&mut self, track: usize, zones: Vec<ZoneData>, set: &[(&str, f32)], what: &'static str) {
+        let meta_before = self.meta();
+        // The parameters reach the engine first, so no note plays the new
+        // zones with the old ones.
+        let specs = InstrumentKind::Sampler.params();
+        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
+        for &(id, value) in set {
+            let Some(index) = specs.iter().position(|s| s.id == id) else { continue };
+            let e = Edit::SetParam { track: track as u8, index: index as u8, value: specs[index].clamp(value) };
+            let Ok(inverse) = self.project.inverse(&e) else { continue };
+            if let Some(applied) = self.apply_raw(e) {
+                inverses.push(inverse);
+                redo.push(applied);
+            }
+        }
+        let t = &mut self.project.tracks[track];
+        t.sample = None;
+        t.zones = zones.into();
+        self.send_sample(track);
+        self.touch();
+        self.redo.clear();
+        let meta_after = self.meta();
+        self.push_change(Change {
+            undo: inverses.into_iter().rev().flatten().collect(),
+            redo,
+            meta_before,
+            meta_after,
+            what,
+            key: None,
+            at: Instant::now(),
+            param: None,
+        });
+    }
+
+    /// Cuts sampler track `track`'s sample as `text` asks
+    /// ([`crate::slice::How::parse`]), as one undo step: the slices become
+    /// the track's zones, a key each up from [`crate::slice::FIRST_KEY`], in
+    /// place of its sample. Of a sample, the part from the track's start to
+    /// its end point is cut, and the points then take in each whole slice;
+    /// zones all of one file, as slicing leaves them, are cut again from
+    /// the whole file.
+    fn slice_sample(&mut self, track: usize, text: &str) -> Result<(), String> {
+        let how = crate::slice::How::parse(text).map_err(|e| format!("Cannot slice: {e}"))?;
+        let t = &self.project.tracks[track];
+        let (path, part) = match (&t.sample, t.zones.first()) {
+            (Some(p), _) => (p.clone(), true),
+            (None, Some(z)) if t.zones.iter().all(|o| o.path == z.path) => (z.path.clone(), false),
+            (None, Some(_)) => {
+                return Err("Cannot slice: the zones play more than one file; load the one to slice".into());
+            }
+            (None, None) => return Err(format!("Cannot slice: no sample; {} loads one", self.k(Action::LoadSample))),
+        };
+        let Some(sample) = self.bank.get(&path).cloned() else {
+            return Err(format!("Cannot slice: {path} is missing"));
+        };
+        let frames = sample.frames();
+        let specs = InstrumentKind::Sampler.params();
+        let index = |id: &str| specs.iter().position(|s| s.id == id).unwrap_or(0);
+        // Their lanes would go on moving the points into every slice.
+        for (id, name) in [("start", "Start"), ("end", "End")] {
+            let target = Some(LaneTarget::Track(2 + index(id) as u8));
+            if t.lanes.iter().any(|l| l.target == target && l.points.iter().flatten().any(Option::is_some)) {
+                return Err(format!("Cannot slice: the {name} lane would trim every slice; clear its points first"));
+            }
+        }
+        // To the frame as the sampler plays them.
+        let (from, to) = if part {
+            let at = |id: &str| ((f64::from(t.params[index(id)]) * frames as f64).floor() as usize).min(frames);
+            (at("start"), at("end"))
+        } else {
+            (0, frames)
+        };
+        let starts = crate::slice::starts(sample.audio(), sample.sample_rate, from, to, how)
+            .map_err(|e| format!("Cannot slice: {e}"))?;
+        let zones: Vec<ZoneData> = crate::slice::placements(&starts, to)
+            .into_iter()
+            .map(|place| ZoneData { place, path: path.clone() })
+            .collect();
+        let n = zones.len();
+        let name = Path::new(&path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
+        self.slice_text = how.text();
+        // The same cut again changes nothing, and keeps the voices playing.
+        let whole = t.params[index("start")] == 0.0 && t.params[index("end")] == 1.0;
+        if t.sample.is_none() && whole && *t.zones == *zones {
+            self.set_status(format!("{name} is already cut so: {n} slices"));
+            return Ok(());
+        }
+        self.replace_zones(track, zones, &[("start", 0.0), ("end", 1.0)], "slice");
+        let first = crate::slice::FIRST_KEY;
+        let keys = format!("{} to {}", note_name(first), note_name(first + n as u8 - 1));
+        self.set_status(match how {
+            crate::slice::How::Parts(_) => format!("Sliced {name} into {n} equal parts on keys {keys}"),
+            crate::slice::How::Transients(s) if n == 1 => {
+                let more = if s < 80 { "try t 80, or equal parts" } else { "try equal parts" };
+                format!("No transient in {name}: 1 slice on {}; {more}", note_name(first))
+            }
+            crate::slice::How::Transients(_) => format!("Sliced {name} at {} transients: keys {keys}", n - 1),
+        });
         Ok(())
     }
 
@@ -3598,6 +3678,11 @@ impl App {
                             self.set_status(e);
                         }
                     }
+                    PromptKind::Slice => {
+                        if let Err(e) = self.slice_sample(self.track, &text) {
+                            self.set_status(e);
+                        }
+                    }
                     PromptKind::Marker => self.set_marker(&text),
                     PromptKind::Style(role) => self.set_style(role, &text),
                     PromptKind::Channel => self.set_channel(&text),
@@ -4940,6 +5025,15 @@ impl App {
                     self.mode = Mode::Prompt(PromptKind::LoadSample, current);
                 } else {
                     let status = format!("Samples load into sampler tracks ({}, 7 adds one)", self.k(Action::AddTrack));
+                    self.set_status(status);
+                }
+            }
+            Action::Slice => {
+                if self.project.tracks[self.track].kind == InstrumentKind::Sampler {
+                    self.mode = Mode::Prompt(PromptKind::Slice, self.slice_text.clone());
+                } else {
+                    let status =
+                        format!("Slicing cuts a sampler track's sample ({}, 7 adds one)", self.k(Action::AddTrack));
                     self.set_status(status);
                 }
             }
@@ -6513,6 +6607,9 @@ impl App {
                     PromptKind::Rename => "Track name: ".to_string(),
                     PromptKind::RenameGroup => "Group name: ".to_string(),
                     PromptKind::LoadSample => "Load WAV sample or SFZ instrument: ".to_string(),
+                    PromptKind::Slice => {
+                        format!("Slice into equal parts (2-{}), or t [sensitivity 0-100]: ", crate::slice::MAX_SLICES)
+                    }
                     PromptKind::Marker => {
                         format!("Marker on entry {} (empty removes it): ", self.song_cursor + 1)
                     }
@@ -8974,6 +9071,115 @@ mod tests {
             }
         }
         assert_eq!(last, Some((t, true)), "and sent");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sample_slices_into_zones_in_one_undo_step() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-slice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Four hits a quarter of a second apart.
+        let mut audio = vec![0.0f32; 48_000];
+        for k in 0..4 {
+            let start = 2_000 + k * 12_000;
+            for (i, x) in audio[start..start + 4_000].iter_mut().enumerate() {
+                *x = (i as f32 * 0.3).sin() * (-(i as f32) / 600.0).exp();
+            }
+        }
+        let path = dir.join("break.wav");
+        wav::write_file(&path, &audio, 1, 48_000, SampleFormat::Float32).unwrap();
+        let key = path.display().to_string();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let t = p.tracks.len() - 1;
+        let (tx, mut rx) = spsc::channel(256);
+        let mut a = App::new(p, None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "test".into());
+        a.track = t;
+        a.mode = Mode::Prompt(PromptKind::LoadSample, key.clone());
+        keys(&mut a, &[Key::Enter]);
+        let specs = InstrumentKind::Sampler.params();
+        let (start, end) =
+            (specs.iter().position(|s| s.id == "start").unwrap(), specs.iter().position(|s| s.id == "end").unwrap());
+        // The track plays from a fifth in: the first hit is cut off.
+        assert!(a.edit(Edit::SetParam { track: t as u8, index: start as u8, value: 0.2 }));
+        while rx.pop().is_some() {}
+        keys(&mut a, &[Key::Char('%')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Slice, "t 50".into()));
+        // Not while a lane moves the start point: it would trim every slice.
+        let lane_of = |index: usize| LaneTarget::Track(2 + index as u8);
+        a.project.tracks[t].lanes[0] = crate::project::LaneData::new(Some(lane_of(start)), false);
+        a.project.tracks[t].lanes[0].points[0][0] = Some(0.5);
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some("Cannot slice: the Start lane would trim every slice; clear its points first")
+        );
+        assert_eq!(a.project.tracks[t].zones.len(), 0);
+        a.project.tracks[t].lanes[0] = crate::project::LaneData::new(None, false);
+        a.mode = Mode::Prompt(PromptKind::Slice, "t 50".into());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("Sliced break.wav at 3 transients: keys C2 to D#2"));
+        let tr = &a.project.tracks[t];
+        let got: Vec<_> = tr.zones.iter().map(|z| (z.place.keys.0, z.place.root, z.place.start, z.place.end)).collect();
+        let want = [(36, 9_600, 14_000), (37, 14_000, 26_000), (38, 26_000, 38_000), (39, 38_000, 48_000)];
+        assert_eq!(got.len(), 4, "{got:?}");
+        for ((k, root, s, e), (wk, ws, we)) in got.iter().zip(want) {
+            assert_eq!((*k, *root), (wk, Some(wk)));
+            assert!(s.abs_diff(ws) <= 48 && e.unwrap().abs_diff(we) <= 48, "{got:?}");
+        }
+        assert!(tr.zones.iter().all(|z| z.path == key));
+        assert_eq!((tr.sample.as_deref(), tr.params[start], tr.params[end]), (None, 0.0, 1.0));
+        let mut sent = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            if let Command::SetSamples { track, map } = cmd {
+                sent.push((usize::from(track), map.map(|m| m.zones().len())));
+            }
+        }
+        assert_eq!(sent, [(t, Some(4))]);
+        // One step takes it back, start point and all.
+        a.undo();
+        let tr = &a.project.tracks[t];
+        assert_eq!((tr.sample.as_deref(), tr.zones.len(), tr.params[start]), (Some(key.as_str()), 0, 0.2));
+        a.redo();
+        assert_eq!(a.project.tracks[t].zones.len(), 4);
+        // Slices of one file are cut again from the whole of it.
+        a.mode = Mode::Prompt(PromptKind::Slice, "8".into());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("Sliced break.wav into 8 equal parts on keys C2 to G2"));
+        let starts: Vec<u32> = a.project.tracks[t].zones.iter().map(|z| z.place.start).collect();
+        assert_eq!(starts, (0..8).map(|k| k * 6_000).collect::<Vec<_>>());
+        assert_eq!(a.slice_text, "8");
+        // The same cut again is no step of its own.
+        let steps = a.undo.len();
+        while rx.pop().is_some() {}
+        a.mode = Mode::Prompt(PromptKind::Slice, "8".into());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("break.wav is already cut so: 8 slices"));
+        assert_eq!(a.undo.len(), steps);
+        assert!(std::iter::from_fn(|| rx.pop()).all(|c| !matches!(c, Command::SetSamples { .. })), "nothing sent");
+        // What it cannot do changes nothing.
+        let zones = a.project.tracks[t].zones.clone();
+        a.mode = Mode::Prompt(PromptKind::Slice, "x".into());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Cannot slice: a number of equal parts"), "{:?}", a.status_text());
+        a.mode = Mode::Prompt(PromptKind::Slice, "64".into());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.project.tracks[t].zones.len(), 64);
+        a.undo();
+        assert_eq!(a.project.tracks[t].zones, zones);
+        // Back past both slicings, the start point and the load.
+        for _ in 0..4 {
+            a.undo();
+        }
+        assert_eq!((a.project.tracks[t].sample.as_deref(), a.project.tracks[t].zones.len()), (None, 0));
+        a.mode = Mode::Prompt(PromptKind::Slice, "t".into());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Cannot slice: no sample"), "{:?}", a.status_text());
+        assert!(a.edit(Edit::AddTrack(InstrumentKind::Synth)));
+        a.track = a.track_count() - 1;
+        keys(&mut a, &[Key::Char('%')]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.status_text().unwrap().starts_with("Slicing cuts a sampler track's sample"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
