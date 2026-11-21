@@ -25,7 +25,8 @@ use tinvo::engine::{
 };
 use tinvo::group::{GROUP_PARAMS, MAX_GROUPS, group_param};
 use tinvo::insert::{EffectKind, Insert, MAX_INSERTS, MAX_SLOTS};
-use tinvo::instrument::InstrumentKind;
+use tinvo::instrument::zone::{Placement, Trigger};
+use tinvo::instrument::{InstrumentKind, SampleMap};
 use tinvo::midi::{MOD_WHEEL, Message, OutEvent, Parser, SUSTAIN};
 use tinvo::mix::{MIX_PARAMS, mp, send};
 use tinvo::project::{LaneData, Project};
@@ -133,10 +134,23 @@ impl Rig {
     }
 }
 
-fn sample(frames: usize, seed: u64) -> Arc<Sample> {
+/// A sampler's samples: the whole sample over the keyboard, and layered
+/// over it zones of parts of it that take turns and sound on release.
+fn sample(frames: usize, seed: u64) -> Arc<SampleMap> {
     let mut rng = Rng::new(seed);
     let audio: Vec<f32> = (0..frames).map(|_| rng.bipolar() * 0.5).collect();
-    Arc::new(Sample::from_mono(&audio, [22_050, 44_100, 48_000, 96_000][(seed % 4) as usize]).unwrap())
+    let s = Arc::new(Sample::from_mono(&audio, [22_050, 44_100, 48_000, 96_000][(seed % 4) as usize]).unwrap());
+    let part = |k: u8, trigger| Placement {
+        root: Some(60 + k),
+        seq: (1 + k % 2, 2),
+        trigger,
+        tune: f32::from(k) * 10.0,
+        start: u32::from(k) * 100,
+        end: Some(u32::from(k) * 100 + 2000),
+        ..Placement::WHOLE
+    };
+    let zones = (0..4).map(|k| (part(k, if k == 3 { Trigger::Release } else { Trigger::Attack }), s.clone()));
+    Arc::new(SampleMap::new(std::iter::once((Placement::WHOLE, s.clone())).chain(zones)))
 }
 
 /// The demo with every strip stage, every send, every bus and the limiter
@@ -211,7 +225,7 @@ fn heavy_song() -> usize {
     let p = heavy_project();
     let mut rig = Rig::new(&p);
     let sampler = (p.tracks.len() - 1) as u8;
-    rig.send(Command::SetSample { track: sampler, sample: Some(sample(30_000, 1)) });
+    rig.send(Command::SetSamples { track: sampler, map: Some(sample(30_000, 1)) });
     play_song(&mut rig, 2000)
 }
 
@@ -299,7 +313,7 @@ fn full_song() -> usize {
     let mut rig = Rig::new(&p);
     for (t, track) in p.tracks.iter().enumerate() {
         if track.kind == InstrumentKind::Sampler {
-            rig.send(Command::SetSample { track: t as u8, sample: Some(sample(30_000, t as u64)) });
+            rig.send(Command::SetSamples { track: t as u8, map: Some(sample(30_000, t as u64)) });
         }
     }
     play_song(&mut rig, 2000)
@@ -344,7 +358,7 @@ fn random_slot_command(rng: &mut Rng) -> Command {
 }
 
 /// A random edit or command, about what a busy user sends.
-fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
+fn random_command(rng: &mut Rng, samples: &[Arc<SampleMap>]) -> Command {
     let mut r = |n: u64| rng.next_u64() % n;
     let track = r(MAX_TRACKS as u64 + 1) as u8;
     let kind = InstrumentKind::ALL[r(InstrumentKind::ALL.len() as u64) as usize];
@@ -423,7 +437,7 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
                 5 => Command::SetLiveTrack(track),
                 _ => {
                     let s = (r(3) > 0).then(|| samples[r(samples.len() as u64) as usize].clone());
-                    Command::SetSample { track, sample: s }
+                    Command::SetSamples { track, map: s }
                 }
             };
         }
@@ -433,7 +447,7 @@ fn random_command(rng: &mut Rng, samples: &[Arc<Sample>]) -> Command {
 
 fn edits_while_playing() -> usize {
     let mut rig = Rig::new(&heavy_project());
-    let samples: Vec<Arc<Sample>> = (0..6).map(|i| sample([1, 7, 64, 4800, 48_000, 200_000][i], i as u64)).collect();
+    let samples: Vec<Arc<SampleMap>> = (0..6).map(|i| sample([1, 7, 64, 4800, 48_000, 200_000][i], i as u64)).collect();
     let mut rng = Rng::new(42);
     rig.send(Command::PlaySong { entry: 0 });
     let mut calls = 0;

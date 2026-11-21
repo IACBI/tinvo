@@ -15,9 +15,9 @@ use crate::clap::host::{Instance, Mode, PluginHost, Request, Role};
 use crate::clap::scan::Catalog;
 use crate::engine::transport::Transport;
 use crate::engine::{BLOCK, Command, Edit, Engine, MAX_PATTERNS, RETIRE_QUEUE, Retired, Shared};
+use crate::instrument::SampleMap;
 use crate::project::{PluginPlace, Project, TrackData};
 use crate::rt::spsc::{self, Consumer};
-use crate::sample::Sample;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ pub fn check_destination(project: &Project, project_path: Option<&Path>, out: &P
     if project_path.is_some_and(same) {
         return Err("is the project itself".into());
     }
-    if project.tracks.iter().filter_map(|t| t.sample.as_deref()).any(|s| same(Path::new(s))) {
+    if project.tracks.iter().flat_map(TrackData::sample_paths).any(|s| same(Path::new(s))) {
         return Err("is a sample the project plays".into());
     }
     Ok(())
@@ -277,15 +277,15 @@ impl Playing {
 
 /// Renders the project as interleaved stereo, handing it to `sink` block by
 /// block, and returns the number of frames rendered. Memory use does not
-/// depend on the length of the render. `samples` holds each track's sample
-/// (see [`Project::load_samples`]); missing entries play silence. Every
+/// depend on the length of the render. `samples` holds what each track
+/// plays (see [`Project::sample_maps`]); missing entries play silence. Every
 /// plugin place gets an instance from `plugins` before anything is
 /// rendered. A `sink` error, a plugin that cannot load or fails, or plugins
 /// on one path later together than is made up for, stop the render, and
 /// the error is returned.
 pub fn render_into(
     project: &Project,
-    samples: &[Option<Arc<Sample>>],
+    samples: &[Option<Arc<SampleMap>>],
     opts: &RenderOptions,
     plugins: &mut dyn PluginSource,
     sink: &mut dyn FnMut(&[f32]) -> Result<(), String>,
@@ -294,7 +294,7 @@ pub fn render_into(
     let shared = Arc::new(Shared::new());
     let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::clone(&shared), None);
     for (track, sample) in samples.iter().enumerate() {
-        engine.set_sample(track, sample.clone());
+        engine.set_samples(track, sample.clone());
     }
     let mut playing = Playing::attach(&mut engine, project, sr, plugins)?;
     if shared.latency_over.load(std::sync::atomic::Ordering::Relaxed) {
@@ -382,7 +382,7 @@ pub fn render_into(
 
 /// [`render_into`] collected in memory, for a project without plugins.
 #[cfg(test)]
-pub fn render(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<f32> {
+pub fn render(project: &Project, samples: &[Option<Arc<SampleMap>>], opts: &RenderOptions) -> Vec<f32> {
     let mut out = Vec::new();
     let mut sink = |b: &[f32]| {
         out.extend_from_slice(b);
@@ -484,7 +484,11 @@ pub fn stem_project(project: &Project, stem: Stem) -> Project {
 /// imported elsewhere; added together they make the mix. The export
 /// streams each stem instead ([`render_into`]).
 #[cfg(test)]
-pub fn render_stems(project: &Project, samples: &[Option<Arc<Sample>>], opts: &RenderOptions) -> Vec<(Stem, Vec<f32>)> {
+pub fn render_stems(
+    project: &Project,
+    samples: &[Option<Arc<SampleMap>>],
+    opts: &RenderOptions,
+) -> Vec<(Stem, Vec<f32>)> {
     let mut stems: Vec<(Stem, Vec<f32>)> =
         stems(project).into_iter().map(|s| (s, render(&stem_project(project, s), samples, opts))).collect();
     let len = stems.iter().map(|(_, s)| s.len()).max().unwrap_or(0);

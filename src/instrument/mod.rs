@@ -8,15 +8,16 @@
 mod drums;
 mod sampler;
 mod synth;
+pub mod zone;
 
 use crate::clap::PluginRef;
 use crate::clap::host::{Instance, NoteId, Role};
 use crate::clap::slot::PluginSlot;
-use crate::sample::Sample;
 pub use drums::Drum;
-pub use sampler::{SAMPLER_VOICES, Sampler};
+pub use sampler::{HELD_NOTES, SAMPLER_VOICES, Sampler};
 use std::sync::Arc;
 pub use synth::{PolySynth, SYNTH_VOICES};
+pub use zone::SampleMap;
 
 /// The project format that introduced parameter `index` of `kind`.
 pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
@@ -430,14 +431,14 @@ impl Instrument {
         }
     }
 
-    /// Gives a sampler its sample and returns the one it replaces. Other
-    /// instruments hand the sample straight back. The result must be
+    /// Gives a sampler its samples and returns the ones they replace.
+    /// Other instruments hand them straight back. The result must be
     /// disposed of off the audio thread.
     #[must_use]
-    pub fn set_sample(&mut self, sample: Option<Arc<Sample>>) -> Option<Arc<Sample>> {
+    pub fn set_samples(&mut self, map: Option<Arc<SampleMap>>) -> Option<Arc<SampleMap>> {
         match self {
-            Instrument::Sampler(s) => s.set_sample(sample),
-            _ => sample,
+            Instrument::Sampler(s) => s.set_samples(map),
+            _ => map,
         }
     }
 
@@ -516,6 +517,7 @@ impl Instrument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample::Sample;
 
     const SR: f32 = 48_000.0;
 
@@ -646,7 +648,7 @@ mod tests {
             // A sampler is silent until it has a sample.
             let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
             let sample = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
-            let returned = inst.set_sample(Some(sample));
+            let returned = inst.set_samples(Some(Arc::new(SampleMap::single(sample))));
             assert_eq!(returned.is_some(), k != InstrumentKind::Sampler, "{k:?}");
             inst.note_on(k.default_note(), 100);
             let mut buf = vec![0.0f32; 4800];

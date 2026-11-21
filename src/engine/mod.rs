@@ -29,13 +29,13 @@ use crate::dsp::smooth::Smoother;
 use crate::dsp::{db_to_gain, pan_gains};
 use crate::group::{self, Group, MAX_GROUPS};
 use crate::insert::{Chain, EffectKind, Insert, MAX_SLOTS};
+use crate::instrument::SampleMap;
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
 use crate::midi::{MOD_WHEEL, Message, OutEvent, SUSTAIN};
 use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{Consumer, Producer};
-use crate::sample::Sample;
 use crate::strip::{self, StereoStrip, Strip, track_param};
 use std::fmt;
 use std::sync::Arc;
@@ -407,6 +407,8 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 /// and a chord lasts at most `MAX_STEPS` steps; ratchet repeats are shorter
 /// than a step. The rest is headroom for auditions.
 const MAX_PENDING_OFFS: usize = MAX_STEPS * MAX_CHORD + 4 * MAX_CHORD * MAX_RATCHET as usize;
+// A sampler keeps every note a track can hold for its release zones.
+const _: () = assert!(MAX_PENDING_OFFS + MAX_LIVE <= crate::instrument::HELD_NOTES);
 const SMOOTHING_TIME: f32 = 0.005;
 /// A removed track goes on sounding while it falls linearly to silence over
 /// this time, instead of stopping dead.
@@ -795,11 +797,11 @@ pub enum Command {
         step: Step,
         frames: u32,
     },
-    /// Gives a sampler track its sample (other tracks ignore it). The sample
-    /// it replaces goes back through the retirement queue.
-    SetSample {
+    /// Gives a sampler track its samples (other tracks ignore them). The
+    /// ones they replace go back through the retirement queue.
+    SetSamples {
         track: u8,
-        sample: Option<Arc<Sample>>,
+        map: Option<Arc<SampleMap>>,
     },
     /// [`Edit::SetSlot`] with the effect built by the sender, since
     /// building one allocates. The effect it replaces goes back through
@@ -1003,7 +1005,7 @@ fn command_cost(cmd: &Command) -> u32 {
 /// come back stopped.
 #[derive(Debug)]
 pub enum Retired {
-    Sample(Arc<Sample>),
+    Samples(Arc<SampleMap>),
     /// An effect, with its plugin instance if it is a plugin insert.
     Insert(Box<Insert>),
     /// A plugin instance the engine let go of.
@@ -1040,9 +1042,9 @@ pub const HELD_FOR_GOOD: usize =
 /// Hands a sample the engine no longer uses to the UI thread, so the audio
 /// thread never frees it. Without a queue (offline rendering) it is dropped
 /// here, which is fine off the audio thread.
-fn retire(queue: &mut Option<Producer<Retired>>, sample: Option<Arc<Sample>>) {
-    if let Some(s) = sample {
-        retire_any(queue, Retired::Sample(s));
+fn retire(queue: &mut Option<Producer<Retired>>, map: Option<Arc<SampleMap>>) {
+    if let Some(m) = map {
+        retire_any(queue, Retired::Samples(m));
     }
 }
 
@@ -1057,7 +1059,7 @@ fn retire_insert(queue: &mut Option<Producer<Retired>>, mut insert: Box<Insert>)
 /// [`retire`] for what an instrument holds: its sample, or its plugin
 /// instance.
 fn retire_instrument(queue: &mut Option<Producer<Retired>>, instrument: &mut Instrument) {
-    retire(queue, instrument.set_sample(None));
+    retire(queue, instrument.set_samples(None));
     if let Some(i) = instrument.plugin_slot().and_then(PluginSlot::take) {
         retire_any(queue, Retired::Plugin(i));
     }
@@ -1938,7 +1940,7 @@ impl Engine {
         // Nothing sounded yet, so a track removed on the way has nothing to fade.
         for f in &mut e.fading[..] {
             f.left = 0;
-            drop(f.track.instrument.set_sample(None));
+            drop(f.track.instrument.set_samples(None));
             f.track.chain = Chain::default();
         }
         // Nor do groups removed on the way ring out.
@@ -2325,11 +2327,11 @@ impl Engine {
         }
     }
 
-    /// Same as handling [`Command::SetSample`].
-    pub fn set_sample(&mut self, track: usize, sample: Option<Arc<Sample>>) {
+    /// Same as handling [`Command::SetSamples`].
+    pub fn set_samples(&mut self, track: usize, map: Option<Arc<SampleMap>>) {
         let old = match self.tracks[..self.track_count].get_mut(track) {
-            Some(t) => t.instrument.set_sample(sample),
-            None => sample,
+            Some(t) => t.instrument.set_samples(map),
+            None => map,
         };
         retire(&mut self.retired, old);
     }
@@ -2470,7 +2472,7 @@ impl Engine {
                 // Back to the knob values, so auditions sound as set.
                 self.automate(self.now);
             }
-            Command::SetSample { track, sample } => self.set_sample(usize::from(track), sample),
+            Command::SetSamples { track, map } => self.set_samples(usize::from(track), map),
             Command::SetSlot { chain, slot, insert } => self.place_slot(chain, slot, insert),
             Command::SetPlugin { track, instance } => self.set_plugin(usize::from(track), instance),
             Command::SetSlotPlugin { chain, slot, instance } => self.set_slot_plugin(chain, slot, instance),
@@ -4656,6 +4658,7 @@ fn mix_track(
 mod tests {
     use super::*;
     use crate::rt::spsc;
+    use crate::sample::Sample;
 
     const SR: f32 = 48_000.0;
 
@@ -5816,7 +5819,7 @@ mod tests {
         let mut e = engine(&[Edit::AddTrack(InstrumentKind::Sampler)]);
         e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 4), frames: 48_000 });
         assert_eq!(e.tracks[0].off_count, 0);
-        e.set_sample(0, Some(Arc::new(Sample::from_mono(&[0.5; 4800], 48_000).unwrap())));
+        e.set_samples(0, Some(Arc::new(SampleMap::single(Arc::new(Sample::from_mono(&[0.5; 4800], 48_000).unwrap())))));
         e.handle(Command::Audition { track: 0, step: Step::new(60, 100, 4), frames: 48_000 });
         assert_eq!(e.tracks[0].off_count, 1, "one with a sample does");
     }
@@ -7947,28 +7950,28 @@ mod tests {
     #[test]
     fn released_samples_go_back_through_the_queue() {
         let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
-        let a = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
-        let b = Arc::new(Sample::from_mono(&tone, 44_100).unwrap());
+        let a = Arc::new(SampleMap::single(Arc::new(Sample::from_mono(&tone, 48_000).unwrap())));
+        let b = Arc::new(SampleMap::single(Arc::new(Sample::from_mono(&tone, 44_100).unwrap())));
         let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
         let mut e = engine(&[Edit::AddTrack(InstrumentKind::Sampler), Edit::AddTrack(InstrumentKind::Kick)]);
         e.attach_retirement(tx);
         let mut back = Vec::new();
         let mut drain = |rx: &mut spsc::Consumer<Retired>| {
             while let Some(r) = rx.pop() {
-                let Retired::Sample(s) = r else { panic!("only samples were sent") };
+                let Retired::Samples(s) = r else { panic!("only samples were sent") };
                 back.push(s);
             }
             back.len()
         };
 
-        e.handle(Command::SetSample { track: 0, sample: Some(a.clone()) });
+        e.handle(Command::SetSamples { track: 0, map: Some(a.clone()) });
         assert_eq!(drain(&mut rx), 0);
         e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 1000 });
         assert!(run(&mut e, 256).iter().any(|x| x.abs() > 0.01), "the sampler track plays");
         // Replacing returns the old sample; a non-sampler track hands it straight back.
-        e.handle(Command::SetSample { track: 0, sample: Some(b.clone()) });
-        e.handle(Command::SetSample { track: 1, sample: Some(a.clone()) });
-        e.handle(Command::SetSample { track: 9, sample: Some(a.clone()) });
+        e.handle(Command::SetSamples { track: 0, map: Some(b.clone()) });
+        e.handle(Command::SetSamples { track: 1, map: Some(a.clone()) });
+        e.handle(Command::SetSamples { track: 9, map: Some(a.clone()) });
         assert_eq!(drain(&mut rx), 3);
         // Removing the track releases its sample too, once it has faded out.
         e.apply(Edit::RemoveTrack(0));

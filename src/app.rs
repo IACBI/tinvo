@@ -19,7 +19,7 @@ use crate::engine::{
 };
 use crate::group::{MAX_GROUPS, group_param};
 use crate::insert::{EffectKind, Insert, MAX_SLOTS};
-use crate::instrument::{InstrumentKind, ParamSpec};
+use crate::instrument::{InstrumentKind, ParamSpec, SampleMap};
 use crate::keymap::{Action, Context, Keymap};
 use crate::lock::{self, Lock};
 use crate::midi::schedule::{self, OutSlot, OutputThread};
@@ -27,12 +27,14 @@ use crate::midi::{self, Message};
 use crate::mix;
 use crate::note_take::{MAX_TAKE_NOTES, NoteTake, follow_track};
 use crate::plugins::Plugins;
-use crate::project::{self, FILE_EXTENSION, Marker, PAN, PluginPlace, Project, SlotData, VOLUME, pattern_name};
+use crate::project::{
+    self, FILE_EXTENSION, Marker, PAN, PluginPlace, Project, SlotData, TrackData, VOLUME, ZoneData, pattern_name,
+};
 use crate::record::{self as record_mod, Recorder};
 use crate::render::{self, RenderOptions, Source};
 use crate::rt::mailbox::Mailbox;
 use crate::rt::spsc::{self, Consumer, Producer};
-use crate::sample::{self as sample_mod, Sample};
+use crate::sample::{self as sample_mod, Bank, Sample};
 use crate::settings::{self as settings_mod, MidiOut, OPTIONS, Recording, Settings};
 use crate::strip::{self, track_param};
 use crate::theme::{self as theme_mod, Role, Theme};
@@ -193,7 +195,7 @@ impl EngineLink {
                     Retired::Insert(mut i) => {
                         self.gone.extend(i.plugin_slot().and_then(|s| s.instance()).map(|i| i.token()))
                     }
-                    Retired::Sample(_) => {}
+                    Retired::Samples(_) => {}
                 }
             }
         }
@@ -222,7 +224,7 @@ impl EngineLink {
     fn try_push(&mut self, cmd: Command) -> Result<(), Command> {
         let carries = match &cmd {
             _ if self.retired.is_none() => 0,
-            Command::SetSample { sample: Some(_), .. }
+            Command::SetSamples { map: Some(_), .. }
             | Command::SetPlugin { .. }
             | Command::SetSlotPlugin { .. }
             | Command::Return(_) => 1,
@@ -281,9 +283,17 @@ struct Clip {
 struct TrackMeta {
     name: String,
     sample: Option<String>,
+    zones: Arc<[ZoneData]>,
 }
 
-/// What lives outside the [`Edit`] stream: each track's name and sample,
+impl TrackMeta {
+    /// The sample files it plays, as [`TrackData::sample_paths`].
+    fn sample_paths(&self) -> impl Iterator<Item = &str> {
+        self.sample.as_deref().into_iter().chain(self.zones.iter().map(|z| z.path.as_str()))
+    }
+}
+
+/// What lives outside the [`Edit`] stream: each track's name and samples,
 /// each group's name, the song's markers and the plugins' states.
 #[derive(Clone, Debug, PartialEq)]
 struct Meta {
@@ -1743,12 +1753,16 @@ impl App {
         }
         let history =
             undo.iter().chain(redo.iter()).flat_map(|c| c.meta_before.tracks.iter().chain(&c.meta_after.tracks));
-        let used: std::collections::HashSet<&str> = project
-            .tracks
-            .iter()
-            .filter_map(|t| t.sample.as_deref())
-            .chain(history.filter_map(|m| m.sample.as_deref()))
-            .collect();
+        let mut used: std::collections::HashSet<&str> =
+            project.tracks.iter().flat_map(TrackData::sample_paths).collect();
+        // Steps share a track's zones until they change: each list is read once.
+        let mut lists = std::collections::HashSet::new();
+        for m in history {
+            used.extend(m.sample.as_deref());
+            if lists.insert(Arc::as_ptr(&m.zones).cast::<ZoneData>()) {
+                used.extend(m.zones.iter().map(|z| z.path.as_str()));
+            }
+        }
         bank.retain(|path, _| used.contains(path.as_str()));
     }
 
@@ -1825,7 +1839,7 @@ impl App {
                 .project
                 .tracks
                 .iter()
-                .map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone() })
+                .map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone(), zones: Arc::clone(&t.zones) })
                 .collect(),
             groups: self.project.groups.iter().map(|g| g.name.clone()).collect(),
             markers: self.project.markers.clone(),
@@ -1938,32 +1952,31 @@ impl App {
         }
         for (i, m) in meta.tracks.iter().enumerate() {
             self.project.tracks[i].name.clone_from(&m.name);
-            if self.project.tracks[i].sample != m.sample {
-                self.project.tracks[i].sample.clone_from(&m.sample);
+            let t = &mut self.project.tracks[i];
+            if t.sample != m.sample || t.zones != m.zones {
+                t.sample.clone_from(&m.sample);
+                t.zones = Arc::clone(&m.zones);
                 self.send_sample(i);
             }
         }
     }
 
-    /// Sends track `i`'s sample (from the bank) to the engine.
+    /// Sends what track `i` plays of the bank's samples to the engine.
     fn send_sample(&mut self, i: usize) {
-        let sample = self.project.tracks[i].sample.as_ref().and_then(|p| self.bank.get(p)).cloned();
-        self.send(Command::SetSample { track: i as u8, sample });
+        let map = self.project.tracks[i].sample_map(&self.bank);
+        self.send(Command::SetSamples { track: i as u8, map });
     }
 
-    /// Each track's loaded sample, for the engine and for export.
-    pub fn track_samples(&self) -> Vec<Option<Arc<Sample>>> {
-        self.project.tracks.iter().map(|t| t.sample.as_ref().and_then(|p| self.bank.get(p)).cloned()).collect()
+    /// What each track plays of the bank's samples, for the engine and for
+    /// export.
+    pub fn track_samples(&self) -> Vec<Option<Arc<SampleMap>>> {
+        self.project.sample_maps(&self.bank)
     }
 
-    /// Adds already-loaded samples (one per track, as from
-    /// [`Project::load_samples`]) to the bank.
-    pub fn with_samples(mut self, samples: Vec<Option<Arc<Sample>>>) -> Self {
-        for (t, s) in self.project.tracks.iter().zip(samples) {
-            if let (Some(path), Some(s)) = (&t.sample, s) {
-                self.bank.insert(path.clone(), s);
-            }
-        }
+    /// Adds already-loaded samples (as from [`Project::load_samples`]) to
+    /// the bank.
+    pub fn with_bank(mut self, bank: Bank) -> Self {
+        self.bank.extend(bank);
         self
     }
 
@@ -1974,10 +1987,14 @@ impl App {
         if let Some(why) = sample_mod::unstorable(&key) {
             return Err(why.into());
         }
-        // The project's other samples count against its budget, each once.
+        // The project's other samples count against its budget, each once:
+        // the other tracks', and this one's zones.
         let mut others: Vec<&str> = (0..self.track_count())
-            .filter(|&i| i != track)
-            .filter_map(|i| self.project.tracks[i].sample.as_deref())
+            .flat_map(|i| {
+                let t = &self.project.tracks[i];
+                let sample = t.sample.as_deref().filter(|_| i != track);
+                sample.into_iter().chain(t.zones.iter().map(|z| z.path.as_str()))
+            })
             .filter(|&k| k != key)
             .collect();
         others.sort_unstable();
@@ -1989,19 +2006,18 @@ impl App {
         let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
         self.set_status(format!("Loaded {name}: {secs:.2} s at {} Hz{mono}", loaded.sample_rate));
-        let reloaded = self.bank.insert(key.clone(), loaded).is_some();
+        self.bank.insert(key.clone(), loaded);
         let meta_before = self.meta();
         self.project.tracks[track].sample = Some(key.clone());
         self.send_sample(track);
         // The file as loaded now is what every track using it plays, as an
-        // export and the saved project would have it.
-        if reloaded {
-            let others: Vec<usize> = (0..self.track_count())
-                .filter(|&i| i != track && self.project.tracks[i].sample.as_deref() == Some(key.as_str()))
-                .collect();
-            for &i in &others {
-                self.send_sample(i);
-            }
+        // export and the saved project would have it: loaded again, or
+        // loaded at last where it was missing.
+        let others: Vec<usize> = (0..self.track_count())
+            .filter(|&i| i != track && self.project.tracks[i].sample_paths().any(|p| p == key))
+            .collect();
+        for &i in &others {
+            self.send_sample(i);
         }
         self.touch();
         self.redo.clear();
@@ -2063,7 +2079,7 @@ impl App {
     /// at most `budget` frames together, each file once. The history keeps
     /// paths, and a file loaded again since may have grown.
     fn samples_fit(&self, meta: &Meta, budget: usize) -> bool {
-        let mut keys: Vec<&str> = meta.tracks.iter().filter_map(|t| t.sample.as_deref()).collect();
+        let mut keys: Vec<&str> = meta.tracks.iter().flat_map(TrackMeta::sample_paths).collect();
         keys.sort_unstable();
         keys.dedup();
         keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() <= budget
@@ -5290,10 +5306,19 @@ impl App {
         };
         // A track whose sample did not load would be silent in the file.
         let missing =
-            self.project.tracks.iter().find_map(|t| t.sample.as_ref().filter(|p| !self.bank.contains_key(*p)));
+            self.project.tracks.iter().flat_map(TrackData::sample_paths).find(|p| !self.bank.contains_key(*p));
         if let Some(p) = missing {
-            let load = self.k(Action::LoadSample);
-            return self.set_status(format!("Not exported: the sample {p} is missing; {load} loads it again"));
+            // Loading puts a file in as the selected track's sample, not as a
+            // zone: the hint names the track whose sample it is.
+            let owner = self.project.tracks.iter().find(|t| t.sample.as_deref() == Some(p));
+            let why = match owner {
+                Some(t) => {
+                    let load = self.k(Action::LoadSample);
+                    format!("the sample {p} of {} is missing; {load} on that track loads it again", t.name)
+                }
+                None => format!("the zone file {p} is missing; put it back and open the project again"),
+            };
+            return self.set_status(format!("Not exported: {why}"));
         }
         let mut plugins: Box<dyn render::PluginSource> = if self.project.plugin_places().is_empty() {
             Box::new(render::NoPlugins)
@@ -6071,18 +6096,34 @@ impl App {
                 } else {
                     String::new()
                 };
-                match (&t.sample, t.kind) {
-                    (Some(path), _) => {
-                        let file = Path::new(path)
-                            .file_name()
-                            .map_or(std::borrow::Cow::Borrowed(path.as_str()), |n| n.to_string_lossy());
-                        let missing = if self.bank.contains_key(path) { "" } else { " (missing)" };
-                        format!(" {} · {} · {file}{missing}{page} ", t.name, self.kind_label(t.kind))
+                match t.kind {
+                    InstrumentKind::Sampler if t.sample.is_some() || !t.zones.is_empty() => {
+                        let file = t.sample.as_deref().map(|path| {
+                            Path::new(path)
+                                .file_name()
+                                .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned())
+                        });
+                        let zones = match t.zones.len() {
+                            0 => None,
+                            1 => Some("1 zone".to_string()),
+                            n => Some(format!("{n} zones")),
+                        };
+                        let what: Vec<String> = file.into_iter().chain(zones).collect();
+                        let gone: std::collections::HashSet<&str> =
+                            t.sample_paths().filter(|p| !self.bank.contains_key(*p)).collect();
+                        let missing = match gone.len() {
+                            0 => String::new(),
+                            1 if t.zones.is_empty() => " (missing)".to_string(),
+                            1 => " (1 file missing)".to_string(),
+                            n => format!(" ({n} files missing)"),
+                        };
+                        let what = what.join(" + ");
+                        format!(" {} · {} · {what}{missing}{page} ", t.name, self.kind_label(t.kind))
                     }
-                    (None, InstrumentKind::Sampler) => {
+                    InstrumentKind::Sampler => {
                         format!(" {} · Sampler · no sample, press {}{page} ", t.name, self.k(Action::LoadSample))
                     }
-                    (None, kind) => {
+                    kind => {
                         let window = match kind.plugin() {
                             Some(r) if self.page == Page::Instrument => {
                                 self.window_mark(PluginPlace::Track(self.track as u8), r)
@@ -6718,7 +6759,7 @@ fn with_extension(text: &str, ext: &str) -> PathBuf {
 /// the reason audio is unavailable.
 pub fn start_audio(
     project: &Project,
-    samples: &[Option<Arc<Sample>>],
+    samples: &[Option<Arc<SampleMap>>],
     config: &StreamConfig,
     live: Option<&Arc<Mailbox<Message>>>,
     midi_out: Option<&OutSlot>,
@@ -6754,7 +6795,7 @@ pub fn start_audio(
             }
         }
         for (track, sample) in samples.into_iter().enumerate() {
-            engine.set_sample(track, sample);
+            engine.set_samples(track, sample);
         }
         EngineCallback { engine, shared: cb_shared, sample_rate: sample_rate as f32, load: 0.0 }
     })?;
@@ -7152,7 +7193,7 @@ pub unsafe fn run(
         message = format!("{} sample(s) missing, e.g. {first}", errors.len());
     }
     let mut app = App::new(project, path, None, 48_000, "no audio".into())
-        .with_samples(samples)
+        .with_bank(samples)
         .with_settings(settings)
         .with_settings_file(settings_path);
     if recovered || midi {
@@ -8583,7 +8624,7 @@ mod tests {
     #[test]
     fn sample_changes_never_overflow_the_retirement_queue() {
         let tone: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin()).collect();
-        let s = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
+        let s = Arc::new(SampleMap::single(Arc::new(Sample::from_mono(&tone, 48_000).unwrap())));
         let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
         let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
         let shared = Arc::new(Shared::new());
@@ -8592,7 +8633,7 @@ mod tests {
         e.attach_retirement(retire_tx);
         // Every track starts with a sample, as after opening a project.
         for t in 0..MAX_TRACKS {
-            e.set_sample(t, Some(s.clone()));
+            e.set_samples(t, Some(s.clone()));
         }
         let mut link = EngineLink::new(tx, shared).with_retirement(retire_rx, MAX_TRACKS);
         // The samples held so far count as in flight.
@@ -8601,7 +8642,7 @@ mod tests {
         // Far more sample changes than the queue holds, between two callbacks.
         for round in 0..10 {
             for _ in 0..300 {
-                link.send(Command::SetSample { track: 0, sample: Some(s.clone()) });
+                link.send(Command::SetSamples { track: 0, map: Some(s.clone()) });
             }
             assert!(link.in_flight <= RETIRE_QUEUE, "round {round}: {}", link.in_flight);
             e.process(&mut out);
@@ -8645,8 +8686,8 @@ mod tests {
             keys(a, &[Key::Enter]);
             let mut v = Vec::new();
             while let Some(cmd) = rx.pop() {
-                if let Command::SetSample { track, sample: Some(s) } = cmd {
-                    v.push((track, s.audio()[10]));
+                if let Command::SetSamples { track, map: Some(m) } = cmd {
+                    v.push((track, m.zones()[0].sample.audio()[10]));
                 }
             }
             v
@@ -8661,7 +8702,85 @@ mod tests {
         assert_eq!(sent.iter().map(|&(t, _)| t).collect::<Vec<_>>(), [1, 0]);
         assert!(sent.iter().all(|&(_, x)| x == quieter[10]), "{sent:?}");
         let samples = a.track_samples();
-        assert!(Arc::ptr_eq(samples[0].as_ref().unwrap(), samples[1].as_ref().unwrap()));
+        let sample = |t: usize| &samples[t].as_ref().unwrap().zones()[0].sample;
+        assert!(Arc::ptr_eq(sample(0), sample(1)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sampler_track_s_zones_play_show_and_come_back() {
+        use crate::instrument::zone::{Placement, Trigger};
+        let dir = std::env::temp_dir().join(format!("tinvo-app-zones-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a_path, b_path) = (dir.join("a.wav"), dir.join("b.wav"));
+        wav::write_file(&a_path, &[0.25; 480], 1, 48_000, SampleFormat::Float32).unwrap();
+        wav::write_file(&b_path, &[0.5; 960], 1, 48_000, SampleFormat::Float32).unwrap();
+        let (a_key, b_key) = (a_path.display().to_string(), b_path.display().to_string());
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let t = p.tracks.len() - 1;
+        p.tracks[t].sample = Some(a_key.clone());
+        let release = Placement { trigger: Trigger::Release, ..Placement::WHOLE };
+        p.tracks[t].zones = vec![
+            ZoneData { place: Placement::WHOLE, path: b_key.clone() },
+            ZoneData { place: release, path: b_key.clone() },
+        ]
+        .into();
+        let (bank, errors) = p.load_samples();
+        assert!(errors.is_empty(), "{errors:?}");
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(p, None, Some(link), 48_000, "test".into()).with_bank(bank);
+        a.track = t;
+        assert_eq!(a.track_samples()[t].as_ref().unwrap().zones().len(), 3, "the sample and both zones");
+        let mut s = Screen::new(160, 40);
+        let title = |a: &App, s: &mut Screen| {
+            a.draw(s);
+            (0..40).map(|y| s.row_text(y)).find(|r| r.contains("· Sampler ·")).unwrap()
+        };
+        assert!(title(&a, &mut s).contains(" · a.wav + 2 zones "), "{}", title(&a, &mut s));
+        // Each file counts once against the project's budget, and stays
+        // loaded while a track plays it.
+        let meta = a.meta();
+        assert!(a.samples_fit(&meta, 480 + 960) && !a.samples_fit(&meta, 480 + 959));
+        a.prune_bank();
+        assert_eq!(a.bank.len(), 2);
+        // A zone whose file is missing is told, and the export refused.
+        let b = a.bank.remove(&b_key).unwrap();
+        assert!(title(&a, &mut s).contains(" · a.wav + 2 zones (1 file missing) "), "{}", title(&a, &mut s));
+        a.export_to(&dir.join("out.wav"));
+        let said = a.status_text().unwrap();
+        assert!(said.contains(&format!("the zone file {b_key} is missing; put it back")), "{said}");
+        // Loaded at last into another track, it reaches this one too.
+        drop(b);
+        assert!(a.edit(Edit::AddTrack(InstrumentKind::Sampler)));
+        a.track = a.track_count() - 1;
+        while rx.pop().is_some() {}
+        a.mode = Mode::Prompt(PromptKind::LoadSample, b_key.clone());
+        keys(&mut a, &[Key::Enter]);
+        let mut sent = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            if let Command::SetSamples { track, map } = cmd {
+                sent.push((usize::from(track), map.map(|m| m.zones().len())));
+            }
+        }
+        assert_eq!(sent, [(t + 1, Some(1)), (t, Some(3))]);
+        keys(&mut a, &[Key::Char('u')]);
+        assert!(a.edit(Edit::RemoveTrack((t + 1) as u8)));
+        a.track = t;
+        // A deleted track comes back with its zones, and plays them.
+        while rx.pop().is_some() {}
+        keys(&mut a, &[Key::Char('D'), Key::Char('y')]);
+        assert_eq!((a.project.tracks.len(), a.bank.len()), (t, 2), "the history can bring them back");
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!(a.project.tracks[t].zones.len(), 2);
+        let mut sent = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            if let Command::SetSamples { track, map } = cmd {
+                sent.push((usize::from(track), map.map(|m| m.zones().len())));
+            }
+        }
+        assert_eq!(sent, [(t, Some(3))]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -8708,8 +8827,8 @@ mod tests {
         let sent = |rx: &mut spsc::Consumer<Command>| {
             let mut v = Vec::new();
             while let Some(cmd) = rx.pop() {
-                if let Command::SetSample { track, sample } = cmd {
-                    v.push((track, sample.is_some()));
+                if let Command::SetSamples { track, map } = cmd {
+                    v.push((track, map.is_some()));
                 }
             }
             v
@@ -10077,7 +10196,11 @@ mod tests {
         assert!(!out.exists());
         assert_eq!(
             a.status_text().unwrap(),
-            format!("Not exported: the sample {gone} is missing; {} loads it again", a.k(Action::LoadSample))
+            format!(
+                "Not exported: the sample {gone} of {} is missing; {} on that track loads it again",
+                a.project.tracks[t].name,
+                a.k(Action::LoadSample)
+            )
         );
         // As MIDI it does not matter.
         a.export_to(&dir.join("out.mid"));

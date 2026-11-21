@@ -9,7 +9,7 @@
 use crate::wav;
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Zero frames stored before and after the audio, so the interpolators can
 /// read their whole kernel without bounds checks.
@@ -222,7 +222,9 @@ pub fn relativize(path: &str, project_dir: Option<&Path>) -> String {
     match p.strip_prefix(dir) {
         Ok(rel) if rel.components().all(|c| matches!(c, Component::Normal(_))) => {
             let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-            parts.join("/")
+            let rel = parts.join("/");
+            // A line is trimmed: a path starting with whitespace stays whole.
+            if rel.trim_start() == rel { rel } else { path.to_string() }
         }
         _ => path.to_string(),
     }
@@ -231,6 +233,9 @@ pub fn relativize(path: &str, project_dir: Option<&Path>) -> String {
 /// The longest sample path a project keeps, in bytes: as long as a path
 /// most systems open.
 pub const MAX_PATH_BYTES: usize = 4096;
+
+/// Loaded samples by the path they were loaded from.
+pub type Bank = std::collections::HashMap<String, Arc<Sample>>;
 
 /// Why `path` cannot be kept as a sample path, if it cannot: a project
 /// file must give it back unchanged. Files hold one setting per line, and

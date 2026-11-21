@@ -585,6 +585,20 @@ For realistic instruments without plugins, and for chopping breaks (drum and bas
 - 16 voices per sampler. Samples stay in memory as today.
 - Tests: zone and layer choice, round-robin order, the SFZ reader fuzzed, slice points on a synthetic signal.
 
+It comes in three parts, each merged on its own, and ships whole.
+
+#### 13a: Zones ✅
+
+- A sampler track plays its sample over the whole keyboard, as before, and zones: a sample file each, with a key range, a velocity range, a root key (or the track's root note), a round-robin position and cycle, attack or release, its own tuning in cents and gain in dB, and the frames of the file it plays. A note plays every attack zone it reaches, so zones of one range layer, and a zone that takes turns plays the notes that reach it in its turn, counted per zone as SFZ does. A key coming up plays its release zones, at the velocity it went down with, once to their end whatever the mode; stopping lets keys go without them.
+- The track's parameters apply to every zone: tune and fine on top of each zone's tuning, and the start, end and loop points as fractions of each zone's part of its file.
+- 16 voices, up to 1024 zones a track besides its sample. One note starts at most 16 voices, and the layers of one note, or of one key coming up, never take each other's voices; turns are counted for every note that reaches a zone, voices or not. Each key knows its zones, so a note looks only at those.
+- The engine gets each track's zones in one `Arc`, built on the UI thread from the loaded files and handed back to it to free, as the sample was.
+- Project format 18: `zone` lines in a sampler track, paths relative to the project as the sample's. Each file a track plays loads once and counts once against the project's budget; a zone whose file is missing is left out, the panel's title counts the zones and the missing files, and a WAV export waits for every file.
+
+#### 13b: SFZ import
+
+#### 13c: The slicer
+
 ### Phase 14: Synth engines (small to medium)
 
 For FM keys, basses and bells, and wavetable leads and pads.

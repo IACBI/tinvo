@@ -18,7 +18,7 @@
 use crate::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
 use crate::group::MAX_GROUPS;
 use crate::insert::{EffectKind, MAX_INSERTS, MAX_SLOTS};
-use crate::instrument::InstrumentKind;
+use crate::instrument::{InstrumentKind, SampleMap};
 use crate::mix::send;
 use crate::project::Project;
 use crate::sample::Sample;
@@ -46,7 +46,7 @@ pub struct Scenario {
 /// A scenario's project, the samples of its tracks, and how it plays.
 struct Setup {
     project: Project,
-    samples: Vec<Option<Arc<Sample>>>,
+    samples: Vec<Option<Arc<SampleMap>>>,
     play: Command,
 }
 
@@ -70,7 +70,7 @@ pub const SCENARIOS: [Scenario; 7] = [
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
     Scenario {
         id: "sampler",
-        label: "Sampler, 8 voices resampled through sinc and filter",
+        label: "Sampler, 16 voices resampled through sinc and filter",
         budget: 0.1,
         build: sampler,
     },
@@ -91,7 +91,7 @@ impl Scenario {
         let edits = setup.project.to_edits();
         let mut engine = Engine::with_edits(SAMPLE_RATE as f32, &edits, Arc::new(Shared::new()), None);
         for (track, sample) in setup.samples.into_iter().enumerate() {
-            engine.set_sample(track, sample);
+            engine.set_samples(track, sample);
         }
         engine.handle(setup.play);
         engine
@@ -290,10 +290,10 @@ fn set(p: &mut Project, kind: InstrumentKind, values: &[(&str, f32)]) {
     }
 }
 
-/// Two overlapping four-note chords on every step keep all eight voices of
-/// track 0 sounding.
-fn chords(p: &mut Project, root: u8) {
-    let chord = Step { chord: [3, 7, 10], ..Step::new(root, 100, 2) };
+/// A four-note chord on every step, each `len` steps long: `len` of them
+/// overlap, keeping `4 * len` voices of track 0 sounding.
+fn chords(p: &mut Project, root: u8, len: u8) {
+    let chord = Step { chord: [3, 7, 10], ..Step::new(root, 100, len) };
     for step in 0..16 {
         ok(p.apply(Edit::SetStep { track: 0, pattern: 0, step, value: Some(chord) }));
     }
@@ -308,7 +308,7 @@ fn synth() -> Setup {
         InstrumentKind::Synth,
         &[("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)],
     );
-    chords(&mut p, 48);
+    chords(&mut p, 48, 2);
     Setup { project: p, samples: Vec::new(), play: Command::Play }
 }
 
@@ -318,7 +318,7 @@ fn sampler() -> Setup {
     let mut p = Project::new();
     ok(p.apply(Edit::AddTrack(InstrumentKind::Sampler)));
     set(&mut p, InstrumentKind::Sampler, &[("interp", 0.0), ("loop", 1.0), ("cutoff", 3000.0), ("resonance", 0.5)]);
-    chords(&mut p, 55);
+    chords(&mut p, 55, 4);
     let rate = 44_100;
     let audio: Vec<f32> = (0..rate * 2)
         .map(|i| {
@@ -328,7 +328,7 @@ fn sampler() -> Setup {
         })
         .collect();
     let sample = Sample::from_mono(&audio, rate as u32).expect("a valid sample");
-    Setup { project: p, samples: vec![Some(Arc::new(sample))], play: Command::Play }
+    Setup { project: p, samples: vec![Some(Arc::new(SampleMap::single(Arc::new(sample))))], play: Command::Play }
 }
 
 /// Instruction budgets: `id instructions-per-second` lines, `#` comments.
