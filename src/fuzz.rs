@@ -1312,6 +1312,9 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
         Err(_) if info.frames == 0 || info.frames > sample::MAX_FRAMES as u64 => None,
         Err(e) => return Err(format!("the sample loader refuses a file that decodes: {e}")),
     };
+    if let Some(s) = &loaded {
+        check_slices(s, hash_of(input))?;
+    }
     if render {
         if let Some(s) = loaded {
             let single = Arc::new(SampleMap::single(s.clone()));
@@ -1333,6 +1336,42 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
         features.push(hash_of(("chunk", if known { id } else { b"?" })));
     }
     Ok(Outcome { accepted: true, features })
+}
+
+/// The slicer on a sample, both ways, over a part of it the input picks:
+/// the same each time, starting at the part's start and on in order inside
+/// it, at most so many, and each slice a zone that can play.
+fn check_slices(s: &sample::Sample, seed: u64) -> Result<(), String> {
+    use crate::slice::{How, MAX_SLICES};
+    let frames = s.frames();
+    let from = if seed % 4 == 0 { (seed >> 8) as usize % frames } else { 0 };
+    let to = if seed % 3 == 0 { from + (seed >> 24) as usize % (frames - from) + 1 } else { frames };
+    let ways = [How::Transients(((seed >> 40) % 101) as u8), How::Parts(2 + (seed >> 48) as usize % (MAX_SLICES - 1))];
+    for how in ways {
+        let starts = match crate::slice::starts(s.audio(), s.sample_rate, from, to, how) {
+            Ok(v) => v,
+            Err(_) if matches!(how, How::Parts(n) if to - from < n) => continue,
+            Err(e) => return Err(format!("{how:?} of frames {from} to {to} fails: {e}")),
+        };
+        if crate::slice::starts(s.audio(), s.sample_rate, from, to, how).as_ref() != Ok(&starts) {
+            return Err(format!("{how:?} slices differently twice"));
+        }
+        if starts.first() != Some(&from)
+            || starts.len() > MAX_SLICES
+            || starts.windows(2).any(|w| w[0] >= w[1])
+            || starts.last().is_some_and(|&l| l >= to)
+            || matches!(how, How::Parts(n) if starts.len() != n)
+            || matches!(how, How::Transients(_) if starts.len() > 1
+                && (starts.windows(2).any(|w| w[1] - w[0] < crate::slice::min_gap(s.sample_rate))
+                    || to - starts[starts.len() - 1] < crate::slice::min_gap(s.sample_rate)))
+        {
+            return Err(format!("{how:?} of frames {from} to {to} gives {starts:?}"));
+        }
+        for p in crate::slice::placements(&starts, to) {
+            p.check().map_err(|e| format!("a slice that cannot play: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ edits

@@ -141,6 +141,7 @@ actions! {
     MidiOut "midi_out" Track [c('V')] "send the track's notes to the MIDI output instead of sounding them (→ before the channel they go on)";
     Preview "preview" Track [c('p')] "preview the track's note";
     LoadSample "load_sample" Track [c('o')] "load a WAV file or an SFZ instrument into a sampler track";
+    Slice "slice" Track [c('%')] "slice the sampler track's sample into zones, a key each from C2: at its transients or into equal parts";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";
     PianoRoll "piano_roll" Track [c('v')] "piano roll for a melodic track / back to the grid";
     TrackGroup "track_group" Track [c('i')] "send the track to the next group, or from the last back to the master";
@@ -213,7 +214,7 @@ impl Action {
 /// keys to other actions. A key a file gives another action, where both are
 /// active together, is taken from one of these instead of being refused, so
 /// a file written for an earlier TINVO still loads.
-const LATE: &[Action] = &[Action::PluginWindow];
+const LATE: &[Action] = &[Action::PluginWindow, Action::Slice];
 
 /// Whether `a` and `b` are active at the same time somewhere, so cannot
 /// share a key.

@@ -10,7 +10,7 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security
 
 - **No third-party crates.** Use only `std` and direct FFI to operating-system APIs. A pull request that adds a dependency will not be merged. Write the piece you need, with tests.
 - **The audio thread is sacred.** Code reachable from `Engine::process` must not allocate, lock, block, do I/O or panic on valid input. Size everything when the engine is built.
-- **Every document change is an `Edit`.** New features that change the project go through `Project::apply`, need an inverse in `Project::inverse`, and must round-trip through the `.tvo` format.
+- **Every document change is an `Edit`.** New features that change the project go through `Project::apply`, need an inverse in `Project::inverse`, and must round-trip through the `.tvo` format. The exceptions are what the history stores whole before and after a step (`Meta` in `app.rs`: track names, sample paths and sampler zones, group names, song markers, plugin states): change those through the same helpers the editor uses (`App::meta` and a `Change`), so undo restores them.
 - **Do not break old files.** When the file format changes, bump `FORMAT_VERSION` and keep reading older versions. Add new instrument parameters at the end of the list.
 - **Prove it.** New behaviour comes with tests that would fail without the change. DSP claims (pitch, timing, frequency response) are measured in tests, not assumed.
 
@@ -27,7 +27,7 @@ cargo test --release
 
 If you changed anything the engine runs, run `tinvo bench --check` in release mode: it prints each scenario's cost per callback against its time budget. CI also counts the instructions each scenario takes with Valgrind's cachegrind, on x86-64 Linux, against `bench/instructions.txt`, and fails beyond 10 % over. If a change makes rendering costlier on purpose, run `tinvo bench --instructions bench/instructions.txt` there (the CI log shows the same output), copy the measured lines into the file, and say why in the pull request. The counts depend on the compiler, so a new stable Rust can move them too.
 
-If you changed the project format, the WAV reader, the edit model, the MIDI file reader or the SFZ reader, run `tinvo fuzz project`, `tinvo fuzz wav`, `tinvo fuzz edits`, `tinvo fuzz midi` or `tinvo fuzz sfz` for a few minutes (each runs 60 s by default; `--seconds N` for longer). A failing input is saved, and `tinvo fuzz TARGET --check FILE` replays it.
+If you changed the project format, the WAV reader or the slicer, the edit model, the MIDI file reader or the SFZ reader, run `tinvo fuzz project`, `tinvo fuzz wav`, `tinvo fuzz edits`, `tinvo fuzz midi` or `tinvo fuzz sfz` for a few minutes (each runs 60 s by default; `--seconds N` for longer). A failing input is saved, and `tinvo fuzz TARGET --check FILE` replays it.
 
 A new editor key is an `Action` in `src/keymap.rs`, with its context and default keys, and a new colour is a `Role` in `src/theme.rs`, with a style for both built-in themes. The handlers and drawing use these, never a key code or a colour directly, so the settings file and the key list pick them up. The keymap's tests fail if a default key clashes with another in the same view. Something new the mouse should reach is a `Target` in `src/app.rs`: the code that draws it records where (`App::hit`), and `click` or `wheel` says what it does, through the same functions as its keys.
 

@@ -41,6 +41,9 @@ USAGE:
     tinvo sfz INSTRUMENT.sfz            check an SFZ instrument: what the sampler plays of
                                         it and what it leaves out (o on a sampler track
                                         imports it)
+    tinvo slice SAMPLE.wav [N | t [S]]  where the slicer cuts a sample: into N equal parts,
+                                        or at its transients with sensitivity S from 0 to
+                                        100 (50 by default; % on a sampler track slices)
     tinvo demo OUT.tvo                  write the demo project to a file
     tinvo devices                       list the audio output devices
     tinvo midi                          list the MIDI inputs and outputs
@@ -124,6 +127,7 @@ fn main() -> ExitCode {
         Some("settings") => cmd_settings(&args[1..]),
         Some("import") => cmd_import(&args[1..]),
         Some("sfz") => cmd_sfz(&args[1..]),
+        Some("slice") => cmd_slice(&args[1..]),
         Some(_) => cmd_edit(&args),
     };
     match result {
@@ -389,6 +393,30 @@ fn cmd_sfz(args: &[String]) -> Result<(), String> {
     }
     for note in &inst.notes {
         println!("- {}", tinvo::tui::printable(note));
+    }
+    Ok(())
+}
+
+fn cmd_slice(args: &[String]) -> Result<(), String> {
+    use tinvo::slice::{FIRST_KEY, How, MAX_SLICES};
+    let (input, how) = match args {
+        [input] => (input, How::Transients(tinvo::slice::DEFAULT_SENSITIVITY)),
+        [input, how @ ..] if !how.is_empty() => (input, How::parse(&how.join(" "))?),
+        _ => return Err(format!("slice needs a SAMPLE.wav{SEE_HELP}")),
+    };
+    let s = tinvo::sample::load(std::path::Path::new(input))?;
+    let starts = tinvo::slice::starts(s.audio(), s.sample_rate, 0, s.frames(), how)?;
+    let how = match how {
+        How::Parts(_) => "equal parts".to_string(),
+        How::Transients(x) => format!("at transients, sensitivity {x}"),
+    };
+    println!("{}: {} slices ({how}; at most {MAX_SLICES})", shown(input), starts.len());
+    println!("  key   start frame  length   at");
+    let sr = f64::from(s.sample_rate);
+    let ends = starts.iter().skip(1).copied().chain(std::iter::once(s.frames()));
+    for (k, (&start, end)) in starts.iter().zip(ends).enumerate() {
+        let key = tinvo::instrument::note_name(FIRST_KEY + k as u8);
+        println!("  {key:<5} {start:>11}  {:>7.3} s  {:.3} s", (end - start) as f64 / sr, start as f64 / sr);
     }
     Ok(())
 }
