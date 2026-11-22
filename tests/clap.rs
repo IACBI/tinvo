@@ -319,6 +319,7 @@ struct Stats {
     flushes: u32,
     overlaps: u32,
     start_gain: f64,
+    chokes: u32,
 }
 
 #[repr(C)]
@@ -458,6 +459,50 @@ fn a_midi_instrument_gets_one_note_a_key() {
     drop(sine);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_choke_silences_every_note_held_or_not() {
+    for name in ["choke", "midi"] {
+        // Not the folders of the tests that install these names too.
+        let dir = temp_dir(&format!("{name}-choke"));
+        let file = install(&dir, name);
+        let mut host = PluginHost::new();
+        let mut sine = create(&mut host, &file, SINE, Role::Instrument).unwrap();
+        let mut io = vec![0.0; 2 * 8];
+        sine.note_on(60, 0.5).unwrap();
+        sine.note_on(64, 0.5).unwrap();
+        assert!(sine.process(&mut io));
+        assert_ne!(io[0], 0.0, "{name}");
+        sine.choke_all();
+        assert!(sine.process(&mut io));
+        assert!(io.iter().all(|&x| x == 0.0), "{name}: {io:?}");
+        let s = stats(&sine);
+        assert_eq!((s.notes_on, s.notes_off, s.chokes, s.broken), (2, 0, 1, 0), "{name}: {s:?}");
+        // With no note held, as once they are let go of, it goes all the
+        // same: a released note may still sound.
+        let n = sine.note_on(67, 0.5).unwrap();
+        assert!(sine.process(&mut io));
+        sine.note_off(n);
+        assert!(sine.process(&mut io));
+        sine.choke_all();
+        assert!(sine.process(&mut io));
+        let s = stats(&sine);
+        assert_eq!((s.notes_on, s.notes_off, s.chokes, s.broken), (3, 1, 2, 0), "{name}: {s:?}");
+        // With the queue full of notes, the choke takes their place.
+        while let Some(n) = sine.note_on(60, 1.0) {
+            sine.note_off(n);
+        }
+        sine.choke_all();
+        assert!(sine.process(&mut io));
+        assert!(io.iter().all(|&x| x == 0.0), "{name}: {io:?}");
+        let s = stats(&sine);
+        assert_eq!((s.notes_on, s.notes_off, s.chokes, s.broken), (3, 1, 3, 0), "{name}: {s:?}");
+        sine.stop();
+        drop(sine);
+        drop(host);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

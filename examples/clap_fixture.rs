@@ -800,6 +800,8 @@ pub struct Stats {
     pub overlaps: u32,
     /// The gain as it was activated.
     pub start_gain: f64,
+    /// Chokes of every note, or All Sound Off, taken.
+    pub chokes: u32,
 }
 
 #[repr(C)]
@@ -956,6 +958,7 @@ struct Instance {
     broken: AtomicU32,
     notes_on: AtomicU32,
     notes_off: AtomicU32,
+    chokes: AtomicU32,
     offline: AtomicU32,
     frames: AtomicU32,
     steady: AtomicU32,
@@ -1468,6 +1471,18 @@ impl Instance {
             self.take_param(unsafe { &*e.cast::<ClapEventParamValue>() });
             return;
         }
+        if (h.space_id, h.kind) == (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_CHOKE) {
+            self.require(!midi_only && h.size as usize == size_of::<ClapEventNote>());
+            // SAFETY: a note event, by its kind.
+            let n = unsafe { &*e.cast::<ClapEventNote>() };
+            // Only the host's choke of every note is expected.
+            self.require(n.note_id == -1 && n.key == -1 && n.channel == -1 && n.port_index == 0);
+            for v in &mut audio.voices {
+                v.on = false;
+            }
+            self.chokes.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let (on, id, key, velocity) = match (h.space_id, h.kind) {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF) => {
                 self.require(!midi_only && h.size as usize == size_of::<ClapEventNote>());
@@ -1483,6 +1498,14 @@ impl Instance {
                 match m.data[0] & 0xf0 {
                     0x90 if m.data[2] > 0 => (true, -1, m.data[1], f64::from(m.data[2]) / 127.0),
                     0x80 | 0x90 => (false, -1, m.data[1], 0.0),
+                    // All Sound Off.
+                    0xB0 if m.data[1] == 120 => {
+                        for v in &mut audio.voices {
+                            v.on = false;
+                        }
+                        self.chokes.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     _ => return,
                 }
             }
@@ -1614,6 +1637,7 @@ unsafe extern "C" fn get_stats(p: *const ClapPlugin, out: *mut Stats) {
         broken: n(&me.broken),
         notes_on: n(&me.notes_on),
         notes_off: n(&me.notes_off),
+        chokes: n(&me.chokes),
         offline: n(&me.offline),
         max_frames: n(&me.max_frames),
         frames: n(&me.frames),
@@ -1971,6 +1995,7 @@ unsafe extern "C" fn create_plugin(
         broken: AtomicU32::new(0),
         notes_on: AtomicU32::new(0),
         notes_off: AtomicU32::new(0),
+        chokes: AtomicU32::new(0),
         offline: AtomicU32::new(0),
         frames: AtomicU32::new(0),
         steady: AtomicU32::new(0),

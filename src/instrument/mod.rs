@@ -433,6 +433,21 @@ impl Instrument {
         }
     }
 
+    /// Silences every voice at once, released ones too (a plugin is sent a
+    /// choke of every note, or All Sound Off).
+    pub fn stop_all(&mut self) {
+        match self {
+            Instrument::Synth(s) => s.stop_all(),
+            Instrument::Sampler(s) => s.stop_all(),
+            Instrument::Drum(d) => d.stop(),
+            Instrument::Plugin(p) => {
+                if let Some(i) = p.instance() {
+                    i.choke_all();
+                }
+            }
+        }
+    }
+
     /// Gives a sampler its samples and returns the ones they replace.
     /// Other instruments hand them straight back. The result must be
     /// disposed of off the audio thread.

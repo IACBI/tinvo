@@ -1446,6 +1446,52 @@ impl Instance {
         }
     }
 
+    /// Ends every sound it makes at once, released notes too: one choke
+    /// of every note where the plugin takes CLAP notes (note id, channel
+    /// and key all -1), All Sound Off (CC 120) on its MIDI port otherwise.
+    /// Its notes are let go of, and the notes queued for the next call left
+    /// out (the choke would end them at once), so there is room for it.
+    pub fn choke_all(&mut self) {
+        self.held.clear();
+        self.events.truncate(self.params_queued);
+        let Some((port, clap)) = self.layout.notes else { return };
+        let event = if clap {
+            Event {
+                note: ClapEventNote {
+                    header: ClapEventHeader {
+                        size: size_of::<ClapEventNote>() as u32,
+                        time: 0,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        kind: CLAP_EVENT_NOTE_CHOKE,
+                        flags: 0,
+                    },
+                    note_id: -1,
+                    port_index: port as i16,
+                    channel: -1,
+                    key: -1,
+                    velocity: 0.0,
+                },
+            }
+        } else {
+            Event {
+                midi: ClapEventMidi {
+                    header: ClapEventHeader {
+                        size: size_of::<ClapEventMidi>() as u32,
+                        time: 0,
+                        space_id: CLAP_CORE_EVENT_SPACE_ID,
+                        kind: CLAP_EVENT_MIDI,
+                        flags: 0,
+                    },
+                    port_index: port,
+                    data: [0xB0, crate::midi::ALL_SOUND_OFF, 0],
+                },
+            }
+        };
+        if self.events.len() - self.params_queued < MAX_EVENTS {
+            self.events.push(event);
+        }
+    }
+
     /// Queues a note event, at the start of the next process call. Room is
     /// there: a note-on checked for it, and a release uses its note's.
     fn push_note(&mut self, kind: u16, held: Held, velocity: f32) {

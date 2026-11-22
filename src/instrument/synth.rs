@@ -432,6 +432,15 @@ impl PolySynth {
         }
     }
 
+    /// Silences every voice at once (without a click), released or not.
+    pub fn stop_all(&mut self) {
+        for v in &mut self.voices {
+            v.held = false;
+            v.amp.stop();
+            v.fenv.gate_off();
+        }
+    }
+
     pub fn active_voices(&self) -> usize {
         self.voices.iter().filter(|v| v.amp.is_active()).count()
     }

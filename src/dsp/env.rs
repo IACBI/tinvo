@@ -18,12 +18,16 @@ pub enum Stage {
     /// Exponential approach to the sustain level; also tracks sustain changes.
     Decay,
     Release,
+    /// A fade to silence in [`STOP_TIME`], whatever the release.
+    Stop,
 }
 
 /// Shortest allowed segment, long enough to avoid audible clicks.
 const MIN_TIME: f32 = 0.0005;
 /// Release ends below this level (-100 dB).
 const END_LEVEL: f32 = 1.0e-5;
+/// A stopped envelope falls by 60 dB in this time: at once, without a click.
+pub const STOP_TIME: f32 = 0.005;
 
 /// Linear-attack, exponential-decay/release envelope.
 ///
@@ -36,6 +40,7 @@ pub struct Adsr {
     attack_step: f32,
     decay_coef: f32,
     release_coef: f32,
+    stop_coef: f32,
     sustain: f32,
 }
 
@@ -47,13 +52,22 @@ impl Default for Adsr {
 
 impl Adsr {
     pub const fn new() -> Self {
-        Self { stage: Stage::Idle, level: 0.0, attack_step: 1.0, decay_coef: 0.0, release_coef: 0.0, sustain: 1.0 }
+        Self {
+            stage: Stage::Idle,
+            level: 0.0,
+            attack_step: 1.0,
+            decay_coef: 0.0,
+            release_coef: 0.0,
+            stop_coef: 0.0,
+            sustain: 1.0,
+        }
     }
 
     pub fn set_params(&mut self, p: &AdsrParams, sample_rate: f32) {
         self.attack_step = 1.0 / (p.attack.max(MIN_TIME) * sample_rate);
         self.decay_coef = decay_coef(p.decay.max(MIN_TIME), sample_rate);
         self.release_coef = decay_coef(p.release.max(MIN_TIME), sample_rate);
+        self.stop_coef = decay_coef(STOP_TIME, sample_rate);
         self.sustain = p.sustain.clamp(0.0, 1.0);
     }
 
@@ -62,8 +76,15 @@ impl Adsr {
     }
 
     pub fn gate_off(&mut self) {
-        if self.stage != Stage::Idle {
+        if matches!(self.stage, Stage::Attack | Stage::Decay) {
             self.stage = Stage::Release;
+        }
+    }
+
+    /// Fades out in [`STOP_TIME`], from wherever it is.
+    pub fn stop(&mut self) {
+        if self.stage != Stage::Idle {
+            self.stage = Stage::Stop;
         }
     }
 
@@ -87,8 +108,8 @@ impl Adsr {
             Stage::Decay => {
                 self.level = self.sustain + flush_denormal((self.level - self.sustain) * self.decay_coef);
             }
-            Stage::Release => {
-                self.level *= self.release_coef;
+            Stage::Release | Stage::Stop => {
+                self.level *= if self.stage == Stage::Stop { self.stop_coef } else { self.release_coef };
                 if self.level < END_LEVEL {
                     self.level = 0.0;
                     self.stage = Stage::Idle;
@@ -147,6 +168,40 @@ mod tests {
         }
         // After the decay time the distance to sustain is down by 60 dB.
         assert!((e.level() - 0.5).abs() < 0.5 * 1.1e-3, "{}", e.level());
+    }
+
+    #[test]
+    fn a_stop_fades_out_at_once_whatever_the_release() {
+        let mut e = env(0.001, 0.05, 1.0, 10.0);
+        e.gate_on();
+        for _ in 0..1000 {
+            e.tick();
+        }
+        e.gate_off();
+        e.stop();
+        // A key let go of after it does not slow it down.
+        e.gate_off();
+        assert_eq!(e.stage(), Stage::Stop);
+        // A fade, not a cut: -60 dB in the stop's time, not at once.
+        let start = e.level();
+        e.tick();
+        assert!(e.level() > start * 0.9, "{start} -> {}", e.level());
+        for _ in 1..(STOP_TIME * SR) as usize {
+            e.tick();
+        }
+        assert!((e.level() / start - 1e-3).abs() < 1e-4, "{}", e.level() / start);
+        let bound = (STOP_TIME * SR * 5.0 / 3.0) as usize + 2;
+        let mut n = 0;
+        while e.is_active() {
+            e.tick();
+            n += 1;
+            assert!(n <= bound, "the stop did not finish");
+        }
+        // Idle stays idle; a new note starts again.
+        e.stop();
+        assert!(!e.is_active());
+        e.gate_on();
+        assert_eq!(e.stage(), Stage::Attack);
     }
 
     #[test]

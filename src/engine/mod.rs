@@ -1395,6 +1395,9 @@ struct Track {
     audible: bool,
     midi_offs: [MidiOff; MAX_PENDING_OFFS],
     midi_off_count: usize,
+    /// The MIDI input channels that played it live since All Sound Off on
+    /// them, one bit each: their sound may still ring here.
+    heard: u16,
     gain_l: Smoother,
     gain_r: Smoother,
     /// Send levels, applied after fader and pan.
@@ -1441,6 +1444,7 @@ impl Track {
             audible: true,
             midi_offs: [MidiOff { frame: 0, channel: 0, note: 0, tag: 0 }; MAX_PENDING_OFFS],
             midi_off_count: 0,
+            heard: 0,
             gain_l: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             gain_r: Smoother::new(0.0, SMOOTHING_TIME, sample_rate),
             sends: [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT],
@@ -1488,6 +1492,7 @@ impl Track {
         self.route_left = 0;
         self.audible = true;
         self.midi_off_count = 0;
+        self.heard = 0;
         self.gain_l = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.gain_r = Smoother::new(0.0, SMOOTHING_TIME, sample_rate);
         self.sends = [Smoother::new(0.0, SMOOTHING_TIME, sample_rate); send::COUNT];
@@ -2621,14 +2626,40 @@ impl Engine {
     }
 
     /// Ends the keys of `channel` as their releases would, so the pedal
-    /// holds them on; `at_once`, pedal or not.
+    /// holds them on (All Notes Off). `at_once` (All Sound Off), the
+    /// tracks it plays and those it played live since fall silent at once,
+    /// whatever their release, one-shots and released notes too. A MIDI-out
+    /// track's keys are released: its receiver, maybe shared with other
+    /// tracks on its channel, is not told to cut its sound.
     fn channel_off(&mut self, channel: u8, at_once: bool) {
         if at_once {
+            let bit = 1 << (channel & 0x0F);
+            let mut tracks = self.targets(channel);
+            for (i, t) in self.tracks[..self.track_count].iter_mut().enumerate() {
+                if t.heard & bit != 0 {
+                    tracks |= 1 << i;
+                }
+                t.heard &= !bit;
+            }
             while let Some(k) = self.held[..self.held_count].iter().position(|h| h.channel == channel) {
-                self.release_held(k);
+                let h = self.held[k];
+                match h.out {
+                    Some((c, n, tag)) => self.midi.note_off(self.now, c, n, tag),
+                    None => tracks |= 1 << h.track,
+                }
+                // Not released: a release could start a release sample.
+                self.held.copy_within(k + 1..self.held_count, k);
+                self.held_count -= 1;
             }
             while let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.channel == channel) {
                 self.end_held(k);
+            }
+            while tracks != 0 {
+                let i = tracks.trailing_zeros() as usize;
+                tracks &= tracks - 1;
+                if let Some(t) = self.tracks[..self.track_count].get_mut(i).filter(|t| !t.midi_out) {
+                    t.instrument.stop_all();
+                }
             }
             return;
         }
@@ -2904,6 +2935,8 @@ impl Engine {
             }
             return;
         }
+        // Its sound may ring on after its key, a drum's too.
+        t.heard |= 1 << (channel & 0x0F);
         // Drums sound at their own pitch whatever the key.
         let pitch = if kind.is_drum() { kind.default_note() } else { note.min(127) };
         let voice = t.instrument.note_on(pitch, velocity.min(127));
@@ -5714,6 +5747,24 @@ mod tests {
     }
 
     #[test]
+    fn all_sound_off_on_a_midi_out_track_releases_its_keys() {
+        let (mut e, live) = live_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetMidiOut { track: 0, on: true },
+            Edit::SetChannel { track: 0, channel: Some(2) },
+        ]);
+        let (tx, mut rx) = spsc::channel(MIDI_OUT_QUEUE);
+        e.attach_midi_out(tx);
+        live.push(Message::note(2, 64, 80)).unwrap();
+        live.push(Message::Control { channel: 2, controller: ALL_SOUND_OFF, value: 0 }).unwrap();
+        run(&mut e, 480);
+        // Its receiver, which other tracks on channel 3 may share, is not
+        // told to cut everything.
+        assert_eq!(sent(&mut rx), [(0, vec![0x92, 64, 80]), (0, vec![0x82, 64, 0])]);
+        assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
     fn a_live_note_is_sent_as_late_as_a_gate_just_put_in() {
         let l = crate::dsp::gate::lookahead_frames(SR);
         let (mut e, live) = live_engine(&[
@@ -6480,6 +6531,61 @@ mod tests {
         run(&mut e, 64);
         assert_eq!(e.held_count, 0);
         assert!(energy(&run(&mut e, 48_000)[24_000..]) < 1e-6, "silent once released");
+    }
+
+    #[test]
+    fn all_sound_off_silences_a_long_release_at_once() {
+        let specs = InstrumentKind::Synth.params();
+        let release = specs.iter().position(|s| s.id == "amp_release").unwrap();
+        let tail = |controller: u8| {
+            let edits = [
+                Edit::AddTrack(InstrumentKind::Synth),
+                Edit::SetParam { track: 0, index: release as u8, value: specs[release].max },
+            ];
+            let (mut e, live) = live_engine(&edits);
+            press(&live, 60, 100);
+            run(&mut e, 4800);
+            send(&live, Message::Control { channel: 0, controller, value: 0 });
+            let out = run(&mut e, 9600);
+            (energy(&out[out.len() / 2..]), e.held_count)
+        };
+        let (released, _) = tail(ALL_NOTES_OFF);
+        assert!(released > 1e-4, "all notes off lets the release ring: {released}");
+        let (stopped, held) = tail(ALL_SOUND_OFF);
+        assert_eq!((stopped, held), (0.0, 0), "all sound off ends it within milliseconds");
+    }
+
+    #[test]
+    fn all_sound_off_reaches_a_release_left_behind_on_another_track() {
+        let specs = InstrumentKind::Synth.params();
+        let release = specs.iter().position(|s| s.id == "amp_release").unwrap();
+        let (mut e, live) = live_engine(&[
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetParam { track: 0, index: release as u8, value: specs[release].max },
+            Edit::AddTrack(InstrumentKind::Synth),
+        ]);
+        press(&live, 60, 100);
+        run(&mut e, 480);
+        press(&live, 60, 0);
+        run(&mut e, 480);
+        // The key is up and the live track moved: the release rings on.
+        e.handle(Command::SetLiveTrack(1));
+        assert!(energy(&run(&mut e, 4800)) > 1e-4);
+        send(&live, Message::Control { channel: 0, controller: ALL_SOUND_OFF, value: 0 });
+        let out = run(&mut e, 9600);
+        assert_eq!(energy(&out[out.len() / 2..]), 0.0, "the channel played it");
+        assert_eq!(e.tracks[0].heard, 0);
+        // A track's storage made anew, as a later track reuses it, does not
+        // keep what the old one heard.
+        press(&live, 62, 100);
+        run(&mut e, 64);
+        assert_ne!(e.tracks[1].heard, 0);
+        e.handle(Command::Edit(Edit::RemoveTrack(1)));
+        run(&mut e, 64);
+        let t = &mut e.tracks[1];
+        t.heard = u16::MAX;
+        t.reset(InstrumentKind::Synth, 48_000.0);
+        assert_eq!(t.heard, 0);
     }
 
     #[test]

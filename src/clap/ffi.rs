@@ -168,6 +168,7 @@ pub struct ClapEventHeader {
 pub const CLAP_CORE_EVENT_SPACE_ID: u16 = 0;
 pub const CLAP_EVENT_NOTE_ON: u16 = 0;
 pub const CLAP_EVENT_NOTE_OFF: u16 = 1;
+pub const CLAP_EVENT_NOTE_CHOKE: u16 = 2;
 
 /// `clap_event_note_t`.
 #[repr(C)]

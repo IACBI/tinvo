@@ -459,6 +459,17 @@ impl Sampler {
         self.down.fill(Down::UP);
     }
 
+    /// Silences every voice at once (without a click), one-shots and
+    /// released ones too. No key is down after it, so none starts a
+    /// release sample.
+    pub fn stop_all(&mut self) {
+        for v in &mut self.voices {
+            v.held = false;
+            v.amp.stop();
+        }
+        self.down.fill(Down::UP);
+    }
+
     pub fn active_voices(&self) -> usize {
         self.voices.iter().filter(|v| v.playing).count()
     }
@@ -783,6 +794,32 @@ mod tests {
         s.note_off(id);
         run(&mut s, 9600);
         assert_eq!(s.active_voices(), 0);
+    }
+
+    #[test]
+    fn a_stop_silences_one_shots_and_releases_and_starts_no_release_sample() {
+        let s4 = Arc::new(Sample::from_mono(&[0.5; 48_000], 48_000).unwrap());
+        let mut s = Sampler::new(SR);
+        let one_shot = Placement { mode: Mode::OneShot, ..Placement::WHOLE };
+        let rel = Placement { trigger: Trigger::Release, ..Placement::WHOLE };
+        drop(s.set_samples(Some(Arc::new(SampleMap::new([(one_shot, Arc::clone(&s4)), (rel, s4)])))));
+        let held = s.note_on(60, 100);
+        let let_go = s.note_on(62, 100);
+        s.note_off(let_go);
+        run(&mut s, 480);
+        assert_eq!(s.active_voices(), 3, "two one-shots and a release sample");
+        s.stop_all();
+        // Within the stop's fade (5 ms to -60 dB, -100 dB within 8.4 ms).
+        run(&mut s, 480);
+        assert_eq!(s.active_voices(), 0);
+        // The key let go of after it starts nothing.
+        s.note_off(held);
+        run(&mut s, 48);
+        assert_eq!(s.active_voices(), 0);
+        // A new note plays as before.
+        s.note_on(60, 100);
+        run(&mut s, 48);
+        assert_eq!(s.active_voices(), 1);
     }
 
     #[test]
