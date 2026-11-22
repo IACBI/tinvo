@@ -77,6 +77,25 @@ impl From<&crate::sample::Sample> for FileInfo {
     }
 }
 
+/// The files an import loads, given in the order of the first region that
+/// plays each with the frames each holds, as the editor loads them: each
+/// while it fits in what is left of `budget` frames (and in a sample's
+/// most), a file that does not left out with its regions and the later
+/// ones still tried. Returns the files loaded and those left out, with why.
+pub fn admit<K>(files: Vec<(K, u64)>, budget: usize) -> (Vec<K>, Vec<(K, String)>) {
+    let (mut loaded, mut refused, mut used) = (Vec::new(), Vec::new(), 0u64);
+    for (file, frames) in files {
+        let left = (budget as u64).saturating_sub(used).min(crate::sample::MAX_FRAMES as u64);
+        if frames <= left {
+            used += frames;
+            loaded.push(file);
+        } else {
+            refused.push((file, format!("{frames} frames, more than the {left} left of the project's")));
+        }
+    }
+    (loaded, refused)
+}
+
 impl Region {
     /// Its placement with what its file gives: the root key, and the loop
     /// points (the file's where the SFZ gives none or one). Fails if it
@@ -705,6 +724,11 @@ fn region<'a>(
     if midi_key("sw_down")?.is_some() {
         return Err("plays only while a keyswitch is held (sw_down)".into());
     }
+    // No key is held as a keyswitch, so a region silenced while one is
+    // plays whatever the player holds.
+    if midi_key("sw_up")?.is_some() {
+        notes.push("sw_up (played while its key is held too)".into());
+    }
     let switch = match (midi_key("sw_last")?, midi_key("sw_lolast")?, midi_key("sw_hilast")?) {
         (Some(k), _, _) => Some((k, k)),
         (None, Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
@@ -938,7 +962,26 @@ mod tests {
         assert_eq!(r[4].resolve(&looped).unwrap().mode, Mode::Sustain(Some((10, 20))));
         // A loop asked for by name keeps its one point, and ends at the file's end.
         assert_eq!(r[5].resolve(&plain).unwrap().mode, Mode::Continuous(Some((300, 1000))));
+        // An SFZ loop end past the file ends at the file's end; a start past
+        // it plays once.
         assert_eq!(r[6].resolve(&plain).unwrap().mode, Mode::Continuous(Some((10, 1000))));
+        assert_eq!(r[6].resolve(&file(10, None, None)).unwrap().mode, Mode::NoLoop);
+    }
+
+    #[test]
+    fn files_load_while_they_fit_and_a_later_one_still_may() {
+        let (loaded, refused) = admit(vec![("a", 60), ("b", 50), ("c", 40), ("d", 1)], 100);
+        assert_eq!(loaded, ["a", "c"]);
+        assert_eq!(
+            refused,
+            [
+                ("b", "50 frames, more than the 40 left of the project's".to_string()),
+                ("d", "1 frames, more than the 0 left of the project's".to_string())
+            ]
+        );
+        let most = crate::sample::MAX_FRAMES as u64;
+        let (loaded, refused) = admit(vec![("big", most + 1), ("ok", most)], usize::MAX);
+        assert_eq!((loaded, refused.len()), (vec!["ok"], 1));
     }
 
     #[test]
@@ -1053,6 +1096,12 @@ mod tests {
         assert_eq!(kept(&i), ["b.wav"]);
         assert!(i.notes.iter().any(|n| n.contains("a keyswitch outside sw_lokey to sw_hikey")), "{:?}", i.notes);
         // A negative key switches a condition off.
+        // A region silenced while a key is held plays anyway, and says so.
+        let i = read("<region> sample=a.wav sw_up=30\n<region> sample=b.wav sw_up=-1");
+        assert_eq!(i.regions.len(), 2);
+        assert!(i.notes.iter().any(|n| n.contains("sw_up (played while its key is held too)")), "{:?}", i.notes);
+        let i = read("<region> sample=a.wav sw_up=-1");
+        assert!(!i.notes.iter().any(|n| n.contains("sw_up")), "{:?}", i.notes);
         let i = read("<region> sample=a.wav sw_down=-1 sw_last=-1");
         assert_eq!(i.regions.len(), 1, "{:?}", i.notes);
     }

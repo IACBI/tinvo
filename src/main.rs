@@ -343,45 +343,52 @@ fn cmd_sfz(args: &[String]) -> Result<(), String> {
     let key = |r: &tinvo::sfz::Region| tinvo::sample::absolute(&dir.join(&r.path).to_string_lossy());
     let mut files = std::collections::BTreeMap::new();
     for r in &inst.regions {
-        files.entry(key(r)).or_insert_with_key(|k| tinvo::sfz::FileInfo::read(k));
+        files.entry(key(r)).or_insert_with_key(|k| match tinvo::sample::unstorable(&k.to_string_lossy()) {
+            Some(why) => Err(why.to_string()),
+            None => tinvo::sfz::FileInfo::read(k),
+        });
     }
     let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
-    let mut playing = Vec::new();
-    let mut used = std::collections::BTreeSet::new();
+    let mut playable = Vec::new();
     for r in &inst.regions {
         let k = key(r);
         if let Ok(info) = &files[&k] {
             match r.resolve(info) {
-                Ok(place) => {
-                    playing.push((r, place));
-                    used.insert(k);
-                }
+                Ok(place) => playable.push((r, place, k)),
                 Err(why) => *skipped.entry(why).or_default() += 1,
             }
         }
     }
+    // The files those regions play, loaded as the editor would into a
+    // project with no other samples.
+    let mut order = Vec::new();
+    for (_, _, k) in &playable {
+        if let (false, Ok(info)) = (order.iter().any(|(o, _)| o == &k), &files[k]) {
+            order.push((k, info.frames));
+        }
+    }
+    let (loaded, refused) = tinvo::sfz::admit(order, tinvo::sample::PROJECT_FRAMES);
+    let playing: Vec<_> = playable.iter().filter(|(_, _, k)| loaded.contains(&k)).collect();
     let (n, total) = (playing.len(), inst.regions.len());
-    let good = files.values().filter(|f| f.is_ok()).count();
-    let keys = playing.iter().fold(None, |k: Option<(u8, u8)>, (_, p)| {
+    let keys = playing.iter().fold(None, |k: Option<(u8, u8)>, (_, p, _)| {
         Some(k.map_or(p.keys, |(lo, hi)| (lo.min(p.keys.0), hi.max(p.keys.1))))
     });
     let over = keys.map_or_else(String::new, |(lo, hi)| format!(" over keys {lo} to {hi}"));
-    println!("{}: {n} of {total} regions play{over}, from {good} of {} files", shown(input), files.len());
-    for (f, e) in files.iter().filter_map(|(f, r)| r.as_ref().err().map(|e| (f, e))) {
-        println!("- not loaded: {}: {}", tinvo::tui::printable(&f.display().to_string()), tinvo::tui::printable(e));
+    println!(
+        "{}: {n} of {total} regions play{over}, from {} of {} files (imported into a project with no other samples)",
+        shown(input),
+        loaded.len(),
+        files.len()
+    );
+    let unread = files.iter().filter_map(|(f, r)| r.as_ref().err().map(|e| (f, e.clone())));
+    for (f, e) in unread.chain(refused) {
+        println!("- not loaded: {}: {}", tinvo::tui::printable(&f.display().to_string()), tinvo::tui::printable(&e));
     }
     for (why, n) in skipped {
         println!("- {n} {} skipped: {why}", if n == 1 { "region" } else { "regions" });
     }
-    // What the editor would load: the files a region plays.
-    let frames: u64 = used.iter().filter_map(|k| files[k].as_ref().ok()).map(|f| f.frames).sum();
-    if frames > tinvo::sample::PROJECT_FRAMES as u64 {
-        println!(
-            "- {frames} frames in all, more than a project holds ({}): the editor loads files in order until they fill it",
-            tinvo::sample::PROJECT_FRAMES
-        );
-    }
-    if let Some((r, _)) = playing.first() {
+    // The envelope of the first region loaded, as the editor takes it.
+    if let Some((r, _, _)) = playing.first() {
         let e = r.envelope;
         println!(
             "- envelope: attack {} s, decay {} s, sustain {}%, release {} s",

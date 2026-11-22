@@ -8,6 +8,9 @@ Author: 𝓐.𝓒.𝓑
 
 ### Fixed
 
+- `tinvo sfz` counted every region its files' headers let play, even when the files held more than a project does, and gave one total for what would not fit. It now loads them as the editor's import would into a project with no other samples: in order, each file while it fits, later ones still tried, and paths a project cannot keep refused. It names each file left out and why, and its first line says what it assumed.
+- An SFZ region with `sw_up`, silenced while its key is held, plays whatever is held, since TINVO holds no key as a keyswitch. The import now says so.
+- The 0.28.0 notes said a region whose loop runs past its file plays once. That holds for a WAV file's own loop and for a `loop_start` past the file; an SFZ `loop_end` past the file ends the loop at the file's end.
 - On macOS, the HAL's audio thread allocated the first time it called into a plugin (or a plugin asked which thread it was on): macOS gives a thread its thread-local storage from the heap at first use, and the plugin host kept two values there. They now live in slots of pthread keys made before any plugin is called, which need no allocation.
 - When a macOS capture device could not take back a buffer mid-stream, the capture callback formatted its message and took a lock. It now records the status code, and the message is made when read.
 - Save As kept any extension it was given, so a name such as `kick.wav` wrote the project over a sample it played. Save As now writes `.tvo` files (or the file the project was opened from), and no save writes over a sample the project plays, however its path is spelled.
