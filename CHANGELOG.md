@@ -8,7 +8,9 @@ Author: 𝓐.𝓒.𝓑
 
 ### Fixed
 
-- `tinvo sfz` counted every region its files' headers let play, even when the files held more than a project does, and gave one total for what would not fit. It now loads them as the editor's import would into a project with no other samples: in order, each file while it fits, later ones still tried, and paths a project cannot keep refused. It names each file left out and why, and its first line says what it assumed.
+- The 0.28.0 notes said a WAV export refused for a missing sample names the track whose sample it is. That holds for a track's own sample in the editor; a missing zone file is named by its path, and `tinvo render` names the files it cannot load.
+- The README said the editor follows the system's default output when it changes; on Linux, ALSA's `default` plays wherever it is set to. It also said what you hear is what you export: plugins export as fresh instances rendering offline, and nothing played live is exported. Its stems now say that a track in a group is in its group's stem only, and both languages list `cargo test --release` among the checks a change has to pass, as CONTRIBUTING and the pull request template do.
+- `tinvo sfz` counted every region its files' headers let play, even when the files held more than a project does, and gave one total for what would not fit. It now works out from the files' headers what the editor's import would load into a project with no other samples: in order, each file while it fits, later ones still tried, and paths a project cannot keep refused. It names each file left out and why, and its first line says what it assumed.
 - An SFZ region with `sw_up`, silenced while its key is held, plays whatever is held, since TINVO holds no key as a keyswitch. The import now says so.
 - The 0.28.0 notes said a region whose loop runs past its file plays once. That holds for a WAV file's own loop and for a `loop_start` past the file; an SFZ `loop_end` past the file ends the loop at the file's end.
 - On macOS, the HAL's audio thread allocated the first time it called into a plugin (or a plugin asked which thread it was on): macOS gives a thread its thread-local storage from the heap at first use, and the plugin host kept two values there. They now live in slots of pthread keys made before any plugin is called, which need no allocation.
@@ -22,6 +24,10 @@ Author: 𝓐.𝓒.𝓑
 - A WAV file of a little audio and millions of tiny chunks kept the editor, `tinvo sfz` and `tinvo slice` reading headers to its end. A file of more than 4096 chunks is now refused.
 - `tinvo fuzz TARGET --check FILE` read any file whole, a pipe or a huge file included. It now reads as the editor's readers do: a plain file of at most 256 MiB.
 - A project file with many `parts` lines for one track, or with markers past the longest song, could take gigabytes of memory or minutes of work before it was refused. Such lines are now refused where they stand.
+
+### Verified
+- WASAPI on a real endpoint in CI: the Windows jobs install VB-CABLE, so WASAPI's tests, a recording from its input and `tinvo probe` (which now fails if the stream asks for no audio) run there instead of skipping. Rust 1.85 checks every target on Windows and macOS as well as Linux, and the CLI smoke test runs `slice`, `sfz` and the export of a project with zones.
+- A benchmark scenario for zones (`zones`): one sampler track whose every key played reaches 1024 zones in velocity layers, round-robin turns and release zones with short loops, with a time and an instruction budget.
 
 ## [0.28.0] - 2026-11-21
 

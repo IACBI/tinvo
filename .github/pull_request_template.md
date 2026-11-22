@@ -10,6 +10,6 @@
 
 **Checklist**
 - [ ] No new dependencies
-- [ ] Nothing new allocates, locks or blocks on the audio thread
+- [ ] Nothing new allocates, frees, locks or blocks on the audio thread
 - [ ] Old `.tvo` files still load (if the format changed)
 - [ ] `CHANGELOG.md` updated under `[Unreleased]`

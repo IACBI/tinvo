@@ -4,7 +4,7 @@ Author: 𝓐.𝓒.𝓑
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem. Report it privately through GitHub instead: [open a private vulnerability report](https://github.com/IACBI/tinvo/security/advisories/new). Only the maintainer sees it, and the discussion, the fix and the advisory stay in one place.
+Please do not open a public issue for a security problem. Report it privately through GitHub instead: [open a private vulnerability report](https://github.com/IACBI/tinvo/security/advisories/new). It stays private between you and the maintainers, and the discussion, the fix and the advisory stay in one place.
 
 A useful report says which version you ran (`tinvo --version`), on which system, what you did, and what happened. If a file triggers it, attach the file.
 
