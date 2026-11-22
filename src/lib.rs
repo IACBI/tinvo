@@ -1,6 +1,7 @@
 //! TINVO — a terminal-based digital audio workstation.
 //!
-//! The crate is layered so that each layer only depends on the ones below it:
+//! An overview of the main modules (the full list, and how they fit
+//! together, is in `docs/ARCHITECTURE.md`):
 //!
 //! ```text
 //!   app        keyboard-driven UI state machine and drawing

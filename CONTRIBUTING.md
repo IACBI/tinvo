@@ -9,7 +9,7 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security
 ## Ground rules
 
 - **No third-party crates.** Use only `std` and direct FFI to operating-system APIs. A pull request that adds a dependency will not be merged. Write the piece you need, with tests.
-- **The audio thread is sacred.** Code reachable from `Engine::process` must not allocate, lock, block, do I/O or panic on valid input. Size everything when the engine is built.
+- **The audio thread is sacred.** Code reachable from `Engine::process` must not allocate or free memory, lock, block, do I/O or panic on valid input. Size everything when the engine is built.
 - **Every document change is an `Edit`.** New features that change the project go through `Project::apply`, need an inverse in `Project::inverse`, and must round-trip through the `.tvo` format. The exceptions are what the history stores whole before and after a step (`Meta` in `app.rs`: track names, sample paths and sampler zones, group names, song markers, plugin states): change those through the same helpers the editor uses (`App::meta` and a `Change`), so undo restores them.
 - **Do not break old files.** When the file format changes, bump `FORMAT_VERSION` and keep reading older versions. Add new instrument parameters at the end of the list.
 - **Prove it.** New behaviour comes with tests that would fail without the change. DSP claims (pitch, timing, frequency response) are measured in tests, not assumed.
@@ -23,7 +23,7 @@ cargo test
 cargo test --release
 ```
 
-`cargo test` includes `tests/realtime.rs`, which counts every allocation made while the engine renders, while it takes edits, live notes and samples, and while input and MIDI are read. It must stay at zero; on a failure it prints where the allocation happened.
+`cargo test` includes `tests/realtime.rs`, which counts every allocation, reallocation and free made while the engine renders, while it takes edits, live notes and samples, and while input and MIDI are read. It must stay at zero; on a failure it prints where the allocation happened.
 
 If you changed anything the engine runs, run `tinvo bench --check` in release mode: it prints each scenario's cost per callback against its time budget. CI also counts the instructions each scenario takes with Valgrind's cachegrind, on x86-64 Linux, against `bench/instructions.txt`, and fails beyond 10 % over. If a change makes rendering costlier on purpose, run `tinvo bench --instructions bench/instructions.txt` there (the CI log shows the same output), copy the measured lines into the file, and say why in the pull request. The counts depend on the compiler, so a new stable Rust can move them too.
 

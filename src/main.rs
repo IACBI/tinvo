@@ -32,7 +32,8 @@ USAGE:
                                         export WAV (the song if it has entries, else
                                         pattern A); --from alone is that marker's section,
                                         --to stops where its marker starts; --stems also
-                                        writes one file per track
+                                        writes one file per track outside a group
+                                        and one per group
     tinvo render PROJECT OUT.mid [--loops N] [--song | --region | --pattern A-P | ...]
                                         export a Standard MIDI File instead (one pass
                                         unless --loops, at most 32)
