@@ -994,7 +994,9 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
         }
     }
     if let Some(path) = check {
-        let input = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // As the readers it checks read: a plain file, of a bounded size.
+        let input = tinvo::fsutil::read_bytes(&path, tinvo::project::MAX_FILE_BYTES)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let accepted = fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", path.display()))?;
         println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
         return Ok(());

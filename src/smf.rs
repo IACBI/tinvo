@@ -494,6 +494,9 @@ pub struct Import {
     /// The bars past the last pattern or song entry TINVO can hold were
     /// left out.
     pub cut: bool,
+    /// How the file is incomplete, if it is: it ends inside a track, or
+    /// holds fewer tracks than its header names. What it has is read.
+    pub incomplete: Option<String>,
 }
 
 impl Import {
@@ -519,6 +522,9 @@ impl Import {
         }
         if self.cut {
             s += "; cut where the song is full";
+        }
+        if let Some(why) = &self.incomplete {
+            s += &format!("; {why}, so music may be missing");
         }
         s
     }
@@ -591,6 +597,7 @@ struct Parsed {
     meter: Option<(u8, u8)>,
     names: HashMap<u16, String>,
     markers: Vec<(u64, String)>,
+    incomplete: Option<String>,
 }
 
 const MAX_TEMPOS: usize = 65_536;
@@ -685,7 +692,7 @@ fn parse(bytes: &[u8]) -> Result<(u16, Parsed), String> {
         return Err("the MIDI header is cut short".into());
     }
     let format = r.u16()?;
-    let _tracks = r.u16()?;
+    let declared = r.u16()?;
     let division = r.u16()?;
     r.take(len - 6)?;
     if format > 1 {
@@ -698,19 +705,26 @@ fn parse(bytes: &[u8]) -> Result<(u16, Parsed), String> {
         return Err("the file has 0 ticks per quarter note".into());
     }
     let mut parsed = Parsed::default();
-    let mut track = 0u16;
+    let (mut track, mut found) = (0u16, 0u16);
     while r.left() >= 8 {
         let id = r.take(4)?;
         // A chunk cut short by the end of the file is read as far as it
-        // goes.
-        let n = (r.u32()? as usize).min(r.left());
-        let data = r.take(n)?;
+        // goes, and said to be.
+        let len = r.u32()? as usize;
+        if len > r.left() {
+            parsed.incomplete = Some("the file ends inside a track".into());
+        }
+        let data = r.take(len.min(r.left()))?;
         if id == b"MTrk" {
             read_track(data, track, &mut parsed)?;
+            found = found.saturating_add(1);
             if format == 1 {
                 track = track.saturating_add(1);
             }
         }
+    }
+    if parsed.incomplete.is_none() && found < declared {
+        parsed.incomplete = Some(format!("the file has {found} of the {declared} tracks its header names"));
     }
     Ok((division, parsed))
 }
@@ -792,6 +806,8 @@ const MAX_SETTLE: usize = 8;
 pub fn read(bytes: &[u8]) -> Result<Import, String> {
     let mut imp = read_once(bytes)?;
     let total = imp.notes + imp.dropped;
+    // Of the file read, not of the complete files it is written back as.
+    let incomplete = imp.incomplete.take();
     for _ in 0..MAX_SETTLE {
         let again = read_once(&write(&imp.project, Source::Song, 1)?)?;
         if again.project == imp.project {
@@ -801,6 +817,7 @@ pub fn read(bytes: &[u8]) -> Result<Import, String> {
     }
     // Notes two strikes of one key became one of are left out too.
     imp.dropped = total.saturating_sub(imp.notes);
+    imp.incomplete = incomplete;
     Ok(imp)
 }
 
@@ -970,7 +987,7 @@ fn read_once(bytes: &[u8]) -> Result<Import, String> {
             let _ = project.set_marker(e as u16, name);
         }
     }
-    Ok(Import { project, notes, dropped, cut })
+    Ok(Import { project, notes, dropped, cut, incomplete: parsed.incomplete })
 }
 
 fn bpm(us: u32) -> f32 {
@@ -1541,7 +1558,22 @@ mod tests {
         assert!(read(&file(0, 96, &[&[0x00, 0xF8]])).unwrap_err().contains("system byte"));
         assert!(read(&file(0, 96, &[&[0x00, 0xFF, 0x03, 0x20, b'x']])).unwrap_err().contains("ends inside"));
         assert!(read(&file(0, 96, &[&[]])).unwrap_err().contains("no notes"));
-        // A track cut short by the end of the file is read as far as it goes.
-        assert!(read(&ok[..ok.len() - 4]).is_ok());
+        assert_eq!(read(&ok).unwrap().incomplete, None);
+        // A track cut short by the end of the file is read as far as it
+        // goes, and said to be.
+        let short = read(&ok[..ok.len() - 4]).unwrap();
+        assert_eq!(short.incomplete.as_deref(), Some("the file ends inside a track"));
+        assert!(
+            short.summary().ends_with("; the file ends inside a track, so music may be missing"),
+            "{}",
+            short.summary()
+        );
+        // As is a file of fewer tracks than its header names.
+        let mut fewer = file(1, 96, &[&note]);
+        fewer[11] = 3;
+        assert_eq!(
+            read(&fewer).unwrap().incomplete.as_deref(),
+            Some("the file has 1 of the 3 tracks its header names")
+        );
     }
 }
