@@ -31,7 +31,7 @@ use crate::group::{self, Group, MAX_GROUPS};
 use crate::insert::{Chain, EffectKind, Insert, MAX_SLOTS};
 use crate::instrument::SampleMap;
 use crate::instrument::{Instrument, InstrumentKind, MAX_PARAMS, ParamSpec, SILENT_DB, Unit, VoiceId};
-use crate::midi::{MOD_WHEEL, Message, OutEvent, SUSTAIN};
+use crate::midi::{ALL_NOTES_OFF, ALL_SOUND_OFF, MOD_WHEEL, Message, OutEvent, SUSTAIN};
 use crate::mix::{self, Mix, send};
 use crate::rt::AtomicF32;
 use crate::rt::mailbox::Mailbox;
@@ -2559,6 +2559,8 @@ impl Engine {
                 self.wheels[usize::from(channel & 0x0F)] = f32::from(value) / 127.0;
                 self.sync_controllers();
             }
+            Message::Control { channel, controller: ALL_SOUND_OFF, .. } => self.channel_off(channel, true),
+            Message::Control { channel, controller: ALL_NOTES_OFF..=127, .. } => self.channel_off(channel, false),
             Message::Control { .. } => {}
             Message::Bend { channel, value } => {
                 self.bends[usize::from(channel & 0x0F)] = f32::from(value) / 8192.0;
@@ -2615,6 +2617,31 @@ impl Engine {
             }
             t.instrument.set_bend(b);
             t.instrument.set_wheel(w);
+        }
+    }
+
+    /// Ends the keys of `channel` as their releases would, so the pedal
+    /// holds them on; `at_once`, pedal or not.
+    fn channel_off(&mut self, channel: u8, at_once: bool) {
+        if at_once {
+            while let Some(k) = self.held[..self.held_count].iter().position(|h| h.channel == channel) {
+                self.release_held(k);
+            }
+            while let Some(k) = self.rec_held[..self.rec_count].iter().position(|h| h.channel == channel) {
+                self.end_held(k);
+            }
+            return;
+        }
+        // Each key released marks it held by the pedal or ends it, so this
+        // ends.
+        loop {
+            let up = |c: u8, sustained: bool| c == channel && !sustained;
+            let note =
+                self.held[..self.held_count].iter().find(|h| up(h.channel, h.sustained)).map(|h| h.note).or_else(
+                    || self.rec_held[..self.rec_count].iter().find(|h| up(h.channel, h.sustained)).map(|h| h.note),
+                );
+            let Some(note) = note else { break };
+            self.live_off(channel, note);
         }
     }
 
@@ -6424,6 +6451,35 @@ mod tests {
         press(&live, 62, 0);
         run(&mut e, 64);
         assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn all_notes_off_and_all_sound_off_end_a_channel_s_keys() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        let control = |channel, controller| Message::Control { channel, controller, value: 0 };
+        press(&live, 60, 100);
+        send(&live, Message::NoteOn { channel: 1, note: 64, velocity: 100 });
+        send(&live, control(0, ALL_NOTES_OFF));
+        run(&mut e, 64);
+        assert_eq!((e.held_count, e.held[0].note), (1, 64), "only the other channel's key is left");
+        // The pedal holds them on, as it would released keys; all sound
+        // off ends them anyway.
+        send(&live, pedal(1, true));
+        send(&live, control(1, ALL_NOTES_OFF));
+        run(&mut e, 64);
+        assert!(e.held_count == 1 && e.held[0].sustained);
+        send(&live, control(1, ALL_SOUND_OFF));
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 0);
+        // A mode message ends the keys too; another controller does not.
+        press(&live, 62, 100);
+        send(&live, control(0, 119));
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 1);
+        send(&live, control(0, 126));
+        run(&mut e, 64);
+        assert_eq!(e.held_count, 0);
+        assert!(energy(&run(&mut e, 48_000)[24_000..]) < 1e-6, "silent once released");
     }
 
     #[test]
