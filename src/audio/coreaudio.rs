@@ -931,15 +931,7 @@ mod tests {
         }
     }
 
-    /// Held by each test that plays into a device. BlackHole mixes what
-    /// every stream plays into it, and a test reopening it at another
-    /// period glitches the stream recording from it, so the loopback
-    /// check would hear the other test's ramp or a gap.
-    static DEVICES: Mutex<()> = Mutex::new(());
-
-    fn devices_to_myself() -> std::sync::MutexGuard<'static, ()> {
-        DEVICES.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::audio::devices_to_myself;
 
     fn require(var: &str, why: &str) {
         if std::env::var_os(var).is_some() {

@@ -10639,6 +10639,7 @@ mod tests {
     /// tracks inserted and removed meanwhile; skipped without an input.
     #[test]
     fn recording_loads_the_take_into_its_track_as_one_undo_step() {
+        let _alone = crate::audio::devices_to_myself();
         let dir = std::env::temp_dir().join(format!("tinvo-app-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -10718,6 +10719,7 @@ mod tests {
     /// is no audio device (as on CI runners).
     #[test]
     fn output_opens_switches_and_falls_back_on_real_devices() {
+        let _alone = crate::audio::devices_to_myself();
         let mut a = app();
         let mut out = Output::new(StreamConfig::default(), None, None);
         if out.open(&mut a).is_err() {
