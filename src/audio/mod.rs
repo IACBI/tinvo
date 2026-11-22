@@ -183,6 +183,17 @@ pub fn find_device<'a>(devices: &'a [Device], query: &str) -> Result<&'a Device,
     }
 }
 
+/// Held by every test that opens a real device, wherever it is. A device
+/// is shared: BlackHole mixes what every stream plays into it, and a test
+/// opening a stream on it (an input, another period, the default output)
+/// glitches the streams already running, so the loopback check would hear
+/// another test's signal or a gap.
+#[cfg(test)]
+pub(crate) fn devices_to_myself() -> std::sync::MutexGuard<'static, ()> {
+    static DEVICES: Mutex<()> = Mutex::new(());
+    DEVICES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Failure reporting from the audio thread.
 #[derive(Debug, Default)]
 pub struct StreamHealth {

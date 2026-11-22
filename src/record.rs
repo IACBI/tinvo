@@ -293,6 +293,7 @@ mod tests {
     /// `default` with no card behind it.
     #[test]
     fn records_from_the_default_input_if_there_is_one() {
+        let _alone = crate::audio::devices_to_myself();
         let dir = temp_dir("device");
         let path = dir.join("device.wav");
         let opened = std::time::Instant::now();
