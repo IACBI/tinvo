@@ -10679,11 +10679,23 @@ mod tests {
         a.track = t;
         a.toggle_recording();
         assert!(a.recording());
+        // Some audio first: a take ended before the device delivered any
+        // is empty, which no track can load.
+        let begin = Instant::now();
+        while begin.elapsed() < Duration::from_millis(200) {
+            a.tick();
+            std::thread::sleep(Duration::from_millis(16));
+        }
         a.track = 0;
         a.mode = Mode::Prompt(PromptKind::Rename, "Kick 2".into());
         a.finish_take(true, None);
         assert_eq!(a.track, 0);
-        assert_eq!(a.project.tracks[t].sample.as_deref().map(PathBuf::from), Some(dir.join("song-Vox-02.wav")));
+        assert_eq!(
+            a.project.tracks[t].sample.as_deref().map(PathBuf::from),
+            Some(dir.join("song-Vox-02.wav")),
+            "{:?}",
+            a.status_text()
+        );
         keys(&mut a, &[Key::Enter]);
         assert_eq!((a.project.tracks[0].name.as_str(), a.project.tracks[t].name.as_str()), ("Kick 2", "Vox"));
         let _ = std::fs::remove_dir_all(&dir);
