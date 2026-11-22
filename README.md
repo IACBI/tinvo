@@ -19,7 +19,7 @@ A keyboard-driven digital audio workstation for the terminal: zero dependencies,
 
 TINVO is a step-sequencer DAW that runs in a terminal window. Everything is written in Rust on top of the standard library alone: the synthesizer and drums, the real-time engine, the WAV writer, and the audio backends (WASAPI, ALSA, JACK, CoreAudio) are called through hand-written FFI. There are no crates to download, so it builds offline. The release binary is a few megabytes (about 3 MB on Windows).
 
-The audio thread never allocates, locks or blocks. WAV export runs the same engine as playback, so what you hear is what you export.
+The audio callback never allocates or frees memory, takes a lock or blocks. WAV export runs the same engine as playback, so what you hear is what you export.
 
 https://github.com/user-attachments/assets/46029a57-69c3-407c-a1af-21c34194486d
 
@@ -205,7 +205,7 @@ MIT. See [LICENSE](LICENSE). Author: 𝓐.𝓒.𝓑
 
 TINVO, terminal penceresinde çalışan, adım sıralayıcı (step sequencer) tabanlı bir DAW. Synth ve davullar, gerçek zamanlı motor ve WAV yazıcı Rust'ın standart kütüphanesinden başka hiçbir şey kullanmadan yazıldı. Ses altyapıları (WASAPI, ALSA, JACK, CoreAudio) elle yazılmış FFI ile çağrılıyor. İndirilecek tek bir crate yok, bu yüzden internet olmadan da derleniyor. Release binary'si birkaç megabayt (Windows'ta yaklaşık 3 MB).
 
-Ses thread'i hiçbir zaman bellek ayırmaz, kilit almaz, beklemez. WAV dışa aktarma çalmayla aynı motoru kullanır: ne duyuyorsan dosyaya o yazılır.
+Ses callback'i hiçbir zaman bellek ayırıp serbest bırakmaz, kilit almaz, beklemez. WAV dışa aktarma çalmayla aynı motoru kullanır: ne duyuyorsan dosyaya o yazılır.
 
 https://github.com/user-attachments/assets/46029a57-69c3-407c-a1af-21c34194486d
 

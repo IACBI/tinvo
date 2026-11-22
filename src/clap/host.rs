@@ -26,9 +26,10 @@
 //!   deinitialised only after the last of them is destroyed (dropping an
 //!   instance, polling and dropping a host let go of files nothing uses, on
 //!   whichever host's thread does so first, which CLAP allows);
-//! - a thread that will process calls [`prepare_audio_thread`] before its
-//!   first real-time call: on macOS a thread's first use of thread-local
-//!   storage may allocate;
+//! - what each thread keeps of its own (whether it plays the audio thread,
+//!   its key) is read and set without allocating, on the system's audio
+//!   threads too: on macOS, where a thread's first use of thread-local
+//!   storage allocates, it lives in pthread keys' slots;
 //! - the main-thread calls CLAP allows while the plugin processes (reading
 //!   a parameter's value or text, saving its state) go through a
 //!   [`PluginHandle`], which never touches the [`Instance`] the audio
@@ -44,7 +45,6 @@
 use super::PluginRef;
 use super::ffi::*;
 use super::library::Dso;
-use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -84,11 +84,89 @@ const MAX_PORT_CHANNELS: u32 = 32;
 /// The largest call an instance is activated for; longer ones are split.
 pub const MAX_FRAMES: usize = 8192;
 
-thread_local! {
-    // Const-initialised and without destructors, so reading them allocates
-    // nothing once the thread has used them (`prepare_audio_thread`).
-    static AUDIO: Cell<bool> = const { Cell::new(false) };
-    static KEY: Cell<u64> = const { Cell::new(0) };
+/// Two values of each thread's own, which a real-time thread reads and sets
+/// without allocating, the first time too: whether it plays CLAP's audio
+/// thread, and its key (0 until given one).
+#[cfg(not(target_os = "macos"))]
+mod mine {
+    use std::cell::Cell;
+
+    // Linux and Windows give a program's own thread-locals their storage as
+    // each thread starts, the threads the system makes for audio too.
+    thread_local! {
+        static AUDIO: Cell<bool> = const { Cell::new(false) };
+        static KEY: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn audio() -> bool {
+        AUDIO.with(Cell::get)
+    }
+
+    pub fn set_audio(on: bool) -> bool {
+        AUDIO.with(|a| a.replace(on))
+    }
+
+    pub fn key() -> u64 {
+        KEY.with(Cell::get)
+    }
+
+    pub fn set_key(key: u64) {
+        KEY.with(|k| k.set(key));
+    }
+}
+
+/// macOS gives a thread's thread-locals their storage, from the heap, the
+/// first time it uses one: on the first call of the HAL's audio thread. A
+/// pthread key's slot is part of the thread itself.
+#[cfg(target_os = "macos")]
+mod mine {
+    use std::ffi::{c_int, c_ulong, c_void};
+    use std::sync::OnceLock;
+
+    unsafe extern "C" {
+        fn pthread_key_create(key: *mut c_ulong, destructor: Option<unsafe extern "C" fn(*mut c_void)>) -> c_int;
+        fn pthread_getspecific(key: c_ulong) -> *mut c_void;
+        fn pthread_setspecific(key: c_ulong, value: *const c_void) -> c_int;
+    }
+
+    /// The audio flag's key and the thread key's. Made by the first thread
+    /// to ask, which makes a host before any thread processes a plugin, so
+    /// an audio thread only ever reads them.
+    fn keys() -> (c_ulong, c_ulong) {
+        static KEYS: OnceLock<(c_ulong, c_ulong)> = OnceLock::new();
+        *KEYS.get_or_init(|| {
+            let make = || {
+                let mut key = 0;
+                // SAFETY: `key` is written on success; no destructor.
+                let r = unsafe { pthread_key_create(&mut key, None) };
+                assert_eq!(r, 0, "no pthread key left");
+                key
+            };
+            (make(), make())
+        })
+    }
+
+    pub fn audio() -> bool {
+        // SAFETY: a key made by `keys`, never deleted.
+        !unsafe { pthread_getspecific(keys().0) }.is_null()
+    }
+
+    pub fn set_audio(on: bool) -> bool {
+        let was = audio();
+        // SAFETY: as in `audio`; the value is a flag, never dereferenced.
+        unsafe { pthread_setspecific(keys().0, usize::from(on) as *const c_void) };
+        was
+    }
+
+    pub fn key() -> u64 {
+        // SAFETY: as in `audio`; the value is a number stored as a pointer.
+        unsafe { pthread_getspecific(keys().1) as usize as u64 }
+    }
+
+    pub fn set_key(key: u64) {
+        // SAFETY: as in `key`.
+        unsafe { pthread_setspecific(keys().1, key as usize as *const c_void) };
+    }
 }
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
@@ -99,24 +177,25 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// A number for this thread, unique in the process (thread ids may be
 /// reused); given the first time it is asked for, without allocating.
 fn thread_key() -> u64 {
-    KEY.with(|k| {
-        if k.get() == 0 {
-            k.set(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
-        }
-        k.get()
-    })
+    let key = mine::key();
+    if key != 0 {
+        return key;
+    }
+    let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+    mine::set_key(key);
+    key
 }
 
 /// Whether this thread is playing CLAP's audio thread now.
 pub fn is_audio_thread() -> bool {
-    AUDIO.with(Cell::get)
+    mine::audio()
 }
 
-/// Sets up this thread's thread-local storage for processing: called once
-/// on a thread before it processes in real time, since on macOS a thread's
-/// first use of it may allocate.
+/// Gives this thread its key, and on macOS makes the pthread keys if no host
+/// has yet. A thread the program's own real-time code runs on before any
+/// `PluginHost` exists calls it first; otherwise it is not needed: what
+/// each thread keeps of its own is read and set without allocating.
 pub fn prepare_audio_thread() {
-    AUDIO.with(|_| ());
     thread_key();
 }
 
@@ -131,13 +210,13 @@ pub struct AudioRole {
 
 impl AudioRole {
     pub fn enter() -> AudioRole {
-        AudioRole { was: AUDIO.with(|a| a.replace(true)), _not_send: PhantomData }
+        AudioRole { was: mine::set_audio(true), _not_send: PhantomData }
     }
 }
 
 impl Drop for AudioRole {
     fn drop(&mut self) {
-        AUDIO.with(|a| a.set(self.was));
+        mine::set_audio(self.was);
     }
 }
 
@@ -2170,5 +2249,39 @@ impl PluginHandle {
     /// home first).
     pub fn take_state_dirty(&self) -> bool {
         self.host.dirty.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_thread_has_a_key_of_its_own_and_its_own_audio_role() {
+        let mine = thread_key();
+        assert_ne!(mine, 0);
+        assert_eq!(thread_key(), mine);
+        assert!(!is_audio_thread());
+        {
+            let _outer = AudioRole::enter();
+            assert!(is_audio_thread());
+            {
+                let _inner = AudioRole::enter();
+                assert!(is_audio_thread());
+            }
+            assert!(is_audio_thread(), "the inner role gave back the outer one's");
+            // Another thread neither shares the key nor plays the role.
+            let theirs = std::thread::spawn(|| {
+                let fresh = (mine::key(), is_audio_thread());
+                prepare_audio_thread();
+                (fresh, thread_key(), thread_key())
+            })
+            .join()
+            .unwrap();
+            assert_eq!(theirs.0, (0, false));
+            assert_eq!(theirs.1, theirs.2);
+            assert!(theirs.1 != 0 && theirs.1 != mine);
+        }
+        assert!(!is_audio_thread());
     }
 }

@@ -18,7 +18,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::clap::PluginRef;
-use tinvo::clap::host::{Instance, Mode, PluginHost, Role, prepare_audio_thread};
+use tinvo::clap::host::{Instance, Mode, PluginHost, Role};
 use tinvo::dsp::noise::Rng;
 use tinvo::engine::{
     ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, PluginAt, PluginPlace, Retired, Shared, Step, Take,
@@ -636,10 +636,10 @@ fn fixture() -> std::path::PathBuf {
 /// A plugin instrument and a plugin effect: notes, releases, parameter
 /// changes (some flushed while the effect is skipped) and processing at
 /// every buffer size, a start, and the stop before they leave, on a
-/// fresh thread that has called `prepare_audio_thread`, as an audio
-/// callback's would. (On macOS a thread's first use of thread-local storage
-/// may call the system's allocator directly, which this allocator cannot
-/// see; preparing the thread is what keeps that out of the callback.)
+/// fresh thread nothing prepared, as the system's audio thread is. (This
+/// allocator cannot see the system allocator's own calls, which on macOS a
+/// thread's first use of thread-local storage makes; what the host keeps per
+/// thread lives in pthread keys' slots there.)
 fn plugins() -> usize {
     let mut host = PluginHost::new();
     let file = fixture();
@@ -655,7 +655,6 @@ fn plugins() -> usize {
     let mut played = true;
     std::thread::scope(|s| {
         s.spawn(|| {
-            prepare_audio_thread();
             for i in 0..400 {
                 let frames = SIZES[i % SIZES.len()];
                 let io = &mut buf[..2 * frames];

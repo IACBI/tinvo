@@ -4,10 +4,11 @@
 //! |----------|-----------------------------|-----------------------|
 //! | Windows  | WASAPI, shared/event mode   | ole32, avrt (system)  |
 //! | Linux    | ALSA PCM; JACK (or PipeWire's JACK) | libasound; libjack loaded at run time |
-//! | macOS    | AudioToolbox AudioQueue     | AudioToolbox.framework|
+//! | macOS    | output Audio Unit; AudioQueue capture | AudioToolbox, CoreAudio, CoreFoundation frameworks |
 //!
-//! Each backend runs a dedicated audio thread, asks a factory for the
-//! callback once the device sample rate is known, and converts the callback's
+//! Each backend asks a factory for the callback once the device sample rate
+//! is known (on its audio thread, or on the thread opening the stream where
+//! the system's own thread renders: CoreAudio, JACK), and converts the callback's
 //! interleaved stereo `f32` to whatever the device needs. Backends also list
 //! the output devices and open one by its id (otherwise the system default).
 
@@ -20,7 +21,7 @@ mod jack;
 #[cfg(windows)]
 mod wasapi;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -187,9 +188,21 @@ pub fn find_device<'a>(devices: &'a [Device], query: &str) -> Result<&'a Device,
 pub struct StreamHealth {
     failed: AtomicBool,
     message: Mutex<String>,
+    /// The OSStatus of a failure recorded by [`StreamHealth::fail_enqueue`],
+    /// 0 for none.
+    enqueue: AtomicI32,
 }
 
 impl StreamHealth {
+    /// Records, from inside a capture callback, that an input buffer could
+    /// not be queued again (OSStatus `status`, not 0): without allocating or
+    /// locking, made a message when it is read. Only the first is kept.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(crate) fn fail_enqueue(&self, status: i32) {
+        let _ = self.enqueue.compare_exchange(0, status, Ordering::Relaxed, Ordering::Relaxed);
+        self.failed.store(true, Ordering::Release);
+    }
+
     /// Records a fatal stream error. Called once, as the audio thread exits.
     pub(crate) fn fail(&self, message: String) {
         if let Ok(mut m) = self.message.lock() {
@@ -200,6 +213,10 @@ impl StreamHealth {
 
     pub fn error(&self) -> Option<String> {
         if self.failed.load(Ordering::Acquire) {
+            let status = self.enqueue.load(Ordering::Relaxed);
+            if status != 0 {
+                return Some(format!("input device lost (AudioQueueEnqueueBuffer OSStatus {status})"));
+            }
             Some(self.message.lock().map(|m| m.clone()).unwrap_or_default())
         } else {
             None
@@ -489,6 +506,15 @@ pub fn convert_stereo(src: &[f32], dst: &mut [u8], channels: usize, format: Devi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_status_failure_reads_as_a_message_and_the_first_one_stays() {
+        let h = super::StreamHealth::default();
+        assert_eq!(h.error(), None);
+        h.fail_enqueue(-50);
+        h.fail_enqueue(1);
+        assert_eq!(h.error().as_deref(), Some("input device lost (AudioQueueEnqueueBuffer OSStatus -50)"));
+    }
+
     use super::*;
 
     /// Exercises the platform's device listing (with or without devices);
