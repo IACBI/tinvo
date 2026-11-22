@@ -932,6 +932,16 @@ mod tests {
         }
     }
 
+    /// Held by each test that plays into a device. BlackHole mixes what
+    /// every stream plays into it, and a test reopening it at another
+    /// period glitches the stream recording from it, so the loopback
+    /// check would hear the other test's ramp or a gap.
+    static DEVICES: Mutex<()> = Mutex::new(());
+
+    fn devices_to_myself() -> std::sync::MutexGuard<'static, ()> {
+        DEVICES.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn require(var: &str, why: &str) {
         if std::env::var_os(var).is_some() {
             panic!("{var} is set but {why}");
@@ -943,6 +953,7 @@ mod tests {
     /// low latency, and checks the unit really calls back at the device rate.
     #[test]
     fn output_units_render_on_every_device() {
+        let _alone = devices_to_myself();
         let devices = devices().unwrap_or_default();
         if devices.is_empty() {
             return require("TINVO_REQUIRE_AUDIO", "there is no output device");
@@ -983,6 +994,7 @@ mod tests {
     /// back unchanged and in order.
     #[test]
     fn samples_loop_back_through_a_loopback_device() {
+        let _alone = devices_to_myself();
         let find = |list: Vec<Device>| list.into_iter().find(|d| d.name.contains("BlackHole"));
         let (Some(out), Some(inp)) = (find(devices().unwrap_or_default()), find(input_devices().unwrap_or_default()))
         else {
