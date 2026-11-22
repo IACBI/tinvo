@@ -51,7 +51,7 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 7] = [
+pub const SCENARIOS: [Scenario; 8] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
     Scenario {
@@ -73,6 +73,12 @@ pub const SCENARIOS: [Scenario; 7] = [
         label: "Sampler, 16 voices resampled through sinc and filter",
         budget: 0.1,
         build: sampler,
+    },
+    Scenario {
+        id: "zones",
+        label: "Sampler, as many zones as a track holds over the keys played: layers, turns, release zones, short loops",
+        budget: 0.15,
+        build: zones,
     },
 ];
 
@@ -329,6 +335,36 @@ fn sampler() -> Setup {
         .collect();
     let sample = Sample::from_mono(&audio, rate as u32).expect("a valid sample");
     Setup { project: p, samples: vec![Some(Arc::new(SampleMap::single(Arc::new(sample))))], play: Command::Play }
+}
+
+/// One sampler track whose every key played answers as many zones as a
+/// track holds, in velocity layers, turns and release zones with loops of
+/// a few dozen frames: a note looks through them all, every key-up starts
+/// release zones, and the loops wrap often. Short chords keep keys going
+/// up and down.
+fn zones() -> Setup {
+    use crate::instrument::zone::{MAX_ZONES, Mode, Placement, Trigger};
+    let mut p = Project::new();
+    ok(p.apply(Edit::AddTrack(InstrumentKind::Sampler)));
+    chords(&mut p, 55, 1);
+    let rate = 44_100;
+    let audio: Vec<f32> = (0..rate).map(|i| ((i as f32 / rate as f32 * 110.0).fract() * 2.0 - 1.0) * 0.5).collect();
+    let sample = Arc::new(Sample::from_mono(&audio, rate as u32).expect("a valid sample"));
+    let zones = (0..MAX_ZONES).map(|i| {
+        let layer = (i % 8) as u8;
+        let start = 1000 + (i % 97) as u32 * 100;
+        let place = Placement {
+            keys: (48, 71),
+            vels: (layer * 16, layer * 16 + 15),
+            root: Some(60 + (i % 5) as u8),
+            seq: ((i / 8 % 4) as u8 + 1, 4),
+            trigger: if i / 32 % 2 == 0 { Trigger::Attack } else { Trigger::Release },
+            mode: Mode::Continuous(Some((start, start + 24 + (i % 40) as u32))),
+            ..Placement::WHOLE
+        };
+        (place, Arc::clone(&sample))
+    });
+    Setup { project: p, samples: vec![Some(Arc::new(SampleMap::new(zones)))], play: Command::Play }
 }
 
 /// Instruction budgets: `id instructions-per-second` lines, `#` comments.
