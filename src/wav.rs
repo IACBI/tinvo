@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 const TAG_PCM: u16 = 1;
 const TAG_FLOAT: u16 = 3;
 const TAG_EXTENSIBLE: u16 = 0xFFFE;
+/// The most chunks a file's header is looked through for. Real files have
+/// a handful; past this a file of tiny chunks would only cost reads.
+const MAX_CHUNKS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleFormat {
@@ -394,7 +397,12 @@ pub fn read_info<R: Read + Seek>(r: &mut R) -> Result<Info, WavError> {
     let mut fmt: Option<(u16, u16, u32, u16, u16)> = None; // tag, ch, rate, align, bits
     let mut data: Option<(u64, u64)> = None;
     let (mut loop_points, mut unity_note) = (None, None);
+    let mut chunks = 0;
     while pos + 8 <= file_len {
+        chunks += 1;
+        if chunks > MAX_CHUNKS {
+            return Err(WavError::Malformed("more chunks than a WAV file has"));
+        }
         let mut ch = [0u8; 8];
         r.seek(SeekFrom::Start(pos)).map_err(io_error)?;
         r.read_exact(&mut ch).map_err(io_error)?;
@@ -755,6 +763,20 @@ pub(crate) mod tests {
         assert_eq!(info(with_smpl(100, 60, None)).loop_points, None);
         assert_eq!(info(with_smpl(100, 60, Some((40, 20)))).loop_points, None, "it ends before it starts");
         assert_eq!(info(with_smpl(100, 60, Some((0, u32::MAX)))).loop_points, None);
+        // Found after the audio and many other chunks, up to a bound.
+        let padded = |n: usize| {
+            let (mut b, _) = encode(&vec![0.25; 100], 1, 48_000, SampleFormat::Pcm16, 0).unwrap();
+            for _ in 0..n {
+                b.extend_from_slice(b"junk\0\0\0\0");
+            }
+            b.extend_from_slice(&with_smpl(100, 57, None)[44 + 200..]);
+            b
+        };
+        assert_eq!(info(padded(MAX_CHUNKS - 3)).unity_note, Some(57));
+        assert!(matches!(
+            read_info(&mut Cursor::new(&padded(MAX_CHUNKS - 2))),
+            Err(WavError::Malformed("more chunks than a WAV file has"))
+        ));
         let mut back_and_forth = with_smpl(100, 60, Some((10, 49)));
         let at = back_and_forth.len() - 60 + 40;
         back_and_forth[at] = 1;

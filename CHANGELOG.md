@@ -11,6 +11,9 @@ Author: 𝓐.𝓒.𝓑
 - Importing an SFZ instrument kept the track's start and end points, so a track trimmed until nothing played stayed silent with its new zones. The import now resets them in the same undo step (the regions' own offsets and ends say where they play), and is refused while a lane has a point for the start or end point, as slicing is.
 - An undo or redo that brought back a file no longer there, or too large for what the project has left, said only "Undid" and left the track silent. It now names the file and why it did not load.
 - Loading a WAV on a track with zones (after an SFZ import or slicing, say) says that the file plays over the whole keyboard together with them.
+- A MIDI file cut short, or holding fewer tracks than its header names, imported as if complete. What it has is still read, and the import now says the file is incomplete.
+- A WAV file of a little audio and millions of tiny chunks kept the editor, `tinvo sfz` and `tinvo slice` reading headers to its end. A file of more than 4096 chunks is now refused.
+- `tinvo fuzz TARGET --check FILE` read any file whole, a pipe or a huge file included. It now reads as the editor's readers do: a plain file of at most 256 MiB.
 - A project file with many `parts` lines for one track, or with markers past the longest song, could take gigabytes of memory or minutes of work before it was refused. Such lines are now refused where they stand.
 
 ## [0.28.0] - 2026-11-21
