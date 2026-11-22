@@ -45,7 +45,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1509,16 +1509,30 @@ impl App {
                 }
             }
             Message::Lost => self.midi_reset(),
+            // The keys of a channel ended at once, as their releases would.
+            Message::Control { channel, controller: midi::ALL_SOUND_OFF | midi::ALL_NOTES_OFF..=127, .. } => {
+                let before = self.entry_held.len();
+                self.entry_held.retain(|&(c, _)| c != channel);
+                if self.entry_held.len() < before {
+                    self.entry_keys_up(entering);
+                }
+            }
             Message::Control { .. } | Message::Bend { .. } => {}
             Message::NoteOff { channel, note } => {
                 let Some(i) = self.entry_held.iter().position(|&k| k == (channel, note)) else { return };
                 self.entry_held.swap_remove(i);
-                if self.entry_held.is_empty() {
-                    self.entry_notes.clear();
-                    if entering {
-                        self.step = (self.step + 1) % self.pattern_len().max(1);
-                    }
-                }
+                self.entry_keys_up(entering);
+            }
+        }
+    }
+
+    /// After a key of step entry is up: once none is down, the chord is
+    /// done and the cursor moves on.
+    fn entry_keys_up(&mut self, entering: bool) {
+        if self.entry_held.is_empty() {
+            self.entry_notes.clear();
+            if entering {
+                self.step = (self.step + 1) % self.pattern_len().max(1);
             }
         }
     }
@@ -7336,6 +7350,9 @@ struct MidiSession {
     /// Set by the handler when a mailbox had no room for a message, or the
     /// input lost some.
     lost: Arc<AtomicBool>,
+    /// The channels whose All Sound Off found the engine's mailbox full,
+    /// one bit each: sent again once it has room.
+    hush: Arc<AtomicU16>,
     /// Every held note is to be let go (`Message::Lost` not yet sent).
     release: bool,
 }
@@ -7347,6 +7364,7 @@ impl MidiSession {
             live: Arc::new(Mailbox::new(LIVE_QUEUE)),
             ui: Arc::new(Mailbox::new(LIVE_QUEUE)),
             lost: Arc::new(AtomicBool::new(false)),
+            hush: Arc::new(AtomicU16::new(0)),
             release: false,
         }
     }
@@ -7371,7 +7389,7 @@ impl MidiSession {
 
     /// What runs on the MIDI thread for each message.
     fn handler(&self) -> impl FnMut(Message) + Send + 'static {
-        let (live, ui, lost) = (self.live.clone(), self.ui.clone(), self.lost.clone());
+        let (live, ui, lost, hush) = (self.live.clone(), self.ui.clone(), self.lost.clone(), self.hush.clone());
         move |m: Message| {
             // A full mailbox drops a message rather than block this thread.
             // A lost key or pedal message is said, since a lost release
@@ -7380,6 +7398,19 @@ impl MidiSession {
             let vital = match m {
                 Message::NoteOn { .. } | Message::NoteOff { .. } => ui.push(m).is_err() | live.push(m).is_err(),
                 Message::Control { controller: midi::SUSTAIN, .. } => live.push(m).is_err(),
+                // A lost All Sound Off is sent again, not only made up for
+                // by letting every key go, which leaves one-shots and
+                // releases sounding.
+                Message::Control { channel, controller: midi::ALL_SOUND_OFF, .. } => {
+                    let lost = live.push(m).is_err();
+                    if lost {
+                        hush.fetch_or(1 << (channel & 0x0F), Ordering::Relaxed);
+                    }
+                    ui.push(m).is_err() | lost
+                }
+                Message::Control { controller: midi::ALL_NOTES_OFF..=127, .. } => {
+                    ui.push(m).is_err() | live.push(m).is_err()
+                }
                 Message::Control { .. } | Message::Bend { .. } => {
                     let _ = live.push(m);
                     false
@@ -7411,6 +7442,13 @@ impl MidiSession {
             app.midi_reset();
             // Tried again next frame if the mailbox is full or busy.
             self.release = self.live.push(Message::Lost).is_err();
+        }
+        let hush = self.hush.swap(0, Ordering::Relaxed);
+        for channel in (0..16u8).filter(|&c| hush & 1 << c != 0) {
+            let m = Message::Control { channel, controller: midi::ALL_SOUND_OFF, value: 0 };
+            if self.live.push(m).is_err() {
+                self.hush.fetch_or(1 << channel, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -11085,6 +11123,21 @@ mod tests {
         a.midi_message(Message::note(11, 50, 0));
         a.midi_message(Message::note(0, 50, 0));
         assert!(a.entry_held.is_empty() && a.entry_notes.is_empty());
+        // All Notes Off ends a channel's keys as their releases would: the
+        // chord is done once those of every channel are up.
+        let at = a.step;
+        a.midi_message(Message::note(0, 52, 90));
+        a.midi_message(Message::note(1, 55, 90));
+        a.midi_message(Message::Control { channel: 0, controller: midi::ALL_NOTES_OFF, value: 0 });
+        assert_eq!((a.entry_held.clone(), a.step), (vec![(1, 55)], at));
+        a.midi_message(Message::Control { channel: 1, controller: midi::ALL_SOUND_OFF, value: 0 });
+        assert!(a.entry_held.is_empty() && a.entry_notes.is_empty());
+        assert_eq!(a.step, (at + 1) % a.pattern_len());
+        // Another controller ends nothing.
+        a.midi_message(Message::note(0, 52, 90));
+        a.midi_message(Message::Control { channel: 0, controller: 119, value: 0 });
+        assert_eq!(a.entry_held, [(0, 52)]);
+        a.midi_message(Message::note(0, 52, 0));
     }
 
     #[test]
@@ -11106,6 +11159,34 @@ mod tests {
         handler(pedal);
         session.poll(&mut a);
         assert!(session.release, "a lost pedal could hold notes");
+        // A lost All Sound Off is sent again after the release, once the
+        // mailbox has room.
+        let mut session = MidiSession::new();
+        let mut handler = session.handler();
+        for _ in 0..LIVE_QUEUE {
+            session.live.push(bend).unwrap();
+        }
+        handler(Message::Control { channel: 3, controller: midi::ALL_SOUND_OFF, value: 0 });
+        session.poll(&mut a);
+        while session.live.pop().is_some() {}
+        session.poll(&mut a);
+        let hush = Message::Control { channel: 3, controller: midi::ALL_SOUND_OFF, value: 0 };
+        assert_eq!(
+            (session.live.pop(), session.live.pop(), session.live.pop()),
+            (Some(Message::Lost), Some(hush), None)
+        );
+        // As could a lost controller that ends a channel's notes; not a
+        // lost mod wheel.
+        for controller in [midi::ALL_SOUND_OFF, midi::ALL_NOTES_OFF, 127, midi::MOD_WHEEL, 119] {
+            let mut session = MidiSession::new();
+            let mut handler = session.handler();
+            for _ in 0..LIVE_QUEUE {
+                session.live.push(bend).unwrap();
+            }
+            handler(Message::Control { channel: 0, controller, value: 0 });
+            session.poll(&mut a);
+            assert_eq!(session.release, ![midi::MOD_WHEEL, 119].contains(&controller), "{controller}");
+        }
     }
 
     #[test]

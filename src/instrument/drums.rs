@@ -180,7 +180,8 @@ impl Drum {
 
     /// Starts a hit. The note transposes the drum relative to middle C (60).
     pub fn trigger(&mut self, note: u8, velocity: u8) {
-        self.declick = if self.active { self.last } else { 0.0 };
+        // Also while what a stop left fades out.
+        self.declick = if self.active || self.declick != 0.0 { self.last } else { 0.0 };
         self.active = true;
         self.t = 0;
         self.gain = velocity_to_gain(velocity);
@@ -270,6 +271,15 @@ impl Drum {
         if self.kind == InstrumentKind::HatOpen && self.active {
             self.choked = true;
             self.amp_coef = self.amp_coef.min(decay_coef(CHOKE_TIME, self.sample_rate));
+        }
+    }
+
+    /// Silences it at once: what it last played fades out as a
+    /// retrigger's does (1 ms time constant, -100 dB within about 12 ms).
+    pub fn stop(&mut self) {
+        if self.active {
+            self.declick = self.last;
+            self.active = false;
         }
     }
 
@@ -465,6 +475,37 @@ mod tests {
         // -100 dB at 5/3 of the 12 ms choke time, plus margin.
         assert!(choked < (SR * 0.012 * 5.0 / 3.0) as usize + 10, "{choked}");
         assert_eq!(ring(InstrumentKind::Kick, true), ring(InstrumentKind::Kick, false));
+    }
+
+    #[test]
+    fn a_stopped_drum_falls_silent_at_once_without_a_jump() {
+        for kind in [InstrumentKind::Kick, InstrumentKind::HatOpen, InstrumentKind::Clap] {
+            let mut d = Drum::new(kind, SR);
+            d.trigger(60, 127);
+            let mut buf = vec![0.0; 480];
+            d.render(&mut buf);
+            let before = buf[479];
+            d.stop();
+            let mut after = vec![0.0; 960];
+            d.render(&mut after);
+            assert!((after[0] - before).abs() < 0.05, "{kind:?}: {before} -> {}", after[0]);
+            assert!(after[48..].iter().all(|&x| x.abs() <= before.abs() * 0.4), "{kind:?} falls from the first ms");
+            // -100 dB from at most full scale is 11.5 time constants of 1 ms.
+            assert!(after[600..].iter().all(|&x| x == 0.0), "{kind:?} silent within 12.5 ms");
+            assert!(!d.active);
+            // A hit during the fade starts from where it is, too.
+            let mut d = Drum::new(kind, SR);
+            d.trigger(60, 127);
+            d.render(&mut buf);
+            d.stop();
+            let mut one = [0.0f32; 1];
+            d.render(&mut one);
+            d.trigger(60, 127);
+            let mut next = [0.0f32; 1];
+            d.render(&mut next);
+            // Without it, the jump is the whole of what was playing.
+            assert!((next[0] - one[0]).abs() < 0.1, "{kind:?}: {} then {}", one[0], next[0]);
+        }
     }
 
     #[test]

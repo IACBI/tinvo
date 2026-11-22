@@ -24,6 +24,11 @@ pub use schedule::OutEvent;
 pub const SUSTAIN: u8 = 64;
 /// The mod wheel's controller.
 pub const MOD_WHEEL: u8 = 1;
+/// All Sound Off: a channel's notes end at once, the pedal or not.
+pub const ALL_SOUND_OFF: u8 = 120;
+/// All Notes Off: a channel's notes end as their keys' release would. The
+/// mode messages after it (omni and mono/poly, 124 to 127) do the same.
+pub const ALL_NOTES_OFF: u8 = 123;
 
 /// A decoded channel message TINVO uses. Everything else (program changes,
 /// aftertouch, system messages) is skipped.
