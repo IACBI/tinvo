@@ -61,12 +61,27 @@ jobs:
           sleep 5
           echo TINVO_REQUIRE_AUDIO=1 >> "$GITHUB_ENV"
           echo TINVO_REQUIRE_LOOPBACK=1 >> "$GITHUB_ENV"
+          echo TINVO_REQUIRE_INPUT=1 >> "$GITHUB_ENV"
       # Hosted Windows runners have no audio device; VB-CABLE gives WASAPI
       # an output and an input to open, so the tests and the probe below run
       # against a real stream.
       - name: Install a virtual sound card
         if: runner.os == 'Windows'
         uses: LABSN/sound-ci-helpers@e9d6ba52163a3283714a68412036ddf33f78d49c
+      # Windows refuses capture (E_ACCESSDENIED) until microphone access is
+      # allowed, for desktop programs too.
+      - name: Allow recording from it
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($root in 'HKCU:', 'HKLM:') {
+            foreach ($key in 'microphone', 'microphone\NonPackaged') {
+              $path = "$root\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$key"
+              New-Item -Path $path -Force | Out-Null
+              Set-ItemProperty -Path $path -Name Value -Value Allow
+            }
+          }
+          "TINVO_REQUIRE_INPUT=1" >> $env:GITHUB_ENV
       - name: Format
         run: cargo fmt --check
       - name: Clippy

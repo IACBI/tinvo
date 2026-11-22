@@ -287,9 +287,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Records briefly from this machine's default input; skipped where
-    /// the system lists none (as on some CI runners), but a failure to
-    /// record from one it lists fails.
+    /// Records briefly from this machine's default input. Skipped where it
+    /// cannot be opened, unless `TINVO_REQUIRE_INPUT` is set (CI sets it
+    /// where it installs an input): a listing cannot tell, since ALSA lists
+    /// `default` with no card behind it.
     #[test]
     fn records_from_the_default_input_if_there_is_one() {
         let dir = temp_dir("device");
@@ -297,12 +298,14 @@ mod tests {
         let opened = std::time::Instant::now();
         let mut r = match Recorder::start(None, &path) {
             Ok(r) => r,
-            Err(e) if crate::audio::input_devices().is_ok_and(|d| d.is_empty()) => {
-                eprintln!("no input device ({e}); skipping");
+            Err(e) if std::env::var_os("TINVO_REQUIRE_INPUT").is_some() => {
+                panic!("TINVO_REQUIRE_INPUT is set but recording from the default input failed: {e}")
+            }
+            Err(e) => {
+                eprintln!("no input to record from ({e}); skipping");
                 let _ = std::fs::remove_dir_all(&dir);
                 return;
             }
-            Err(e) => panic!("an input is listed but recording from it failed: {e}"),
         };
         let begin = std::time::Instant::now();
         while begin.elapsed() < std::time::Duration::from_millis(500) {
