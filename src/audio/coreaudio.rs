@@ -808,8 +808,7 @@ unsafe extern "C" fn captured<C: CaptureCallback>(
         // SAFETY: re-enqueueing the buffer we were handed.
         let status = unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null()) };
         if status != 0 && !stopping.swap(true, Ordering::AcqRel) {
-            // Error path only: the queue is dead, so taking a lock is acceptable.
-            health.fail(format!("input device lost (AudioQueueEnqueueBuffer OSStatus {status})"));
+            health.fail_enqueue(status);
         }
     }
 }

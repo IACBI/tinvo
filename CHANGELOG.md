@@ -7,6 +7,9 @@ Author: 𝓐.𝓒.𝓑
 ## [Unreleased]
 
 ### Fixed
+
+- On macOS, the HAL's audio thread allocated the first time it called into a plugin (or a plugin asked which thread it was on): macOS gives a thread its thread-local storage from the heap at first use, and the plugin host kept two values there. They now live in slots of pthread keys made before any plugin is called, which need no allocation.
+- When a macOS capture device could not take back a buffer mid-stream, the capture callback formatted its message and took a lock. It now records the status code, and the message is made when read.
 - Save As kept any extension it was given, so a name such as `kick.wav` wrote the project over a sample it played. Save As now writes `.tvo` files (or the file the project was opened from), and no save writes over a sample the project plays, however its path is spelled.
 - Importing an SFZ instrument kept the track's start and end points, so a track trimmed until nothing played stayed silent with its new zones. The import now resets them in the same undo step (the regions' own offsets and ends say where they play), and is refused while a lane has a point for the start or end point, as slicing is.
 - An undo or redo that brought back a file no longer there, or too large for what the project has left, said only "Undid" and left the track silent. It now names the file and why it did not load.
