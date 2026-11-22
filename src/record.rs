@@ -288,16 +288,21 @@ mod tests {
     }
 
     /// Records briefly from this machine's default input; skipped where
-    /// there is none (as on CI runners).
+    /// the system lists none (as on some CI runners), but a failure to
+    /// record from one it lists fails.
     #[test]
     fn records_from_the_default_input_if_there_is_one() {
         let dir = temp_dir("device");
         let path = dir.join("device.wav");
         let opened = std::time::Instant::now();
-        let Ok(mut r) = Recorder::start(None, &path) else {
-            eprintln!("no input device; skipping");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
+        let mut r = match Recorder::start(None, &path) {
+            Ok(r) => r,
+            Err(e) if crate::audio::input_devices().is_ok_and(|d| d.is_empty()) => {
+                eprintln!("no input device ({e}); skipping");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(e) => panic!("an input is listed but recording from it failed: {e}"),
         };
         let begin = std::time::Instant::now();
         while begin.elapsed() < std::time::Duration::from_millis(500) {

@@ -775,6 +775,10 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         return Err(format!("stream failed: {e}"));
     }
     drop(stream);
+    // A stream that opened but never called back plays nothing.
+    if delivered == 0 {
+        return Err(format!("the stream opened but asked for no audio in {elapsed:.2} s"));
+    }
     let rate = delivered as f64 / elapsed;
     println!(
         "{} callbacks, {delivered} frames in {elapsed:.2} s = {rate:.0} frames/s ({:+.2} % vs nominal)",

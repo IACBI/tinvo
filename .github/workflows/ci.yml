@@ -61,6 +61,12 @@ jobs:
           sleep 5
           echo TINVO_REQUIRE_AUDIO=1 >> "$GITHUB_ENV"
           echo TINVO_REQUIRE_LOOPBACK=1 >> "$GITHUB_ENV"
+      # Hosted Windows runners have no audio device; VB-CABLE gives WASAPI
+      # an output and an input to open, so the tests and the probe below run
+      # against a real stream.
+      - name: Install a virtual sound card
+        if: runner.os == 'Windows'
+        uses: LABSN/sound-ci-helpers@e9d6ba52163a3283714a68412036ddf33f78d49c
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -79,6 +85,17 @@ jobs:
           cargo run --release -- inputs
           cargo run --release -- midi
           cargo run --release -- plugins
+          cargo run --release -- slice demo.wav
+          cargo run --release -- slice demo.wav 8
+          printf '<region> sample=demo.wav lokey=36 hikey=59 pitch_keycenter=48\n<region> sample=demo.wav lokey=60 hikey=84 loop_mode=one_shot\n' > demo.sfz
+          cargo run --release -- sfz demo.sfz
+          printf 'tinvo 19\ntempo 120\ntrack sampler\nzone 0-59 48 0-127 1/1 attack 0 0 0 - 0-1 track demo.wav\nzone 60-127 72 0-127 1/1 attack 0 0 0 - 0-1 oneshot demo.wav\nstep 0 60 100 1 100 1 0 -\nstep 4 48 100 1 100 1 0 -\nend\n' > zones.tvo
+          cargo run --release -- render zones.tvo zones.wav --loops 1
+      - name: Probe the virtual sound card
+        if: runner.os == 'Windows'
+        run: |
+          cargo run --release -- probe 1
+          cargo run --release -- probe --low-latency 1
       - name: Probe JACK, then PipeWire's JACK
         if: runner.os == 'Linux'
         run: |
@@ -145,9 +162,14 @@ jobs:
       - run: ./target/release/tinvo bench --instructions bench/instructions.txt
 
   msrv:
-    name: Minimum Rust version (1.85)
-    runs-on: ubuntu-latest
+    # The Linux job keeps the name the ruleset requires.
+    name: Minimum Rust version (1.85)${{ matrix.os != 'ubuntu-latest' && format(', {0}', matrix.os) || '' }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -157,4 +179,5 @@ jobs:
           rustup toolchain install 1.85 --profile minimal
           rustup default 1.85
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        if: runner.os == 'Linux'
       - run: cargo check --all-targets
