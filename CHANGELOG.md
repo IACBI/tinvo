@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-11-22
+
 ### Fixed
 
 - The 0.28.0 notes said a WAV export refused for a missing sample names the track whose sample it is. That holds for a track's own sample in the editor; a missing zone file is named by its path, and `tinvo render` names the files it cannot load.
@@ -524,7 +526,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/IACBI/tinvo/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/IACBI/tinvo/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/IACBI/tinvo/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/IACBI/tinvo/compare/v0.25.0...v0.26.0

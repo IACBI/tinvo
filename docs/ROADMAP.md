@@ -440,6 +440,22 @@ A review of all of 0.24.0, with extra attention to Phase 10, made with an indepe
 Known limits (found bounded, and left for later):
 - A synth voice stolen for a new note keeps its old release queued until it is due; it then does nothing. The queue is bounded per track.
 
+## Review: the whole project after 0.28.0 ✅ (0.28.1)
+
+A review of all of 0.28.0, the repository's documents and its CI, made with an independent model reading the code, which then reviewed each fix. Each finding was checked against the code, and each fix that changes behaviour has a test that fails without it:
+- Files: Save As writes `.tvo` files and no save writes over a sample the project plays; the project reader refuses a second `parts` line for a track and a marker past the longest song where they stand; a WAV file of more chunks than a file holds is refused; a MIDI file that ends inside a track or names more tracks than it has says so; `fuzz --check` reads its input as the readers do.
+- The sampler: an SFZ import resets the start and end points and is refused while a lane moves them; an undo that brings back a file no longer there says which and why; `tinvo sfz` reports what the import would load; `sw_up` is named as played whatever is held.
+- MIDI input: All Notes Off and the mode messages end a channel's keys, and All Sound Off stops the instruments it plays at once, a plugin by a note choke; a lost one is sent again.
+- Real time: on macOS, the plugin host's per-thread values live in pthread keys' slots, since the system gives a thread-local storage from the heap at first use; a capture device failing records its status without allocating.
+- CI: Windows plays and records through a virtual sound card, Rust 1.85 checks every platform, the smoke test covers `slice`, `sfz` and zones, the BlackHole tests no longer overlap, and a benchmark holds 1024 zones.
+- Documents: README, ARCHITECTURE, CONTRIBUTING, SECURITY and the pull request template say what the code does.
+
+Known limits (left as they are):
+- A plugin id interned for an instance that failed to load keeps its place in the process's pool of 4096: taking it back is unsafe while other threads may intern the same id.
+- Interpolation reads across a slice's cut into the next slice, as the file does; each zone's end fades over 64 frames.
+- While the MIDI input's queue overflows, a lost All Sound Off sent again a frame later can cut a note played just after it.
+- The first callback of the HAL's audio thread has not been traced for allocations on a Mac; Rust's counting allocator cannot see the system's.
+
 ## Planned: more kinds of music
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
@@ -633,4 +649,4 @@ For vocals, guitars and other live instruments: pop, rock, singer-songwriter.
 ## Known limitations of the foundation
 
 - Linux and macOS backends have run only on virtual devices (a JACK server, PipeWire, BlackHole and the macOS runner's devices), not on real audio hardware.
-- CI runs on hosted Windows, Linux and macOS machines, which have no sound card. JACK (jackd and PipeWire) and CoreAudio (BlackHole and the runner's virtual devices) are played through there; WASAPI and ALSA are only compiled, linted and listed.
+- CI runs on hosted Windows, Linux and macOS machines, which have no sound card. JACK (jackd and PipeWire), CoreAudio (BlackHole and the runner's virtual devices) and WASAPI (VB-CABLE, output and capture) are played through there; ALSA is only compiled, linted and opened on its `null` device.
