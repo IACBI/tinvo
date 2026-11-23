@@ -464,12 +464,14 @@ impl ParseError {
 
     fn new(line: usize, mut message: String) -> Self {
         if message.len() > Self::MAX_MESSAGE {
-            let mut cut = Self::MAX_MESSAGE;
+            let mut cut = Self::MAX_MESSAGE - '…'.len_utf8();
             while !message.is_char_boundary(cut) {
                 cut -= 1;
             }
             message.truncate(cut);
             message.push('…');
+            // An error may be kept a while: not with the line's storage.
+            message.shrink_to_fit();
         }
         Self { line, message }
     }
@@ -2144,13 +2146,15 @@ impl Project {
             let mib = max_state >> 20;
             return Err(std::io::Error::other(format!("a plugin's state is over the {mib} MiB a project keeps")));
         }
-        // The states alone may be over: then nothing is built, as their
-        // text is a third larger than they are.
+        // The states' lines alone may be over: then nothing is built, as
+        // their text is a third larger than they are. Each line is at least
+        // `state `, its base64 and a line break.
+        const STATE_LINE: &str = "state \n";
         let encoded: u64 = self
             .plugin_places()
             .into_iter()
             .filter_map(|(place, _)| self.plugin_state(place))
-            .map(|s| (s.len() as u64).div_ceil(3) * 4)
+            .map(|s| (s.len() as u64).div_ceil(3) * 4 + STATE_LINE.len() as u64)
             .sum();
         if encoded > max {
             let (size, mib) = (encoded >> 20, max >> 20);
@@ -3679,13 +3683,10 @@ song A",
         let key = "\u{1b}".repeat(1 << 20);
         let e = Project::from_text(&format!("tinvo 20\n{key} 1\n")).unwrap_err();
         assert_eq!(e.line, 2);
-        assert!(
-            e.message.len() <= ParseError::MAX_MESSAGE + '…'.len_utf8() && e.message.ends_with('…'),
-            "{}",
-            e.message.len()
-        );
+        assert!(e.message.len() <= ParseError::MAX_MESSAGE && e.message.ends_with('…'), "{}", e.message.len());
+        assert!(e.message.capacity() <= ParseError::MAX_MESSAGE, "{}", e.message.capacity());
         let e = Project::from_text(&format!("tinvo 20\nbpm {}\n", "é".repeat(400))).unwrap_err();
-        assert!(e.message.len() <= ParseError::MAX_MESSAGE + '…'.len_utf8(), "cut on a character's boundary");
+        assert!(e.message.len() <= ParseError::MAX_MESSAGE, "cut on a character's boundary");
     }
 
     #[test]
@@ -3708,8 +3709,8 @@ song A",
         let e = p.save_within(&path, 2 << 20).unwrap_err();
         assert_eq!(e.to_string(), "the project would be over 4 MiB, more than the 2 MiB a project file can hold");
         // They fit, the rest of the text does not.
-        let encoded = (3u64 << 20).div_ceil(3) * 4;
-        let e = p.save_within(&path, encoded + 1).unwrap_err();
+        let line = (3u64 << 20).div_ceil(3) * 4 + "state \n".len() as u64;
+        let e = p.save_within(&path, line).unwrap_err();
         assert!(e.to_string().starts_with("the project would be 4 MiB, over the "), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), kept, "the file there as it was");
         p.save_within(&path, 5 << 20).unwrap();

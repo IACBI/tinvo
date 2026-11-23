@@ -290,10 +290,6 @@ fn fields_of(line: &str) -> Option<Vec<&str>> {
 
 /// Reads a line [`plugin_line`] wrote, without its first word.
 fn parse_plugin(fields: &[&str]) -> Option<PluginInfo> {
-    // No more features than a scan reads from a plugin.
-    if fields.len() > 5 + super::library::MAX_FEATURES {
-        return None;
-    }
     let mut text = fields.iter().map(|f| unescape(f));
     let mut next = || text.next().flatten();
     let (id, name, vendor, version, description) = (next()?, next()?, next()?, next()?, next()?);
@@ -414,16 +410,23 @@ fn contain_children() {
 /// `None` for anything else, such as a result cut short or with lines after
 /// its end.
 fn parse_result(text: &str) -> Option<Result<Vec<PluginInfo>, String>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let (&RESULT_HEADER, rest) = lines.split_first()? else { return None };
+    let mut lines = text.lines();
+    if lines.next()? != RESULT_HEADER {
+        return None;
+    }
+    // Its plugins and its `end`, no more lines than a scan writes.
+    let mut rest = Vec::new();
+    for line in lines {
+        if rest.len() > super::library::MAX_DESCRIPTORS as usize {
+            return None;
+        }
+        rest.push(line);
+    }
     let (&"end", body) = rest.split_last()? else { return None };
     if let [line] = body {
         if let Some(why) = line.strip_prefix("error\t") {
             return Some(Err(unescape(why)?));
         }
-    }
-    if body.len() > super::library::MAX_DESCRIPTORS as usize {
-        return None;
     }
     let mut plugins = Vec::new();
     for line in body {
@@ -702,9 +705,10 @@ fn cache_text(entries: &[Entry]) -> String {
     text
 }
 
-/// Writes the cache at `path`, its folder made if need be.
+/// Writes the cache at `path`, its folder made if need be: the first
+/// [`MAX_FILES`] entries, as many as it is read back with.
 pub fn write_cache(path: &Path, entries: &[Entry]) -> Result<(), String> {
-    let text = cache_text(entries);
+    let text = cache_text(&entries[..entries.len().min(MAX_FILES)]);
     if text.len() as u64 > MAX_CACHE_BYTES {
         return Err("the plugin cache would be too large to keep".into());
     }
@@ -987,6 +991,16 @@ mod tests {
         let plugins = |n: usize| format!("{}\n{file}{}", cache_header(), format!("{line}\n").repeat(n));
         assert!(parse_cache(&plugins(most)).is_some());
         assert_eq!(parse_cache(&plugins(most + 1)), None);
+        // What is written is no more than what is read back.
+        let dir = temp_dir("cache-cap");
+        let entries: Vec<Entry> = (0..=MAX_FILES)
+            .map(|i| Entry { path: dir.join(format!("{i}.clap")), fingerprint: "f".into(), result: Ok(Vec::new()) })
+            .collect();
+        write_cache(&dir.join("cache"), &entries).unwrap();
+        let back = read_cache(&dir.join("cache"));
+        assert_eq!(back.len(), MAX_FILES);
+        assert_eq!(back[0].path, entries[0].path, "the first kept");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

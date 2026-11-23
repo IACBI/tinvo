@@ -158,7 +158,7 @@ pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file).take(max + 1).read_to_end(&mut bytes)?;
+    Read::by_ref(&mut file).take(max.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(too_large());
     }

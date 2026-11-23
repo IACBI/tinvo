@@ -896,6 +896,9 @@ pub struct App {
     bank: HashMap<String, Arc<Sample>>,
     undo: VecDeque<Change>,
     redo: Vec<Change>,
+    /// The bytes of plugin states the history keeps beyond the project's:
+    /// [`HISTORY_STATE_BYTES`], less in tests.
+    state_budget: usize,
     /// Stops the next edit merging into a change that was just undone/redone.
     sealed: bool,
     link: Option<EngineLink>,
@@ -1137,6 +1140,7 @@ impl App {
             bank: HashMap::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
+            state_budget: HISTORY_STATE_BYTES,
             sealed: false,
             link,
             sample_rate,
@@ -1767,14 +1771,15 @@ impl App {
         if self.undo.len() > HISTORY_LIMIT {
             self.undo.pop_front();
         }
-        self.trim_states(HISTORY_STATE_BYTES);
+        self.trim_states();
         self.prune_bank();
     }
 
-    /// Forgets the oldest undo steps while the plugin states the history
-    /// keeps, and the project does not, take more than `budget` bytes. A
-    /// state shared by several steps counts once; the newest step stays.
-    fn trim_states(&mut self, budget: usize) {
+    /// Forgets the steps farthest from the present, the oldest undo steps
+    /// and then the last redo steps, while the plugin states the history
+    /// keeps, and the project does not, take more than its budget. A state
+    /// shared by several steps counts once.
+    fn trim_states(&mut self) {
         loop {
             let ours: std::collections::HashSet<*const u8> = self
                 .project
@@ -1784,17 +1789,18 @@ impl App {
                 .map(|s| Arc::as_ptr(s).cast::<u8>())
                 .collect();
             let mut seen = std::collections::HashSet::new();
-            let steps = self.undo.iter().chain(&self.redo);
-            let bytes: usize = steps
+            let bytes: usize = (self.undo.iter().chain(&self.redo))
                 .flat_map(|c| c.meta_before.states.iter().chain(&c.meta_after.states))
                 .map(|(_, s)| (Arc::as_ptr(s).cast::<u8>(), s.len()))
                 .filter(|&(p, _)| !ours.contains(&p) && seen.insert(p))
                 .map(|(_, n)| n)
                 .sum();
-            if bytes <= budget || self.undo.len() <= 1 {
+            if bytes <= self.state_budget {
                 return;
             }
-            self.undo.pop_front();
+            if self.undo.pop_front().is_none() {
+                self.redo.remove(0);
+            }
         }
     }
 
@@ -1848,7 +1854,7 @@ impl App {
         paths.sort_unstable();
         paths.dedup();
         let (loaded, wanted): (Vec<&str>, Vec<&str>) = paths.into_iter().partition(|p| self.bank.contains_key(*p));
-        let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.cost()).sum();
+        let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.frames()).sum();
         let (mut got, mut failed) = (Vec::new(), Vec::new());
         for p in wanted {
             let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
@@ -1978,7 +1984,7 @@ impl App {
     ///
     /// Returns what could not be saved, a line for each plugin.
     fn sync_states(&mut self) -> Vec<String> {
-        let mut failed = Vec::new();
+        let (mut failed, mut replaced) = (Vec::new(), false);
         for Live { place, handle, saves, .. } in &self.live {
             if !saves || !handle.is_alive() {
                 continue;
@@ -1989,12 +1995,17 @@ impl App {
                 Ok(state) if state.as_deref() == self.project.plugin_state(*place).map(|s| &s[..]) => {}
                 Ok(state) => {
                     self.project.set_plugin_state(*place, state.map(Into::into));
+                    replaced = true;
                 }
                 Err(e) => {
                     let name = self.plugins.plugin_of(handle.token()).map(|r| self.plugins.name(r));
                     failed.push(format!("{} {e}", name.unwrap_or_else(|| "A plugin".into())));
                 }
             }
+        }
+        // The states replaced may now be the history's alone.
+        if replaced {
+            self.trim_states();
         }
         failed
     }
@@ -2122,7 +2133,7 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum();
+        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
         let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
         let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load {noun}: {e}"))?);
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
@@ -2188,7 +2199,7 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum();
+        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
         let mut failed = std::collections::BTreeMap::<String, String>::new();
         let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
         // First what each file holds, from what is loaded or the file's
@@ -2535,7 +2546,8 @@ impl App {
         self.after_history_move(&c, "Undid");
         self.say_unloaded("Undid", c.what, &failed);
         self.redo.push(c);
-        // What the step walked away from may be more than the budget keeps.
+        // What the step walked away from may be more than the budgets keep.
+        self.trim_states();
         self.prune_bank();
     }
 
@@ -2560,17 +2572,18 @@ impl App {
         self.say_unloaded("Redid", c.what, &failed);
         // Not via push_change: the remaining redo stack stays valid.
         self.undo.push_back(c);
+        self.trim_states();
         self.prune_bank();
     }
 
-    /// Whether the samples the tracks of `meta` play, as loaded now, cost
-    /// at most `budget` frames together ([`Sample::cost`]), each file once. The history keeps
+    /// Whether the samples the tracks of `meta` play, as loaded now, hold
+    /// at most `budget` frames together, each file once. The history keeps
     /// paths, and a file loaded again since may have grown.
     fn samples_fit(&self, meta: &Meta, budget: usize) -> bool {
         let mut keys: Vec<&str> = meta.tracks.iter().flat_map(TrackMeta::sample_paths).collect();
         keys.sort_unstable();
         keys.dedup();
-        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum::<usize>() <= budget
+        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() <= budget
     }
 
     fn after_history_move(&mut self, c: &Change, verb: &str) {
@@ -9320,8 +9333,9 @@ mod tests {
     #[test]
     fn the_history_keeps_plugin_states_within_a_budget() {
         let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        a.state_budget = 350;
         let place = PluginPlace::Track(0);
-        let step = |n: u8| {
+        let step = |a: &App, n: u8| {
             let mut meta = a.meta();
             meta.states = vec![(place, Arc::from(vec![n; 100]))];
             Change {
@@ -9335,17 +9349,21 @@ mod tests {
                 param: None,
             }
         };
-        let steps: Vec<Change> = (0..10).map(step).collect();
-        let shared = Arc::clone(&steps[9].meta_after.states[0].1);
-        for c in steps {
+        for n in 0..10 {
+            let c = step(&a, n);
             a.push_change(c);
         }
-        assert_eq!(a.undo.len(), 10, "1000 bytes are within the budget");
-        a.trim_states(350);
         assert_eq!(a.undo.len(), 3, "the newest three, 100 bytes each");
-        assert!(Arc::ptr_eq(&a.undo.back().unwrap().meta_after.states[0].1, &shared));
-        a.trim_states(0);
-        assert_eq!(a.undo.len(), 1, "the newest step stays");
+        assert_eq!(a.undo.back().unwrap().meta_after.states[0].1[0], 9);
+        // Moving through the history keeps to it too: the oldest undo step
+        // goes first, then the farthest redo step.
+        a.undo();
+        a.undo();
+        assert_eq!((a.undo.len(), a.redo.len()), (1, 2));
+        a.state_budget = 150;
+        a.undo();
+        assert_eq!((a.undo.len(), a.redo.len()), (0, 1), "one step's 100 bytes");
+        assert_eq!(a.redo[0].meta_after.states[0].1[0], 7, "the nearest redo step stays");
     }
 
     #[test]

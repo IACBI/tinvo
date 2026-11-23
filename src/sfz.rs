@@ -993,6 +993,12 @@ mod tests {
         let note = i.notes.iter().find(|n| n.contains("unreadable")).unwrap();
         assert!(note.starts_with("100000 unreadable: line 2: '?', line 3: '?'"), "{note}");
         assert_eq!(note.matches("'?'").count(), 5, "{note}");
+        // And it keeps no more than it quotes.
+        let mut r = Reader::default();
+        for n in 0..100_000 {
+            r.unreadable(n, 0, "?");
+        }
+        assert_eq!((r.unreadable.len(), r.unreadable_n), (SHOWN_UNREADABLE, 100_000));
     }
 
     #[test]
