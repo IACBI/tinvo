@@ -624,12 +624,20 @@ impl PolySynth {
                 }
                 let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
                 let fe = v.fenv.tick();
-                let pos = wt_pos + lfo_pos * l + env_pos * fe;
                 let mut s = 0.0;
-                for k in 0..u {
-                    let a = read(&mut v.osc1[k], w1, t1, inc[0][k], &mip[0][k], width, pos);
-                    let b = read(&mut v.osc2[k], w2, t2, inc[1][k], &mip[1][k], width, pos);
-                    s += a * (1.0 - mix) + b * mix;
+                if t1 || t2 {
+                    let pos = wt_pos + lfo_pos * l + env_pos * fe;
+                    for k in 0..u {
+                        let a = read(&mut v.osc1[k], w1, t1, inc[0][k], &mip[0][k], width, pos);
+                        let b = read(&mut v.osc2[k], w2, t2, inc[1][k], &mip[1][k], width, pos);
+                        s += a * (1.0 - mix) + b * mix;
+                    }
+                } else {
+                    // Without a table, the oscillators as they always ran.
+                    for k in 0..u {
+                        s += v.osc1[k].next(w1, inc[0][k], width) * (1.0 - mix)
+                            + v.osc2[k].next(w2, inc[1][k], width) * mix;
+                    }
                 }
                 s *= uni_gain;
                 if noise > 0.0 {
