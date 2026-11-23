@@ -3898,8 +3898,14 @@ impl App {
                     PromptKind::Export => {
                         let path = with_extension(&text, "wav");
                         // What would be refused anyway is not asked about.
-                        let refused = render::check_destination(&self.project, self.path.as_deref(), &path).is_err()
-                            || render::check_length(&self.project, &self.export_options(), self.export_format).is_err();
+                        // A MIDI file has a limit of its own, not a WAV file's.
+                        let too_long = if crate::smf::is_midi_path(&path) {
+                            self.export_loops > crate::smf::MAX_LOOPS
+                        } else {
+                            render::check_length(&self.project, &self.export_options(), self.export_format).is_err()
+                        };
+                        let refused =
+                            render::check_destination(&self.project, self.path.as_deref(), &path).is_err() || too_long;
                         if std::fs::symlink_metadata(&path).is_err() {
                             // A file another program puts there meanwhile is
                             // kept: the export takes the next free name.
@@ -6955,12 +6961,12 @@ impl App {
                 let name = crate::tui::printable_line(&name);
                 // The question is always seen: a long name loses its start.
                 const ASK: &str = " exists. Replace it? (y/n)";
+                // Columns, not characters: a wide character takes two.
                 let room = usize::from(w).saturating_sub(ASK.len()).max(2);
-                let n = name.chars().count();
-                let name = if n <= room {
+                let name = if crate::tui::screen::text_width(&name) <= room {
                     name
                 } else {
-                    std::iter::once('…').chain(name.chars().skip(n - room + 1)).collect()
+                    format!("…{}", crate::tui::screen::fit_end(&name, room - 1))
                 };
                 s.put(0, y, &format!("{name}{ASK}"), prompt);
             }
@@ -11437,6 +11443,32 @@ mod tests {
         a.draw(&mut s);
         assert!(s.row_text(29).trim_end().ends_with("bbb.tvo exists. Replace it? (y/n)"), "{}", s.row_text(29));
         keys(&mut a, &[Key::Char('n')]);
+        // Columns count, not characters: a wide character takes two.
+        let wide = dir.join(format!("{}.tvo", "漢".repeat(30)));
+        std::fs::write(&wide, "someone's project").unwrap();
+        a.mode = Mode::Prompt(PromptKind::SaveAs, wide.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        let mut s = Screen::new(MIN_W, 30);
+        a.draw(&mut s);
+        let row = s.row_text(29);
+        assert!(row.starts_with('…') && row.trim_end().ends_with(".tvo exists. Replace it? (y/n)"), "{row}");
+        keys(&mut a, &[Key::Char('n')]);
+        // A MIDI file is asked about even when the WAV file would be too
+        // long, as a MIDI export is not refused for that.
+        let mid = dir.join("old.mid");
+        std::fs::write(&mid, "an earlier MIDI file").unwrap();
+        let mut b = app();
+        b.project.tempo = crate::engine::MIN_TEMPO;
+        for index in 0..64 {
+            assert!(b.edit(Edit::InsertSongEntry { index, pattern: 0 }));
+        }
+        (b.export_loops, b.export_source, b.export_format) = (32, Source::Song, crate::wav::SampleFormat::Float32);
+        assert!(render::check_length(&b.project, &b.export_options(), b.export_format).is_err());
+        b.mode = Mode::Prompt(PromptKind::Export, mid.display().to_string());
+        keys(&mut b, &[Key::Enter]);
+        assert_eq!(b.mode, Mode::Confirm(Confirm::ExportOver(mid.clone())));
+        keys(&mut b, &[Key::Char('n')]);
+        assert_eq!(std::fs::read_to_string(&mid).unwrap(), "an earlier MIDI file");
         // Nor is a save asked about that would be refused: a project open
         // in another session, or one with a crashed session's autosave.
         let held = dir.join("held.tvo");
