@@ -4701,6 +4701,7 @@ fn mix_track(
         s.current() != 0.0 || s.target() != 0.0
     });
     if sending.contains(&true) {
+        let mut fed = [0; send::BUSES];
         let mut inputs = mix.inputs(sending);
         for i in 0..n {
             let (x, y) = sig(i);
@@ -4712,12 +4713,19 @@ fn mix_track(
             let j = at + 2 * i;
             for (bus, input) in inputs.iter_mut().enumerate() {
                 if sending[bus] {
-                    let g = t.sends[bus].tick();
+                    // Fed while its send is or will be above zero: a send
+                    // reaching zero mid-segment feeds the bus up to there.
+                    let s = &mut t.sends[bus];
+                    if s.current() != 0.0 || s.target() != 0.0 {
+                        fed[bus] = i + 1;
+                    }
+                    let g = s.tick();
                     input[j] += l * g;
                     input[j + 1] += r * g;
                 }
             }
         }
+        mix.feed(fed);
     } else {
         for i in 0..n {
             let (x, y) = sig(i);
@@ -8859,6 +8867,48 @@ mod tests {
                 got.extend(run(&mut e, size.min((reference.len() - got.len()) / 2)));
             }
             assert_eq!(got, reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_send_closing_mid_callback_stops_feeding_its_bus_there() {
+        // A chorus send closed by a held point and opened again: the frame
+        // it reaches zero falls inside large callbacks, and the chorus must
+        // run past it as an unfed bus does, at any buffer size.
+        use crate::mix::mp;
+        let n = InstrumentKind::Synth.params().len();
+        let chorus_send = (n + strip::sp::COUNT + send::CHORUS) as u8;
+        let point = |step, value| Edit::SetPoint { track: 0, lane: 0, pattern: 0, step, value: Some(value) };
+        let edits = vec![
+            // Silent until the send opens again: the chorus is idle when
+            // the send closes, so only feeding it moves its sweep on.
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 8, value: step(64) },
+            Edit::SetParam { track: 0, index: chorus_send, value: 0.0 },
+            Edit::SetMixParam { index: mp::CHORUS_DEPTH as u8, value: 0.004 },
+            // A track's lane targets start with its volume and pan.
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(chorus_send + 2)), ramp: false },
+            point(1, SILENT_DB),
+            point(8, 0.0),
+        ];
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = Vec::new();
+            while out.len() < 2 * 60_000 {
+                out.extend(run(&mut e, 1));
+            }
+            out
+        };
+        assert!(reference[2 * 30_000..].iter().any(|&x| x != 0.0));
+        for size in [17usize, 1000, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut got = Vec::new();
+            while got.len() < reference.len() {
+                got.extend(run(&mut e, size.min((reference.len() - got.len()) / 2)));
+            }
+            assert!(got == reference, "buffer size {size}");
         }
     }
 
