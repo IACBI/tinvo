@@ -185,7 +185,8 @@ pub fn color_name(c: Color) -> String {
 
 /// Reads a style: `[FG] [on BG] [bold]`, such as `black on bright-white`.
 pub fn parse_style(s: &str) -> Result<Style, String> {
-    let words: Vec<&str> = s.split_whitespace().collect();
+    // A style has at most four words: a fifth is all an error needs.
+    let words: Vec<&str> = s.split_whitespace().take(5).collect();
     let mut style = Style::DEFAULT;
     let mut rest = &words[..];
     if let [first, tail @ ..] = rest {
@@ -281,6 +282,8 @@ mod tests {
         assert_eq!(parse_style("on 236"), Ok(Style::DEFAULT.on(Color::Indexed(236))));
         assert_eq!(parse_style("bold"), Ok(Style::DEFAULT.bold()));
         assert_eq!(parse_style("grey"), Ok(Style::fg(Gray)));
+        let long = format!("red on blue bold extra {}", "x ".repeat(100_000));
+        assert_eq!(parse_style(&long), Err("unexpected 'extra' (a style is [colour] [on colour] [bold])".into()));
         for bad in ["", "on", "pink", "256", "#12345", "red bold blue", "red on", "#gg0000"] {
             assert!(parse_style(bad).is_err(), "{bad:?}");
         }

@@ -716,6 +716,11 @@ fn parse(bytes: &[u8]) -> Result<(u16, Parsed), String> {
         }
         let data = r.take(len.min(r.left()))?;
         if id == b"MTrk" {
+            // A header names at most 65 535 tracks; past that, tracks would
+            // share a number and be read as one.
+            if found == u16::MAX {
+                return Err(format!("more than {} tracks", u16::MAX));
+            }
             read_track(data, track, &mut parsed)?;
             found = found.saturating_add(1);
             if format == 1 {
@@ -1575,5 +1580,11 @@ mod tests {
             read(&fewer).unwrap().incomplete.as_deref(),
             Some("the file has 1 of the 3 tracks its header names")
         );
+        // More tracks than a header can name would share a number.
+        let mut many = file(1, 96, &[&note]);
+        many.extend(b"MTrk\0\0\0\0".repeat(usize::from(u16::MAX)));
+        assert_eq!(read(&many).unwrap_err(), "more than 65535 tracks");
+        many.truncate(many.len() - 8);
+        assert!(read(&many).is_ok());
     }
 }

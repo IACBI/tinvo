@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// At most this many descriptors are read from one factory.
-const MAX_DESCRIPTORS: u32 = 256;
+pub(super) const MAX_DESCRIPTORS: u32 = 256;
 /// At most this many features are read from one descriptor.
-const MAX_FEATURES: usize = 64;
+pub(super) const MAX_FEATURES: usize = 64;
 /// At most this many bytes are read from one of a descriptor's strings.
 const MAX_STRING: usize = 1024;
 

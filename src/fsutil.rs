@@ -144,14 +144,23 @@ pub fn read_bytes(path: &Path, max: u64) -> io::Result<Vec<u8>> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
     }
     let mut file = open_without_waiting(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    let too_large = || {
+        let size = if max >= 1 << 20 { format!("{} MiB", max >> 20) } else { format!("{max} bytes") };
+        io::Error::new(io::ErrorKind::InvalidData, format!("larger than {size}"))
+    };
+    // Known too large, it is not read; the reading stays bounded too, as
+    // the file may grow meanwhile.
+    if meta.len() > max {
+        return Err(too_large());
     }
     let mut bytes = Vec::new();
     Read::by_ref(&mut file).take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
-        let size = if max >= 1 << 20 { format!("{} MiB", max >> 20) } else { format!("{max} bytes") };
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("larger than {size}")));
+        return Err(too_large());
     }
     Ok(bytes)
 }

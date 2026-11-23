@@ -82,6 +82,9 @@ const MIN_GRID_ROWS: u16 = 3;
 const MIN_W: u16 = 64;
 const MIN_H: u16 = 16;
 const HISTORY_LIMIT: usize = 1000;
+/// The bytes of plugin states the history may keep beyond the project's
+/// own: as much as a project file may hold.
+const HISTORY_STATE_BYTES: usize = 256 << 20;
 /// Chord shapes that `c` cycles through, as intervals above the root.
 const CHORDS: [(&str, [u8; MAX_CHORD - 1]); 7] = [
     ("", [0, 0, 0]),
@@ -1764,7 +1767,35 @@ impl App {
         if self.undo.len() > HISTORY_LIMIT {
             self.undo.pop_front();
         }
+        self.trim_states(HISTORY_STATE_BYTES);
         self.prune_bank();
+    }
+
+    /// Forgets the oldest undo steps while the plugin states the history
+    /// keeps, and the project does not, take more than `budget` bytes. A
+    /// state shared by several steps counts once; the newest step stays.
+    fn trim_states(&mut self, budget: usize) {
+        loop {
+            let ours: std::collections::HashSet<*const u8> = self
+                .project
+                .plugin_places()
+                .into_iter()
+                .filter_map(|(p, _)| self.project.plugin_state(p))
+                .map(|s| Arc::as_ptr(s).cast::<u8>())
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            let steps = self.undo.iter().chain(&self.redo);
+            let bytes: usize = steps
+                .flat_map(|c| c.meta_before.states.iter().chain(&c.meta_after.states))
+                .map(|(_, s)| (Arc::as_ptr(s).cast::<u8>(), s.len()))
+                .filter(|&(p, _)| !ours.contains(&p) && seen.insert(p))
+                .map(|(_, n)| n)
+                .sum();
+            if bytes <= budget || self.undo.len() <= 1 {
+                return;
+            }
+            self.undo.pop_front();
+        }
     }
 
     /// Drops loaded samples nothing can bring back: no track uses them and
@@ -1774,7 +1805,8 @@ impl App {
     }
 
     /// [`App::prune_bank`], keeping the history's samples that no track plays
-    /// only while they add up to at most `budget` frames, the steps nearest
+    /// only while they cost at most `budget` frames ([`Sample::cost`]: a
+    /// wavetable built from one counts too), the steps nearest
     /// the present first, undo and redo alike; an undo or redo reads the
     /// rest again from disk.
     fn prune_bank_within(&mut self, budget: usize) {
@@ -1797,8 +1829,8 @@ impl App {
                 lists.insert(Arc::as_ptr(&m.zones).cast::<ZoneData>()).then(|| m.zones.iter().map(|z| z.path.as_str()));
             for path in m.sample.as_deref().into_iter().chain(zones.into_iter().flatten()) {
                 if let (false, Some(s)) = (keep.contains(path), bank.get(path)) {
-                    if spent + s.frames() <= budget {
-                        spent += s.frames();
+                    if spent + s.cost() <= budget {
+                        spent += s.cost();
                         keep.insert(path);
                     }
                 }
@@ -1816,7 +1848,7 @@ impl App {
         paths.sort_unstable();
         paths.dedup();
         let (loaded, wanted): (Vec<&str>, Vec<&str>) = paths.into_iter().partition(|p| self.bank.contains_key(*p));
-        let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.frames()).sum();
+        let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.cost()).sum();
         let (mut got, mut failed) = (Vec::new(), Vec::new());
         for p in wanted {
             let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
@@ -2090,7 +2122,7 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum();
         let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
         let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load {noun}: {e}"))?);
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
@@ -2156,7 +2188,7 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum();
         let mut failed = std::collections::BTreeMap::<String, String>::new();
         let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
         // First what each file holds, from what is loaded or the file's
@@ -2531,14 +2563,14 @@ impl App {
         self.prune_bank();
     }
 
-    /// Whether the samples the tracks of `meta` play, as loaded now, hold
-    /// at most `budget` frames together, each file once. The history keeps
+    /// Whether the samples the tracks of `meta` play, as loaded now, cost
+    /// at most `budget` frames together ([`Sample::cost`]), each file once. The history keeps
     /// paths, and a file loaded again since may have grown.
     fn samples_fit(&self, meta: &Meta, budget: usize) -> bool {
         let mut keys: Vec<&str> = meta.tracks.iter().flat_map(TrackMeta::sample_paths).collect();
         keys.sort_unstable();
         keys.dedup();
-        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() <= budget
+        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.cost()).sum::<usize>() <= budget
     }
 
     fn after_history_move(&mut self, c: &Change, verb: &str) {
@@ -9282,6 +9314,67 @@ mod tests {
             }
         }
         assert_eq!(last, Some((t, true)), "and sent");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_history_keeps_plugin_states_within_a_budget() {
+        let mut a = App::new(Project::new(), None, None, 48_000, "test".into());
+        let place = PluginPlace::Track(0);
+        let step = |n: u8| {
+            let mut meta = a.meta();
+            meta.states = vec![(place, Arc::from(vec![n; 100]))];
+            Change {
+                undo: Vec::new(),
+                redo: Vec::new(),
+                meta_before: meta.clone(),
+                meta_after: meta,
+                what: "test",
+                key: None,
+                at: Instant::now(),
+                param: None,
+            }
+        };
+        let steps: Vec<Change> = (0..10).map(step).collect();
+        let shared = Arc::clone(&steps[9].meta_after.states[0].1);
+        for c in steps {
+            a.push_change(c);
+        }
+        assert_eq!(a.undo.len(), 10, "1000 bytes are within the budget");
+        a.trim_states(350);
+        assert_eq!(a.undo.len(), 3, "the newest three, 100 bytes each");
+        assert!(Arc::ptr_eq(&a.undo.back().unwrap().meta_after.states[0].1, &shared));
+        a.trim_states(0);
+        assert_eq!(a.undo.len(), 1, "the newest step stays");
+    }
+
+    #[test]
+    fn the_history_counts_the_wavetables_it_keeps() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-history-tables-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|n| {
+                let p = dir.join(format!("{n}.wav"));
+                let cycle: Vec<f32> = (0..100).map(|i| (i as f32 * 0.0628).sin()).collect();
+                wav::write_file(&p, &cycle, 1, 48_000, SampleFormat::Float32).unwrap();
+                p.display().to_string()
+            })
+            .collect();
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        let t = p.tracks.len() - 1;
+        let mut a = App::new(p, None, None, 48_000, "test".into());
+        a.track = t;
+        for path in &paths {
+            a.mode = Mode::Prompt(PromptKind::LoadSample, path.clone());
+            keys(&mut a, &[Key::Enter]);
+        }
+        let first = Arc::clone(&a.bank[&paths[0]]);
+        assert!(first.cost() > first.frames(), "its table was built and counts");
+        // Room for the first file's frames, not for its table as well.
+        a.prune_bank_within(first.frames() + 1);
+        assert!(!a.bank.contains_key(&paths[0]) && a.bank.contains_key(&paths[1]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
