@@ -2146,6 +2146,16 @@ impl Project {
             let mib = max_state >> 20;
             return Err(std::io::Error::other(format!("a plugin's state is over the {mib} MiB a project keeps")));
         }
+        unicode_path(path).map_err(std::io::Error::other)?;
+        // Each sample path as it would be written, which a load must take.
+        let dir = project_dir(path);
+        for p in self.tracks.iter().flat_map(TrackData::sample_paths) {
+            let written = crate::sample::relativize(p, dir.as_deref());
+            if let Some(why) = crate::sample::unwritable(&written) {
+                let shown = crate::tui::printable_line(&written);
+                return Err(std::io::Error::other(format!("the sample path {shown} would not load back: {why}")));
+            }
+        }
         // The states' lines alone may be over: then nothing is built, as
         // their text is a third larger than they are. Each line is at least
         // `state `, its base64 and a line break.
@@ -2162,7 +2172,7 @@ impl Project {
                 "the project would be over {size} MiB, more than the {mib} MiB a project file can hold"
             )));
         }
-        let text = self.to_text_in(project_dir(path).as_deref());
+        let text = self.to_text_in(dir.as_deref());
         if text.len() as u64 > max {
             let (size, mib) = (text.len() >> 20, max >> 20);
             return Err(std::io::Error::other(format!(
@@ -2205,8 +2215,10 @@ impl Project {
 
     /// Loads a project file; sample paths come back absolute.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = crate::fsutil::read_text(path, MAX_FILE_BYTES).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut p = Self::from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        unicode_path(path).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))?;
+        let text = crate::fsutil::read_text(path, MAX_FILE_BYTES)
+            .map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))?;
+        let mut p = Self::from_text(&text).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))?;
         let dir = project_dir(path);
         let resolve = |s: &str| crate::sample::resolve(s, dir.as_deref()).to_string_lossy().into_owned();
         for t in &mut p.tracks {
@@ -2468,6 +2480,17 @@ fn parse_pattern(s: &str) -> Result<u8, String> {
 
 fn check_pattern(p: u8) -> Result<(), EditError> {
     if usize::from(p) < MAX_PATTERNS { Ok(()) } else { Err(EditError::NoSuchPattern(p)) }
+}
+
+/// Refuses a project path that is not Unicode text: the sample paths a
+/// project keeps are text, relative to its folder, and could not be
+/// written or found from it.
+fn unicode_path(path: &Path) -> Result<(), &'static str> {
+    if path.to_str().is_some() && std::path::absolute(path).is_ok_and(|p| p.to_str().is_some()) {
+        Ok(())
+    } else {
+        Err("the project's path is not Unicode text; keep it in a folder whose name is")
+    }
 }
 
 /// The absolute directory holding a project file.
@@ -3687,6 +3710,44 @@ song A",
         assert!(e.message.capacity() <= ParseError::MAX_MESSAGE, "{}", e.message.capacity());
         let e = Project::from_text(&format!("tinvo 20\nbpm {}\n", "é".repeat(400))).unwrap_err();
         assert!(e.message.len() <= ParseError::MAX_MESSAGE, "cut on a character's boundary");
+    }
+
+    #[test]
+    fn a_sample_path_that_would_not_load_back_is_not_saved() {
+        let dir = std::env::temp_dir().join(format!("tinvo-project-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.tvo");
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        for (sample, why) in [
+            ("/a\nb/kick.wav".to_string(), "cannot contain line breaks"),
+            (format!("/{}/kick.wav", "a".repeat(5000)), "at most 4096 bytes long"),
+        ] {
+            p.tracks[0].sample = Some(sample);
+            let e = p.save(&path).unwrap_err().to_string();
+            assert!(e.starts_with("the sample path ") && e.contains(why), "{e}");
+            assert!(!e.contains('\n'), "named on one line: {e}");
+            assert!(!path.exists());
+        }
+        // A path inside the project's folder is written relative to it.
+        p.tracks[0].sample = Some(dir.join("kick.wav").display().to_string());
+        p.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\nsample kick.wav\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_whose_path_is_not_unicode_is_refused() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        let name = <OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![b'a', 0xff, b'/', b's']);
+        #[cfg(windows)]
+        let name = <OsString as std::os::windows::ffi::OsStringExt>::from_wide(&[u16::from(b'a'), 0xD800]);
+        let path = std::env::temp_dir().join(name).join("song.tvo");
+        let want = "the project's path is not Unicode text; keep it in a folder whose name is";
+        assert!(Project::load(&path).unwrap_err().ends_with(want));
+        assert_eq!(Project::new().save(&path).unwrap_err().to_string(), want);
     }
 
     #[test]

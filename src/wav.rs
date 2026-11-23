@@ -102,6 +102,14 @@ pub struct Writer<W: Write + Seek> {
 }
 
 /// Bytes before the sample data: RIFF + fmt (+ fact for float) + data headers.
+/// Whether a file of `samples` interleaved samples in `format` fits the
+/// sizes a WAV header holds.
+pub fn fits(samples: u64, format: SampleFormat) -> bool {
+    let data_len = samples.saturating_mul(u64::from(format.bits() / 8));
+    // RIFF size field: everything after it, including a pad byte.
+    (header_len(format) - 8).saturating_add(data_len).saturating_add(data_len & 1) <= u64::from(u32::MAX)
+}
+
 fn header_len(format: SampleFormat) -> u64 {
     if format == SampleFormat::Float32 { 12 + 8 + 18 + 12 + 8 } else { 12 + 8 + 16 + 8 }
 }
@@ -156,10 +164,7 @@ impl<W: Write + Seek> Writer<W> {
 
     /// Appends interleaved samples.
     pub fn write(&mut self, samples: &[f32]) -> Result<(), WavError> {
-        let width = u64::from(self.format.bits() / 8);
-        let data_len = (self.samples + samples.len() as u64) * width;
-        // RIFF size field: everything after it, including a pad byte.
-        if header_len(self.format) - 8 + data_len + (data_len & 1) > u64::from(u32::MAX) {
+        if !fits(self.samples + samples.len() as u64, self.format) {
             return Err(WavError::TooLarge);
         }
         self.buf.clear();
@@ -254,7 +259,8 @@ pub struct FileWriter {
 
 impl FileWriter {
     pub fn create(path: &Path, channels: u16, sample_rate: u32, format: SampleFormat) -> Result<Self, String> {
-        let (file, tmp) = crate::fsutil::create_temp_beside(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (file, tmp) =
+            crate::fsutil::create_temp_beside(path).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))?;
         // From here on, dropping `w` removes the temporary file.
         let mut w = Self { inner: None, tmp: Some(tmp), path: path.to_path_buf() };
         let writer =

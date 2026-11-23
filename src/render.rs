@@ -59,6 +59,15 @@ pub fn check_overwrite(project: &Project, project_path: Option<&Path>, out: &Pat
     Ok(())
 }
 
+/// Checks that nothing is at `out`: a file named after another, as a stem
+/// is after the mix, is never written over one there.
+pub fn check_free(out: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(out) {
+        Ok(_) => Err("exists already; stems replace no file, so move it away or name the mix otherwise".into()),
+        Err(_) => Ok(()),
+    }
+}
+
 /// What a render plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -136,6 +145,18 @@ pub fn main_frames(project: &Project, opts: &RenderOptions) -> u64 {
             (sps * sixteenths).round() as u64
         }
     }
+}
+
+/// Checks, before anything is rendered, that the stereo file of `opts`'s
+/// passes fits a WAV file in `format`. The tail after them is not known
+/// yet: a file that only it makes too long still fails as it is written.
+pub fn check_length(project: &Project, opts: &RenderOptions, format: crate::wav::SampleFormat) -> Result<(), String> {
+    let frames = main_frames(project, opts);
+    if crate::wav::fits(frames.saturating_mul(2), format) {
+        return Ok(());
+    }
+    let minutes = frames / u64::from(opts.sample_rate.max(1)) / 60;
+    Err(format!("{minutes} minutes of {} audio would not fit a WAV file; export fewer repeats", format.label()))
 }
 
 /// Frames the engine renders per call while exporting.
@@ -513,6 +534,20 @@ mod tests {
     use crate::instrument::InstrumentKind;
 
     #[test]
+    fn an_export_too_long_for_a_wav_file_is_refused_before_it_starts() {
+        // A bar of 16ths at 120 BPM: 2 s, 288 000 bytes in 24-bit stereo.
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Kick)).unwrap();
+        let opts = |loops| RenderOptions { loops, source: Source::Pattern(0), ..Default::default() };
+        let format = crate::wav::SampleFormat::Pcm24;
+        assert_eq!(check_length(&p, &opts(7000), format), Ok(()));
+        let e = check_length(&p, &opts(8000), format).unwrap_err();
+        assert_eq!(e, "266 minutes of 24-bit audio would not fit a WAV file; export fewer repeats");
+        assert!(crate::wav::fits(u64::from(u32::MAX) / 4 - 20, crate::wav::SampleFormat::Float32));
+        assert!(!crate::wav::fits(u64::from(u32::MAX) / 4, crate::wav::SampleFormat::Float32));
+    }
+
+    #[test]
     fn an_export_writes_only_a_new_or_exported_file() {
         let dir = std::env::temp_dir().join(format!("tinvo-dest-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -547,6 +582,9 @@ mod tests {
         let odd = dir.join("odd.wav");
         std::fs::write(&odd, "x").unwrap();
         assert_eq!(check_destination(&p, Some(&odd), &odd), Err("is the project itself".into()));
+        // A stem's name is free or refused.
+        assert_eq!(check_free(&dir.join("free-01-Kick.wav")), Ok(()));
+        assert!(check_free(&song).unwrap_err().starts_with("exists already"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

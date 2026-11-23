@@ -174,9 +174,9 @@ pub fn default_path() -> Option<PathBuf> {
 /// defaults, and `false` for whether one was read.
 pub fn load(path: &Path) -> Result<(Settings, bool), String> {
     match crate::fsutil::read_text(path, MAX_FILE_BYTES) {
-        Ok(text) => parse(&text).map(|s| (s, true)).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(text) => parse(&text).map(|s| (s, true)).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Settings::default(), false)),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        Err(e) => Err(format!("{}: {e}", crate::fsutil::shown(path))),
     }
 }
 

@@ -85,13 +85,26 @@ pub fn find(project: Option<&Path>) -> Option<Found> {
 }
 
 /// Moves an autosave that cannot be read out of the way, so the next
-/// autosave does not overwrite it; returns where it went.
+/// autosave does not overwrite it; returns where it went. One set aside
+/// before stays: the name taken is the first free one.
 pub fn set_aside(path: &Path) -> io::Result<PathBuf> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".unreadable");
-    let to = PathBuf::from(name);
-    std::fs::rename(path, &to)?;
-    Ok(to)
+    for n in 1..=100 {
+        let mut name = path.as_os_str().to_owned();
+        name.push(if n == 1 { ".unreadable".to_string() } else { format!(".unreadable-{n}") });
+        let to = PathBuf::from(name);
+        match crate::fsutil::rename_new(path, &to) {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "100 unreadable autosaves are set aside already"))
+}
+
+/// Whether `path` names an autosave, which is not opened as a project:
+/// saving its project would delete it under the session that had it open.
+pub fn is_autosave(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(SUFFIX))
 }
 
 /// Writes the autosave of one editing session.
@@ -170,6 +183,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn an_unreadable_autosave_is_set_aside_beside_earlier_ones() {
+        let d = temp_dir("aside");
+        let a = d.join("song.tvo.autosave");
+        std::fs::write(&a, "first").unwrap();
+        assert_eq!(set_aside(&a).unwrap(), d.join("song.tvo.autosave.unreadable"));
+        std::fs::write(&a, "second").unwrap();
+        assert_eq!(set_aside(&a).unwrap(), d.join("song.tvo.autosave.unreadable-2"));
+        assert_eq!(std::fs::read_to_string(d.join("song.tvo.autosave.unreadable")).unwrap(), "first");
+        assert!(!a.exists());
+        assert!(is_autosave(&a) && !is_autosave(&d.join("song.tvo")));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

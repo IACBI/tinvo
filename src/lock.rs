@@ -29,6 +29,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SUFFIX: &str = ".lock";
+/// The most a lock file holds: one line naming the version and process.
+const MAX_LOCK_BYTES: u64 = 256;
 
 /// The lock file of the project at `project`.
 pub fn path_for(project: &Path) -> Option<PathBuf> {
@@ -82,9 +84,11 @@ impl Lock {
         // emptying it, or deleting it when the lock goes, would destroy it.
         // Read through the handle held, so it is the file locked and no
         // holder is still writing it; letting go of it here leaves it.
+        // A lock line is short; one byte past the most it may be is read,
+        // so a longer file is never taken for one by what it starts with.
         let mut text = String::new();
-        let read = Read::by_ref(&mut file).take(4096).read_to_string(&mut text);
-        if read.is_err() || !is_marker(&text) {
+        let read = Read::by_ref(&mut file).take(MAX_LOCK_BYTES + 1).read_to_string(&mut text);
+        if read.is_err() || text.len() as u64 > MAX_LOCK_BYTES || !is_marker(&text) {
             return Err(foreign(&path));
         }
         file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
@@ -437,6 +441,11 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe, 0]).unwrap();
         assert!(Lock::acquire(&song).is_err(), "nor a binary one");
         assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, 0]);
+        // A lock line padded past what a lock file holds, with more after it.
+        let padded = format!("tinvo 0.25.0 pid 12{}more of someone's file\n", " ".repeat(4096));
+        std::fs::write(&path, &padded).unwrap();
+        assert!(Lock::acquire(&song).is_err(), "a long file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), padded);
         for text in ["tinvo notes\n", "tinvo 0.25.0 pid 12\nmore\n", "tinvo 0.25.0\npid 12\n", "tinvo 0.25.0 pid me\n"]
         {
             std::fs::write(&path, text).unwrap();

@@ -217,7 +217,7 @@ pub fn load(path: &Path) -> Result<Sample, String> {
 /// Like [`load`], for a sample that may hold at most `max_frames`: what is
 /// left of the project's [`PROJECT_FRAMES`].
 pub fn load_within(path: &Path, max_frames: usize) -> Result<Sample, String> {
-    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", crate::fsutil::shown(path));
     let file = open(path).map_err(|e| fail(&e))?;
     read_limited(&mut std::io::BufReader::new(file), max_frames).map_err(|e| fail(&e))
 }
@@ -392,6 +392,23 @@ pub fn unstorable(path: &str) -> Option<&'static str> {
         Some("A sample path cannot contain line breaks")
     } else if path.split(std::path::is_separator).any(|c| c.trim() != c) {
         Some("A sample path cannot have a folder or file name that starts or ends with whitespace")
+    } else {
+        None
+    }
+}
+
+/// Why `written`, a sample path as a project file writes it, would not load
+/// back unchanged, if it would not: its line is trimmed, and must be one
+/// line of at most [`MAX_PATH_BYTES`].
+pub fn unwritable(written: &str) -> Option<&'static str> {
+    if written.is_empty() {
+        Some("A sample path cannot be empty")
+    } else if written.len() > MAX_PATH_BYTES {
+        Some("A sample path can be at most 4096 bytes long")
+    } else if written.contains(['\n', '\r']) {
+        Some("A sample path cannot contain line breaks")
+    } else if written.trim() != written {
+        Some("A sample path cannot start or end with whitespace")
     } else {
         None
     }

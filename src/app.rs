@@ -659,10 +659,14 @@ pub enum Focus {
     Params,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirm {
     Quit,
     DeleteTrack,
+    /// Saving the project over this file, which is not the project's.
+    SaveOver(PathBuf),
+    /// Exporting over this file.
+    ExportOver(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3844,6 +3848,8 @@ impl App {
                     }
                 }
             }
+            Confirm::SaveOver(path) => self.save_to(path),
+            Confirm::ExportOver(path) => self.export_to(&path),
         }
     }
 
@@ -3874,13 +3880,30 @@ impl App {
                         // there again; a new name is a .tvo file.
                         let ours = self.path.as_deref() == Some(path.as_path())
                             || self.lock.as_ref().is_some_and(|l| l.is_for(&path));
-                        if tvo || ours {
+                        if ours {
                             self.save_to(path);
+                        } else if tvo {
+                            // Another file there is replaced only when asked.
+                            let refused = render::check_overwrite(&self.project, None, &path).is_err();
+                            if std::fs::symlink_metadata(&path).is_ok() && !refused {
+                                self.mode = Mode::Confirm(Confirm::SaveOver(path));
+                            } else {
+                                self.save_to(path);
+                            }
                         } else {
                             self.set_status(format!("Not saved: {} is not a .{FILE_EXTENSION} file", path.display()));
                         }
                     }
-                    PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
+                    PromptKind::Export => {
+                        let path = with_extension(&text, "wav");
+                        // What would be refused anyway is not asked about.
+                        let refused = render::check_destination(&self.project, self.path.as_deref(), &path).is_err();
+                        if std::fs::symlink_metadata(&path).is_ok() && !refused {
+                            self.mode = Mode::Confirm(Confirm::ExportOver(path));
+                        } else {
+                            self.export_to(&path);
+                        }
+                    }
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => {
                         let synth =
@@ -5783,12 +5806,20 @@ impl App {
                 // A state that could not be saved, or saved before its
                 // plugin had a value sent to it, is still unsaved.
                 self.dirty = !failed.is_empty() || self.unsettled;
-                self.autosave.saved(&path, self.revision);
+                if unlocked.is_some() {
+                    // Another session may have the file there, and its
+                    // autosave: this one stops autosaving instead.
+                    self.autosave.discard();
+                    self.autosave = Autosave::default();
+                } else {
+                    self.autosave.saved(&path, self.revision);
+                }
                 self.set_status(match (unlocked, failed.first()) {
                     (_, Some(f)) => format!("Saved {}, but {f}; its last saved state was kept", path.display()),
-                    (Some(why), None) => {
-                        format!("Saved {}, but {why}; another session could open it too", path.display())
-                    }
+                    (Some(why), None) => format!(
+                        "Saved {}, but {why}; another session could open it too, and it is not autosaved",
+                        path.display()
+                    ),
                     (None, None) => format!("Saved {}", path.display()),
                 });
                 self.path = Some(path);
@@ -5849,6 +5880,9 @@ impl App {
             source: self.export_render_source(),
             ..Default::default()
         };
+        if let Err(e) = render::check_length(&self.project, &opts, self.export_format) {
+            return self.set_status(format!("Not exported: {e}"));
+        }
         // A track whose sample did not load would be silent in the file.
         let missing =
             self.project.tracks.iter().flat_map(TrackData::sample_paths).find(|p| !self.bank.contains_key(*p));
@@ -6877,6 +6911,10 @@ impl App {
             Mode::Confirm(Confirm::DeleteTrack) => {
                 let name = self.project.tracks.get(self.track).map_or("", |t| t.name.as_str());
                 s.put(0, y, &format!("Delete track '{name}'? (y/n)"), prompt);
+            }
+            Mode::Confirm(Confirm::SaveOver(path) | Confirm::ExportOver(path)) => {
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into());
+                s.put(0, y, &format!("{} exists. Replace it? (y/n)", crate::tui::printable_line(&name)), prompt);
             }
             Mode::AddTrack => {
                 s.put(0, y, ADD_TRACK_PROMPT, prompt);
@@ -7964,19 +8002,25 @@ type SessionLock = (Option<PathBuf>, Option<Lock>, Option<String>);
 /// and news for the status line. Fails when another session has the
 /// project open.
 fn session_lock(path: Option<&Path>, state: Option<&Path>) -> Result<SessionLock, String> {
-    let unlocked =
-        |e: &lock::Error, p: &Path| Some(format!("Warning: {}; another session could open it too.", e.describe(p)));
+    // Without its lock a session neither autosaves nor recovers: another
+    // session may have the same project, and so the same autosave.
+    let unlocked = |e: &lock::Error, p: &Path| {
+        Some(format!("Warning: {}; another session could open it too, and it is not autosaved.", e.describe(p)))
+    };
     if let Some(p) = path {
+        if autosave::is_autosave(p) {
+            return Err(format!("{} is an autosave: open its project to recover it", p.display()));
+        }
         return match Lock::acquire(p) {
             Ok(l) => Ok((Some(p.to_path_buf()), Some(l), None)),
             Err(e @ lock::Error::Held(_)) => Err(e.describe(p)),
-            Err(e) => Ok((Some(p.to_path_buf()), None, unlocked(&e, p))),
+            Err(e) => Ok((None, None, unlocked(&e, p))),
         };
     }
     let Some(dir) = state else { return Ok((None, None, None)) };
     let first = autosave::untitled_in(dir, 1);
     if let Err(e) = std::fs::create_dir_all(dir) {
-        return Ok((Some(first.clone()), None, unlocked(&lock::Error::Io(e), &first)));
+        return Ok((None, None, unlocked(&lock::Error::Io(e), &first)));
     }
     // A free slot with an autosave was left by a session that crashed, so
     // it comes first; then the first free one.
@@ -7986,7 +8030,7 @@ fn session_lock(path: Option<&Path>, state: Option<&Path>) -> Result<SessionLock
         match Lock::acquire(&base) {
             Ok(l) => return Ok((Some(base), Some(l), None)),
             Err(lock::Error::Held(_)) => {}
-            Err(e) => return Ok((Some(base.clone()), None, unlocked(&e, &base))),
+            Err(e) => return Ok((None, None, unlocked(&e, &base))),
         }
     }
     Err(format!("{} untitled sessions are running already; open a project file instead", autosave::UNTITLED_SLOTS))
@@ -10915,6 +10959,15 @@ mod tests {
         assert_eq!(again, Some(state.join("untitled.tvo")));
         assert_eq!(session_lock(None, None).unwrap().0, None, "no state directory, no autosave");
         drop((l1, l2, l3));
+        // Without its lock, a session neither autosaves nor recovers.
+        let other = dir.join("other.tvo");
+        std::fs::write(dir.join("other.tvo.lock"), "someone's notes").unwrap();
+        let (base, held, news) = session_lock(Some(&other), Some(&state)).unwrap();
+        assert!(base.is_none() && held.is_none(), "no autosave to share");
+        assert!(news.unwrap().ends_with("another session could open it too, and it is not autosaved."));
+        // An autosave is not opened as a project.
+        let err = session_lock(Some(&dir.join("song.tvo.autosave")), Some(&state)).err().unwrap();
+        assert!(err.ends_with("is an autosave: open its project to recover it"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -11269,6 +11322,48 @@ mod tests {
         a.paste("xXq", false);
         assert_eq!((a.project.tracks[0].steps.clone(), a.quit), (steps, false));
         assert_eq!(a.status_text(), Some("Pasting works in a text prompt only"));
+    }
+
+    #[test]
+    fn saving_or_exporting_over_another_file_asks_first() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        let (other, wav) = (dir.join("other.tvo"), dir.join("mix.wav"));
+        std::fs::write(&other, "someone's project").unwrap();
+        std::fs::write(&wav, "an earlier mix").unwrap();
+        for (kind, path) in [(PromptKind::SaveAs, &other), (PromptKind::Export, &wav)] {
+            a.mode = Mode::Prompt(kind, path.display().to_string());
+            keys(&mut a, &[Key::Enter]);
+            let mut s = Screen::new(100, 30);
+            a.draw(&mut s);
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(s.row_text(29).contains(&format!("{name} exists. Replace it? (y/n)")), "{}", s.row_text(29));
+            keys(&mut a, &[Key::Char('n')]);
+            assert_eq!(a.mode, Mode::Normal);
+            assert!(std::fs::read_to_string(path).unwrap().starts_with(if kind == PromptKind::SaveAs {
+                "someone"
+            } else {
+                "an earlier"
+            }));
+            a.mode = Mode::Prompt(kind, path.display().to_string());
+            keys(&mut a, &[Key::Enter, Key::Char('y')]);
+            assert!(
+                !std::fs::read_to_string(path).is_ok_and(|t| t.starts_with("someone") || t.starts_with("an earlier"))
+            );
+        }
+        assert_eq!(a.path.as_deref(), Some(other.as_path()));
+        // The project's own file is saved over without asking.
+        a.mode = Mode::Prompt(PromptKind::SaveAs, other.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.status_text().unwrap().starts_with("Saved "), "{:?}", a.status_text());
+        // A new file is written at once.
+        a.mode = Mode::Prompt(PromptKind::Export, dir.join("new.wav").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(dir.join("new.wav").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

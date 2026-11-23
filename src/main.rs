@@ -100,7 +100,15 @@ fn main() -> ExitCode {
             _ => ExitCode::from(2),
         };
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // A project keeps its paths as text: an argument that is not Unicode
+    // could not be kept, and is refused rather than read some other way.
+    let args = match unicode_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match args.first().map(String::as_str) {
         None => cmd_edit(&[]),
         Some("-h" | "--help" | "help") => {
@@ -138,6 +146,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The arguments as text, or which one is not.
+fn unicode_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.map(|a| {
+        a.into_string().map_err(|bad| {
+            let bad = tinvo::tui::printable_line(&bad.to_string_lossy());
+            format!("the argument '{bad}' is not Unicode text; TINVO takes file names that are")
+        })
+    })
+    .collect()
 }
 
 fn cmd_render(args: &[String]) -> Result<(), String> {
@@ -257,8 +276,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     };
     for (path, _) in &stem_paths {
         render::check_destination(&project, Some(project_path), path)
+            .and_then(|()| render::check_free(path))
             .map_err(|e| format!("{} {e}", shown(&path.display().to_string())))?;
     }
+    render::check_length(&project, &opts, format)?;
     let mut plugins = plugin_source(&project)?;
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
@@ -1008,8 +1029,9 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
     if let Some(path) = check {
         // As the readers it checks read: a plain file, of a bounded size.
         let input = tinvo::fsutil::read_bytes(&path, tinvo::project::MAX_FILE_BYTES)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let accepted = fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
+        let accepted =
+            fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
         println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
         return Ok(());
     }
@@ -1180,6 +1202,18 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn arguments_that_are_not_unicode_are_refused() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        let bad = <OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![b'a', 0xff]);
+        #[cfg(windows)]
+        let bad = <OsString as std::os::windows::ffi::OsStringExt>::from_wide(&[u16::from(b'a'), 0xD800]);
+        let e = unicode_args([OsString::from("render"), bad].into_iter()).unwrap_err();
+        assert_eq!(e, "the argument 'a\u{fffd}' is not Unicode text; TINVO takes file names that are");
+        assert_eq!(unicode_args([OsString::from("é")].into_iter()), Ok(vec!["é".to_string()]));
     }
 
     #[test]
