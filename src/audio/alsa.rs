@@ -14,12 +14,17 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const SND_PCM_STREAM_PLAYBACK: c_int = 0;
 const SND_PCM_STREAM_CAPTURE: c_int = 1;
 /// Capture latency; recording does not need it short.
 const CAPTURE_LATENCY_US: c_uint = 100_000;
-const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
+/// Native-endian float: the buffers passed are plain `f32`s.
+const SND_PCM_FORMAT_FLOAT: c_int = if cfg!(target_endian = "big") { 15 } else { 14 };
+const SND_PCM_STATE_SUSPENDED: c_int = 7;
+/// How long a suspended device is given to resume before it counts as lost.
+const RESUME_WAIT: Duration = Duration::from_secs(5);
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
 /// Rates tried in turn for one the device takes as it is; ALSA's own
 /// resampler, used otherwise, is a plain linear one.
@@ -48,6 +53,9 @@ unsafe extern "C" {
     fn snd_pcm_writei(pcm: *mut c_void, buffer: *const c_void, frames: c_ulong) -> c_long;
     fn snd_pcm_readi(pcm: *mut c_void, buffer: *mut c_void, frames: c_ulong) -> c_long;
     fn snd_pcm_recover(pcm: *mut c_void, err: c_int, silent: c_int) -> c_int;
+    fn snd_pcm_state(pcm: *mut c_void) -> c_int;
+    fn snd_pcm_resume(pcm: *mut c_void) -> c_int;
+    fn snd_pcm_prepare(pcm: *mut c_void) -> c_int;
     fn snd_pcm_drop(pcm: *mut c_void) -> c_int;
     fn snd_pcm_close(pcm: *mut c_void) -> c_int;
     fn snd_strerror(err: c_int) -> *const c_char;
@@ -164,9 +172,8 @@ where
                 continue;
             }
             // SAFETY: recovering a valid handle from an overrun or suspend.
-            let r = unsafe { snd_pcm_recover(pcm.0, n as c_int, 1) };
-            if r < 0 {
-                health.fail(alsa_error("input device lost", r));
+            if let Err(e) = unsafe { recover(pcm.0, n as c_int, &stop, "input device lost") } {
+                health.fail(e);
                 return;
             }
         }
@@ -189,6 +196,63 @@ pub(crate) fn alsa_error(what: &str, err: c_int) -> String {
     // SAFETY: snd_strerror returns a static NUL-terminated string.
     let msg = unsafe { CStr::from_ptr(snd_strerror(err)) }.to_string_lossy();
     format!("{what}: {msg}")
+}
+
+/// Recovers `pcm` after the error `err` as `snd_pcm_recover` does, except
+/// that a suspended device is waited for in short steps that see `stop`,
+/// and for at most `RESUME_WAIT`: libasound's own wait for it has no end,
+/// and would keep the stream's thread, and whoever joins it, waiting.
+///
+/// # Safety
+/// `pcm` is an open PCM handle.
+unsafe fn recover(pcm: *mut c_void, err: c_int, stop: &AtomicBool, what: &str) -> Result<(), String> {
+    // SAFETY: an open handle, as the caller says.
+    let r = unsafe {
+        if snd_pcm_state(pcm) != SND_PCM_STATE_SUSPENDED {
+            snd_pcm_recover(pcm, err, 1)
+        } else {
+            match resume(|| snd_pcm_resume(pcm), stop, RESUME_WAIT, Duration::from_millis(20)) {
+                Resume::Done | Resume::Stopped => 0,
+                // One that cannot resume starts again from the top.
+                Resume::Cannot => snd_pcm_prepare(pcm),
+                Resume::TimedOut => return Err(format!("{what}: still suspended after {} s", RESUME_WAIT.as_secs())),
+            }
+        }
+    };
+    if r < 0 { Err(alsa_error(what, r)) } else { Ok(()) }
+}
+
+/// How waiting for a suspended device to resume ended.
+#[derive(Debug, PartialEq)]
+enum Resume {
+    Done,
+    Stopped,
+    /// It cannot resume (it does not, or failed otherwise than by asking
+    /// to be tried again).
+    Cannot,
+    TimedOut,
+}
+
+/// Calls `resume` until it stops answering `-EAGAIN`, `stop` is set or
+/// `wait` has passed, sleeping `step` between calls.
+fn resume(mut resume: impl FnMut() -> c_int, stop: &AtomicBool, wait: Duration, step: Duration) -> Resume {
+    let start = Instant::now();
+    loop {
+        let r = resume();
+        if r >= 0 {
+            return Resume::Done;
+        }
+        if std::io::Error::from_raw_os_error(-r).kind() != std::io::ErrorKind::WouldBlock {
+            return Resume::Cannot;
+        }
+        if stop.load(Ordering::Acquire) {
+            return Resume::Stopped;
+        }
+        if start.elapsed() >= wait {
+            return Resume::TimedOut;
+        }
+        std::thread::sleep(step);
+    }
 }
 
 struct Pcm(*mut c_void);
@@ -247,10 +311,12 @@ where
                     continue;
                 }
                 // SAFETY: recovering a valid handle from an xrun or suspend.
-                let r = unsafe { snd_pcm_recover(pcm.0, n as c_int, 1) };
-                if r < 0 {
-                    health.fail(alsa_error("audio device lost", r));
+                if let Err(e) = unsafe { recover(pcm.0, n as c_int, &stop, "audio device lost") } {
+                    health.fail(e);
                     return;
+                }
+                if stop.load(Ordering::Acquire) {
+                    break;
                 }
             }
         }
@@ -299,7 +365,7 @@ unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm
     let rate = unsafe { native_rate(pcm.0) };
     // SAFETY: `pcm` is an open handle.
     let r = unsafe {
-        snd_pcm_set_params(pcm.0, SND_PCM_FORMAT_FLOAT_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1, latency_us)
+        snd_pcm_set_params(pcm.0, SND_PCM_FORMAT_FLOAT, SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1, latency_us)
     };
     if r < 0 {
         return Err(alsa_error("cannot configure ALSA device", r));
@@ -315,6 +381,34 @@ unsafe fn open_pcm(name: &str, stream: c_int, latency_us: c_uint) -> Result<(Pcm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_suspended_device_is_waited_for_a_while_and_not_past_a_stop() {
+        use super::{AtomicBool, Duration, Ordering, Resume, resume};
+        const EAGAIN: i32 = 11;
+        const ENOSYS: i32 = 38;
+        let step = Duration::from_millis(1);
+        let going = AtomicBool::new(false);
+        // Resumes on the third try.
+        let mut tries = 0;
+        let r = resume(
+            || {
+                tries += 1;
+                if tries < 3 { -EAGAIN } else { 0 }
+            },
+            &going,
+            Duration::from_secs(5),
+            step,
+        );
+        assert_eq!((r, tries), (Resume::Done, 3));
+        assert_eq!(resume(|| -ENOSYS, &going, Duration::from_secs(5), step), Resume::Cannot);
+        // Never resuming: given up after the wait, or at once once stopped.
+        let start = std::time::Instant::now();
+        assert_eq!(resume(|| -EAGAIN, &going, Duration::from_millis(30), step), Resume::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        going.store(true, Ordering::Release);
+        assert_eq!(resume(|| -EAGAIN, &going, Duration::from_secs(60), step), Resume::Stopped);
+    }
+
     use super::*;
 
     #[test]

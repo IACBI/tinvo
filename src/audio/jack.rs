@@ -292,12 +292,19 @@ fn listing(ports: fn(&Client) -> Vec<String>) -> Vec<Device> {
     }
 }
 
-/// Waits on the audio thread until the stream is stopped or the server
-/// goes away.
-fn wait(stop: &AtomicBool, dead: &AtomicBool, health: &StreamHealth) {
+/// Waits on the audio thread until the stream is stopped, the server goes
+/// away, or its sample rate (`rate` asks it) moves from `opened`: what
+/// plays and records would then be at the wrong pitch and speed, so the
+/// stream counts as lost, for the editor to open it again.
+fn wait(stop: &AtomicBool, dead: &AtomicBool, health: &StreamHealth, opened: u32, rate: impl Fn() -> u32) {
     while !stop.load(Ordering::Acquire) {
         if dead.load(Ordering::Acquire) {
             health.fail("the JACK server stopped".into());
+            return;
+        }
+        let now = rate();
+        if now != opened {
+            health.fail(format!("the JACK sample rate changed from {opened} Hz to {now} Hz"));
             return;
         }
         std::thread::park_timeout(Duration::from_millis(50));
@@ -400,7 +407,8 @@ where
                     low_latency: false,
                     format: "F32".into(),
                 }));
-                wait(&stop, &dead, &health);
+                // SAFETY: an open client, asked from a thread of its own.
+                wait(&stop, &dead, &health, rate, || unsafe { (client.lib.sample_rate)(client.ptr) });
             }
             Err(e) => report(Err(e)),
         }
@@ -500,7 +508,8 @@ where
                     channels: 2,
                     format: "F32".into(),
                 }));
-                wait(&stop, &dead, &health);
+                // SAFETY: an open client, asked from a thread of its own.
+                wait(&stop, &dead, &health, rate, || unsafe { (client.lib.sample_rate)(client.ptr) });
             }
             Err(e) => report(Err(e)),
         }

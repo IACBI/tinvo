@@ -42,6 +42,9 @@ const EVENT_START: u8 = 30;
 const EVENT_CONTINUE: u8 = 31;
 const EVENT_STOP: u8 = 32;
 const EVENT_CLOCK: u8 = 36;
+/// A subscription of the port's ended: its source went (closed or
+/// unplugged), and the keys held on it will never be released.
+const EVENT_PORT_UNSUBSCRIBED: u8 = 67;
 const QUEUE_DIRECT: u8 = 253;
 const ADDRESS_SUBSCRIBERS: u8 = 254;
 const ADDRESS_UNKNOWN: u8 = 253;
@@ -321,6 +324,7 @@ fn message(ev: &Event) -> Option<Message> {
             Some(Message::Control { channel, controller, value: word(8).clamp(0, 127) as u8 })
         }
         EVENT_PITCHBEND => Some(Message::Bend { channel, value: word(8).clamp(-8192, 8191) as i16 }),
+        EVENT_PORT_UNSUBSCRIBED => Some(Message::Lost),
         _ => None,
     }
 }
@@ -551,5 +555,8 @@ mod tests {
         let wait = Duration::from_secs(2);
         assert_eq!(rx.recv_timeout(wait), Ok(Message::NoteOn { channel: 1, note: 64, velocity: 90 }));
         assert_eq!(rx.recv_timeout(wait), Ok(Message::NoteOff { channel: 1, note: 64 }));
+        // The source going lets every held key go.
+        drop(sender);
+        assert_eq!(rx.recv_timeout(wait), Ok(Message::Lost));
     }
 }

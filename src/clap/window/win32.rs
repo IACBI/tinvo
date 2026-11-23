@@ -135,7 +135,11 @@ unsafe extern "system" {
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
     fn SetForegroundWindow(hwnd: Hwnd) -> i32;
     fn SetWindowPos(hwnd: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+    // On 32-bit Windows these are macros for the plain versions, which
+    // user32 exports instead.
+    #[cfg_attr(target_pointer_width = "32", link_name = "GetWindowLongW")]
     fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+    #[cfg_attr(target_pointer_width = "32", link_name = "SetWindowLongW")]
     fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
     fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
