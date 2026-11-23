@@ -392,6 +392,13 @@ fn an_effect_plays_on_the_audio_thread_and_ends_on_the_main_one() {
     }
     gain.stop();
     assert_eq!(stats(&gain).broken, 0);
+    // What it gives back is bounded as a loaded sample is: huge values to
+    // +-1024, subnormal ones and NaN to silence.
+    let mut io = vec![f32::MAX, -1e30, 1e-39, f32::NAN, 0.5, -0.25];
+    io.resize(128, 0.0);
+    assert!(gain.process(&mut io));
+    assert_eq!(io[..6], [1024.0, -1024.0, 0.0, 0.0, 0.25, -0.125]);
+    gain.stop();
     drop(gain);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);

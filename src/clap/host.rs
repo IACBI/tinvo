@@ -1739,7 +1739,9 @@ impl Instance {
         let out = b.input_planes;
         // SAFETY: as above, after the plugin returned.
         unsafe {
-            let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
+            // Bounded as a loaded sample is: a finite value huge enough would
+            // overflow the gains, sends and filters it passes through.
+            let clean = crate::sample::clean;
             if self.layout.outputs[0] == 2 {
                 let (l, r) = (b.plane(out, frames), b.plane(out + 1, frames));
                 for (i, f) in io.chunks_exact_mut(2).enumerate() {
