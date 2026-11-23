@@ -2424,7 +2424,14 @@ impl Engine {
                     self.release_live();
                 }
                 let layout = matches!(e, Edit::InsertTrack { .. } | Edit::RemoveTrack(_));
+                // The live track removed last stays the last track until
+                // the editor's selection arrives, so no note is lost.
+                let live = self.live_track < self.track_count && matches!(e, Edit::RemoveTrack(_));
                 self.apply(e);
+                if live && self.live_track >= self.track_count && self.track_count > 0 {
+                    self.live_track = self.track_count - 1;
+                    self.sync_controllers();
+                }
                 if layout && self.recording {
                     self.push_take(Take::Layout);
                 }
@@ -6837,6 +6844,14 @@ mod tests {
         run(&mut e, 96_000);
         let quiet = run(&mut e, 2400);
         assert!(quiet.iter().all(|x| x.abs() < 1e-6), "the note on track 1 must have been released");
+        // Removing the live track when it is the last moves it to the one
+        // before, which the editor selects too.
+        e.handle(Command::SetLiveTrack(1));
+        e.handle(Command::Edit(Edit::RemoveTrack(1)));
+        press(&live, 64, 100);
+        run(&mut e, 2400);
+        assert!(e.shared.track_peaks[0].take() > 0.0, "a note right after the removal is heard");
+        press(&live, 64, 0);
         // A live track past the last track plays nothing.
         e.handle(Command::SetLiveTrack(5));
         press(&live, 64, 100);

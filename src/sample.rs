@@ -32,9 +32,11 @@ pub const MAX_VALUES: u64 = 4 * MAX_FRAMES as u64;
 pub const MAX_LEVEL: f32 = 1024.0;
 
 /// A sample value as stored: finite and within [`MAX_LEVEL`], with
-/// non-finite values replaced by silence.
+/// non-finite values replaced by silence. A subnormal value, far below
+/// anything heard, is silence too: arithmetic on one is slow on many CPUs,
+/// and a sample's values are read on every frame it plays.
 pub fn clean(x: f32) -> f32 {
-    if x.is_finite() { x.clamp(-MAX_LEVEL, MAX_LEVEL) } else { 0.0 }
+    if !x.is_finite() || x.abs() < f32::MIN_POSITIVE { 0.0 } else { x.clamp(-MAX_LEVEL, MAX_LEVEL) }
 }
 
 /// Taps of the windowed-sinc interpolator.
@@ -162,13 +164,14 @@ impl Sample {
     }
 
     /// The data index of frame `at - PAD` as a loop from `start` to `end`
-    /// plays it: frames from `end` on come round from its start, and once
-    /// it has `wrapped`, frames before `start` from its end.
+    /// plays it: while it is `ahead` (still looping), frames from `end` on
+    /// come round from its start, and once it has `wrapped`, frames before
+    /// `start` from its end.
     #[inline]
-    fn looped(at: usize, start: usize, end: usize, wrapped: bool) -> usize {
+    fn looped(at: usize, start: usize, end: usize, wrapped: bool, ahead: bool) -> usize {
         if end <= start {
             at
-        } else if at >= end + PAD {
+        } else if ahead && at >= end + PAD {
             start + (at - PAD - end) % (end - start) + PAD
         } else if wrapped && at < start + PAD {
             end + PAD - 1 - (start + PAD - at - 1) % (end - start)
@@ -183,16 +186,16 @@ impl Sample {
     pub fn linear_looped(&self, pos: f64, start: usize, end: usize) -> f32 {
         let i = pos as usize;
         let f = (pos - i as f64) as f32;
-        let at = |n| self.data[Self::looped(n, start, end, false)];
+        let at = |n| self.data[Self::looped(n, start, end, false, true)];
         let (a, b) = (at(i + PAD), at(i + 1 + PAD));
         a + (b - a) * f
     }
 
     /// [`Sample::sinc`] inside a loop, as [`Sample::linear_looped`]; once
     /// the loop has `wrapped`, the frames before its start are read from
-    /// its end too.
+    /// its end too. A loop let go (not `ahead`) reads on past its end.
     #[inline]
-    pub fn sinc_looped(&self, pos: f64, start: usize, end: usize, wrapped: bool) -> f32 {
+    pub fn sinc_looped(&self, pos: f64, start: usize, end: usize, wrapped: bool, ahead: bool) -> f32 {
         let i = pos as usize;
         let phase = (pos - i as f64) * SINC_PHASES as f64;
         let p = (phase as usize).min(SINC_PHASES - 1);
@@ -201,7 +204,7 @@ impl Sample {
         let (a, b) = (&table[p], &table[p + 1]);
         let mut acc = 0.0;
         for k in 0..SINC_TAPS {
-            acc += self.data[Self::looped(i + 1 + k, start, end, wrapped)] * (a[k] + (b[k] - a[k]) * t);
+            acc += self.data[Self::looped(i + 1 + k, start, end, wrapped, ahead)] * (a[k] + (b[k] - a[k]) * t);
         }
         acc
     }
@@ -410,6 +413,16 @@ mod tests {
 
     fn sine(freq: f64, sr: u32, frames: usize) -> Vec<f32> {
         (0..frames).map(|i| (std::f64::consts::TAU * freq * i as f64 / f64::from(sr)).sin() as f32 * 0.5).collect()
+    }
+
+    #[test]
+    fn stored_values_are_finite_bounded_and_never_subnormal() {
+        assert_eq!(clean(1e-39), 0.0);
+        assert_eq!(clean(-f32::MIN_POSITIVE / 2.0), 0.0);
+        assert_eq!(clean(f32::MIN_POSITIVE), f32::MIN_POSITIVE);
+        assert_eq!(clean(f32::NAN), 0.0);
+        assert_eq!(clean(-1e9), -MAX_LEVEL);
+        assert_eq!(clean(0.5), 0.5);
     }
 
     #[test]
