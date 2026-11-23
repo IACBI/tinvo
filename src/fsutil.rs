@@ -191,7 +191,8 @@ mod tests {
     fn a_file_with_a_name_as_long_as_names_go_is_written() {
         let dir = std::env::temp_dir().join(format!("tinvo-fsutil-long-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.tvo", "a".repeat(250)));
+        // 255 bytes, the most a name may be on most file systems.
+        let path = dir.join(format!("{}.tvo", "a".repeat(251)));
         write_atomic(&path, b"tinvo 20\n").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"tinvo 20\n");
         std::fs::remove_dir_all(&dir).unwrap();

@@ -103,8 +103,15 @@ pub fn set_aside(path: &Path) -> io::Result<PathBuf> {
 
 /// Whether `path` names an autosave, which is not opened as a project:
 /// saving its project would delete it under the session that had it open.
+/// A name differing only in case, or a link to an autosave, counts too.
 pub fn is_autosave(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(SUFFIX))
+    let named = |p: &Path| {
+        p.file_name().is_some_and(|n| {
+            let n = n.as_encoded_bytes();
+            n.len() >= SUFFIX.len() && n[n.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX.as_bytes())
+        })
+    };
+    named(path) || std::fs::canonicalize(path).is_ok_and(|p| named(&p))
 }
 
 /// Writes the autosave of one editing session.
@@ -196,6 +203,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.join("song.tvo.autosave.unreadable")).unwrap(), "first");
         assert!(!a.exists());
         assert!(is_autosave(&a) && !is_autosave(&d.join("song.tvo")));
+        assert!(is_autosave(&d.join("song.tvo.AutoSave")));
+        #[cfg(unix)]
+        {
+            std::fs::write(&a, "third").unwrap();
+            std::os::unix::fs::symlink(&a, d.join("link.tvo")).unwrap();
+            assert!(is_autosave(&d.join("link.tvo")));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -64,7 +64,9 @@ pub fn check_overwrite(project: &Project, project_path: Option<&Path>, out: &Pat
 pub fn check_free(out: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(out) {
         Ok(_) => Err("exists already; stems replace no file, so move it away or name the mix otherwise".into()),
-        Err(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Such as a name too long: refused before anything is written.
+        Err(e) => Err(format!("cannot be written ({e}); name the mix otherwise")),
     }
 }
 
@@ -585,6 +587,8 @@ mod tests {
         // A stem's name is free or refused.
         assert_eq!(check_free(&dir.join("free-01-Kick.wav")), Ok(()));
         assert!(check_free(&song).unwrap_err().starts_with("exists already"));
+        let long = dir.join(format!("{}.wav", "a".repeat(300)));
+        assert!(check_free(&long).unwrap_err().starts_with("cannot be written"), "a name too long");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

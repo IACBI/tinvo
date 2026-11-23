@@ -270,7 +270,7 @@ impl FileWriter {
     }
 
     fn error(&self, e: &dyn fmt::Display) -> String {
-        format!("{}: {e}", self.path.display())
+        format!("{}: {e}", crate::fsutil::shown(&self.path))
     }
 
     pub fn write(&mut self, samples: &[f32]) -> Result<(), String> {
