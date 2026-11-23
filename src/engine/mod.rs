@@ -1835,6 +1835,10 @@ pub struct Engine {
     /// Frames of a device callback [`Engine::begin`] anchored that the
     /// calls to [`Engine::process`] have not rendered yet.
     anchored: u32,
+    /// Whether the callback [`Engine::begin`] started has had its commands
+    /// and live notes: its later parts take none, so a device callback
+    /// spends one budget on them however it is rendered.
+    drained: bool,
     /// Whether Play sends MIDI clock ([`Command::SetMidiClock`]).
     midi_clock: bool,
     /// The clock waits for its first pulse on a 16th note to send Continue.
@@ -1926,6 +1930,7 @@ impl Engine {
             click: Click::default(),
             midi: MidiSink { out: None, latency: 0, lost: false, tag: 0 },
             anchored: 0,
+            drained: false,
             midi_clock: false,
             clock_resume: false,
             clock_pulse: None,
@@ -3919,6 +3924,7 @@ impl Engine {
     pub fn begin(&mut self, frames: u32) {
         self.anchor_midi(frames);
         self.anchored = frames;
+        self.drained = false;
     }
 
     fn anchor_midi(&mut self, frames: u32) {
@@ -3931,17 +3937,19 @@ impl Engine {
     /// commands. Real-time safe.
     pub fn process(&mut self, out: &mut [f32]) {
         let frames = (out.len() / 2) as u32;
+        let first = self.anchored == 0 || !self.drained;
         if self.anchored == 0 {
             self.anchor_midi(frames);
         } else {
             self.midi.latency = self.latency() as u64;
             self.anchored = self.anchored.saturating_sub(frames);
         }
+        self.drained = self.anchored > 0;
         if let Some(mut rx) = self.commands.take() {
             // A callback handles commands up to a work budget; the rest wait,
             // in order, for the next one. The UI may keep pushing while this
             // drains, so draining until empty would not be bounded.
-            let mut budget = COMMAND_BUDGET;
+            let mut budget = if first { COMMAND_BUDGET } else { 0 };
             while budget > 0 {
                 let Some(cmd) = rx.pop() else { break };
                 budget = budget.saturating_sub(command_cost(&cmd));
@@ -3951,7 +3959,9 @@ impl Engine {
         }
         self.plan_latency();
         self.midi.latency = self.latency() as u64;
-        self.play_live();
+        if first {
+            self.play_live();
+        }
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
         }
@@ -6860,6 +6870,19 @@ mod tests {
     }
 
     #[test]
+    fn live_notes_are_taken_once_a_device_callback() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.begin(256);
+        run(&mut e, 128);
+        press(&live, 60, 100);
+        run(&mut e, 128);
+        assert_eq!(e.held_count, 0, "a later part of the same callback takes none");
+        e.begin(128);
+        run(&mut e, 128);
+        assert_eq!(e.held_count, 1);
+    }
+
+    #[test]
     fn retriggers_limits_and_track_changes_keep_the_held_list_sound() {
         let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
         press(&live, 60, 100);
@@ -7483,6 +7506,18 @@ mod tests {
         e.process(&mut out);
         e.process(&mut out);
         assert!(e.commands.as_mut().unwrap().pop().is_none());
+        // A device callback rendered in parts has one budget, not one a part.
+        for _ in 0..16 {
+            tx.push(Command::Edit(Edit::RemoveTrack(0))).unwrap();
+        }
+        e.begin(256);
+        for _ in 0..4 {
+            e.process(&mut out[..128]);
+        }
+        assert_eq!(e.track_count(), 8, "the parts of one callback");
+        e.begin(64);
+        e.process(&mut out);
+        assert_eq!(e.track_count(), 0, "the next callback");
     }
 
     fn effect_param(kind: EffectKind, id: &str) -> u8 {
