@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-23
+
 ### Added
 - An FM synth: `a` `9` adds a track playing four sine operators per voice, 8 voices. Eight algorithms route them, from a chain of four to four heard side by side; operator 4 can modulate itself (feedback). Each operator has a frequency ratio (0.25 to 16, in quarters), a detune of up to a semitone either way, a level (how loud a heard operator is, or how far a modulator moves what it modulates: up to two cycles), a velocity response and an envelope of its own, and the track bends by its `Bend range`. Where an operator's sidebands would pass 45 % of the sample rate, its modulation is turned down until they do not, so high notes grow duller rather than folding back; a heard operator above that fades out. `tinvo bench` has an FM scenario.
 - Wavetables in the synth: either oscillator can play one (`table`, after `sine`). Four are built in: `basic` (sine, triangle, saw, square), `pulse` (a square narrowing to 4 %), `sync` (a saw reset by the cycle while it runs one to eight times faster) and `fold` (a sine folded back on itself ever harder). On a synth track, `o` loads a WAV file as the track's own (`file`): shorter than 2048 samples it is one cycle, otherwise frames of 2048 samples, 64 at most, spread over a longer file. Loading it switches the track to it, and oscillator 1 to the table when neither plays one, as one undo step. `WT pos` moves through the frames, blending neighbours, and the LFO (`LFO>WT pos`), the filter envelope (`Env>WT pos`, either way) and the mod wheel (a new `WT pos` target) move it. Each table is kept at ten bandwidths, and a note blends the two fullest below Nyquist, so brightness follows pitch without a step; at a steady position, what folds back from the built-in tables stays 70 dB down from 27 Hz to 11 kHz. `tinvo bench` has a wavetable scenario.
@@ -531,7 +533,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.28.1...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/IACBI/tinvo/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/IACBI/tinvo/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/IACBI/tinvo/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/IACBI/tinvo/compare/v0.26.0...v0.27.0
