@@ -289,5 +289,10 @@ mod tests {
             (&[0, 1][..], &[0, 1][..], &[1, 2][..], &[1, 2][..])
         );
         assert_eq!(SampleMap::single(s).zones()[0].gain, 1.0);
+        // A synth's table, with no zones, is something to play.
+        let t = crate::dsp::wavetable::Wavetable::from_audio(&[0.0, 1.0, 0.0, -1.0]).unwrap();
+        let m = SampleMap::wavetable(t);
+        assert!(!m.is_empty() && m.zones().is_empty() && m.table().is_some());
+        assert!(SampleMap::new([]).is_empty() && SampleMap::new([]).table().is_none());
     }
 }

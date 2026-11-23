@@ -407,11 +407,18 @@ mod tests {
         for (i, &c) in short.iter().enumerate() {
             assert!((s.read(i as f64 / m as f64, 0.0, &full) - c).abs() < 1e-3, "sample {i}");
         }
-        // No read goes past the loudest sample, at any level.
-        for inc in [0.0, 0.003, 0.02, 0.1, 0.3] {
-            let mip = Mip::for_inc(inc);
-            assert!((0..n).all(|i| t.read(i as f64 / n as f64, 0.0, &mip).abs() <= 1.0), "{inc}");
+        // No read goes past the loudest sample, at any level: of a square,
+        // the levels with few harmonics peak highest.
+        let square: Vec<f32> = (0..CYCLE).map(|i| if i < CYCLE / 2 { 1.0 } else { -1.0 }).collect();
+        let sq = Wavetable::from_audio(&square).unwrap();
+        for table in [&t, &sq] {
+            for inc in [0.0, 0.003, 0.02, 0.1, 0.2, 0.3] {
+                let mip = Mip::for_inc(inc);
+                assert!((0..n).all(|i| table.read(i as f64 / n as f64, 0.0, &mip).abs() <= 1.0), "{inc}");
+            }
         }
+        let fundamental = Mip { lo: 0, hi: 0, lo_gain: 0.0, hi_gain: 1.0 };
+        assert!((sq.read(0.25, 0.0, &fundamental) - 1.0).abs() < 1e-3, "the sine alone is the loudest");
         // DC goes; too little audio makes no table.
         let dc = Wavetable::from_audio(&[1.0; 100]).unwrap();
         assert!((0..100).all(|i| dc.read(i as f64 / 100.0, 0.0, &full).abs() < 1e-6));

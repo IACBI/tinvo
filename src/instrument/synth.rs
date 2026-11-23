@@ -881,6 +881,20 @@ mod tests {
         moving.set_param(p::LFO_PITCH, 1e-6);
         let moving = play(&mut moving, 100, 1 << 15);
         assert!(alias_db(&moving[4096..4096 + (1 << 14)]) < -70.0);
+        // The second oscillator an octave up reads levels an octave
+        // emptier, static or moving.
+        for wobble in [0.0, 1e-6] {
+            let mut up = table_synth(2, 0.9);
+            up.set_param(p::WAVE1, 3.0);
+            up.set_param(p::WAVE2, TABLE_WAVE as f32);
+            up.set_param(p::MIX, 1.0);
+            up.set_param(p::SEMI, 12.0);
+            up.set_param(p::FINE, 0.0);
+            up.set_param(p::LFO_PITCH, wobble);
+            let out = play(&mut up, 88, 1 << 15);
+            let db = alias_db(&out[4096..4096 + (1 << 14)]);
+            assert!(db < -70.0, "{wobble}: {db:.1} dB");
+        }
     }
 
     /// A pure sine through an open filter: makes pitch directly measurable.
