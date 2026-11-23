@@ -10968,6 +10968,11 @@ mod tests {
         // An autosave is not opened as a project.
         let err = session_lock(Some(&dir.join("song.tvo.autosave")), Some(&state)).err().unwrap();
         assert!(err.ends_with("is an autosave: open its project to recover it"), "{err}");
+        // Nor when its state directory cannot be made.
+        let blocked = dir.join("a-file");
+        std::fs::write(&blocked, "").unwrap();
+        let (base, held, news) = session_lock(None, Some(&blocked.join("state"))).unwrap();
+        assert!(base.is_none() && held.is_none() && news.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
