@@ -628,23 +628,23 @@ It comes in three parts, each merged on its own, and ships whole with 0.28.0, wh
 - `tinvo slice SAMPLE.wav [N | t [S]]` prints the cut: each slice's key, start, length and time.
 - Tests: slice points on synthetic hits, a drum loop with ghost notes, decaying, held and low tones, a faint hit over a tail, a faint change before an attack, zero crossings, frames that are not numbers, a very low rate, too many hits, and the editor's slicing, its refusals and its undo. `tinvo fuzz wav` slices every sample that loads over a part of it, both ways.
 
-### Phase 14: Synth engines (small to medium)
+### Phase 14: Synth engines (small to medium) ✅ (0.29.0)
 
 For FM keys, basses and bells, and wavetable leads and pads.
 - A 4-operator FM synth: the common algorithms, feedback and an envelope per operator.
 - Wavetable oscillators in the synth: built-in tables and any WAV loaded as one, the position moved by the LFO and envelopes, band-limited across the keyboard.
 - Tests: FM sidebands against their Bessel amplitudes, wavetable aliasing measured by FFT like the existing oscillators.
 
-It comes in two parts, each merged on its own, and ships whole with 0.29.0.
+It comes in two parts, each merged on its own, and ships whole with 0.29.0, which freezes project format 20.
 
-#### 14a: FM ✅
+#### 14a: FM ✅ (0.29.0)
 
 - A new instrument, `fm` (`a` `9`): 8 voices of four sine operators, phase-modulating one another along one of eight algorithms (`4>3>2>1` to `4 3 2 1`), operator 4 fed back the average of its last two outputs. Each operator has a ratio, a detune, a level (a heard operator's gain, or a modulator's index: up to 4π radians), a velocity response and an ADSR of its own; a voice lasts as long as its heard operators.
 - Instead of oversampling, which would add latency: per 64-frame chunk, Carson's rule bounds each operator's spectrum from its sounding modulators' indices, peak frequencies and spectra, and the modulation is scaled until it stays under 45 % of the sample rate. High notes modulated hard, through one modulator, a chain or a cascade, fold back less than −30 dB of their power instead of −1 to −20 dB.
 - 35 parameters, so an instrument may now have up to 40. Project format 20 (`track fm`).
 - Tests: sidebands against `J_n(β)`, every algorithm's routing, feedback's harmonics and its staying periodic at full, velocity per operator, envelopes per operator, stealing, callback sizes, and the folding with and without the limit. A bench scenario of 8 voices in a chain with feedback.
 
-#### 14b: Wavetables ✅
+#### 14b: Wavetables ✅ (0.29.0)
 
 - In the existing synth, not a new kind: a fifth wave, `table`, for either oscillator, and four parameters after the synth's others (the table, its position, LFO and filter envelope to the position) plus a mod wheel target for the position.
 - Four built-in tables (`basic`, `pulse`, `sync`, `fold`), built once before audio starts, since instruments are made on the audio thread. A WAV file loaded with `o` on a synth track is the track's `sample`, so it is saved, undone, budgeted, reloaded when missing and exported as a sampler's is; it reaches the engine as a table built off the audio thread and goes back to be freed there. Up to 2048 samples it is one cycle; longer, frames of 2048, at most 64, spread evenly over it.
