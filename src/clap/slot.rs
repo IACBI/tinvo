@@ -93,6 +93,18 @@ impl PluginSlot {
         matches!(&self.held, Held::Playing(i) if i.has_tail())
     }
 
+    /// Whether the instance playing here asked to be processed again
+    /// whatever its input ([`Instance::keeps_going`]).
+    pub fn keeps_going(&self) -> bool {
+        matches!(&self.held, Held::Playing(i) if i.keeps_going())
+    }
+
+    /// Whether the instance playing here asked to be processed since this
+    /// was last asked (`request_process`), as a resting one may.
+    pub fn take_process_request(&self) -> bool {
+        matches!(&self.held, Held::Playing(i) if i.take_process_request())
+    }
+
     /// The frames the instance playing here delays its output by; none
     /// while there is none (a slot lent out passes its input, or is silent).
     pub fn latency(&self) -> usize {

@@ -785,6 +785,7 @@ impl PluginHost {
             started: false,
             failed: false,
             tail: false,
+            going: false,
             plugin_ref,
             inbox: Some(self.inbox.clone()),
             host: ManuallyDrop::new(host),
@@ -1060,8 +1061,12 @@ pub struct Instance {
     /// It could not start processing, or its processing failed: it is not
     /// called again until restarted.
     failed: bool,
-    /// Its last process call said it has a tail still to play.
+    /// Its last process call said it has a tail still to play, or to go
+    /// on while its output is not quiet and it was not.
     tail: bool,
+    /// Its last process call asked to go on being processed, whatever its
+    /// input (`CLAP_PROCESS_CONTINUE`), or had a tail.
+    going: bool,
     plugin_ref: PluginRef,
     /// Where it goes if it is dropped off its host's thread.
     inbox: Option<Arc<Inbox>>,
@@ -1724,6 +1729,8 @@ impl Instance {
         // valid until it returns, and its counts are the plugin's own.
         let status = unsafe { (self.fns.process)(self.plugin, &process) };
         self.tail = status == CLAP_PROCESS_TAIL;
+        self.going = status == CLAP_PROCESS_CONTINUE;
+        let if_loud = status == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET;
         if status == CLAP_PROCESS_ERROR {
             // Its events stay queued for whatever follows: a restart clears
             // them, with the notes they belong to.
@@ -1757,6 +1764,11 @@ impl Instance {
                 }
             }
         }
+        // Not quiet: below what a delay or reverb counts as silence.
+        if if_loud && io.iter().any(|x| x.abs() >= 1e-9) {
+            self.tail = true;
+        }
+        self.going |= self.tail;
         self.advance(frames);
         true
     }
@@ -1768,6 +1780,7 @@ impl Instance {
     /// audio thread (taken here), as CLAP asks of an active plugin.
     pub fn skip(&mut self, frames: usize) {
         self.tail = false;
+        self.going = false;
         if self.params_queued > 0 || self.host.flush.load(Ordering::Acquire) {
             self.flush_params();
         }
@@ -1824,6 +1837,13 @@ impl Instance {
         self.tail
     }
 
+    /// Whether its last process call asked to be processed again whatever
+    /// its input: `CLAP_PROCESS_CONTINUE`, or a tail ([`Instance::has_tail`]).
+    /// A group holding it runs on rather than resting.
+    pub fn keeps_going(&self) -> bool {
+        self.going
+    }
+
     /// Steady time, `frames` on; past what it can count, unknown (-1) for
     /// good, as CLAP allows.
     fn advance(&mut self, frames: usize) {
@@ -1847,6 +1867,7 @@ impl Instance {
             self.started = false;
         }
         self.tail = false;
+        self.going = false;
     }
 }
 
@@ -1885,6 +1906,7 @@ impl Drop for Instance {
                 started: false,
                 failed: self.failed,
                 tail: false,
+                going: false,
                 plugin_ref: self.plugin_ref,
                 inbox: None,
                 // SAFETY: moved out once; this drop touches neither again.

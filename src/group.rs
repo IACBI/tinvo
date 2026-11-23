@@ -259,8 +259,8 @@ impl Group {
             self.run(from, n, &key[done..], &mut mix_l[done..], &mut mix_r[done..], at + 2 * done, mix, retire);
             done += n;
             // An echo still in the chain keeps it running, from the frame
-            // the hold ran out on.
-            if self.hold_left > 0 || self.chain.is_idle() {
+            // the hold ran out on, as does a plugin that asks to go on.
+            if self.hold_left > 0 || !self.chain.keeps_going() {
                 break;
             }
             self.hold_left = self.hold();

@@ -2644,6 +2644,51 @@ fn a_plugin_s_tail_keeps_the_render_going() {
 }
 
 #[test]
+fn a_plugin_on_a_group_keeps_it_running_while_it_asks_and_wakes_it_resting() {
+    let dir = temp_dir("engine-going");
+    let mut host = PluginHost::new();
+    for (stem, going) in [("steady", true), ("loud", true), ("sleep", false)] {
+        let sub = dir.join(stem);
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = install(&sub, stem);
+        let grouped = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+        ];
+        let (mut e, _rx) = plugin_engine(&grouped);
+        let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+        assert!(insert.attach(Box::new(create(&mut host, &file, GAIN, Role::Effect).unwrap())).unwrap().is_none());
+        e.handle(EngineCommand::SetSlot { chain: ChainId::Group(0), slot: 0, insert: Some(insert) });
+        let fed = render(&mut e, 4800, 64);
+        assert!(
+            fed[fed.len() - 64..].iter().all(|x| x.abs() > 0.1),
+            "{stem}: processed while fed {:?}",
+            &fed[fed.len() - 8..]
+        );
+        // Its only track leaves: the group runs out its 2 s hold, then
+        // rests unless the plugin asks to go on.
+        e.handle(EngineCommand::Edit(Edit::SetTrackGroup { track: 0, group: None }));
+        let after = render(&mut e, 3 * RATE as usize, 512);
+        let end = &after[after.len() - 1024..];
+        assert_eq!(end.iter().all(|x| x.abs() > 0.1), going, "{stem}");
+        assert_eq!(end.iter().all(|&x| x == 0.0), !going, "{stem}");
+        // Not quiet, it has a tail: a render waits for it.
+        assert_eq!(e.effects_idle(), stem != "loud", "{stem}");
+        if !going {
+            // Resting, it asks to be processed, and the group wakes.
+            std::fs::write(sub.join("wake"), "").unwrap();
+            let start = Instant::now();
+            while !render(&mut e, 512, 512).iter().any(|x| x.abs() > 0.1) {
+                assert!(start.elapsed() < Duration::from_secs(5), "woken by its request");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_plugin_insert_made_for_another_rate_goes_back() {
     let dir = temp_dir("engine-rate");
     let file = install(&dir, "rate");

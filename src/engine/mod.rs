@@ -4615,7 +4615,12 @@ impl Route<'_> {
         let (a, b) = (self.a, self.b);
         for (i, g) in self.groups.iter_mut().enumerate() {
             let fed = self.fed[i];
-            if (i < self.group_count || i >= MAX_GROUPS) && (fed > 0 || g.is_live()) {
+            let used = i < self.group_count || i >= MAX_GROUPS;
+            // A plugin on a resting group may ask to be processed.
+            if used && fed == 0 && !g.is_live() && g.chain.take_process_request() {
+                g.hold_on();
+            }
+            if used && (fed > 0 || g.is_live()) {
                 g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix, retire);
                 // A removed group that has rung out is done with its effects.
                 if i >= MAX_GROUPS && !g.is_live() {

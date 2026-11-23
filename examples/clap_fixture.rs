@@ -25,6 +25,12 @@
 //! - `midi`: the sine takes MIDI 1 only;
 //! - `both`: the gain takes notes too, so it can be made as an instrument;
 //! - `tail`: the gain says it has a tail to play after every call;
+//! - `steady`: the gain adds 0.25 to what it gives and asks to go on
+//!   being processed (`CLAP_PROCESS_CONTINUE`);
+//! - `sleep`: the same 0.25, but it says it may sleep, and asks to be
+//!   processed (`request_process`) once a file named `wake` is beside it;
+//! - `loud`: the same 0.25, asking to go on while its output is not quiet
+//!   (`CLAP_PROCESS_CONTINUE_IF_NOT_QUIET`);
 //! - `sidechain`: the gain has a second stereo input and a second mono
 //!   output, and checks the input is silent;
 //! - `noactivate` / `nostart`: `activate` / `start_processing` fail;
@@ -123,6 +129,9 @@ enum Mode {
     LateFail,
     Many,
     FloatGui,
+    Steady,
+    Sleep,
+    Loud,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
@@ -134,7 +143,7 @@ static BROKEN: AtomicU32 = AtomicU32::new(0);
 static SAVES: AtomicU32 = AtomicU32::new(0);
 
 fn mode() -> Mode {
-    const ALL: [Mode; 29] = [
+    const ALL: [Mode; 32] = [
         Mode::Normal,
         Mode::NoFactory,
         Mode::CrashOnDeinit,
@@ -164,6 +173,9 @@ fn mode() -> Mode {
         Mode::LateFail,
         Mode::Many,
         Mode::FloatGui,
+        Mode::Steady,
+        Mode::Sleep,
+        Mode::Loud,
     ];
     ALL[usize::from(MODE.load(Ordering::Relaxed))]
 }
@@ -1217,6 +1229,26 @@ unsafe extern "C" fn plugin_start(p: *const ClapPlugin) -> bool {
     }
     me.processing.store(true, Ordering::Relaxed);
     me.starts.fetch_add(1, Ordering::Relaxed);
+    if mode() == Mode::Sleep {
+        // Asks to be processed once a file named `wake` appears beside it,
+        // from a thread of its own, as CLAP lets any thread ask.
+        let host = me.host as usize;
+        let wake = PATH.lock().unwrap().clone().unwrap_or_default().with_file_name("wake");
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                if wake.exists() {
+                    let host = host as *const ClapHost;
+                    // SAFETY: the host's thread-safe callback; the test
+                    // waits for what it asks before it ends.
+                    if let Some(f) = unsafe { (*host).request_process } {
+                        unsafe { f(host) };
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
     true
 }
 
@@ -1382,7 +1414,9 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             }
         }
         let gain = me.value(GAIN).unwrap_or(0.5) as f32;
-        let offset = me.value(OFFSET).unwrap_or(0.0) as f32;
+        // Heard whenever it is processed, whatever its input.
+        let dc = if matches!(mode(), Mode::Steady | Mode::Sleep | Mode::Loud) { 0.25 } else { 0.0 };
+        let offset = me.value(OFFSET).unwrap_or(0.0) as f32 + dc;
         for c in 0..2 {
             // SAFETY: the main ports, stereo as checked.
             let (i, o) = unsafe { (channel(&ins[0], c, frames), channel(&outs[0], c, frames)) };
@@ -1455,7 +1489,12 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
             unsafe { channel(&outs[1], 0, frames) }.fill(1.0);
         }
     }
-    if mode() == Mode::Tail { CLAP_PROCESS_TAIL } else { CLAP_PROCESS_CONTINUE }
+    match mode() {
+        Mode::Tail => CLAP_PROCESS_TAIL,
+        Mode::Sleep => CLAP_PROCESS_SLEEP,
+        Mode::Loud => CLAP_PROCESS_CONTINUE_IF_NOT_QUIET,
+        _ => CLAP_PROCESS_CONTINUE,
+    }
 }
 
 impl Instance {
@@ -2160,6 +2199,18 @@ unsafe extern "C" fn init(plugin_path: *const c_char) -> bool {
         }
         "tail" => {
             set(Mode::Tail);
+            true
+        }
+        "steady" => {
+            set(Mode::Steady);
+            true
+        }
+        "sleep" => {
+            set(Mode::Sleep);
+            true
+        }
+        "loud" => {
+            set(Mode::Loud);
             true
         }
         "leak" => {
