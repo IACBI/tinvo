@@ -91,7 +91,6 @@
 //! and loading is lossless.
 
 use crate::clap::PluginRef;
-use crate::dsp::wavetable::Wavetable;
 use crate::engine::{ChainId, PluginAt};
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
@@ -259,7 +258,7 @@ impl TrackData {
     pub fn sample_map(&self, bank: &Bank) -> Option<Arc<SampleMap>> {
         if self.kind == InstrumentKind::Synth {
             let sample = bank.get(self.sample.as_ref()?)?;
-            return Some(Arc::new(SampleMap::wavetable(Wavetable::from_audio(sample.audio())?)));
+            return Some(Arc::new(SampleMap::wavetable(sample.wavetable())));
         }
         let whole = self.sample.as_ref().and_then(|p| bank.get(p)).map(|s| (Placement::WHOLE, Arc::clone(s)));
         let zones = self.zones.iter().filter_map(|z| Some((z.place, Arc::clone(bank.get(&z.path)?))));
@@ -1845,8 +1844,14 @@ impl Project {
                         let value = match spec {
                             Some(spec) => parse_in(v, spec),
                             None => parse_finite(v),
-                        };
-                        t.lanes[k].points[pattern][i] = Some(value.map_err(err)?);
+                        }
+                        .map_err(err)?;
+                        if let Some(LaneTarget::Track(x)) = target.filter(|_| spec.is_some()) {
+                            if let Some(p) = usize::from(x).checked_sub(2) {
+                                known_value(t.kind, p, value, ver).map_err(err)?;
+                            }
+                        }
+                        t.lanes[k].points[pattern][i] = Some(value);
                     }
                     "param" => {
                         let (id, value) = rest
@@ -1857,7 +1862,9 @@ impl Project {
                             .filter_map(|i| track_param(t.kind, i).map(|s| (i, s)))
                             .find(|(_, s)| s.id == id)
                             .ok_or_else(|| err(format!("unknown parameter '{id}' for {}", t.kind.id())))?;
-                        t.params[i] = parse_in(value.trim(), spec).map_err(err)?;
+                        let v = parse_in(value.trim(), spec).map_err(err)?;
+                        known_value(t.kind, i, v, ver).map_err(err)?;
+                        t.params[i] = v;
                     }
                     "step" => {
                         let f = fields(rest, 8);
@@ -2175,6 +2182,19 @@ impl Project {
             }
         }
         Ok(p)
+    }
+}
+
+/// Whether format `ver` has `value` for track parameter `index` of
+/// `kind`: a stepped parameter can gain choices after the format that
+/// introduced it.
+fn known_value(kind: InstrumentKind, index: usize, value: f32, ver: u32) -> Result<(), String> {
+    match crate::instrument::param_max(kind, index, ver) {
+        Some(max) if value > max => {
+            let id = track_param(kind, index).map_or("?", |s| s.id);
+            Err(format!("'{id}' has no value {value} before format {}", ver + 1))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -4359,6 +4379,39 @@ pattern_division A 1/8
         assert!(e.line == 3 && e.message.contains("unknown parameter"), "{e:?}");
         let e = Project::from_text("tinvo 20\ntrack fm\nsample t.wav\nend").unwrap_err();
         assert!(e.line == 3 && e.message.contains("fm track has no sample"), "{e:?}");
+        // Nor the table among the waves, or the wheel's target for it, in
+        // a parameter or a lane's point; format 20 has both.
+        for line in ["param osc1_wave 4", "param osc2_wave 4", "param wheel 11", "lane 0 osc2_wave hold\npoint 0 3 4"] {
+            let old = format!("tinvo 19\ntrack synth\n{line}\nend");
+            let e = Project::from_text(&old).unwrap_err();
+            assert!(e.message.contains("before format 20"), "{line}: {e:?}");
+            Project::from_text(&old.replace("tinvo 19", "tinvo 20")).unwrap();
+            Project::from_text(&old.replace(" 4", " 3").replace(" 11", " 10")).unwrap();
+        }
+    }
+
+    #[test]
+    fn synth_tracks_on_one_file_share_its_table() {
+        let mut p = Project::new();
+        for _ in 0..3 {
+            p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        }
+        p.apply(Edit::AddTrack(InstrumentKind::Sampler)).unwrap();
+        let cycle: Vec<f32> = (0..700).map(|i| (i as f32 * 0.03).sin()).collect();
+        let mut bank = Bank::new();
+        bank.insert("a.wav".into(), Arc::new(crate::sample::Sample::from_mono(&cycle, 48_000).unwrap()));
+        for t in [0, 1, 3] {
+            p.tracks[t].sample = Some("a.wav".into());
+        }
+        let maps = p.sample_maps(&bank);
+        let table = |t: usize| maps[t].as_ref().and_then(|m| m.table()).map(|w| w as *const _);
+        assert!(table(0).is_some() && table(0) == table(1), "one table, built once");
+        assert!(maps[2].is_none(), "a synth with no file");
+        assert!(table(3).is_none() && !maps[3].as_ref().unwrap().zones().is_empty(), "the sampler plays the file");
+        // Asked again, the same table; a file loaded again makes a new one.
+        assert_eq!(p.sample_maps(&bank)[0].as_ref().and_then(|m| m.table()).map(|w| w as *const _), table(0));
+        bank.insert("a.wav".into(), Arc::new(crate::sample::Sample::from_mono(&cycle, 48_000).unwrap()));
+        assert_ne!(p.sample_maps(&bank)[0].as_ref().and_then(|m| m.table()).map(|w| w as *const _), table(0));
     }
 
     #[test]

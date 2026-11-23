@@ -122,6 +122,16 @@ pub(crate) mod p {
     pub const COUNT: usize = 36;
 }
 
+/// Of a parameter that gained choices in format 20, the highest value
+/// before: the waves before "table", the wheel's targets before "WT pos".
+pub(crate) fn max_before_20(index: usize) -> Option<f32> {
+    match index {
+        p::WAVE1 | p::WAVE2 => Some((TABLE_WAVE - 1) as f32),
+        p::WHEEL => Some((WHEEL_TARGETS.len() - 2) as f32),
+        _ => None,
+    }
+}
+
 /// Semitone-sized steps for frequencies, ~10 % steps for times.
 const HZ_STEP: f32 = 1.059_463_1;
 const TIME_STEP: f32 = 1.1;
@@ -548,10 +558,13 @@ impl PolySynth {
         let (wt_pos, lfo_pos, env_pos) = (pr[p::WT_POS], pr[p::LFO_POS], pr[p::ENV_POS]);
         // The table levels of a pitch capped at `max_hz`, as a logarithm.
         let lowest = (0.5 * sr / max_hz).log2();
+        // Taken off the logarithm so that rounding, here and in the
+        // increments, never leaves a level's top harmonic just past Nyquist.
+        const SLACK: f32 = 1e-4;
         let incs = |f: f32, inc: &mut [[f64; MAX_UNISON]; 2], mip: &mut [[Mip; MAX_UNISON]; 2]| {
             // The levels take a logarithm of the pitch: one for every copy,
             // and only for a table.
-            let room = if t1 || t2 { (0.5 * sr / f).log2() } else { 0.0 };
+            let room = if t1 || t2 { (0.5 * sr / f).log2() - SLACK } else { 0.0 };
             for k in 0..u {
                 let fk = f * uni_ratio[k];
                 inc[0][k] = f64::from(fk.min(max_hz) / sr);
@@ -834,7 +847,7 @@ mod tests {
         let mut s = table_synth(TABLES.len() - 1, 0.0);
         assert!(play(&mut s, 60, 4800).iter().all(|&x| x == 0.0), "no file, no sound");
         let cycle: Vec<f32> = (0..600).map(|i| (std::f32::consts::TAU * i as f32 / 600.0).sin()).collect();
-        let map = Arc::new(SampleMap::wavetable(Wavetable::from_audio(&cycle).unwrap()));
+        let map = Arc::new(SampleMap::wavetable(Arc::new(Wavetable::from_audio(&cycle).unwrap())));
         assert!(s.set_samples(Some(map.clone())).is_none());
         s.release_all();
         let out = play(&mut s, 69, 48_000);
@@ -1092,6 +1105,34 @@ mod tests {
         let whole = render(4800);
         for block in [1, 7, 64] {
             assert_eq!(render(block), whole, "blocks of {block}");
+        }
+    }
+
+    #[test]
+    fn a_moving_table_note_does_not_depend_on_the_block_size() {
+        // Position and pitch moving every sample, in unison, both oscillators.
+        let render = |block: usize| {
+            let mut s = table_synth(2, 0.3);
+            s.set_param(p::WAVE2, TABLE_WAVE as f32);
+            s.set_param(p::MIX, 0.5);
+            s.set_param(p::UNISON, 3.0);
+            s.set_param(p::LFO_PITCH, 0.4);
+            s.set_param(p::LFO_RATE, 7.0);
+            s.set_param(p::LFO_POS, 0.5);
+            s.set_param(p::ENV_POS, 0.4);
+            s.set_param(p::F_S, 0.0);
+            s.note_on(45, 127);
+            s.note_on(76, 100);
+            let mut b = vec![0.0f32; 9600];
+            for c in b.chunks_mut(block) {
+                s.render(c);
+            }
+            b
+        };
+        let whole = render(9600);
+        assert!(whole.iter().any(|x| x.abs() > 0.05));
+        for block in [1, 7, 64, 333] {
+            assert!(render(block) == whole, "blocks of {block}");
         }
     }
 

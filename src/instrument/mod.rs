@@ -33,6 +33,16 @@ pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
     }
 }
 
+/// The highest value format `ver` allows parameter `index` of `kind`,
+/// where that is below the parameter's own maximum: the choices a stepped
+/// parameter gained later. `None` where the format has them all.
+pub fn param_max(kind: InstrumentKind, index: usize, ver: u32) -> Option<f32> {
+    match kind {
+        InstrumentKind::Synth if ver < 20 => synth::max_before_20(index),
+        _ => None,
+    }
+}
+
 /// The kinds of instrument a track can host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InstrumentKind {

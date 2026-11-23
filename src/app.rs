@@ -2296,10 +2296,13 @@ impl App {
         mono: &str,
     ) -> Result<(), String> {
         let len = loaded.frames();
-        let frames = Wavetable::frames_from(len);
-        if frames == 0 {
+        if len < 2 {
             return Err(format!("Cannot load wavetable: {name} is too short to hold a cycle"));
         }
+        let frames = Wavetable::frames_from(len);
+        // Built now, before anything reaches the engine: the table and the
+        // parameters that play it then arrive in the same callback.
+        loaded.wavetable();
         let specs = InstrumentKind::Synth.params();
         let id = |id: &str| specs.iter().position(|s| s.id == id).expect("a synth parameter");
         let (wave1, wave2, table) = (id("osc1_wave"), id("osc2_wave"), id("wavetable"));
@@ -2317,12 +2320,26 @@ impl App {
             _ => format!("{frames} frames of {} samples", wavetable::CYCLE),
         };
         let osc = if first { " · osc 1 plays it" } else { "" };
-        self.set_status(format!("Loaded {name} as a wavetable: {what}{mono}{osc}"));
+        // A lane on what was just set goes on deciding what plays.
+        let t = &self.project.tracks[track];
+        let laned: Vec<&str> = set
+            .iter()
+            .filter(|&&(i, _)| {
+                let target = Some(LaneTarget::Track(2 + i as u8));
+                t.lanes.iter().any(|l| l.target == target && l.points.iter().flatten().any(Option::is_some))
+            })
+            .map(|&(i, _)| specs[i].label)
+            .collect();
+        let lanes = match laned.as_slice() {
+            [] => String::new(),
+            names => format!(" · its {} lane decides what plays", names.join(" and ")),
+        };
+        self.set_status(format!("Loaded {name} as a wavetable: {what}{mono}{osc}{lanes}"));
         self.bank.insert(key.clone(), loaded);
         let meta_before = self.meta();
-        let (undo, redo) = self.set_params_undoable(track, &set);
         self.project.tracks[track].sample = Some(key.clone());
         self.send_sample(track);
+        let (undo, redo) = self.set_params_undoable(track, &set);
         let others: Vec<usize> = (0..self.track_count())
             .filter(|&i| i != track && self.project.tracks[i].sample_paths().any(|p| p == key))
             .collect();
@@ -7257,6 +7274,10 @@ pub fn start_audio(
     if let Some(l) = &live {
         l.clear();
     }
+    // Built here rather than in the engine, which the backend may make on
+    // the thread it renders on.
+    sample_mod::init();
+    wavetable::prepare();
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
     let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
@@ -9732,7 +9753,19 @@ mod tests {
         keys(&mut a, &[Key::Enter]);
         assert_eq!(a.status_text(), Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples · osc 1 plays it"));
         assert_eq!(values(&a), (4.0, 4.0), "osc 1 plays the file's table");
-        assert_eq!(tables(&mut rx), [(0, Some(3))]);
+        // The table goes first, so the parameters that play it never reach
+        // the engine without it.
+        let mut order = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            match cmd {
+                Command::SetSamples { track: 0, map } => {
+                    order.push(format!("table {:?}", map.and_then(|m| m.table().map(Wavetable::frames))))
+                }
+                Command::Edit(Edit::SetParam { track: 0, .. }) => order.push("param".to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["table Some(3)", "param", "param"]);
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);
         assert!((0..30).any(|y| s.row_text(y).contains("Synth · wavetable table.wav")));
@@ -9751,7 +9784,23 @@ mod tests {
         keys(&mut a, &[Key::Enter]);
         assert_eq!(a.status_text(), Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples"));
         assert_eq!(values(&a), (1.0, 4.0));
-        // The export plays it.
+        // A lane on the table goes on deciding what plays: the load says so.
+        let lane = Edit::SetLane {
+            track: 0,
+            lane: 0,
+            target: Some(LaneTarget::Track(2 + at("wavetable") as u8)),
+            ramp: false,
+        };
+        a.edit(lane);
+        a.edit(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(4.0) });
+        a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples · its Wavetable lane decides what plays")
+        );
+        // The export plays it: oscillator 2 alone, on the file's table.
+        a.edit(Edit::SetParam { track: 0, index: at("osc_mix") as u8, value: 1.0 });
         a.step = 0;
         keys(&mut a, &[Key::Enter]);
         a.export_loops = 1;

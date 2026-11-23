@@ -1370,8 +1370,8 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
                 &sampler_project(true, hash_of(input)),
                 &[Some(Arc::new(fuzz_zones(s.clone(), hash_of(input))))],
             )?;
-            if let Some(table) = Wavetable::from_audio(s.audio()) {
-                let map = Some(Arc::new(SampleMap::wavetable(table)));
+            {
+                let map = Some(Arc::new(SampleMap::wavetable(s.wavetable())));
                 render_check(&table_project(false, 0), std::slice::from_ref(&map))?;
                 render_check(&table_project(true, hash_of(input)), &[map])?;
             }

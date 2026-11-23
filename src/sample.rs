@@ -6,6 +6,7 @@
 //! go of back to the UI thread, so the last reference (and the free) never
 //! happens on the audio thread.
 
+use crate::dsp::wavetable::Wavetable;
 use crate::wav;
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
@@ -54,6 +55,20 @@ pub struct Sample {
     pub loop_points: Option<(u32, u32)>,
     /// The key the file's `smpl` chunk says plays it at its own pitch.
     pub unity_note: Option<u8>,
+    /// The wavetable it makes, once a synth track plays it.
+    table: TableCache,
+}
+
+/// A sample's wavetable, built once on first use (off the audio thread) and
+/// shared by every track that plays the sample. Not part of what a sample
+/// is, so it takes no part in comparing samples.
+#[derive(Debug, Default)]
+struct TableCache(OnceLock<Arc<Wavetable>>);
+
+impl PartialEq for TableCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl Sample {
@@ -72,7 +87,14 @@ impl Sample {
         for (d, &s) in data[PAD..].iter_mut().zip(audio) {
             *d = clean(s);
         }
-        Ok(Self { data: data.into_boxed_slice(), sample_rate, source_channels: 1, loop_points: None, unity_note: None })
+        Ok(Self {
+            data: data.into_boxed_slice(),
+            sample_rate,
+            source_channels: 1,
+            loop_points: None,
+            unity_note: None,
+            table: TableCache::default(),
+        })
     }
 
     /// The sample with loop points `(start, end)`, kept if they lie
@@ -86,6 +108,14 @@ impl Sample {
     /// Length in frames.
     pub fn frames(&self) -> usize {
         self.data.len() - 2 * PAD
+    }
+
+    /// The wavetable the audio makes ([`Wavetable::from_audio`]), built the
+    /// first time it is asked for. That allocates and transforms: never on
+    /// the audio thread.
+    pub fn wavetable(&self) -> Arc<Wavetable> {
+        let table = || Wavetable::from_audio(self.audio()).expect("a sample holds audio");
+        Arc::clone(self.table.0.get_or_init(|| Arc::new(table())))
     }
 
     /// The audio without padding.
@@ -244,6 +274,7 @@ fn read_limited<R: Read + Seek>(file: &mut R, max_frames: usize) -> Result<Sampl
         source_channels: info.channels,
         loop_points: None,
         unity_note: info.unity_note,
+        table: TableCache::default(),
     };
     Ok(s.with_loop(info.loop_points))
 }

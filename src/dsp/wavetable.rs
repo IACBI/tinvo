@@ -78,6 +78,9 @@ impl Mip {
     /// without a step: every harmonic below a quarter of the sample rate
     /// sounds in full, and those up to Nyquist in part.
     pub fn for_inc(inc: f64) -> Self {
+        if inc.is_nan() {
+            return Self::default();
+        }
         Self::from_log2((0.5 / inc.max(1e-12)).log2())
     }
 
@@ -104,10 +107,10 @@ impl Mip {
 impl Wavetable {
     /// A table playing `audio`: under a cycle's length it is one cycle,
     /// otherwise cycles of [`CYCLE`] samples, the rest left out; of more
-    /// than [`MAX_FRAMES`], that many evenly spread. `None` for too little
-    /// audio to hold a cycle.
+    /// than [`MAX_FRAMES`], that many evenly spread. `None` for no audio; a
+    /// single sample is a silent cycle.
     pub fn from_audio(audio: &[f32]) -> Option<Self> {
-        if audio.len() < 2 {
+        if audio.is_empty() {
             return None;
         }
         let cycles: Vec<&[f32]> = if audio.len() < CYCLE { vec![audio] } else { audio.chunks_exact(CYCLE).collect() };
@@ -123,7 +126,7 @@ impl Wavetable {
     /// The frames a table made from `len` samples by [`Wavetable::from_audio`] holds.
     pub fn frames_from(len: usize) -> usize {
         match len {
-            0 | 1 => 0,
+            0 => 0,
             l if l < CYCLE => 1,
             l => (l / CYCLE).min(MAX_FRAMES),
         }
@@ -178,8 +181,9 @@ impl Wavetable {
         let at = pos.clamp(0.0, 1.0) * last as f32;
         let f0 = (at as usize).min(last);
         let t = at - f0 as f32;
-        // A phase out of [0, 1] reads the nearest end.
-        let phase = phase.max(0.0);
+        // A phase out of [0, 1] reads the nearest end, and one that is not a
+        // number the start.
+        let phase = if phase > 0.0 { phase.min(1.0) } else { 0.0 };
         let place = |level: usize| {
             let n = level_len(level);
             let x = phase * n as f64;
@@ -198,28 +202,31 @@ impl Wavetable {
     }
 }
 
-/// The complex amplitudes of harmonics `1..=TOP` of one cycle, those it is
-/// too short to hold left at zero.
+/// The complex amplitudes of harmonics §1..=TOP§ of one cycle, those it is
+/// too short to hold left at zero. Of an even length, the harmonic at half
+/// of it is a cosine, counted once rather than with its mirror image.
 fn spectrum(cycle: &[f32]) -> Vec<(f64, f64)> {
     let n = cycle.len();
     let mut out = vec![(0.0, 0.0); TOP];
+    let held = (n / 2).min(TOP);
+    let scale = |h: usize| if 2 * h == n { 1.0 / n as f64 } else { 2.0 / n as f64 };
     if n.is_power_of_two() {
         let mut re: Vec<f64> = cycle.iter().map(|&x| f64::from(x)).collect();
         let mut im = vec![0.0; n];
         fft(&mut re, &mut im);
-        for (h, o) in out.iter_mut().enumerate().take((n / 2).min(TOP + 1).saturating_sub(1)) {
-            *o = (2.0 * re[h + 1] / n as f64, 2.0 * im[h + 1] / n as f64);
+        for (h, o) in (1..=held).zip(out.iter_mut()) {
+            *o = (re[h] * scale(h), im[h] * scale(h));
         }
     } else {
-        for (h, o) in out.iter_mut().enumerate().take((n / 2).min(TOP + 1).saturating_sub(1)) {
-            let w = -2.0 * PI * (h + 1) as f64 / n as f64;
+        for (h, o) in (1..=held).zip(out.iter_mut()) {
+            let w = -2.0 * PI * h as f64 / n as f64;
             let (mut a, mut b) = (0.0, 0.0);
             for (t, &x) in cycle.iter().enumerate() {
                 let (s, c) = (w * t as f64).sin_cos();
                 a += f64::from(x) * c;
                 b += f64::from(x) * s;
             }
-            *o = (2.0 * a / n as f64, 2.0 * b / n as f64);
+            *o = (a * scale(h), b * scale(h));
         }
     }
     out
@@ -235,7 +242,7 @@ fn draw(frames: usize, shape: impl Fn(usize, f64) -> f64) -> Wavetable {
     let spectra: Vec<Vec<(f64, f64)>> = (0..frames)
         .map(|f| {
             // Drawn between the points, so no point lands on a jump; each
-            // harmonic is then turned back by that half point.
+            // harmonic, a half point ahead, is then turned back by it.
             let mut re: Vec<f64> = (0..DRAW).map(|i| shape(f, (i as f64 + 0.5) / DRAW as f64)).collect();
             let mut im = vec![0.0; DRAW];
             fft(&mut re, &mut im);
@@ -243,7 +250,7 @@ fn draw(frames: usize, shape: impl Fn(usize, f64) -> f64) -> Wavetable {
                 .map(|h| {
                     let (s, c) = (PI * h as f64 / DRAW as f64).sin_cos();
                     let (a, b) = (re[h] * 2.0 / DRAW as f64, im[h] * 2.0 / DRAW as f64);
-                    (a * c - b * s, a * s + b * c)
+                    (a * c + b * s, b * c - a * s)
                 })
                 .collect()
         })
@@ -419,10 +426,35 @@ mod tests {
         }
         let fundamental = Mip { lo: 0, hi: 0, lo_gain: 0.0, hi_gain: 1.0 };
         assert!((sq.read(0.25, 0.0, &fundamental) - 1.0).abs() < 1e-3, "the sine alone is the loudest");
-        // DC goes; too little audio makes no table.
+        // DC goes; a single sample is a silent cycle, and none no table.
         let dc = Wavetable::from_audio(&[1.0; 100]).unwrap();
         assert!((0..100).all(|i| dc.read(i as f64 / 100.0, 0.0, &full).abs() < 1e-6));
-        assert!(Wavetable::from_audio(&[0.5]).is_none());
+        let one = Wavetable::from_audio(&[0.5]).unwrap();
+        assert_eq!((one.frames(), Wavetable::frames_from(1)), (1, 1));
+        assert!((0..10).all(|i| one.read(f64::from(i) / 10.0, 0.0, &full) == 0.0));
+        assert!(Wavetable::from_audio(&[]).is_none() && Wavetable::frames_from(0) == 0);
+        // The shortest cycles keep every harmonic they hold: two samples a
+        // cosine at their half, three and five samples harmonic 1 and 2.
+        let cos = |h: f64, phase: f64| (2.0 * PI * h * phase).cos() as f32;
+        for (cycle, h) in [
+            (vec![1.0, -1.0], 1.0),
+            (vec![1.0, -0.5, -0.5], 1.0),
+            ((0..5).map(|i| cos(2.0, f64::from(i) / 5.0)).collect(), 2.0),
+        ] {
+            let t = Wavetable::from_audio(&cycle).unwrap();
+            for i in 0..64 {
+                let ph = f64::from(i) / 64.0;
+                assert!((t.read(ph, 0.0, &full) - cos(h, ph)).abs() < 2e-3, "{cycle:?} at {ph}");
+            }
+        }
+        // A phase out of range reads an end; one that is not a number, the
+        // start; a pitch that is not a number, silence.
+        let s = Wavetable::from_audio(&short).unwrap();
+        assert_eq!(s.read(2.0, 0.0, &full), s.read(1.0, 0.0, &full));
+        assert_eq!(s.read(-1.0, 0.0, &full), s.read(0.0, 0.0, &full));
+        assert_eq!(s.read(f64::NAN, 0.0, &full), s.read(0.0, 0.0, &full));
+        assert!((s.read(1.0, 0.0, &full) - s.read(0.0, 0.0, &full)).abs() < 1e-6, "the cycle closes");
+        assert_eq!(Mip::for_inc(f64::NAN), Mip::default());
     }
 
     #[test]
@@ -462,6 +494,24 @@ mod tests {
                     assert!(db < -70.0, "{name} at {pos}, {hz} Hz: {db:.1} dB");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_built_in_tables_start_where_their_shapes_do() {
+        prepare();
+        let basic = built_in(0).unwrap();
+        let full = Mip::for_inc(0.0);
+        // The sine rises through zero at the start and peaks a quarter on.
+        assert!(basic.read(0.0, 0.0, &full).abs() < 1e-5, "{}", basic.read(0.0, 0.0, &full));
+        let peak = basic.read(0.25, 0.0, &full);
+        assert!(peak > 0.5 && (basic.read(0.75, 0.0, &full) + peak).abs() < 1e-5);
+        assert!(basic.read(0.5, 0.0, &full).abs() < 1e-5);
+        // The saw crosses zero rising at the start too, and the square sits
+        // at its middle on its jumps.
+        for pos in [2.0 / 3.0, 1.0] {
+            assert!(basic.read(0.0, pos, &full).abs() < 1e-3, "{pos}: {}", basic.read(0.0, pos, &full));
+            assert!(basic.read(0.125, pos, &full) > 0.1);
         }
     }
 

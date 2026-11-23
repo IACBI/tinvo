@@ -461,7 +461,7 @@ fn edits_while_playing() -> usize {
     // Synth tracks' tables: one cycle, and as many frames as a table keeps.
     for len in [600, 70 * wavetable::CYCLE] {
         let audio: Vec<f32> = (0..len).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
-        samples.push(Arc::new(SampleMap::wavetable(Wavetable::from_audio(&audio).unwrap())));
+        samples.push(Arc::new(SampleMap::wavetable(Arc::new(Wavetable::from_audio(&audio).unwrap()))));
     }
     let mut rng = Rng::new(42);
     rig.send(Command::PlaySong { entry: 0 });

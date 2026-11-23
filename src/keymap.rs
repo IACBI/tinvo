@@ -140,7 +140,7 @@ actions! {
     MidiChannel "midi_channel" Track [c('H')] "the MIDI channel that plays the track whichever is selected (shown after its type)";
     MidiOut "midi_out" Track [c('V')] "send the track's notes to the MIDI output instead of sounding them (→ before the channel they go on)";
     Preview "preview" Track [c('p')] "preview the track's note";
-    LoadSample "load_sample" Track [c('o')] "load a WAV file or an SFZ instrument into a sampler track, or a wavetable into a synth track";
+    LoadSample "load_sample" Track [c('o')] "load a WAV file or an SFZ instrument into a sampler track, or a WAV wavetable into a synth track";
     Slice "slice" Track [c('%')] "slice the sampler track's sample into zones, a key each from C2: at its transients or into equal parts";
     Automate "automate" Track [c('A')] "in the panel: give the parameter a lane; in the grid: show the lanes";
     PianoRoll "piano_roll" Track [c('v')] "piano roll for a melodic track / back to the grid";

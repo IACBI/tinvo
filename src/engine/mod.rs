@@ -8150,6 +8150,45 @@ mod tests {
     }
 
     #[test]
+    fn a_synth_tracks_table_goes_back_through_the_queue() {
+        let cycle: Vec<f32> = (0..600).map(|i| (std::f32::consts::TAU * i as f32 / 600.0).sin()).collect();
+        let table =
+            |audio: &[f32]| Arc::new(SampleMap::wavetable(Sample::from_mono(audio, 48_000).unwrap().wavetable()));
+        let (a, b) = (table(&cycle), table(&cycle[..300]));
+        let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.attach_retirement(tx);
+        let specs = InstrumentKind::Synth.params();
+        for (id, value) in [("osc1_wave", 4.0), ("osc_mix", 0.0), ("wavetable", 4.0)] {
+            let index = specs.iter().position(|s| s.id == id).unwrap() as u8;
+            e.apply(Edit::SetParam { track: 0, index, value });
+        }
+        let mut back = Vec::new();
+        let drain = |rx: &mut spsc::Consumer<Retired>, back: &mut Vec<Arc<SampleMap>>| {
+            while let Some(r) = rx.pop() {
+                let Retired::Samples(s) = r else { panic!("only tables were sent") };
+                back.push(s);
+            }
+            back.len()
+        };
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 4800 });
+        assert!(run(&mut e, 512).iter().all(|&x| x == 0.0), "no file, no sound");
+        e.handle(Command::SetSamples { track: 0, map: Some(a.clone()) });
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 4800 });
+        assert!(run(&mut e, 512).iter().any(|x| x.abs() > 0.01), "the synth plays its table");
+        assert_eq!(drain(&mut rx, &mut back), 0);
+        e.handle(Command::SetSamples { track: 0, map: Some(b.clone()) });
+        assert_eq!(drain(&mut rx, &mut back), 1);
+        assert!(Arc::ptr_eq(&back[0], &a));
+        e.apply(Edit::RemoveTrack(0));
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade);
+        assert_eq!(drain(&mut rx, &mut back), 2);
+        drop(back);
+        assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (1, 1), "the engine holds none");
+    }
+
+    #[test]
     fn chord_editing_keeps_canonical_form() {
         let s = Step::new(60, 100, 1);
         let maj = s.with_note(67).unwrap().with_note(64).unwrap();

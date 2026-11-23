@@ -169,7 +169,7 @@ pub struct SampleMap {
     starts: [u32; 129],
     by_key: Vec<u16>,
     /// A synth track's wavetable, in place of zones.
-    table: Option<Wavetable>,
+    table: Option<Arc<Wavetable>>,
 }
 
 impl SampleMap {
@@ -198,12 +198,12 @@ impl SampleMap {
     }
 
     /// A synth track's wavetable, with no zones.
-    pub fn wavetable(table: Wavetable) -> Self {
+    pub fn wavetable(table: Arc<Wavetable>) -> Self {
         Self { table: Some(table), ..Self::new([]) }
     }
 
     pub fn table(&self) -> Option<&Wavetable> {
-        self.table.as_ref()
+        self.table.as_deref()
     }
 
     pub fn zones(&self) -> &[Zone] {
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(SampleMap::single(s).zones()[0].gain, 1.0);
         // A synth's table, with no zones, is something to play.
         let t = crate::dsp::wavetable::Wavetable::from_audio(&[0.0, 1.0, 0.0, -1.0]).unwrap();
-        let m = SampleMap::wavetable(t);
+        let m = SampleMap::wavetable(Arc::new(t));
         assert!(!m.is_empty() && m.zones().is_empty() && m.table().is_some());
         assert!(SampleMap::new([]).is_empty() && SampleMap::new([]).table().is_none());
     }
