@@ -457,6 +457,26 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    /// The most bytes of a message: what it quotes from the file is cut
+    /// short, as a line may be as long as the file.
+    const MAX_MESSAGE: usize = 512;
+
+    fn new(line: usize, mut message: String) -> Self {
+        if message.len() > Self::MAX_MESSAGE {
+            let mut cut = Self::MAX_MESSAGE - '…'.len_utf8();
+            while !message.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            message.truncate(cut);
+            message.push('…');
+            // An error may be kept a while: not with the line's storage.
+            message.shrink_to_fit();
+        }
+        Self { line, message }
+    }
+}
+
 impl Project {
     /// An empty project at 120 BPM with a one-bar pattern.
     pub fn new() -> Self {
@@ -1641,7 +1661,7 @@ impl Project {
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
-            let err = |message: String| ParseError { line: line_no, message };
+            let err = |message: String| ParseError::new(line_no, message);
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -2091,7 +2111,7 @@ impl Project {
         }
         for (m, &line) in p.markers.iter().zip(&marker_lines) {
             if usize::from(m.entry) >= p.song.len() {
-                return Err(ParseError { line, message: format!("marker '{}' is past the end of the song", m.name) });
+                return Err(ParseError::new(line, format!("marker '{}' is past the end of the song", m.name)));
             }
         }
         for (entry, line) in tempo_lines {
@@ -2125,6 +2145,22 @@ impl Project {
         if states.into_iter().any(|s| s.len() > max_state) {
             let mib = max_state >> 20;
             return Err(std::io::Error::other(format!("a plugin's state is over the {mib} MiB a project keeps")));
+        }
+        // The states' lines alone may be over: then nothing is built, as
+        // their text is a third larger than they are. Each line is at least
+        // `state `, its base64 and a line break.
+        const STATE_LINE: &str = "state \n";
+        let encoded: u64 = self
+            .plugin_places()
+            .into_iter()
+            .filter_map(|(place, _)| self.plugin_state(place))
+            .map(|s| (s.len() as u64).div_ceil(3) * 4 + STATE_LINE.len() as u64)
+            .sum();
+        if encoded > max {
+            let (size, mib) = (encoded >> 20, max >> 20);
+            return Err(std::io::Error::other(format!(
+                "the project would be over {size} MiB, more than the {mib} MiB a project file can hold"
+            )));
         }
         let text = self.to_text_in(project_dir(path).as_deref());
         if text.len() as u64 > max {
@@ -3643,6 +3679,17 @@ song A",
     }
 
     #[test]
+    fn an_error_quotes_little_of_a_long_line() {
+        let key = "\u{1b}".repeat(1 << 20);
+        let e = Project::from_text(&format!("tinvo 20\n{key} 1\n")).unwrap_err();
+        assert_eq!(e.line, 2);
+        assert!(e.message.len() <= ParseError::MAX_MESSAGE && e.message.ends_with('…'), "{}", e.message.len());
+        assert!(e.message.capacity() <= ParseError::MAX_MESSAGE, "{}", e.message.capacity());
+        let e = Project::from_text(&format!("tinvo 20\nbpm {}\n", "é".repeat(400))).unwrap_err();
+        assert!(e.message.len() <= ParseError::MAX_MESSAGE, "cut on a character's boundary");
+    }
+
+    #[test]
     fn a_project_a_load_would_refuse_is_not_saved() {
         use crate::clap::PluginRef;
         let dir = std::env::temp_dir().join(format!("tinvo-project-too-big-{}", std::process::id()));
@@ -3658,8 +3705,16 @@ song A",
         let e = p.save(&path).unwrap_err();
         assert_eq!(e.to_string(), "a plugin's state is over the 16 MiB a project keeps");
         assert!(p.set_plugin_state(PluginPlace::Track(0), Some(vec![0u8; 3 << 20].into())));
+        // The states alone are over: refused before any text is built.
         let e = p.save_within(&path, 2 << 20).unwrap_err();
-        assert_eq!(e.to_string(), "the project would be 4 MiB, over the 2 MiB a project file can hold");
+        assert_eq!(e.to_string(), "the project would be over 4 MiB, more than the 2 MiB a project file can hold");
+        // They fit, the rest of the text does not.
+        let line = (3u64 << 20).div_ceil(3) * 4 + "state \n".len() as u64;
+        // A state's line is longer than its base64: counted whole.
+        let e = p.save_within(&path, line - 1).unwrap_err();
+        assert!(e.to_string().starts_with("the project would be over 4 MiB"), "{e}");
+        let e = p.save_within(&path, line).unwrap_err();
+        assert!(e.to_string().starts_with("the project would be 4 MiB, over the "), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), kept, "the file there as it was");
         p.save_within(&path, 5 << 20).unwrap();
         assert_eq!(Project::load(&path).unwrap(), p);

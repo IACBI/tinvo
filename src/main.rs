@@ -1118,7 +1118,8 @@ fn bench_instructions(file: &str) -> Result<(), String> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("instruction budgets are counted on x86-64 Linux, where Valgrind runs".into());
     }
-    let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+    // A line for each scenario: a megabyte is far more than a budget file holds.
+    let text = tinvo::fsutil::read_text(std::path::Path::new(file), 1 << 20).map_err(|e| format!("{file}: {e}"))?;
     let budgets = bench::parse_budgets(&text).map_err(|e| format!("{file}: {e}"))?;
     let missing: Vec<&str> =
         bench::SCENARIOS.iter().map(|s| s.id).filter(|id| !budgets.iter().any(|(b, _)| b == id)).collect();

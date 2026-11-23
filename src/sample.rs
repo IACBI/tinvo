@@ -21,6 +21,10 @@ pub const MAX_FRAMES: usize = 1 << 25;
 /// 46 minutes at 48 kHz), so a project of long samples cannot take all
 /// memory when it opens.
 pub const PROJECT_FRAMES: usize = 1 << 27;
+/// The most values, frames times channels, a sample file may hold: a file
+/// is read and mixed down whole, and its frames alone do not bound that.
+/// Four channels at [`MAX_FRAMES`].
+pub const MAX_VALUES: u64 = 4 * MAX_FRAMES as u64;
 /// Largest sample value kept (+60 dBFS). Float files can hold any value;
 /// beyond this they are corrupt rather than loud, and the products of the
 /// gains on the way to the output (velocity, strip, sends, master) could
@@ -108,6 +112,13 @@ impl Sample {
     /// Length in frames.
     pub fn frames(&self) -> usize {
         self.data.len() - 2 * PAD
+    }
+
+    /// What it keeps in memory, in values the size of a frame: its frames,
+    /// and its wavetable's levels once one is built. Budgets count this, so
+    /// a table kept by the history counts as its file does.
+    pub fn cost(&self) -> usize {
+        self.frames() + self.table.0.get().map_or(0, |t| t.floats())
     }
 
     /// The wavetable the audio makes ([`Wavetable::from_audio`]), built the
@@ -238,7 +249,19 @@ pub fn header(path: &Path) -> Result<wav::Info, String> {
     if info.frames > MAX_FRAMES as u64 {
         return Err(format!("longer than {MAX_FRAMES} frames"));
     }
+    too_wide(&info)?;
     Ok(info)
+}
+
+/// Refuses a file holding more than [`MAX_VALUES`].
+fn too_wide(info: &wav::Info) -> Result<(), String> {
+    if info.frames.saturating_mul(u64::from(info.channels)) > MAX_VALUES {
+        return Err(format!(
+            "{} channels of {} frames, more than the {MAX_VALUES} values a sample file may hold",
+            info.channels, info.frames
+        ));
+    }
+    Ok(())
 }
 
 /// Reads a WAV stream into a mono [`Sample`], like [`load`].
@@ -259,6 +282,7 @@ fn read_limited<R: Read + Seek>(file: &mut R, max_frames: usize) -> Result<Sampl
             format!("longer than {max_frames} frames")
         }));
     }
+    too_wide(&info)?;
     let ch = usize::from(info.channels);
     let gain = 1.0 / ch as f32;
     let mut data = Vec::with_capacity(info.frames as usize + 2 * PAD);
@@ -398,6 +422,35 @@ mod tests {
         let plain = Sample::from_mono(&[0.0; 8], 48_000).unwrap();
         assert_eq!((plain.loop_points, plain.unity_note), (None, None));
         assert_eq!(plain.with_loop(Some((2, 9))).loop_points, None);
+    }
+
+    #[test]
+    fn a_file_of_too_many_channels_is_refused_before_it_is_read() {
+        // 65 535 channels of 2049 frames: few frames, but 134 MB to read.
+        let (channels, frames) = (u16::MAX, 2049u32);
+        let len = u32::from(channels) * frames;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&48_000u32.to_le_bytes());
+        b.extend_from_slice(&(48_000 * u32::from(channels)).to_le_bytes());
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&8u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&len.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("tinvo-sample-wide-{}.wav", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &file, &b).unwrap();
+        file.set_len(b.len() as u64 + u64::from(len)).unwrap();
+        drop(file);
+        for e in [header(&path).unwrap_err(), load(&path).unwrap_err()] {
+            assert!(e.contains("65535 channels of 2049 frames, more than the"), "{e}");
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -1354,7 +1354,13 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
             }
             Some(Arc::new(s))
         }
-        Err(_) if info.frames == 0 || info.frames > sample::MAX_FRAMES as u64 => None,
+        Err(_)
+            if info.frames == 0
+                || info.frames > sample::MAX_FRAMES as u64
+                || info.frames.saturating_mul(u64::from(info.channels)) > sample::MAX_VALUES =>
+        {
+            None
+        }
         Err(e) => return Err(format!("the sample loader refuses a file that decodes: {e}")),
     };
     if let Some(s) = &loaded {

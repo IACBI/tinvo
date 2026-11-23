@@ -26,6 +26,8 @@ const MAX_LINE: usize = 64 << 10;
 /// The most opcode names an import lists as unused, and keeps track of.
 const MAX_LISTED: usize = 40;
 const MAX_UNUSED: usize = 4096;
+/// The most unreadable lines an import quotes.
+const SHOWN_UNREADABLE: usize = 5;
 /// The most regions read before keyswitches choose among them.
 const MAX_CANDIDATES: usize = 16 * MAX_ZONES;
 /// The longest name a define may have, `$` aside.
@@ -265,7 +267,10 @@ struct Reader {
     unused_over: usize,
     skipped: BTreeMap<String, usize>,
     /// Lines it could not read, by line number and file.
+    /// The first lines it could not read, as many as an import shows,
+    /// and how many there were.
     unreadable: Vec<String>,
+    unreadable_n: usize,
 }
 
 type Include<'a> = dyn FnMut(&str) -> Result<String, String> + 'a;
@@ -346,8 +351,8 @@ impl Reader {
     }
 
     fn unreadable(&mut self, n: usize, depth: usize, what: &str) {
-        if self.unreadable.len() >= MAX_LISTED {
-            self.unreadable.push(String::new());
+        self.unreadable_n += 1;
+        if self.unreadable.len() >= SHOWN_UNREADABLE {
             return;
         }
         let place = if depth == 0 { format!("line {}", n + 1) } else { format!("line {} of an include", n + 1) };
@@ -550,11 +555,8 @@ impl Reader {
             let more = if more > 0 { format!(" and {more} more") } else { String::new() };
             notes.push(format!("not used: {}{more}", list.join(", ")));
         }
-        if !self.unreadable.is_empty() {
-            let n = self.unreadable.len();
-            let shown: Vec<&str> =
-                self.unreadable.iter().filter(|u| !u.is_empty()).take(5).map(String::as_str).collect();
-            notes.push(format!("{n} unreadable: {}", shown.join(", ")));
+        if self.unreadable_n > 0 {
+            notes.push(format!("{} unreadable: {}", self.unreadable_n, self.unreadable.join(", ")));
         }
         Ok(Instrument { regions, notes })
     }
@@ -982,6 +984,21 @@ mod tests {
         let most = crate::sample::MAX_FRAMES as u64;
         let (loaded, refused) = admit(vec![("big", most + 1), ("ok", most)], usize::MAX);
         assert_eq!((loaded, refused.len()), (vec!["ok"], 1));
+    }
+
+    #[test]
+    fn unreadable_lines_are_counted_and_a_few_quoted() {
+        let text = format!("<region> sample=a.wav\n{}", "?\n".repeat(100_000));
+        let i = read(&text);
+        let note = i.notes.iter().find(|n| n.contains("unreadable")).unwrap();
+        assert!(note.starts_with("100000 unreadable: line 2: '?', line 3: '?'"), "{note}");
+        assert_eq!(note.matches("'?'").count(), 5, "{note}");
+        // And it keeps no more than it quotes.
+        let mut r = Reader::default();
+        for n in 0..100_000 {
+            r.unreadable(n, 0, "?");
+        }
+        assert_eq!((r.unreadable.len(), r.unreadable_n), (SHOWN_UNREADABLE, 100_000));
     }
 
     #[test]

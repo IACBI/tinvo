@@ -6,6 +6,18 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Fixed
+- Memory the editor keeps is bounded where it was not:
+  - The undo history counts a wavetable built from a sample it keeps against its sample budget.
+  - It keeps the plugin states only it holds up to 256 MiB, forgetting the steps farthest back first.
+- Inputs are bounded before they are read:
+  - A save whose plugin states alone would be over the 256 MiB a project file holds is refused before its text is built.
+  - A sample file holding more than four channels' worth of the longest sample is refused from its header, before it is read and mixed down.
+  - A project file over its limit is refused without reading it, and an error quotes at most 512 bytes of the line it is about.
+  - An SFZ import of many unreadable lines keeps a count and the five it quotes.
+  - A MIDI file of more than 65,535 tracks is refused.
+  - The plugin cache and a scan's result are refused past the files, plugins and features a scan keeps, and a scan writes no more than it reads back.
+
 ## [0.29.0] - 2026-11-23
 
 ### Added

@@ -280,6 +280,14 @@ fn plugin_line(p: &PluginInfo) -> String {
     fields.join("\t")
 }
 
+/// The tab-separated fields of a result or cache line; `None` for more than
+/// a plugin's line has, which are not split any further.
+fn fields_of(line: &str) -> Option<Vec<&str>> {
+    let most = 6 + super::library::MAX_FEATURES;
+    let fields: Vec<&str> = line.splitn(most + 1, '\t').collect();
+    (fields.len() <= most).then_some(fields)
+}
+
 /// Reads a line [`plugin_line`] wrote, without its first word.
 fn parse_plugin(fields: &[&str]) -> Option<PluginInfo> {
     let mut text = fields.iter().map(|f| unescape(f));
@@ -402,8 +410,18 @@ fn contain_children() {
 /// `None` for anything else, such as a result cut short or with lines after
 /// its end.
 fn parse_result(text: &str) -> Option<Result<Vec<PluginInfo>, String>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let (&RESULT_HEADER, rest) = lines.split_first()? else { return None };
+    let mut lines = text.lines();
+    if lines.next()? != RESULT_HEADER {
+        return None;
+    }
+    // Its plugins and its `end`, no more lines than a scan writes.
+    let mut rest = Vec::new();
+    for line in lines {
+        if rest.len() > super::library::MAX_DESCRIPTORS as usize {
+            return None;
+        }
+        rest.push(line);
+    }
     let (&"end", body) = rest.split_last()? else { return None };
     if let [line] = body {
         if let Some(why) = line.strip_prefix("error\t") {
@@ -412,7 +430,7 @@ fn parse_result(text: &str) -> Option<Result<Vec<PluginInfo>, String>> {
     }
     let mut plugins = Vec::new();
     for line in body {
-        let fields: Vec<&str> = line.split('\t').collect();
+        let fields = fields_of(line)?;
         let ["plugin", rest @ ..] = &fields[..] else { return None };
         plugins.push(parse_plugin(rest)?);
     }
@@ -640,8 +658,18 @@ fn parse_cache(text: &str) -> Option<Vec<Entry>> {
     }
     let mut entries: Vec<Entry> = Vec::new();
     for line in lines {
-        let fields: Vec<&str> = line.split('\t').collect();
+        let fields = fields_of(line)?;
         match fields[..] {
+            // No more files or plugins than a scan keeps.
+            ["file", ..] if entries.len() >= MAX_FILES => return None,
+            ["plugin", ..]
+                if entries
+                    .last()
+                    .and_then(|e| e.result.as_ref().ok())
+                    .is_some_and(|l| l.len() >= super::library::MAX_DESCRIPTORS as usize) =>
+            {
+                return None;
+            }
             ["file", path, fingerprint] => entries.push(Entry {
                 path: PathBuf::from(unescape(path)?),
                 fingerprint: unescape(fingerprint)?,
@@ -677,9 +705,10 @@ fn cache_text(entries: &[Entry]) -> String {
     text
 }
 
-/// Writes the cache at `path`, its folder made if need be.
+/// Writes the cache at `path`, its folder made if need be: the first
+/// [`MAX_FILES`] entries, as many as it is read back with.
 pub fn write_cache(path: &Path, entries: &[Entry]) -> Result<(), String> {
-    let text = cache_text(entries);
+    let text = cache_text(&entries[..entries.len().min(MAX_FILES)]);
     if text.len() as u64 > MAX_CACHE_BYTES {
         return Err("the plugin cache would be too large to keep".into());
     }
@@ -941,6 +970,37 @@ mod tests {
         assert_eq!(parse_result(&format!("{RESULT_HEADER}\nerror\ta\nerror\tb\nend\n")), None, "two errors");
         assert_eq!(parse_result(&format!("{RESULT_HEADER}\nend\nend\n")), None);
         assert_eq!(parse_result(""), None);
+        // No more plugins, or features, than a scan reads.
+        let many = |n: usize| format!("{RESULT_HEADER}\n{}end\n", format!("{line}\n").repeat(n));
+        let most = super::super::library::MAX_DESCRIPTORS as usize;
+        assert_eq!(parse_result(&many(most)).map(|r| r.unwrap().len()), Some(most));
+        assert_eq!(parse_result(&many(most + 1)), None);
+        let mut q = info("org.example.y");
+        q.features = vec!["f".into(); super::super::library::MAX_FEATURES];
+        let ok = format!("{RESULT_HEADER}\n{}\nend\n", plugin_line(&q));
+        assert!(parse_result(&ok).is_some());
+        q.features.push("f".into());
+        assert_eq!(parse_result(&format!("{RESULT_HEADER}\n{}\nend\n", plugin_line(&q))), None);
+        // The cache likewise: files, then plugins of a file.
+        let file = "file\ta\tfp\n";
+        assert_eq!(
+            parse_cache(&format!("{}\n{}", cache_header(), file.repeat(MAX_FILES))).map(|e| e.len()),
+            Some(MAX_FILES)
+        );
+        assert_eq!(parse_cache(&format!("{}\n{}", cache_header(), file.repeat(MAX_FILES + 1))), None);
+        let plugins = |n: usize| format!("{}\n{file}{}", cache_header(), format!("{line}\n").repeat(n));
+        assert!(parse_cache(&plugins(most)).is_some());
+        assert_eq!(parse_cache(&plugins(most + 1)), None);
+        // What is written is no more than what is read back.
+        let dir = temp_dir("cache-cap");
+        let entries: Vec<Entry> = (0..=MAX_FILES)
+            .map(|i| Entry { path: dir.join(format!("{i}.clap")), fingerprint: "f".into(), result: Ok(Vec::new()) })
+            .collect();
+        write_cache(&dir.join("cache"), &entries).unwrap();
+        let back = read_cache(&dir.join("cache"));
+        assert_eq!(back.len(), MAX_FILES);
+        assert_eq!(back[0].path, entries[0].path, "the first kept");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -172,6 +172,11 @@ impl Wavetable {
         self.frames
     }
 
+    /// The values it keeps, every level of every frame.
+    pub fn floats(&self) -> usize {
+        self.data.len()
+    }
+
     /// The wave at `phase` (cycles, in `[0, 1)`), `pos` of the way from the
     /// first frame to the last (each read between the two nearest), at the
     /// levels `mip` gives.
