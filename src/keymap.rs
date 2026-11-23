@@ -107,7 +107,7 @@ actions! {
     Export "export" Global [c('e')] "export WAV, or MIDI to a .mid file (←→ song / pattern / loop region, Tab format, ↑↓ repeats)";
     Undo "undo" Global [c('u'), Ctrl('z')] "undo";
     Redo "redo" Global [c('U'), Ctrl('y')] "redo";
-    AddTrack "add_track" Global [c('a')] "add a track (then 1-8 picks its type, 8 a CLAP plugin)";
+    AddTrack "add_track" Global [c('a')] "add a track (then 1-9 picks its type: 8 a CLAP plugin, 9 the FM synth)";
     Plugins "plugins" Global [c('&')] "CLAP plugins: on the inserts page, one for the slot; elsewhere, a new track playing one; and what could not play";
     TempoDown "tempo_down" Global [c('t')] "tempo down";
     TempoUp "tempo_up" Global [c('T')] "tempo up";

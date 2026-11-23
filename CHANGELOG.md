@@ -6,6 +6,10 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+### Added
+- An FM synth: `a` `9` adds a track playing four sine operators per voice, 8 voices. Eight algorithms route them, from a chain of four to four heard side by side; operator 4 can modulate itself (feedback). Each operator has a frequency ratio (0.25 to 16, in quarters), a detune of up to a semitone either way, a level (how loud a heard operator is, or how far a modulator moves what it modulates: up to two cycles), a velocity response and an envelope of its own, and the track bends by its `Bend range`. Where an operator's sidebands would pass 45 % of the sample rate, its modulation is turned down until they do not, so high notes grow duller rather than folding back; a heard operator above that fades out. `tinvo bench` has an FM scenario.
+- Project format 20: FM tracks (`track fm`). Format 19 files still load.
+
 ## [0.28.1] - 2026-11-22
 
 ### Fixed

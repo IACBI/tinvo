@@ -6,6 +6,7 @@
 //! and a plugin its instance in a box it is handed and hands back.
 
 mod drums;
+mod fm;
 mod sampler;
 mod synth;
 pub mod zone;
@@ -14,6 +15,7 @@ use crate::clap::PluginRef;
 use crate::clap::host::{Instance, NoteId, Role};
 use crate::clap::slot::PluginSlot;
 pub use drums::Drum;
+pub use fm::{FM_VOICES, FmSynth};
 pub use sampler::{HELD_NOTES, SAMPLER_VOICES, Sampler};
 use std::sync::Arc;
 pub use synth::{PolySynth, SYNTH_VOICES};
@@ -25,6 +27,7 @@ pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
         InstrumentKind::Synth if index == synth::p::LFO_SYNC => 12,
         InstrumentKind::Synth if index >= synth::p::BEND_RANGE => 13,
         InstrumentKind::Sampler if index >= sampler::BEND_RANGE => 13,
+        InstrumentKind::Fm => 20,
         _ => 1,
     }
 }
@@ -39,13 +42,15 @@ pub enum InstrumentKind {
     HatClosed,
     HatOpen,
     Clap,
+    /// The four-operator FM synth.
+    Fm,
     /// A CLAP plugin, by its id. Not in [`InstrumentKind::ALL`], which is
     /// the built-in kinds.
     Plugin(PluginRef),
 }
 
 impl InstrumentKind {
-    pub const ALL: [InstrumentKind; 7] = [
+    pub const ALL: [InstrumentKind; 8] = [
         InstrumentKind::Synth,
         InstrumentKind::Kick,
         InstrumentKind::Snare,
@@ -53,6 +58,7 @@ impl InstrumentKind {
         InstrumentKind::HatOpen,
         InstrumentKind::Clap,
         InstrumentKind::Sampler,
+        InstrumentKind::Fm,
     ];
 
     /// Stable identifier used in project files; `plugin` for every plugin,
@@ -67,11 +73,21 @@ impl InstrumentKind {
             InstrumentKind::HatClosed => "hat",
             InstrumentKind::HatOpen => "openhat",
             InstrumentKind::Clap => "clap",
+            InstrumentKind::Fm => "fm",
         }
     }
 
     pub fn from_id(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.id() == id)
+    }
+
+    /// The project format that introduced it.
+    pub fn since(self) -> u32 {
+        match self {
+            InstrumentKind::Fm => 20,
+            InstrumentKind::Plugin(_) => 16,
+            _ => 1,
+        }
     }
 
     /// Human-readable name.
@@ -84,6 +100,7 @@ impl InstrumentKind {
             InstrumentKind::HatClosed => "Hi-hat",
             InstrumentKind::HatOpen => "Open hat",
             InstrumentKind::Clap => "Clap",
+            InstrumentKind::Fm => "FM",
             InstrumentKind::Plugin(_) => "Plugin",
         }
     }
@@ -95,6 +112,7 @@ impl InstrumentKind {
             InstrumentKind::Plugin(_) => &[],
             InstrumentKind::Synth => &synth::PARAMS,
             InstrumentKind::Sampler => &sampler::PARAMS,
+            InstrumentKind::Fm => &fm::PARAMS,
             k => drums::params(k),
         }
     }
@@ -108,7 +126,10 @@ impl InstrumentKind {
     }
 
     pub fn is_drum(self) -> bool {
-        !matches!(self, InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_))
+        !matches!(
+            self,
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_)
+        )
     }
 
     /// The plugin it is, for a plugin.
@@ -171,7 +192,7 @@ pub struct ParamSpec {
 pub const SILENT_DB: f32 = -60.0;
 
 /// Most parameters any instrument has.
-pub const MAX_PARAMS: usize = 32;
+pub const MAX_PARAMS: usize = 40;
 
 impl ParamSpec {
     pub const fn linear(
@@ -302,6 +323,7 @@ impl VoiceId {
 #[allow(clippy::large_enum_variant)]
 pub enum Instrument {
     Synth(PolySynth),
+    Fm(FmSynth),
     Sampler(Sampler),
     Drum(Drum),
     /// Silent until an instance is attached ([`Instrument::attach`]).
@@ -315,6 +337,7 @@ impl Instrument {
                 Instrument::Plugin(PluginSlot::new(r, Role::Instrument, f64::from(sample_rate)))
             }
             InstrumentKind::Synth => Instrument::Synth(PolySynth::new(sample_rate)),
+            InstrumentKind::Fm => Instrument::Fm(FmSynth::new(sample_rate)),
             InstrumentKind::Sampler => Instrument::Sampler(Sampler::new(sample_rate)),
             k => Instrument::Drum(Drum::new(k, sample_rate)),
         }
@@ -323,6 +346,7 @@ impl Instrument {
     pub fn kind(&self) -> InstrumentKind {
         match self {
             Instrument::Synth(_) => InstrumentKind::Synth,
+            Instrument::Fm(_) => InstrumentKind::Fm,
             Instrument::Sampler(_) => InstrumentKind::Sampler,
             Instrument::Drum(d) => d.kind(),
             Instrument::Plugin(p) => InstrumentKind::Plugin(p.plugin()),
@@ -333,6 +357,7 @@ impl Instrument {
     pub fn set_param(&mut self, index: usize, value: f32) {
         match self {
             Instrument::Synth(s) => s.set_param(index, value),
+            Instrument::Fm(s) => s.set_param(index, value),
             Instrument::Sampler(s) => s.set_param(index, value),
             Instrument::Drum(d) => d.set_param(index, value),
             Instrument::Plugin(_) => {}
@@ -342,6 +367,7 @@ impl Instrument {
     pub fn param(&self, index: usize) -> Option<f32> {
         match self {
             Instrument::Synth(s) => s.param(index),
+            Instrument::Fm(s) => s.param(index),
             Instrument::Sampler(s) => s.param(index),
             Instrument::Drum(d) => d.param(index),
             Instrument::Plugin(_) => None,
@@ -351,6 +377,7 @@ impl Instrument {
     pub fn note_on(&mut self, note: u8, velocity: u8) -> VoiceId {
         match self {
             Instrument::Synth(s) => s.note_on(note, velocity),
+            Instrument::Fm(s) => s.note_on(note, velocity),
             Instrument::Sampler(s) => s.note_on(note, velocity),
             Instrument::Drum(d) => {
                 d.trigger(note, velocity);
@@ -367,6 +394,7 @@ impl Instrument {
     pub fn note_off(&mut self, id: VoiceId) {
         match self {
             Instrument::Synth(s) => s.note_off(id),
+            Instrument::Fm(s) => s.note_off(id),
             Instrument::Sampler(s) => s.note_off(id),
             Instrument::Drum(_) => {}
             Instrument::Plugin(p) => {
@@ -398,6 +426,7 @@ impl Instrument {
     pub fn set_bend(&mut self, amount: f32) {
         match self {
             Instrument::Synth(s) => s.set_bend(amount),
+            Instrument::Fm(s) => s.set_bend(amount),
             Instrument::Sampler(s) => s.set_bend(amount),
             Instrument::Drum(_) | Instrument::Plugin(_) => {}
         }
@@ -415,7 +444,7 @@ impl Instrument {
         match self {
             Instrument::Synth(s) => s.start(),
             Instrument::Sampler(s) => s.start(),
-            Instrument::Drum(_) | Instrument::Plugin(_) => {}
+            Instrument::Fm(_) | Instrument::Drum(_) | Instrument::Plugin(_) => {}
         }
     }
 
@@ -423,6 +452,7 @@ impl Instrument {
     pub fn release_all(&mut self) {
         match self {
             Instrument::Synth(s) => s.release_all(),
+            Instrument::Fm(s) => s.release_all(),
             Instrument::Sampler(s) => s.release_all(),
             Instrument::Drum(_) => {}
             Instrument::Plugin(p) => {
@@ -438,6 +468,7 @@ impl Instrument {
     pub fn stop_all(&mut self) {
         match self {
             Instrument::Synth(s) => s.stop_all(),
+            Instrument::Fm(s) => s.stop_all(),
             Instrument::Sampler(s) => s.stop_all(),
             Instrument::Drum(d) => d.stop(),
             Instrument::Plugin(p) => {
@@ -469,7 +500,7 @@ impl Instrument {
 
     /// Whether this instrument responds to note-off at all.
     pub fn uses_note_off(&self) -> bool {
-        matches!(self, Instrument::Synth(_) | Instrument::Sampler(_) | Instrument::Plugin(_))
+        matches!(self, Instrument::Synth(_) | Instrument::Fm(_) | Instrument::Sampler(_) | Instrument::Plugin(_))
     }
 
     /// Whether it plays in stereo ([`Instrument::render_stereo`]) rather
@@ -483,6 +514,7 @@ impl Instrument {
     pub fn render(&mut self, out: &mut [f32]) {
         match self {
             Instrument::Synth(s) => s.render(out),
+            Instrument::Fm(s) => s.render(out),
             Instrument::Sampler(s) => s.render(out),
             Instrument::Drum(d) => d.render(out),
             Instrument::Plugin(_) => {}

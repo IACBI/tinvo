@@ -107,7 +107,7 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 19;
+pub const FORMAT_VERSION: u32 = 20;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -2047,9 +2047,9 @@ impl Project {
                 "track" => {
                     let kind = match plugin_id(rest, ver) {
                         Some(id) => InstrumentKind::Plugin(plugin_ref(id).map_err(err)?),
-                        None => {
-                            InstrumentKind::from_id(rest).ok_or_else(|| err(format!("unknown instrument '{rest}'")))?
-                        }
+                        None => InstrumentKind::from_id(rest)
+                            .filter(|k| k.since() <= ver)
+                            .ok_or_else(|| err(format!("unknown instrument '{rest}'")))?,
                     };
                     current = Some(TrackData::new(kind));
                     pattern = 0;
@@ -4310,6 +4310,25 @@ pattern_division A 1/8
             let e = Project::from_text(text).unwrap_err();
             assert!(e.line == line && e.message.contains(what), "{text}: {e:?}");
         }
+    }
+
+    #[test]
+    fn fm_tracks_save_and_load_from_format_20() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Fm)).unwrap();
+        let specs = InstrumentKind::Fm.params();
+        let at = |id: &str| specs.iter().position(|s| s.id == id).unwrap() as u8;
+        for (id, value) in [("algorithm", 4.0), ("feedback", 0.4), ("op4_ratio", 3.5), ("op3_level", 0.7)] {
+            p.apply(Edit::SetParam { track: 0, index: at(id), value }).unwrap();
+        }
+        let text = p.to_text();
+        assert!(text.contains("\ntrack fm\n") && text.contains("\nparam op4_ratio 3.5\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        // Older formats know no FM synth or its parameters.
+        let e = Project::from_text("tinvo 19\ntrack fm\nend").unwrap_err();
+        assert!(e.line == 2 && e.message.contains("unknown instrument"), "{e:?}");
+        let e = Project::from_text("tinvo 20\ntrack synth\nparam op1_level 1\nend").unwrap_err();
+        assert!(e.line == 3 && e.message.contains("unknown parameter"), "{e:?}");
     }
 
     #[test]

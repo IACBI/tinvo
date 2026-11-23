@@ -123,6 +123,16 @@ impl Adsr {
         self.stage != Stage::Idle
     }
 
+    /// The highest level it can reach from here until the gate changes.
+    pub fn peak_ahead(&self) -> f32 {
+        match self.stage {
+            Stage::Idle => 0.0,
+            Stage::Attack => 1.0,
+            Stage::Decay => self.level.max(self.sustain),
+            Stage::Release | Stage::Stop => self.level,
+        }
+    }
+
     pub fn stage(&self) -> Stage {
         self.stage
     }
