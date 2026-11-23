@@ -3,14 +3,20 @@
 //! state-variable filter with its own envelope, then an amplitude envelope.
 //! A free-running LFO can modulate pitch, pulse width, cutoff and level;
 //! glide slides each new note from the previously played pitch.
+//!
+//! Either oscillator can instead play a wavetable, built in or the track's
+//! WAV file, moving through its frames by a position that the LFO, the
+//! filter envelope and the mod wheel can move.
 
-use super::{ParamSpec, Unit, VoiceId};
+use super::{ParamSpec, SampleMap, Unit, VoiceId};
 use crate::dsp::env::{Adsr, AdsrParams};
 use crate::dsp::filter::{FilterMode, Svf};
 use crate::dsp::noise::Rng;
 use crate::dsp::osc::{Oscillator, Waveform};
+use crate::dsp::wavetable::{self, BUILT_IN, Mip, Wavetable};
 use crate::dsp::{midi_to_hz, semitones_to_ratio, velocity_to_gain};
 use std::f64::consts::TAU;
+use std::sync::Arc;
 
 pub const SYNTH_VOICES: usize = 8;
 /// Most oscillator copies per voice for unison.
@@ -21,7 +27,11 @@ const VOICE_GAIN: f32 = 0.3;
 /// Control values (LFO) are computed per chunk of this many samples.
 const CHUNK: usize = 64;
 
-const WAVES: &[&str] = &["saw", "square", "tri", "sine"];
+const WAVES: &[&str] = &["saw", "square", "tri", "sine", "table"];
+/// The position of "table" in [`WAVES`].
+const TABLE_WAVE: usize = 4;
+/// The built-in tables, then the track's file.
+const TABLES: &[&str] = &["basic", "pulse", "sync", "fold", "file"];
 const FILTERS: &[&str] = &["lowpass", "bandpass", "highpass"];
 const LFO_WAVES: &[&str] = &["sine", "tri", "saw", "square", "s&h"];
 const UNISON: &[&str] = &["1", "2", "3", "4"];
@@ -35,12 +45,35 @@ const LFO_SYNC_BEATS: [f32; 14] =
     [0.125, 1.0 / 6.0, 0.25, 0.375, 1.0 / 3.0, 0.5, 0.75, 2.0 / 3.0, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
 /// What the mod wheel moves. Files store the position, so new targets go
 /// at the end.
-const WHEEL_TARGETS: &[&str] =
-    &["off", "cutoff", "resonance", "env amt", "osc mix", "noise", "PW", "LFO>pitch", "LFO>cut", "LFO>level", "LFO>PW"];
+const WHEEL_TARGETS: &[&str] = &[
+    "off",
+    "cutoff",
+    "resonance",
+    "env amt",
+    "osc mix",
+    "noise",
+    "PW",
+    "LFO>pitch",
+    "LFO>cut",
+    "LFO>level",
+    "LFO>PW",
+    "WT pos",
+];
 /// The parameter of each [`WHEEL_TARGETS`] after "off". Each is read once
 /// per chunk, so the wheel reaches it at once.
-const WHEEL_PARAMS: [usize; 10] =
-    [p::CUTOFF, p::RESO, p::ENV_AMT, p::MIX, p::NOISE, p::PW, p::LFO_PITCH, p::LFO_CUTOFF, p::LFO_AMP, p::PWM];
+const WHEEL_PARAMS: [usize; 11] = [
+    p::CUTOFF,
+    p::RESO,
+    p::ENV_AMT,
+    p::MIX,
+    p::NOISE,
+    p::PW,
+    p::LFO_PITCH,
+    p::LFO_CUTOFF,
+    p::LFO_AMP,
+    p::PWM,
+    p::WT_POS,
+];
 const MIN_PW: f32 = 0.05;
 const MAX_PW: f32 = 0.95;
 
@@ -81,7 +114,12 @@ pub(crate) mod p {
     // Added in format 13.
     pub const BEND_RANGE: usize = 30;
     pub const WHEEL: usize = 31;
-    pub const COUNT: usize = 32;
+    // Added in format 20.
+    pub const TABLE: usize = 32;
+    pub const WT_POS: usize = 33;
+    pub const LFO_POS: usize = 34;
+    pub const ENV_POS: usize = 35;
+    pub const COUNT: usize = 36;
 }
 
 /// Semitone-sized steps for frequencies, ~10 % steps for times.
@@ -121,6 +159,10 @@ pub static PARAMS: [ParamSpec; p::COUNT] = [
     ParamSpec::stepped("lfo_sync", "LFO sync", LFO_SYNC, 0.0),
     ParamSpec::linear("bend_range", "Bend range", 0.0, 24.0, 2.0, 1.0, Unit::Semitones),
     ParamSpec::stepped("wheel", "Mod wheel", WHEEL_TARGETS, 1.0),
+    ParamSpec::stepped("wavetable", "Wavetable", TABLES, 0.0),
+    ParamSpec::linear("wt_position", "WT pos", 0.0, 1.0, 0.0, 0.01, Unit::None),
+    ParamSpec::linear("lfo_position", "LFO>WT pos", 0.0, 1.0, 0.0, 0.01, Unit::None),
+    ParamSpec::linear("env_position", "Env>WT pos", -1.0, 1.0, 0.0, 0.01, Unit::None),
 ];
 
 /// Glide covers 99 % of the interval in the glide time.
@@ -225,7 +267,16 @@ pub struct PolySynth {
     tempo: f32,
     wave1: Waveform,
     wave2: Waveform,
+    /// Whether each oscillator plays the wavetable.
+    table1: bool,
+    table2: bool,
+    /// The track's file, whose table plays when "file" is chosen.
+    map: Option<Arc<SampleMap>>,
     osc2_ratio: f32,
+    /// `log2` of `osc2_ratio` and of each `unison_ratio`: how far each
+    /// copy's table levels lie from the note's.
+    osc2_octaves: f32,
+    unison_octaves: [f32; MAX_UNISON],
     mode: FilterMode,
     glide_coef: f32,
     /// Active unison copies and their frequency ratios.
@@ -254,7 +305,12 @@ impl PolySynth {
             tempo: 120.0,
             wave1: Waveform::Saw,
             wave2: Waveform::Saw,
+            table1: false,
+            table2: false,
+            map: None,
             osc2_ratio: 1.0,
+            osc2_octaves: 0.0,
+            unison_octaves: [0.0; MAX_UNISON],
             mode: FilterMode::LowPass,
             glide_coef: 0.0,
             unison: 1,
@@ -280,6 +336,13 @@ impl PolySynth {
 
     pub fn param(&self, index: usize) -> Option<f32> {
         self.params.get(index).copied()
+    }
+
+    /// Gives the synth its file's wavetable and returns what it replaces,
+    /// to be disposed of off the audio thread.
+    #[must_use]
+    pub fn set_samples(&mut self, map: Option<Arc<SampleMap>>) -> Option<Arc<SampleMap>> {
+        std::mem::replace(&mut self.map, map)
     }
 
     pub fn set_tempo(&mut self, bpm: f32) {
@@ -333,7 +396,10 @@ impl PolySynth {
         let pr = &self.params;
         self.wave1 = Waveform::from_index(pr[p::WAVE1] as usize);
         self.wave2 = Waveform::from_index(pr[p::WAVE2] as usize);
+        self.table1 = pr[p::WAVE1] as usize == TABLE_WAVE;
+        self.table2 = pr[p::WAVE2] as usize == TABLE_WAVE;
         self.osc2_ratio = semitones_to_ratio(pr[p::SEMI] + pr[p::FINE] * 0.01);
+        self.osc2_octaves = self.osc2_ratio.log2();
         self.mode = FilterMode::from_index(pr[p::MODE] as usize);
         let glide = pr[p::GLIDE];
         self.glide_coef = if glide > 0.0 { (-GLIDE_NEPERS / (glide * self.sample_rate)).exp() } else { 0.0 };
@@ -346,6 +412,9 @@ impl PolySynth {
             *r = semitones_to_ratio(spread * pr[p::DETUNE] * 0.01);
         }
         self.unison_gain = 1.0 / (u as f32).sqrt();
+        for (o, r) in self.unison_octaves.iter_mut().zip(&self.unison_ratio) {
+            *o = r.log2();
+        }
         let amp = AdsrParams { attack: pr[p::A_A], decay: pr[p::A_D], sustain: pr[p::A_S], release: pr[p::A_R] };
         let flt = AdsrParams { attack: pr[p::F_A], decay: pr[p::F_D], sustain: pr[p::F_S], release: pr[p::F_R] };
         let sr = self.sample_rate;
@@ -468,11 +537,39 @@ impl PolySynth {
         let (w1, w2, mode, ratio, glide) = (self.wave1, self.wave2, self.mode, self.osc2_ratio, self.glide_coef);
         let (pw, pwm, noise) = (pr[p::PW], pr[p::PWM], pr[p::NOISE]);
         let (u, uni_ratio, uni_gain) = (self.unison, self.unison_ratio, self.unison_gain);
-        let incs = |f: f32, inc1: &mut [f64; MAX_UNISON], inc2: &mut [f64; MAX_UNISON]| {
+        let (uni_octaves, osc2_octaves) = (self.unison_octaves, self.osc2_octaves);
+        let (t1, t2) = (self.table1, self.table2);
+        // Without its file (or the built-ins, before they are built), a
+        // table oscillator is silent; its phase runs on all the same.
+        let table: Option<&Wavetable> = match pr[p::TABLE] as usize {
+            i if i < BUILT_IN.len() => wavetable::built_in(i),
+            _ => self.map.as_deref().and_then(SampleMap::table),
+        };
+        let (wt_pos, lfo_pos, env_pos) = (pr[p::WT_POS], pr[p::LFO_POS], pr[p::ENV_POS]);
+        // The table levels of a pitch capped at `max_hz`, as a logarithm.
+        let lowest = (0.5 * sr / max_hz).log2();
+        let incs = |f: f32, inc: &mut [[f64; MAX_UNISON]; 2], mip: &mut [[Mip; MAX_UNISON]; 2]| {
+            // The levels take a logarithm of the pitch: one for every copy,
+            // and only for a table.
+            let room = if t1 || t2 { (0.5 * sr / f).log2() } else { 0.0 };
             for k in 0..u {
                 let fk = f * uni_ratio[k];
-                inc1[k] = f64::from(fk.min(max_hz) / sr);
-                inc2[k] = f64::from((fk * ratio).min(max_hz) / sr);
+                inc[0][k] = f64::from(fk.min(max_hz) / sr);
+                inc[1][k] = f64::from((fk * ratio).min(max_hz) / sr);
+                if t1 {
+                    mip[0][k] = Mip::from_log2(f64::from((room - uni_octaves[k]).max(lowest)));
+                }
+                if t2 {
+                    mip[1][k] = Mip::from_log2(f64::from((room - uni_octaves[k] - osc2_octaves).max(lowest)));
+                }
+            }
+        };
+        let read = |osc: &mut Oscillator, wave: Waveform, on_table: bool, inc: f64, mip: &Mip, width: f64, pos: f32| {
+            if on_table {
+                let phase = osc.advance(inc);
+                table.map_or(0.0, |t| t.read(phase, pos, mip))
+            } else {
+                osc.next(wave, inc, width)
             }
         };
 
@@ -497,9 +594,10 @@ impl PolySynth {
             let cutoff_base = base_cutoff * (vel_cut * (v.vel_norm - 1.0)).exp2();
             // Pitch only needs per-sample work while gliding or modulated.
             let static_pitch = v.pitch == target && lfo_pitch == 0.0;
-            let (mut inc1, mut inc2) = ([0.0; MAX_UNISON], [0.0; MAX_UNISON]);
+            let mut inc = [[0.0; MAX_UNISON]; 2];
+            let mut mip = [[Mip::default(); MAX_UNISON]; 2];
             if static_pitch {
-                incs(midi_to_hz(target + bend), &mut inc1, &mut inc2);
+                incs(midi_to_hz(target + bend), &mut inc, &mut mip);
             }
             for (o, &l) in out.iter_mut().zip(&lfo) {
                 if !static_pitch {
@@ -509,18 +607,21 @@ impl PolySynth {
                             v.pitch = target;
                         }
                     }
-                    incs(midi_to_hz(v.pitch + bend + l * lfo_pitch), &mut inc1, &mut inc2);
+                    incs(midi_to_hz(v.pitch + bend + l * lfo_pitch), &mut inc, &mut mip);
                 }
                 let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
+                let fe = v.fenv.tick();
+                let pos = wt_pos + lfo_pos * l + env_pos * fe;
                 let mut s = 0.0;
                 for k in 0..u {
-                    s += v.osc1[k].next(w1, inc1[k], width) * (1.0 - mix) + v.osc2[k].next(w2, inc2[k], width) * mix;
+                    let a = read(&mut v.osc1[k], w1, t1, inc[0][k], &mip[0][k], width, pos);
+                    let b = read(&mut v.osc2[k], w2, t2, inc[1][k], &mip[1][k], width, pos);
+                    s += a * (1.0 - mix) + b * mix;
                 }
                 s *= uni_gain;
                 if noise > 0.0 {
                     s += noise * v.noise.bipolar();
                 }
-                let fe = v.fenv.tick();
                 v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
                 let y = v.filter.process(s, mode);
                 let a = v.amp.tick() * (1.0 - lfo_amp * 0.5 * (1.0 - l));
@@ -647,6 +748,139 @@ mod tests {
         };
         assert!(render(57, 1.0) == render(69, 0.0));
         assert!((freq(&render(69, -0.5)[480..]) - 440.0 / 2f32.sqrt()).abs() < 1.5);
+    }
+
+    /// [`sine_synth`] with oscillator 1 on built-in table `table` at
+    /// position `pos`.
+    fn table_synth(table: usize, pos: f32) -> PolySynth {
+        wavetable::prepare();
+        let mut s = sine_synth();
+        s.set_param(p::WAVE1, TABLE_WAVE as f32);
+        s.set_param(p::TABLE, table as f32);
+        s.set_param(p::WT_POS, pos);
+        s
+    }
+
+    fn play(s: &mut PolySynth, note: u8, n: usize) -> Vec<f32> {
+        s.note_on(note, 127);
+        let mut out = vec![0.0; n];
+        s.render(&mut out);
+        out
+    }
+
+    #[test]
+    fn the_wavetable_names_line_up() {
+        assert_eq!(WAVES[TABLE_WAVE], "table");
+        assert_eq!(TABLES[..BUILT_IN.len()], BUILT_IN);
+        assert_eq!(TABLES.len(), BUILT_IN.len() + 1);
+        assert_eq!(WHEEL_TARGETS.len(), WHEEL_PARAMS.len() + 1);
+        assert_eq!(WHEEL_PARAMS[WHEEL_TARGETS.iter().position(|&t| t == "WT pos").unwrap() - 1], p::WT_POS);
+    }
+
+    #[test]
+    fn a_table_oscillator_plays_its_table_in_tune() {
+        // At position 0 the basic table is a sine; at 2/3, a saw.
+        let sine = play(&mut table_synth(0, 0.0), 69, 48_000);
+        let crossings = sine[4800..].windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        assert!((crossings as i64 - 396).abs() <= 1, "{crossings}");
+        let h2 = |out: &[f32]| magnitude(&out[4800..43_200], 880.0) / magnitude(&out[4800..43_200], 440.0);
+        assert!(h2(&sine) < 1e-3, "{}", h2(&sine));
+        let saw = play(&mut table_synth(0, 2.0 / 3.0), 69, 48_000);
+        assert!((h2(&saw) - 0.5).abs() < 0.02, "{}", h2(&saw));
+        // The second oscillator plays it too, at its own pitch.
+        let mut s = table_synth(0, 0.0);
+        s.set_param(p::WAVE1, 3.0);
+        s.set_param(p::WAVE2, TABLE_WAVE as f32);
+        s.set_param(p::MIX, 1.0);
+        s.set_param(p::SEMI, 12.0);
+        s.set_param(p::FINE, 0.0);
+        let up = play(&mut s, 57, 48_000);
+        assert!((freq(&up[4800..]) - 440.0).abs() < 1.0, "{}", freq(&up[4800..]));
+        assert!(h2(&up) < 1e-3);
+    }
+
+    #[test]
+    fn the_lfo_the_envelope_and_the_wheel_move_the_position() {
+        // Each moves the position from 0 to a half, as setting it does.
+        let half = play(&mut table_synth(0, 0.5), 60, 24_000);
+        let corner = play(&mut table_synth(0, 0.0), 60, 24_000);
+        assert!(half != corner);
+        let mut lfo = table_synth(0, 0.0);
+        // A square LFO is +1 for its first half cycle, ten seconds here.
+        lfo.set_param(p::LFO_WAVE, 3.0);
+        lfo.set_param(p::LFO_RATE, 0.05);
+        lfo.set_param(p::LFO_POS, 0.5);
+        assert!(play(&mut lfo, 60, 24_000) == half);
+        // The filter envelope, held at full, puts it there once its attack
+        // is over.
+        let mut env = table_synth(0, 0.0);
+        env.set_param(p::F_S, 1.0);
+        env.set_param(p::ENV_POS, 0.5);
+        let out = play(&mut env, 60, 24_000);
+        assert!(out[200..] == half[200..] && out[..50] != half[..50]);
+        // Downwards from the top too.
+        let mut down = table_synth(0, 1.0);
+        down.set_param(p::F_S, 1.0);
+        down.set_param(p::ENV_POS, -0.5);
+        assert!(play(&mut down, 60, 24_000)[200..] == half[200..]);
+        let mut wheel = table_synth(0, 0.0);
+        wheel.set_param(p::WHEEL, WHEEL_TARGETS.iter().position(|&t| t == "WT pos").unwrap() as f32);
+        wheel.set_wheel(0.5);
+        assert!(play(&mut wheel, 60, 24_000) == half);
+    }
+
+    #[test]
+    fn a_file_table_plays_once_it_is_given() {
+        let mut s = table_synth(TABLES.len() - 1, 0.0);
+        assert!(play(&mut s, 60, 4800).iter().all(|&x| x == 0.0), "no file, no sound");
+        let cycle: Vec<f32> = (0..600).map(|i| (std::f32::consts::TAU * i as f32 / 600.0).sin()).collect();
+        let map = Arc::new(SampleMap::wavetable(Wavetable::from_audio(&cycle).unwrap()));
+        assert!(s.set_samples(Some(map.clone())).is_none());
+        s.release_all();
+        let out = play(&mut s, 69, 48_000);
+        assert!((freq(&out[4800..]) - 440.0).abs() < 1.0);
+        // A map with no table (a sampler's) is silence too, and the one it
+        // replaces comes back.
+        let zones = Arc::new(SampleMap::new([]));
+        let back = s.set_samples(Some(zones)).unwrap();
+        assert!(Arc::ptr_eq(&back, &map));
+        s.stop_all();
+        let mut quiet = vec![0.0; 4800];
+        s.render(&mut quiet);
+        assert!(play(&mut s, 60, 4800)[480..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn a_high_table_note_does_not_fold_back() {
+        use crate::dsp::fft::power_spectrum;
+        let hz = midi_to_hz(100.0);
+        let alias_db = |out: &[f32]| {
+            let p = power_spectrum(out);
+            let bin = SR / out.len() as f32;
+            let (mut total, mut alias) = (0.0, 0.0);
+            for (k, &e) in p.iter().enumerate().skip(1) {
+                total += e;
+                let f = k as f32 * bin;
+                let h = (f / hz).round();
+                if h < 1.0 || (f - h * hz).abs() > 8.0 * bin {
+                    alias += e;
+                }
+            }
+            10.0 * (alias / total).log10()
+        };
+        // The sync table near its brightest; the same note on the saw.
+        let table = play(&mut table_synth(2, 0.9), 100, 1 << 15);
+        let db = alias_db(&table[4096..4096 + (1 << 14)]);
+        assert!(db < -70.0, "{db:.1} dB");
+        let mut saw = sine_synth();
+        saw.set_param(p::WAVE1, 0.0);
+        let saw = play(&mut saw, 100, 1 << 15);
+        assert!(alias_db(&saw[4096..4096 + (1 << 14)]) > db + 20.0);
+        // A pitch moving each sample works out its levels each sample.
+        let mut moving = table_synth(2, 0.9);
+        moving.set_param(p::LFO_PITCH, 1e-6);
+        let moving = play(&mut moving, 100, 1 << 15);
+        assert!(alias_db(&moving[4096..4096 + (1 << 14)]) < -70.0);
     }
 
     /// A pure sine through an open filter: makes pitch directly measurable.

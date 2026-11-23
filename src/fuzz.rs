@@ -40,6 +40,7 @@
 //! files) keep most inputs close to valid, where most of the code is.
 
 use crate::dsp::noise::Rng;
+use crate::dsp::wavetable::{Mip, Wavetable};
 use crate::engine::{
     ChainId, Command, Division, Edit, Engine, LaneTarget, MAX_PATTERNS, MAX_SONG, MAX_STEPS, MAX_TRACKS, Meter, Part,
     Shared, Step,
@@ -653,6 +654,10 @@ fn project_seeds() -> Vec<Vec<u8>> {
     .into();
     sampler.steps[15][63] = Some(Step::new(127, 127, 64));
     rich.tracks.push(sampler);
+    let mut table = TrackData::new(InstrumentKind::Synth);
+    table.sample = Some("tables/sweep one.wav".into());
+    table.params[0] = 4.0;
+    rich.tracks.push(table);
     let mut texts = vec![Project::new().to_text(), Project::demo().to_text(), rich.to_text()];
     texts.extend(
         [
@@ -1207,9 +1212,49 @@ fn mutate_wav(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
     }
 }
 
+/// The wavetable `audio` makes: as many frames as it says it will hold,
+/// and no read of it, at any pitch or position, past full scale.
+fn check_table(audio: &[f32]) -> Result<(), String> {
+    let table = Wavetable::from_audio(audio);
+    let frames = table.as_ref().map_or(0, Wavetable::frames);
+    if frames != Wavetable::frames_from(audio.len()) {
+        return Err(format!("a table of {frames} frames from {} samples", audio.len()));
+    }
+    let Some(t) = table else { return Ok(()) };
+    for inc in [0.0, 1e-4, 0.003, 0.05, 0.2, 0.45] {
+        let mip = Mip::for_inc(inc);
+        for k in 0..97 {
+            let (phase, pos) = (f64::from(k) / 97.0, (k % 13) as f32 / 12.0);
+            let y = t.read(phase, pos, &mip);
+            if y.is_nan() || y.abs() > 1.0 {
+                return Err(format!("the table reads {y} at phase {phase}, position {pos}, step {inc}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A sampler track that plays the sample at the extremes of pitch.
 fn sampler_project(heavy: bool, choices: u64) -> Project {
-    let kind = InstrumentKind::Sampler;
+    extremes_project(InstrumentKind::Sampler, heavy, choices)
+}
+
+/// A synth track whose oscillators both play its file's wavetable, at the
+/// extremes of pitch.
+fn table_project(heavy: bool, choices: u64) -> Project {
+    let mut p = extremes_project(InstrumentKind::Synth, heavy, choices);
+    let specs = InstrumentKind::Synth.params();
+    for (id, value) in [("osc1_wave", 4.0), ("osc2_wave", 4.0), ("wavetable", 4.0)] {
+        let index = specs.iter().position(|s| s.id == id).expect("a synth parameter") as u8;
+        p.apply(Edit::SetParam { track: 0, index, value }).expect("a synth parameter");
+    }
+    p
+}
+
+/// A `kind` track playing notes at the extremes of pitch; `heavy`, with
+/// its parameters at extremes chosen by `choices`, and the strip and buses
+/// driven hard.
+fn extremes_project(kind: InstrumentKind, heavy: bool, choices: u64) -> Project {
     let mut p = Project::new();
     let set = |p: &mut Project, edit: Edit| {
         p.apply(edit).unwrap_or_else(|e| panic!("{edit:?}: {e}"));
@@ -1224,7 +1269,7 @@ fn sampler_project(heavy: bool, choices: u64) -> Project {
         // Every instrument parameter at its minimum, maximum or default.
         for i in 0..n {
             let spec = &kind.params()[i];
-            let value = [spec.min, spec.max, spec.default][((choices >> (2 * i)) % 3) as usize];
+            let value = [spec.min, spec.max, spec.default][((choices >> (2 * i % 64)) % 3) as usize];
             set(&mut p, Edit::SetParam { track: 0, index: i as u8, value });
         }
         let strip = |i: usize| track_param(kind, n + i).expect("a strip parameter");
@@ -1314,13 +1359,22 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
     };
     if let Some(s) = &loaded {
         check_slices(s, hash_of(input))?;
+        check_table(s.audio())?;
     }
     if render {
         if let Some(s) = loaded {
             let single = Arc::new(SampleMap::single(s.clone()));
             render_check(&sampler_project(false, 0), &[Some(single.clone())])?;
             render_check(&sampler_project(true, hash_of(input)), &[Some(single)])?;
-            render_check(&sampler_project(true, hash_of(input)), &[Some(Arc::new(fuzz_zones(s, hash_of(input))))])?;
+            render_check(
+                &sampler_project(true, hash_of(input)),
+                &[Some(Arc::new(fuzz_zones(s.clone(), hash_of(input))))],
+            )?;
+            if let Some(table) = Wavetable::from_audio(s.audio()) {
+                let map = Some(Arc::new(SampleMap::wavetable(table)));
+                render_check(&table_project(false, 0), std::slice::from_ref(&map))?;
+                render_check(&table_project(true, hash_of(input)), &[map])?;
+            }
         }
     }
     let chunks = chunk_offsets(input);
@@ -1680,6 +1734,12 @@ fn check_edits(input: &[u8], render: bool) -> Result<Outcome, String> {
                 }
             }
             Action::Sample(t, path) => {
+                // A synth's file is its wavetable: no zones.
+                if let Some(t) = p.tracks.get_mut(t).filter(|t| t.kind == InstrumentKind::Synth) {
+                    if !path.is_empty() && sample::unstorable(&path).is_none() {
+                        t.sample = Some(path.clone());
+                    }
+                }
                 if let Some(t) = p.tracks.get_mut(t).filter(|t| t.kind == InstrumentKind::Sampler) {
                     if !path.is_empty() && sample::unstorable(&path).is_none() {
                         // A zone of the same file, placed by the path's length.

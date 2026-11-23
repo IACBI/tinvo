@@ -644,6 +644,13 @@ It comes in two parts, each merged on its own, and ships whole with 0.29.0.
 - 35 parameters, so an instrument may now have up to 40. Project format 20 (`track fm`).
 - Tests: sidebands against `J_n(β)`, every algorithm's routing, feedback's harmonics and its staying periodic at full, velocity per operator, envelopes per operator, stealing, callback sizes, and the folding with and without the limit. A bench scenario of 8 voices in a chain with feedback.
 
+#### 14b: Wavetables ✅
+
+- In the existing synth, not a new kind: a fifth wave, `table`, for either oscillator, and four parameters after the synth's others (the table, its position, LFO and filter envelope to the position) plus a mod wheel target for the position.
+- Four built-in tables (`basic`, `pulse`, `sync`, `fold`), built once before audio starts, since instruments are made on the audio thread. A WAV file loaded with `o` on a synth track is the track's `sample`, so it is saved, undone, budgeted, reloaded when missing and exported as a sampler's is; it reaches the engine as a table built off the audio thread and goes back to be freed there. Up to 2048 samples it is one cycle; longer, frames of 2048, at most 64, spread evenly over it.
+- Band-limited by mipmaps: each frame is kept at ten bandwidths (harmonics 1, 2, 4 ... 512), each inverse-transformed (`dsp::fft` gained the inverse) with at least 32 samples per period of its top harmonic, so the images linear interpolation makes stay faint. A pitch blends the two fullest levels below Nyquist, the fuller fading in as it falls, so the brightness never steps. What folds back from the built-in tables stays 70 dB down from 27 Hz to 11 kHz; at a high note the PolyBLEP saw folds back over 20 dB more.
+- Tests: the levels' harmonics and their blending as a pitch glides, a cycle's harmonics read back, frames spread over a long file, the built-in tables' spectra against their shapes, the aliasing of every table from low to high, the position moved by the LFO, the envelope and the wheel, a file table given and handed back, the load as one undo step, the format and fuzzing of tables from every WAV file the fuzzer reads. A bench scenario of both oscillators in unison on a table, the position and pitch swept.
+
 ### Phase 15: Audio tracks (large)
 
 For vocals, guitars and other live instruments: pop, rock, singer-songwriter.

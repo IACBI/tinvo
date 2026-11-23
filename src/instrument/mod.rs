@@ -25,6 +25,7 @@ pub use zone::SampleMap;
 pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
     match kind {
         InstrumentKind::Synth if index == synth::p::LFO_SYNC => 12,
+        InstrumentKind::Synth if index >= synth::p::TABLE => 20,
         InstrumentKind::Synth if index >= synth::p::BEND_RANGE => 13,
         InstrumentKind::Sampler if index >= sampler::BEND_RANGE => 13,
         InstrumentKind::Fm => 20,
@@ -479,13 +480,14 @@ impl Instrument {
         }
     }
 
-    /// Gives a sampler its samples and returns the ones they replace.
-    /// Other instruments hand them straight back. The result must be
-    /// disposed of off the audio thread.
+    /// Gives a sampler its samples, or a synth its file's wavetable, and
+    /// returns what they replace. Other instruments hand them straight back.
+    /// The result must be disposed of off the audio thread.
     #[must_use]
     pub fn set_samples(&mut self, map: Option<Arc<SampleMap>>) -> Option<Arc<SampleMap>> {
         match self {
             Instrument::Sampler(s) => s.set_samples(map),
+            Instrument::Synth(s) => s.set_samples(map),
             _ => map,
         }
     }
@@ -698,7 +700,8 @@ mod tests {
             let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();
             let sample = Arc::new(Sample::from_mono(&tone, 48_000).unwrap());
             let returned = inst.set_samples(Some(Arc::new(SampleMap::single(sample))));
-            assert_eq!(returned.is_some(), k != InstrumentKind::Sampler, "{k:?}");
+            let keeps = matches!(k, InstrumentKind::Sampler | InstrumentKind::Synth);
+            assert_eq!(returned.is_some(), !keeps, "{k:?}");
             inst.note_on(k.default_note(), 100);
             let mut buf = vec![0.0f32; 4800];
             inst.render(&mut buf);

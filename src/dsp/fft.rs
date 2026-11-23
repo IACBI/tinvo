@@ -1,4 +1,4 @@
-//! Radix-2 FFT used for spectral analysis (tests today, analyzers later).
+//! Radix-2 FFT: spectral analysis, and building band-limited wavetables.
 
 use std::f64::consts::PI;
 
@@ -23,15 +23,17 @@ pub fn fft(re: &mut [f64], im: &mut [f64]) {
         }
     }
 
+    // Twiddles are computed directly rather than by recurrence so error
+    // does not accumulate on long transforms; each stage reads every
+    // `n / len`-th of them.
+    let twiddles: Vec<(f64, f64)> = (0..n / 2).map(|k| (-2.0 * PI * k as f64 / n as f64).sin_cos()).collect();
     let mut len = 2;
     while len <= n {
         let half = len / 2;
-        let step = -2.0 * PI / len as f64;
+        let stride = n / len;
         for start in (0..n).step_by(len) {
             for k in 0..half {
-                // Twiddles are computed directly rather than by recurrence so
-                // error does not accumulate on long transforms.
-                let (wi, wr) = (step * k as f64).sin_cos();
+                let (wi, wr) = twiddles[k * stride];
                 let a = start + k;
                 let b = a + half;
                 let tr = re[b] * wr - im[b] * wi;
@@ -44,6 +46,16 @@ pub fn fft(re: &mut [f64], im: &mut [f64]) {
         }
         len <<= 1;
     }
+}
+
+/// The inverse of [`fft`], scaled by `1 / n` so that the two round-trip.
+pub fn ifft(re: &mut [f64], im: &mut [f64]) {
+    // The conjugate of the forward transform of the conjugate.
+    im.iter_mut().for_each(|x| *x = -*x);
+    fft(re, im);
+    let scale = 1.0 / re.len() as f64;
+    re.iter_mut().for_each(|x| *x *= scale);
+    im.iter_mut().for_each(|x| *x *= -scale);
 }
 
 /// Power spectrum (`|X[k]|^2`, bins `0..=n/2`) of a real signal after a
@@ -83,6 +95,29 @@ mod tests {
                 si += v * a.sin();
             }
             assert!((sr - re[k]).abs() < 1e-9 && (si - im[k]).abs() < 1e-9, "bin {k}");
+        }
+    }
+
+    #[test]
+    fn the_inverse_undoes_the_transform() {
+        let n = 256;
+        let x: Vec<f64> = (0..n).map(|i| ((i * 13 + 5) % 17) as f64 - 8.0).collect();
+        let y: Vec<f64> = (0..n).map(|i| ((i * 3 + 1) % 7) as f64).collect();
+        let (mut re, mut im) = (x.clone(), y.clone());
+        fft(&mut re, &mut im);
+        assert!(re.iter().zip(&x).any(|(a, b)| (a - b).abs() > 1.0), "the forward transform changed it");
+        ifft(&mut re, &mut im);
+        for i in 0..n {
+            assert!((re[i] - x[i]).abs() < 1e-9 && (im[i] - y[i]).abs() < 1e-9, "sample {i}");
+        }
+        // One harmonic in gives one cosine out, at the bin's amplitude.
+        let (mut re, mut im) = (vec![0.0; n], vec![0.0; n]);
+        re[3] = n as f64 / 2.0;
+        re[n - 3] = n as f64 / 2.0;
+        ifft(&mut re, &mut im);
+        for (i, &v) in re.iter().enumerate() {
+            let want = (2.0 * PI * 3.0 * i as f64 / n as f64).cos();
+            assert!((v - want).abs() < 1e-12 && im[i].abs() < 1e-12, "sample {i}");
         }
     }
 

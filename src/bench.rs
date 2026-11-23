@@ -51,7 +51,7 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 9] = [
+pub const SCENARIOS: [Scenario; 10] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
     Scenario {
@@ -68,6 +68,12 @@ pub const SCENARIOS: [Scenario; 9] = [
     },
     Scenario { id: "tracks32", label: "Demo song's tracks repeated to 32", budget: 0.5, build: tracks32 },
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
+    Scenario {
+        id: "wavetable",
+        label: "Synth on wavetables, 8 voices of both oscillators in unison 4, position and pitch swept",
+        budget: 0.25,
+        build: wavetable,
+    },
     Scenario {
         id: "fm",
         label: "FM synth, 8 voices of four operators in a chain, feedback on",
@@ -319,6 +325,29 @@ fn synth() -> Setup {
         &mut p,
         InstrumentKind::Synth,
         &[("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)],
+    );
+    chords(&mut p, 48, 2);
+    Setup { project: p, samples: Vec::new(), play: Command::Play }
+}
+
+/// The synth with both oscillators on a built-in table: the position moves
+/// every sample, and so does the pitch, so each copy works out its levels
+/// every sample too.
+fn wavetable() -> Setup {
+    let mut p = Project::new();
+    ok(p.apply(Edit::AddTrack(InstrumentKind::Synth)));
+    set(
+        &mut p,
+        InstrumentKind::Synth,
+        &[
+            ("osc1_wave", 4.0),
+            ("osc2_wave", 4.0),
+            ("wavetable", 2.0),
+            ("unison", 3.0),
+            ("lfo_pitch", 0.3),
+            ("lfo_position", 0.5),
+            ("env_position", 0.5),
+        ],
     );
     chords(&mut p, 48, 2);
     Setup { project: p, samples: Vec::new(), play: Command::Play }

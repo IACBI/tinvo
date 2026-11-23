@@ -797,8 +797,9 @@ pub enum Command {
         step: Step,
         frames: u32,
     },
-    /// Gives a sampler track its samples (other tracks ignore them). The
-    /// ones they replace go back through the retirement queue.
+    /// Gives a sampler track its samples, or a synth track its file's
+    /// wavetable (other tracks ignore them). What they replace goes back
+    /// through the retirement queue.
     SetSamples {
         track: u8,
         map: Option<Arc<SampleMap>>,
@@ -1855,6 +1856,7 @@ impl Engine {
     /// engine will ever use is allocated here.
     pub fn new(sample_rate: f32, shared: Arc<Shared>, commands: Option<Consumer<Command>>) -> Box<Self> {
         crate::sample::init();
+        crate::dsp::wavetable::prepare();
         let tracks: Vec<Track> = (0..MAX_TRACKS).map(|_| Track::new(InstrumentKind::Synth, sample_rate)).collect();
         Box::new(Self {
             sample_rate,

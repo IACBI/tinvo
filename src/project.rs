@@ -91,6 +91,7 @@
 //! and loading is lossless.
 
 use crate::clap::PluginRef;
+use crate::dsp::wavetable::Wavetable;
 use crate::engine::{ChainId, PluginAt};
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
@@ -253,9 +254,13 @@ impl TrackData {
     }
 
     /// What the track plays of the samples in `bank`: its sample over the
-    /// whole keyboard, then its zones, each whose file is there. `None` if
-    /// none is.
+    /// whole keyboard, then its zones, each whose file is there; for a synth
+    /// track, the wavetable its file makes. `None` if none is.
     pub fn sample_map(&self, bank: &Bank) -> Option<Arc<SampleMap>> {
+        if self.kind == InstrumentKind::Synth {
+            let sample = bank.get(self.sample.as_ref()?)?;
+            return Some(Arc::new(SampleMap::wavetable(Wavetable::from_audio(sample.audio())?)));
+        }
         let whole = self.sample.as_ref().and_then(|p| bank.get(p)).map(|s| (Placement::WHOLE, Arc::clone(s)));
         let zones = self.zones.iter().filter_map(|z| Some((z.place, Arc::clone(bank.get(&z.path)?))));
         let map = SampleMap::new(whole.into_iter().chain(zones));
@@ -1688,7 +1693,8 @@ impl Project {
                 match key {
                     "name" => t.name = sanitize_name(rest),
                     "sample" if ver >= 4 => {
-                        if t.kind != InstrumentKind::Sampler {
+                        let table = t.kind == InstrumentKind::Synth && ver >= 20;
+                        if t.kind != InstrumentKind::Sampler && !table {
                             return Err(err(format!("a {} track has no sample", t.kind.id())));
                         }
                         if rest.is_empty() {
@@ -4329,6 +4335,30 @@ pattern_division A 1/8
         assert!(e.line == 2 && e.message.contains("unknown instrument"), "{e:?}");
         let e = Project::from_text("tinvo 20\ntrack synth\nparam op1_level 1\nend").unwrap_err();
         assert!(e.line == 3 && e.message.contains("unknown parameter"), "{e:?}");
+    }
+
+    #[test]
+    fn a_synth_track_keeps_its_wavetable_file_from_format_20() {
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
+        let specs = InstrumentKind::Synth.params();
+        let at = |id: &str| specs.iter().position(|s| s.id == id).unwrap() as u8;
+        for (id, value) in [("osc1_wave", 4.0), ("wavetable", 4.0), ("wt_position", 0.25), ("env_position", -0.5)] {
+            p.apply(Edit::SetParam { track: 0, index: at(id), value }).unwrap();
+        }
+        let file = std::env::temp_dir().join("table.wav").display().to_string();
+        p.tracks[0].sample = Some(file.clone());
+        let text = p.to_text();
+        assert!(text.contains(&format!("\nsample {file}\n")) && text.contains("\nparam wt_position 0.25\n"), "{text}");
+        assert_eq!(Project::from_text(&text).unwrap(), p);
+        // Older formats know no synth file or its table's parameters; the
+        // other built-in kinds take none still.
+        let e = Project::from_text("tinvo 19\ntrack synth\nsample t.wav\nend").unwrap_err();
+        assert!(e.line == 3 && e.message.contains("a synth track has no sample"), "{e:?}");
+        let e = Project::from_text("tinvo 19\ntrack synth\nparam wt_position 0.5\nend").unwrap_err();
+        assert!(e.line == 3 && e.message.contains("unknown parameter"), "{e:?}");
+        let e = Project::from_text("tinvo 20\ntrack fm\nsample t.wav\nend").unwrap_err();
+        assert!(e.line == 3 && e.message.contains("fm track has no sample"), "{e:?}");
     }
 
     #[test]

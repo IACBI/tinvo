@@ -3,9 +3,11 @@
 //! own way of looping.
 //!
 //! A [`SampleMap`] is built on the UI thread and reaches the engine in an
-//! `Arc`; the sampler only reads it.
+//! `Arc`; the sampler only reads it. A synth track's file travels the same
+//! way, as a map holding the wavetable built from it.
 
 use crate::dsp::db_to_gain;
+use crate::dsp::wavetable::Wavetable;
 use crate::sample::Sample;
 use std::sync::Arc;
 
@@ -166,6 +168,8 @@ pub struct SampleMap {
     /// so a note looks only at those.
     starts: [u32; 129],
     by_key: Vec<u16>,
+    /// A synth track's wavetable, in place of zones.
+    table: Option<Wavetable>,
 }
 
 impl SampleMap {
@@ -190,7 +194,16 @@ impl SampleMap {
             by_key.extend(answering.map(|(i, _)| i as u16));
             starts[usize::from(key) + 1] = by_key.len() as u32;
         }
-        Self { zones, release, starts, by_key }
+        Self { zones, release, starts, by_key, table: None }
+    }
+
+    /// A synth track's wavetable, with no zones.
+    pub fn wavetable(table: Wavetable) -> Self {
+        Self { table: Some(table), ..Self::new([]) }
+    }
+
+    pub fn table(&self) -> Option<&Wavetable> {
+        self.table.as_ref()
     }
 
     pub fn zones(&self) -> &[Zone] {
@@ -204,7 +217,7 @@ impl SampleMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.zones.is_empty()
+        self.zones.is_empty() && self.table.is_none()
     }
 
     /// Whether a zone sounds when a key comes up.
