@@ -635,6 +635,15 @@ For FM keys, basses and bells, and wavetable leads and pads.
 - Wavetable oscillators in the synth: built-in tables and any WAV loaded as one, the position moved by the LFO and envelopes, band-limited across the keyboard.
 - Tests: FM sidebands against their Bessel amplitudes, wavetable aliasing measured by FFT like the existing oscillators.
 
+It comes in two parts, each merged on its own, and ships whole with 0.29.0.
+
+#### 14a: FM ✅
+
+- A new instrument, `fm` (`a` `9`): 8 voices of four sine operators, phase-modulating one another along one of eight algorithms (`4>3>2>1` to `4 3 2 1`), operator 4 fed back the average of its last two outputs. Each operator has a ratio, a detune, a level (a heard operator's gain, or a modulator's index: up to 4π radians), a velocity response and an ADSR of its own; a voice lasts as long as its heard operators.
+- Instead of oversampling, which would add latency: per 64-frame chunk, Carson's rule bounds each operator's spectrum from its sounding modulators' indices, peak frequencies and spectra, and the modulation is scaled until it stays under 45 % of the sample rate. High notes modulated hard, through one modulator, a chain or a cascade, fold back less than −30 dB of their power instead of −1 to −20 dB.
+- 35 parameters, so an instrument may now have up to 40. Project format 20 (`track fm`).
+- Tests: sidebands against `J_n(β)`, every algorithm's routing, feedback's harmonics and its staying periodic at full, velocity per operator, envelopes per operator, stealing, callback sizes, and the folding with and without the limit. A bench scenario of 8 voices in a chain with feedback.
+
 ### Phase 15: Audio tracks (large)
 
 For vocals, guitars and other live instruments: pop, rock, singer-songwriter.

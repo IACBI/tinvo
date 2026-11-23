@@ -60,7 +60,7 @@ pub fn drum_note(kind: InstrumentKind) -> Option<u8> {
         InstrumentKind::Clap => Some(39),
         InstrumentKind::HatClosed => Some(42),
         InstrumentKind::HatOpen => Some(46),
-        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => None,
+        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => None,
     }
 }
 

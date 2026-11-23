@@ -1077,6 +1077,9 @@ enum Stroke {
     Length { step: usize, pitch: u8, y: u16, remove: bool },
 }
 
+/// What `a` asks, short enough for an 80-column terminal.
+const ADD_TRACK_PROMPT: &str = "Add: 1 Synth 2 Kick 3 Snare 4 Hat 5 Open hat 6 Clap 7 Sampler 8 Plugin 9 FM";
+
 impl App {
     pub fn new(
         project: Project,
@@ -3677,6 +3680,12 @@ impl App {
             }
         } else if key == Key::Char('8') {
             self.open_plugins(PluginFor::Track);
+        } else if key == Key::Char('9') {
+            let kind = InstrumentKind::Fm;
+            if self.edit(Edit::AddTrack(kind)) {
+                self.track = self.track_count() - 1;
+                self.set_status(format!("Added {} track", kind.label()));
+            }
         }
     }
 
@@ -6720,12 +6729,7 @@ impl App {
                 s.put(0, y, &format!("Delete track '{name}'? (y/n)"), prompt);
             }
             Mode::AddTrack => {
-                s.put(
-                    0,
-                    y,
-                    "Add track: 1 Synth  2 Kick  3 Snare  4 Hi-hat  5 Open hat  6 Clap  7 Sampler  8 Plugin  (Esc cancels)",
-                    prompt,
-                );
+                s.put(0, y, ADD_TRACK_PROMPT, prompt);
             }
             _ => {
                 let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
@@ -6989,7 +6993,7 @@ impl App {
         entries.push((String::new(), String::new(), "Fixed keys".into()));
         for (keys, text) in [
             ("y n", "answer a question (quit, delete a track)"),
-            ("1-8", "the type of a new track, after add_track (8: a CLAP plugin, from a list)"),
+            ("1-9", "the type of a new track, after add_track (8: a CLAP plugin, from a list; 9: the FM synth)"),
             ("Esc Ctrl+C", "cancel a prompt, close a list"),
             ("Enter Del r Esc", "on the settings page: add a key or change a setting, remove a key, default, close"),
             ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
@@ -8678,8 +8682,14 @@ mod tests {
         keys(&mut a, &[Key::Char('a'), Key::Char('1')]);
         assert_eq!(a.project.tracks.len(), 1);
         assert_eq!(a.project.tracks[0].kind, InstrumentKind::Synth);
-        keys(&mut a, &[Key::Char('a'), Key::Char('9')]); // invalid choice
-        assert_eq!(a.project.tracks.len(), 1);
+        keys(&mut a, &[Key::Char('a'), Key::Char('9')]);
+        assert_eq!((a.project.tracks.len(), a.track), (2, 1));
+        assert_eq!(a.project.tracks[1].kind, InstrumentKind::Fm);
+        assert_eq!(a.status_text(), Some("Added FM track"));
+        assert!(ADD_TRACK_PROMPT.chars().count() <= 80 && ADD_TRACK_PROMPT.ends_with("9 FM"));
+        keys(&mut a, &[Key::Char('D'), Key::Char('y')]);
+        keys(&mut a, &[Key::Char('a'), Key::Char('0')]); // invalid choice
+        assert_eq!((a.project.tracks.len(), a.track), (1, 0));
         keys(&mut a, &[Key::Char('r'), Key::Backspace, Key::Backspace, Key::Backspace, Key::Backspace, Key::Backspace]);
         keys(&mut a, &[Key::Char('L'), Key::Char('e'), Key::Char('a'), Key::Char('d'), Key::Enter]);
         assert_eq!(a.project.tracks[0].name, "Lead");

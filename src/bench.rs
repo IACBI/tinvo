@@ -51,7 +51,7 @@ struct Setup {
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 8] = [
+pub const SCENARIOS: [Scenario; 9] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
     Scenario {
@@ -68,6 +68,12 @@ pub const SCENARIOS: [Scenario; 8] = [
     },
     Scenario { id: "tracks32", label: "Demo song's tracks repeated to 32", budget: 0.5, build: tracks32 },
     Scenario { id: "synth", label: "Worst-case synth (8 voices, unison 4, noise, LFO)", budget: 0.25, build: synth },
+    Scenario {
+        id: "fm",
+        label: "FM synth, 8 voices of four operators in a chain, feedback on",
+        budget: 0.15,
+        build: fm,
+    },
     Scenario {
         id: "sampler",
         label: "Sampler, 16 voices resampled through sinc and filter",
@@ -313,6 +319,21 @@ fn synth() -> Setup {
         &mut p,
         InstrumentKind::Synth,
         &[("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)],
+    );
+    chords(&mut p, 48, 2);
+    Setup { project: p, samples: Vec::new(), play: Command::Play }
+}
+
+/// One FM track with every voice busy: four operators in a chain, each
+/// heard or modulating, and feedback, so every operator of every voice runs
+/// and the modulation limits are worked out for every chunk.
+fn fm() -> Setup {
+    let mut p = Project::new();
+    ok(p.apply(Edit::AddTrack(InstrumentKind::Fm)));
+    set(
+        &mut p,
+        InstrumentKind::Fm,
+        &[("feedback", 0.6), ("op2_level", 0.3), ("op3_level", 0.3), ("op4_level", 0.3), ("op1_sustain", 1.0)],
     );
     chords(&mut p, 48, 2);
     Setup { project: p, samples: Vec::new(), play: Command::Play }

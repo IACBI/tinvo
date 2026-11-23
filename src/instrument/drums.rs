@@ -60,7 +60,7 @@ pub(super) fn params(kind: InstrumentKind) -> &'static [ParamSpec] {
         InstrumentKind::HatClosed => &HAT_CLOSED,
         InstrumentKind::HatOpen => &HAT_OPEN,
         InstrumentKind::Clap => &CLAP,
-        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => &[],
+        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => &[],
     }
 }
 
@@ -72,7 +72,7 @@ fn noise_seed(kind: InstrumentKind) -> u64 {
         InstrumentKind::HatClosed => 5,
         InstrumentKind::HatOpen => 6,
         InstrumentKind::Clap => 7,
-        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => 1,
+        InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => 1,
     }
 }
 
@@ -211,7 +211,7 @@ impl Drum {
                 self.bursts = 0;
                 self.next_burst = 0;
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => {
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => {
                 unreachable!("Drum is only constructed for drum kinds")
             }
         }
@@ -260,7 +260,7 @@ impl Drum {
                 self.spread = spread;
                 self.f1.set_q(p[0] * self.pitch, 1.5, sr);
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => {
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => {
                 unreachable!("Drum is only constructed for drum kinds")
             }
         }
@@ -361,7 +361,7 @@ impl Drum {
                 self.amp2 = flush_denormal(self.amp2 * self.amp2_coef);
                 1.4 * y
             }
-            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Plugin(_) => 0.0,
+            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_) => 0.0,
         };
         self.t = self.t.saturating_add(1);
         let tail_started = self.kind != InstrumentKind::Clap || self.bursts == 4;

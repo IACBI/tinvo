@@ -39,6 +39,7 @@ TINVO playing [`examples/showcase.tvo`](examples/showcase.tvo). The sound is tha
 - Sends from every track to a tempo-synced delay, an algorithmic reverb and a chorus, sidechain compression through a key bus, and a true-peak limiter on the master. Bus and master settings can be automated.
 - Gain-reduction and loudness meters (momentary, short-term, integrated) while playing.
 - 8-voice subtractive synth with two band-limited oscillators (pulse width, unison with detune), noise, a state-variable filter, two envelopes, glide, an LFO (to pitch, pulse width, cutoff and level; free in Hz or synced to the tempo, 1/32 to four whole notes), and velocity → cutoff.
+- 8-voice four-operator FM synth: eight algorithms, feedback on the top operator, and a frequency ratio, detune, level, velocity response and envelope for each operator. Where its sidebands would fold back past the Nyquist frequency the modulation is turned down, so high notes grow duller instead of aliasing.
 - Synthesized kick, snare, closed and open hi-hat, and clap. The closed hat chokes the open hat.
 - A 16-voice sampler that plays WAV files with windowed-sinc interpolation: root note and tuning, start/end points, loop, gate or one-shot, ADSR and a filter. Besides its sample, a sampler track can lay files over the keyboard as zones, written as `zone` lines in the project file or imported from an SFZ instrument with `o`: key ranges, velocity layers, round robin in turn or at random, release samples, and a loop mode of each zone's own. A WAV file's own loop and root key (its `smpl` chunk) are read. `%` slices a track's sample, at its transients or into equal parts, into zones of one slice per key from C2 that take the place of its sample and zones: a break to play from the keyboard or the grid. Zones that all play one file, as slicing leaves them, are cut again from the whole file.
 - Mixer with click-free volume, pan, mute and solo, plus peak meters.
@@ -141,7 +142,7 @@ The main keys in the editor, as they are by default (press `?` for the full list
 | `c` | in the panel: open or close the plugin's own window (on a plugin track's instrument page, a plugin's page, or its slot on the inserts page) |
 | `A` | automate the selected parameter (panel) / show the automation lanes (grid) |
 | in the automation view | `↑` `↓` lane, `Enter`/`x` add or remove a point, `[` `]` `{` `}` its value, `/` hold or ramp, `-` free the lane |
-| `a` `D` `r` `m` `s` | add (`1`-`7` built-in, `8` a CLAP plugin), delete, rename, mute, solo a track |
+| `a` `D` `r` `m` `s` | add (`1`-`7` built-in, `8` a CLAP plugin, `9` the FM synth), delete, rename, mute, solo a track |
 | `i` `d` | send the track to the next group (from the last, back to the master); a new group for it |
 | `E` `Q` `F` | rename, mute or delete the track's group (its tracks go to the master) |
 | `H` | the MIDI channel (1–16) that plays the track whichever is selected; empty for none |
@@ -225,6 +226,7 @@ TINVO, [`examples/showcase.tvo`](examples/showcase.tvo) projesini çalıyor. Ses
 - Her kanaldan tempoya bağlı bir delay'e, algoritmik bir reverb'e ve chorus'a send, key bus üzerinden sidechain kompresyon, master'da true-peak limiter. Bus ve master ayarları otomasyona bağlanabilir.
 - Çalarken gain reduction ve loudness göstergeleri (momentary, short-term, integrated).
 - 8 sesli subtractive synth: iki band-limited osilatör (pulse width, detune'lu unison), noise, state-variable filtre, iki zarf, glide, LFO (pitch, pulse width, cutoff ve seviyeye; Hz cinsinden serbest ya da tempoya bağlı, 1/32'den dört birliğe kadar) ve velocity → cutoff.
+- 8 sesli, 4 operatörlü FM synth: sekiz algoritma, en üstteki operatörde feedback, her operatörün kendi frekans oranı, detune'u, seviyesi, velocity tepkisi ve zarfı. Yan bantlar Nyquist frekansını aşıp geri katlanacaksa modülasyon kısılır; yüksek notalar aliasing yapmaz, onun yerine matlaşır.
 - Sentezlenmiş kick, snare, kapalı ve açık hi-hat, clap. Kapalı hat açık hat'i susturur (choke).
 - WAV dosyalarını windowed-sinc interpolasyonla çalan 16 sesli sampler: kök nota ve akort, başlangıç/bitiş noktası, loop, gate ya da one-shot, ADSR ve filtre. Bir sampler kanalı kendi sample'ının yanında dosyaları klavyeye bölge olarak da yayabilir; bölgeler proje dosyasında `zone` satırlarıdır ya da `o` ile bir SFZ enstrümanından alınır: tuş aralıkları, velocity katmanları, sırayla ya da rastgele round robin, release sample'ları ve her bölgenin kendi loop modu. WAV dosyasının kendi loop noktaları ve kök notası (`smpl` chunk'ı) da okunur. `%` kanalın sample'ını transient'lerinden ya da eşit parçalara böler; dilimler kanalın sample'ının ve bölgelerinin yerini alır ve her biri C2'den başlayarak bir tuşa düşer, böylece bir break klavyeden ya da grid'den çalınır. Hepsi tek bir dosyayı çalan bölgeler (dilimlemenin bıraktığı gibi) yeniden dosyanın tamamından kesilir.
 - Tıklamasız ses, pan, mute ve solo; seviye göstergeleri.
@@ -327,7 +329,7 @@ Editördeki temel tuşlar, varsayılan halleriyle (tam liste için `?`; orada se
 | `c` | panelde: eklentinin kendi penceresini açar ya da kapatır (eklenti çalan kanalın enstrüman sayfasında, eklentinin sayfasında ya da insert sayfasında slotunda) |
 | `A` | seçili parametreyi otomasyona al (panel) / otomasyon şeritlerini göster (ızgara) |
 | otomasyon görünümünde | `↑` `↓` şerit, `Enter`/`x` nokta ekle ya da sil, `[` `]` `{` `}` değeri, `/` sabit ya da kayan, `-` şeridi boşalt |
-| `a` `D` `r` `m` `s` | kanal ekle (`1`-`7` hazır enstrümanlar, `8` bir CLAP eklentisi), sil, yeniden adlandır, mute, solo |
+| `a` `D` `r` `m` `s` | kanal ekle (`1`-`7` hazır enstrümanlar, `8` bir CLAP eklentisi, `9` FM synth), sil, yeniden adlandır, mute, solo |
 | `i` `d` | kanalı sıradaki gruba gönder (sonuncudan sonra master'a döner); kanal için yeni grup aç |
 | `E` `Q` `F` | kanalın grubunu yeniden adlandır, mute et ya da sil (kanalları master'a gider) |
 | `H` | kanalı, seçili olmasa da çalan MIDI kanalı (1–16); boş bırakılırsa yok |

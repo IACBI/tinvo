@@ -1542,7 +1542,8 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
                 0 => None,
                 1 => Some(LaneTarget::Mix(s.below(MIX_PARAMS.len() + 1) as u8)),
                 2 => Some(LaneTarget::Group { group, index: s.below(GROUP_PARAMS + 3) as u8 }),
-                _ => Some(LaneTarget::Track(s.below(48) as u8)),
+                // Volume and pan, the track's parameters, and one past them.
+                _ => Some(LaneTarget::Track(s.below(kind_of(track).map_or(48, |k| track_param_count(k) + 3)) as u8)),
             };
             Edit::SetLane { track, lane: s.below(6) as u8, target, ramp: s.byte() & 1 == 1 }
         }
@@ -1555,7 +1556,7 @@ fn next_action(s: &mut Script, p: &Project) -> Action {
             Edit::SetPoint { track, lane, pattern, step, value }
         }
         16 => {
-            let index = s.below(48) as u8;
+            let index = s.below(kind_of(track).map_or(48, |k| track_param_count(k) + 1)) as u8;
             let spec = kind_of(track).and_then(|k| track_param(k, usize::from(index)));
             Edit::SetParam { track, index, value: s.value(spec) }
         }
