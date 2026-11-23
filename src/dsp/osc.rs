@@ -45,6 +45,18 @@ impl Oscillator {
         self.phase
     }
 
+    /// The phase, then moves it on by `inc` as [`Oscillator::next`] does:
+    /// for a caller that works out the wave itself.
+    #[inline]
+    pub fn advance(&mut self, inc: f64) -> f64 {
+        let p = self.phase;
+        self.phase += inc.clamp(0.0, 0.499);
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+        p
+    }
+
     /// Produces the next sample. `inc` is frequency / sample-rate and must be
     /// below 0.5; `pulse_width` applies to the square wave only.
     #[inline]

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::clap::PluginRef;
 use tinvo::clap::host::{Instance, Mode, PluginHost, Role};
 use tinvo::dsp::noise::Rng;
+use tinvo::dsp::wavetable::{self, Wavetable};
 use tinvo::engine::{
     ChainId, Command, Edit, Engine, LaneTarget, MAX_TRACKS, Part, PluginAt, PluginPlace, Retired, Shared, Step, Take,
 };
@@ -455,7 +456,13 @@ fn random_command(rng: &mut Rng, samples: &[Arc<SampleMap>]) -> Command {
 
 fn edits_while_playing() -> usize {
     let mut rig = Rig::new(&heavy_project());
-    let samples: Vec<Arc<SampleMap>> = (0..6).map(|i| sample([1, 7, 64, 4800, 48_000, 200_000][i], i as u64)).collect();
+    let mut samples: Vec<Arc<SampleMap>> =
+        (0..6).map(|i| sample([1, 7, 64, 4800, 48_000, 200_000][i], i as u64)).collect();
+    // Synth tracks' tables: one cycle, and as many frames as a table keeps.
+    for len in [600, 70 * wavetable::CYCLE] {
+        let audio: Vec<f32> = (0..len).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        samples.push(Arc::new(SampleMap::wavetable(Arc::new(Wavetable::from_audio(&audio).unwrap()))));
+    }
     let mut rng = Rng::new(42);
     rig.send(Command::PlaySong { entry: 0 });
     let mut calls = 0;

@@ -3,9 +3,9 @@
 //! The processors (filters, envelopes, oscillators, dynamics, effects) are
 //! allocation-free after construction and safe to call from the real-time
 //! audio thread, `loudness::LiveLoudness` among them. Two analysis helpers
-//! are not: `loudness::LoudnessMeter` keeps every block it measures and
-//! `fft::power_spectrum` builds its buffers, so they run off the audio
-//! thread (export, the loopback check, tests). Recursive state is flushed
+//! are not: `loudness::LoudnessMeter` keeps every block it measures, and
+//! `fft` and the wavetable builders allocate, so they run off the audio
+//! thread (export, the loopback check, loading a table, tests). Recursive state is flushed
 //! explicitly instead of relying on the CPU's flush-to-zero mode, because
 //! changing the floating-point environment behind the compiler's back is not
 //! sound in Rust.
@@ -27,6 +27,7 @@ pub mod osc;
 pub mod phaser;
 pub mod reverb;
 pub mod smooth;
+pub mod wavetable;
 
 /// `ln(1000)`: the number of nepers in 60 dB.
 const LN_1000: f32 = 6.907_755_3;

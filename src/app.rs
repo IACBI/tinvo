@@ -12,6 +12,7 @@ use crate::clap::ffi::{CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS};
 use crate::clap::host::{Instance, ParamInfo, PluginHandle, Request, Role as PluginRole};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
+use crate::dsp::wavetable::{self, Wavetable};
 use crate::engine::{
     ChainId, Command, Division, Edit, Engine, HELD_FOR_GOOD, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET,
     MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, PluginAt,
@@ -2067,8 +2068,11 @@ impl App {
         self
     }
 
-    /// Loads a WAV file into sampler track `track`, as one undo step.
+    /// Loads a WAV file into sampler track `track`, or as the wavetable of
+    /// synth track `track`, as one undo step.
     fn load_sample(&mut self, track: usize, text: &str) -> Result<(), String> {
+        let synth = self.project.tracks[track].kind == InstrumentKind::Synth;
+        let noun = if synth { "wavetable" } else { "sample" };
         let path = sample_mod::absolute(text);
         let key = path.to_string_lossy().into_owned();
         if let Some(why) = sample_mod::unstorable(&key) {
@@ -2088,10 +2092,13 @@ impl App {
         others.dedup();
         let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
         let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
-        let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load sample: {e}"))?);
+        let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load {noun}: {e}"))?);
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
         let mono = if loaded.source_channels > 1 { ", mixed to mono" } else { "" };
         let name = path.file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
+        if synth {
+            return self.load_table(track, key, loaded, &name, mono);
+        }
         // A zoned track goes on playing its zones: say so, as after an SFZ
         // or the slicer the file is a layer over all of them.
         let zones = match self.project.tracks[track].zones.len() {
@@ -2277,6 +2284,101 @@ impl App {
         Ok(())
     }
 
+    /// Makes `loaded`, the file at `key`, synth track `track`'s wavetable,
+    /// and the table it plays, as one undo step. With neither oscillator on
+    /// a table, the first one goes on it.
+    fn load_table(
+        &mut self,
+        track: usize,
+        key: String,
+        loaded: Arc<Sample>,
+        name: &str,
+        mono: &str,
+    ) -> Result<(), String> {
+        let len = loaded.frames();
+        if len < 2 {
+            return Err(format!("Cannot load wavetable: {name} is too short to hold a cycle"));
+        }
+        let frames = Wavetable::frames_from(len);
+        // Built now, before anything reaches the engine: the table and the
+        // parameters that play it then arrive in the same callback.
+        loaded.wavetable();
+        let specs = InstrumentKind::Synth.params();
+        let id = |id: &str| specs.iter().position(|s| s.id == id).expect("a synth parameter");
+        let (wave1, wave2, table) = (id("osc1_wave"), id("osc2_wave"), id("wavetable"));
+        let on_table = |i: usize| specs[i].format(self.project.tracks[track].params[i]) == "table";
+        let mut set = vec![(table, specs[table].max)];
+        let first = !on_table(wave1) && !on_table(wave2);
+        if first {
+            let max = specs[wave1].max as usize;
+            let at = (0..=max).find(|&w| specs[wave1].format(w as f32) == "table").expect("a table wave");
+            set.push((wave1, at as f32));
+        }
+        let what = match len / wavetable::CYCLE {
+            0 => format!("one cycle of {len} samples"),
+            n if n > frames => format!("{frames} of its {n} frames of {} samples", wavetable::CYCLE),
+            _ => format!("{frames} frames of {} samples", wavetable::CYCLE),
+        };
+        let osc = if first { " · osc 1 plays it" } else { "" };
+        // A lane on what was just set goes on deciding what plays.
+        let t = &self.project.tracks[track];
+        let laned: Vec<&str> = set
+            .iter()
+            .filter(|&&(i, _)| {
+                let target = Some(LaneTarget::Track(2 + i as u8));
+                t.lanes.iter().any(|l| l.target == target && l.points.iter().flatten().any(Option::is_some))
+            })
+            .map(|&(i, _)| specs[i].label)
+            .collect();
+        let lanes = match laned.as_slice() {
+            [] => String::new(),
+            names => format!(" · its {} lane decides what plays", names.join(" and ")),
+        };
+        self.set_status(format!("Loaded {name} as a wavetable: {what}{mono}{osc}{lanes}"));
+        self.bank.insert(key.clone(), loaded);
+        let meta_before = self.meta();
+        self.project.tracks[track].sample = Some(key.clone());
+        self.send_sample(track);
+        let (undo, redo) = self.set_params_undoable(track, &set);
+        let others: Vec<usize> = (0..self.track_count())
+            .filter(|&i| i != track && self.project.tracks[i].sample_paths().any(|p| p == key))
+            .collect();
+        for &i in &others {
+            self.send_sample(i);
+        }
+        self.touch();
+        self.redo.clear();
+        let meta_after = self.meta();
+        self.push_change(Change {
+            undo,
+            redo,
+            meta_before,
+            meta_after,
+            what: "load wavetable",
+            key: None,
+            at: Instant::now(),
+            param: None,
+        });
+        Ok(())
+    }
+
+    /// Sets parameters `set` (by index) of track `track`'s instrument and
+    /// returns the edits that undo them and those that redo them.
+    fn set_params_undoable(&mut self, track: usize, set: &[(usize, f32)]) -> (Vec<Edit>, Vec<Edit>) {
+        let specs = self.project.tracks[track].kind.params();
+        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
+        for &(index, value) in set {
+            let Some(spec) = specs.get(index) else { continue };
+            let e = Edit::SetParam { track: track as u8, index: index as u8, value: spec.clamp(value) };
+            let Ok(inverse) = self.project.inverse(&e) else { continue };
+            if let Some(applied) = self.apply_raw(e) {
+                inverses.push(inverse);
+                redo.push(applied);
+            }
+        }
+        (inverses.into_iter().rev().flatten().collect(), redo)
+    }
+
     /// Puts `zones` in place of sampler track `track`'s sample and zones,
     /// and sets its parameters `set` (by id), as one undo step.
     fn replace_zones(&mut self, track: usize, zones: Vec<ZoneData>, set: &[(&str, f32)], what: &'static str) {
@@ -2284,16 +2386,9 @@ impl App {
         // The parameters reach the engine first, so no note plays the new
         // zones with the old ones.
         let specs = InstrumentKind::Sampler.params();
-        let (mut inverses, mut redo) = (Vec::new(), Vec::new());
-        for &(id, value) in set {
-            let Some(index) = specs.iter().position(|s| s.id == id) else { continue };
-            let e = Edit::SetParam { track: track as u8, index: index as u8, value: specs[index].clamp(value) };
-            let Ok(inverse) = self.project.inverse(&e) else { continue };
-            if let Some(applied) = self.apply_raw(e) {
-                inverses.push(inverse);
-                redo.push(applied);
-            }
-        }
+        let set: Vec<(usize, f32)> =
+            set.iter().filter_map(|&(id, v)| Some((specs.iter().position(|s| s.id == id)?, v))).collect();
+        let (undo, redo) = self.set_params_undoable(track, &set);
         let t = &mut self.project.tracks[track];
         t.sample = None;
         t.zones = zones.into();
@@ -2302,7 +2397,7 @@ impl App {
         self.redo.clear();
         let meta_after = self.meta();
         self.push_change(Change {
-            undo: inverses.into_iter().rev().flatten().collect(),
+            undo,
             redo,
             meta_before,
             meta_after,
@@ -3743,7 +3838,9 @@ impl App {
                     PromptKind::Export => self.export_to(&with_extension(&text, "wav")),
                     PromptKind::Rename => self.rename_track(&text),
                     PromptKind::LoadSample => {
-                        let done = if crate::sfz::is_sfz(&text) {
+                        let synth =
+                            self.project.tracks.get(self.track).is_some_and(|t| t.kind == InstrumentKind::Synth);
+                        let done = if crate::sfz::is_sfz(&text) && !synth {
                             self.import_sfz(self.track, &text)
                         } else {
                             self.load_sample(self.track, &text)
@@ -5094,12 +5191,14 @@ impl App {
                 self.audition(b);
             }
             Action::LoadSample => {
-                if self.project.tracks[self.track].kind == InstrumentKind::Sampler {
+                if matches!(self.project.tracks[self.track].kind, InstrumentKind::Sampler | InstrumentKind::Synth) {
                     let current = self.project.tracks[self.track].sample.clone().unwrap_or_default();
                     self.mode = Mode::Prompt(PromptKind::LoadSample, current);
                 } else {
-                    let status = format!("Samples load into sampler tracks ({}, 7 adds one)", self.k(Action::AddTrack));
-                    self.set_status(status);
+                    let add = self.k(Action::AddTrack);
+                    self.set_status(format!(
+                        "Samples load into sampler tracks, wavetables into synths ({add}, 7 adds a sampler)"
+                    ));
                 }
             }
             Action::Slice => {
@@ -6498,7 +6597,7 @@ impl App {
                     String::new()
                 };
                 match t.kind {
-                    InstrumentKind::Sampler if t.sample.is_some() || !t.zones.is_empty() => {
+                    InstrumentKind::Sampler | InstrumentKind::Synth if t.sample.is_some() || !t.zones.is_empty() => {
                         let file = t.sample.as_deref().map(|path| {
                             Path::new(path)
                                 .file_name()
@@ -6519,6 +6618,7 @@ impl App {
                             n => format!(" ({n} files missing)"),
                         };
                         let what = what.join(" + ");
+                        let what = if t.kind == InstrumentKind::Synth { format!("wavetable {what}") } else { what };
                         format!(" {} · {} · {what}{missing}{page} ", t.name, self.kind_label(t.kind))
                     }
                     InstrumentKind::Sampler => {
@@ -6683,6 +6783,11 @@ impl App {
                     PromptKind::SaveAs => "Save as: ".to_string(),
                     PromptKind::Rename => "Track name: ".to_string(),
                     PromptKind::RenameGroup => "Group name: ".to_string(),
+                    PromptKind::LoadSample
+                        if self.project.tracks.get(self.track).is_some_and(|t| t.kind == InstrumentKind::Synth) =>
+                    {
+                        "Load WAV wavetable: ".to_string()
+                    }
                     PromptKind::LoadSample => "Load WAV sample or SFZ instrument: ".to_string(),
                     PromptKind::Slice => {
                         format!("Slice into equal parts (2-{}), or t [sensitivity 0-100]: ", crate::slice::MAX_SLICES)
@@ -7169,6 +7274,10 @@ pub fn start_audio(
     if let Some(l) = &live {
         l.clear();
     }
+    // Built here rather than in the engine, which the backend may make on
+    // the thread it renders on.
+    sample_mod::init();
+    wavetable::prepare();
     let shared = Arc::new(Shared::new());
     let (tx, rx) = spsc::channel::<Command>(COMMAND_QUEUE);
     let (retire_tx, retire_rx) = spsc::channel::<Retired>(RETIRE_QUEUE);
@@ -9546,7 +9655,7 @@ mod tests {
             }
             v
         };
-        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('o')]);
+        keys(&mut a, &[Key::Char('a'), Key::Char('2'), Key::Char('o')]);
         assert!(a.status_text().unwrap().contains("sampler tracks"));
         keys(&mut a, &[Key::Char('a'), Key::Char('7'), Key::Char('o')]);
         assert_eq!(a.mode, Mode::Prompt(PromptKind::LoadSample, String::new()));
@@ -9593,6 +9702,112 @@ mod tests {
         let mut s = Screen::new(100, 30);
         a.draw(&mut s);
         assert!((0..30).any(|y| s.row_text(y).contains("tone.wav")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn synth_tracks_load_a_wavetable_as_one_undo_step() {
+        let dir = std::env::temp_dir().join(format!("tinvo-table-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Three frames of 2048 samples, and some left over.
+        let path = dir.join("table.wav");
+        let audio: Vec<f32> = (0..3 * wavetable::CYCLE + 100)
+            .map(|i| (std::f32::consts::TAU * (i % wavetable::CYCLE) as f32 / wavetable::CYCLE as f32).sin() * 0.7)
+            .collect();
+        wav::write_file(&path, &audio, 1, 48_000, SampleFormat::Float32).unwrap();
+        let (tx, mut rx) = spsc::channel(256);
+        let link = EngineLink::new(tx, Arc::new(Shared::new()));
+        let mut a = App::new(Project::new(), None, Some(link), 48_000, "test".into());
+        let tables = |rx: &mut spsc::Consumer<Command>| {
+            let mut v = Vec::new();
+            while let Some(cmd) = rx.pop() {
+                if let Command::SetSamples { track, map } = cmd {
+                    v.push((track, map.and_then(|m| m.table().map(Wavetable::frames))));
+                }
+            }
+            v
+        };
+        let specs = InstrumentKind::Synth.params();
+        let at = |id: &str| specs.iter().position(|s| s.id == id).unwrap();
+        let values =
+            |a: &App| (a.project.tracks[0].params[at("osc1_wave")], a.project.tracks[0].params[at("wavetable")]);
+        keys(&mut a, &[Key::Char('a'), Key::Char('1'), Key::Char('o')]);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::LoadSample, String::new()));
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!((0..30).any(|y| s.row_text(y).contains("Load WAV wavetable:")));
+        // Too short for a cycle: nothing changes.
+        let short = dir.join("short.wav");
+        wav::write_file(&short, &[0.5], 1, 48_000, SampleFormat::Float32).unwrap();
+        a.mode = Mode::Prompt(PromptKind::LoadSample, short.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("Cannot load wavetable: short.wav is too short to hold a cycle"));
+        assert!(a.project.tracks[0].sample.is_none() && a.undo.iter().all(|c| c.what != "load wavetable"));
+        // An SFZ is no wavetable.
+        a.mode = Mode::Prompt(PromptKind::LoadSample, dir.join("kit.sfz").display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert!(a.status_text().unwrap().starts_with("Cannot load wavetable"), "{:?}", a.status_text());
+        while rx.pop().is_some() {}
+
+        a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples · osc 1 plays it"));
+        assert_eq!(values(&a), (4.0, 4.0), "osc 1 plays the file's table");
+        // The table goes first, so the parameters that play it never reach
+        // the engine without it.
+        let mut order = Vec::new();
+        while let Some(cmd) = rx.pop() {
+            match cmd {
+                Command::SetSamples { track: 0, map } => {
+                    order.push(format!("table {:?}", map.and_then(|m| m.table().map(Wavetable::frames))))
+                }
+                Command::Edit(Edit::SetParam { track: 0, .. }) => order.push("param".to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["table Some(3)", "param", "param"]);
+        let mut s = Screen::new(100, 30);
+        a.draw(&mut s);
+        assert!((0..30).any(|y| s.row_text(y).contains("Synth · wavetable table.wav")));
+        // One step undoes the file and the parameters together.
+        keys(&mut a, &[Key::Char('u')]);
+        assert_eq!((a.project.tracks[0].sample.as_deref(), values(&a)), (None, (0.0, 0.0)));
+        assert_eq!(tables(&mut rx), [(0, None)]);
+        keys(&mut a, &[Key::Char('U')]);
+        assert_eq!(values(&a), (4.0, 4.0));
+        assert_eq!(tables(&mut rx), [(0, Some(3))]);
+        // With an oscillator on a table already, it stays as it is.
+        a.edit(Edit::SetParam { track: 0, index: at("osc1_wave") as u8, value: 1.0 });
+        a.edit(Edit::SetParam { track: 0, index: at("osc2_wave") as u8, value: 4.0 });
+        a.edit(Edit::SetParam { track: 0, index: at("wavetable") as u8, value: 2.0 });
+        a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(a.status_text(), Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples"));
+        assert_eq!(values(&a), (1.0, 4.0));
+        // A lane on the table goes on deciding what plays: the load says so.
+        let lane = Edit::SetLane {
+            track: 0,
+            lane: 0,
+            target: Some(LaneTarget::Track(2 + at("wavetable") as u8)),
+            ramp: false,
+        };
+        a.edit(lane);
+        a.edit(Edit::SetPoint { track: 0, lane: 0, pattern: 0, step: 0, value: Some(4.0) });
+        a.mode = Mode::Prompt(PromptKind::LoadSample, path.display().to_string());
+        keys(&mut a, &[Key::Enter]);
+        assert_eq!(
+            a.status_text(),
+            Some("Loaded table.wav as a wavetable: 3 frames of 2048 samples · its Wavetable lane decides what plays")
+        );
+        // The export plays it: oscillator 2 alone, on the file's table.
+        a.edit(Edit::SetParam { track: 0, index: at("osc_mix") as u8, value: 1.0 });
+        a.step = 0;
+        keys(&mut a, &[Key::Enter]);
+        a.export_loops = 1;
+        let out = dir.join("out.wav");
+        a.export_to(&out);
+        let d = wav::decode(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(d.samples.iter().any(|x| x.abs() > 0.1), "the table is audible in the export");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10153,9 +10368,11 @@ mod tests {
         assert!(shown.contains(&last), "{shown:?}");
         assert!((0..MIN_H).all(|y| !s.row_text(y).is_empty()));
         // A large screen shows them all, with no part number.
-        frame(&a);
+        let mut big = Screen::new(120, 40);
+        a.draw(&mut big);
         let all = a.hits.borrow().iter().filter(|h| matches!(h.target, Target::Param(_))).count();
         assert_eq!(all, a.page_params().len());
+        assert!((0..40).all(|y| !big.row_text(y).contains("· 1/")));
     }
 
     #[test]

@@ -797,8 +797,9 @@ pub enum Command {
         step: Step,
         frames: u32,
     },
-    /// Gives a sampler track its samples (other tracks ignore them). The
-    /// ones they replace go back through the retirement queue.
+    /// Gives a sampler track its samples, or a synth track its file's
+    /// wavetable (other tracks ignore them). What they replace goes back
+    /// through the retirement queue.
     SetSamples {
         track: u8,
         map: Option<Arc<SampleMap>>,
@@ -1855,6 +1856,7 @@ impl Engine {
     /// engine will ever use is allocated here.
     pub fn new(sample_rate: f32, shared: Arc<Shared>, commands: Option<Consumer<Command>>) -> Box<Self> {
         crate::sample::init();
+        crate::dsp::wavetable::prepare();
         let tracks: Vec<Track> = (0..MAX_TRACKS).map(|_| Track::new(InstrumentKind::Synth, sample_rate)).collect();
         Box::new(Self {
             sample_rate,
@@ -8145,6 +8147,45 @@ mod tests {
         // The engine holds no reference any more: every count is ours.
         drop(back);
         assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (1, 1));
+    }
+
+    #[test]
+    fn a_synth_tracks_table_goes_back_through_the_queue() {
+        let cycle: Vec<f32> = (0..600).map(|i| (std::f32::consts::TAU * i as f32 / 600.0).sin()).collect();
+        let table =
+            |audio: &[f32]| Arc::new(SampleMap::wavetable(Sample::from_mono(audio, 48_000).unwrap().wavetable()));
+        let (a, b) = (table(&cycle), table(&cycle[..300]));
+        let (tx, mut rx) = spsc::channel(RETIRE_QUEUE);
+        let mut e = engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.attach_retirement(tx);
+        let specs = InstrumentKind::Synth.params();
+        for (id, value) in [("osc1_wave", 4.0), ("osc_mix", 0.0), ("wavetable", 4.0)] {
+            let index = specs.iter().position(|s| s.id == id).unwrap() as u8;
+            e.apply(Edit::SetParam { track: 0, index, value });
+        }
+        let mut back = Vec::new();
+        let drain = |rx: &mut spsc::Consumer<Retired>, back: &mut Vec<Arc<SampleMap>>| {
+            while let Some(r) = rx.pop() {
+                let Retired::Samples(s) = r else { panic!("only tables were sent") };
+                back.push(s);
+            }
+            back.len()
+        };
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 4800 });
+        assert!(run(&mut e, 512).iter().all(|&x| x == 0.0), "no file, no sound");
+        e.handle(Command::SetSamples { track: 0, map: Some(a.clone()) });
+        e.handle(Command::Audition { track: 0, step: Step::new(60, 127, 1), frames: 4800 });
+        assert!(run(&mut e, 512).iter().any(|x| x.abs() > 0.01), "the synth plays its table");
+        assert_eq!(drain(&mut rx, &mut back), 0);
+        e.handle(Command::SetSamples { track: 0, map: Some(b.clone()) });
+        assert_eq!(drain(&mut rx, &mut back), 1);
+        assert!(Arc::ptr_eq(&back[0], &a));
+        e.apply(Edit::RemoveTrack(0));
+        let fade = e.fade_frames as usize;
+        run(&mut e, fade);
+        assert_eq!(drain(&mut rx, &mut back), 2);
+        drop(back);
+        assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (1, 1), "the engine holds none");
     }
 
     #[test]
