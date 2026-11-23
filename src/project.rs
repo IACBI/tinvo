@@ -3710,6 +3710,9 @@ song A",
         assert_eq!(e.to_string(), "the project would be over 4 MiB, more than the 2 MiB a project file can hold");
         // They fit, the rest of the text does not.
         let line = (3u64 << 20).div_ceil(3) * 4 + "state \n".len() as u64;
+        // A state's line is longer than its base64: counted whole.
+        let e = p.save_within(&path, line - 1).unwrap_err();
+        assert!(e.to_string().starts_with("the project would be over 4 MiB"), "{e}");
         let e = p.save_within(&path, line).unwrap_err();
         assert!(e.to_string().starts_with("the project would be 4 MiB, over the "), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), kept, "the file there as it was");
