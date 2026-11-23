@@ -28,8 +28,9 @@
 //! - `steady`: the gain adds 0.25 to what it gives and asks to go on
 //!   being processed (`CLAP_PROCESS_CONTINUE`);
 //! - `sleep`: the same 0.25, but it says it may sleep, and asks to be
-//!   processed (`request_process`) once a file named `wake` is beside it;
-//! - `loud`: the same 0.25, asking to go on while its output is not quiet
+//!   processed (`request_process`) whenever it finds a file named `wake`
+//!   beside it, which it removes;
+//! - `loud`: the gain asks to go on while its output is not quiet
 //!   (`CLAP_PROCESS_CONTINUE_IF_NOT_QUIET`);
 //! - `sidechain`: the gain has a second stereo input and a second mono
 //!   output, and checks the input is silent;
@@ -136,6 +137,8 @@ enum Mode {
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Normal as u8);
 static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The `sleep` mode's waking thread, and what stops it.
+static WAKER: Mutex<Option<(std::sync::Arc<AtomicBool>, std::thread::JoinHandle<()>)>> = Mutex::new(None);
 static ENTRY_INITS: AtomicU32 = AtomicU32::new(0);
 static LIVE: AtomicU32 = AtomicU32::new(0);
 static BROKEN: AtomicU32 = AtomicU32::new(0);
@@ -1208,6 +1211,29 @@ unsafe extern "C" fn plugin_activate(p: *const ClapPlugin, sample_rate: f64, min
     me.start_gain.store(me.values[0].load(Ordering::Relaxed), Ordering::Relaxed);
     me.max_frames.store(max, Ordering::Relaxed);
     me.active.store(true, Ordering::Relaxed);
+    if mode() == Mode::Sleep {
+        // Asks to be processed each time it finds a file named `wake` beside it,
+        // from a thread of its own, as CLAP lets any thread ask; deactivate
+        // ends the thread before the host can go.
+        let host = me.host as usize;
+        let wake = PATH.lock().unwrap().clone().unwrap_or_default().with_file_name("wake");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                if std::fs::remove_file(&wake).is_ok() {
+                    let host = host as *const ClapHost;
+                    // SAFETY: the host's thread-safe callback, while the
+                    // plugin is active.
+                    if let Some(f) = unsafe { (*host).request_process } {
+                        unsafe { f(host) };
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        *WAKER.lock().unwrap() = Some((stop, thread));
+    }
     true
 }
 
@@ -1218,6 +1244,10 @@ unsafe extern "C" fn plugin_deactivate(p: *const ClapPlugin) {
     me.require(me.active.load(Ordering::Relaxed) && !me.processing.load(Ordering::Relaxed));
     me.active.store(false, Ordering::Relaxed);
     me.deactivates.fetch_add(1, Ordering::Relaxed);
+    if let Some((stop, thread)) = WAKER.lock().unwrap().take() {
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap();
+    }
 }
 
 unsafe extern "C" fn plugin_start(p: *const ClapPlugin) -> bool {
@@ -1229,26 +1259,6 @@ unsafe extern "C" fn plugin_start(p: *const ClapPlugin) -> bool {
     }
     me.processing.store(true, Ordering::Relaxed);
     me.starts.fetch_add(1, Ordering::Relaxed);
-    if mode() == Mode::Sleep {
-        // Asks to be processed once a file named `wake` appears beside it,
-        // from a thread of its own, as CLAP lets any thread ask.
-        let host = me.host as usize;
-        let wake = PATH.lock().unwrap().clone().unwrap_or_default().with_file_name("wake");
-        std::thread::spawn(move || {
-            for _ in 0..2000 {
-                if wake.exists() {
-                    let host = host as *const ClapHost;
-                    // SAFETY: the host's thread-safe callback; the test
-                    // waits for what it asks before it ends.
-                    if let Some(f) = unsafe { (*host).request_process } {
-                        unsafe { f(host) };
-                    }
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-    }
     true
 }
 
@@ -1415,7 +1425,7 @@ unsafe extern "C" fn plugin_process(p: *const ClapPlugin, process: *const ClapPr
         }
         let gain = me.value(GAIN).unwrap_or(0.5) as f32;
         // Heard whenever it is processed, whatever its input.
-        let dc = if matches!(mode(), Mode::Steady | Mode::Sleep | Mode::Loud) { 0.25 } else { 0.0 };
+        let dc = if matches!(mode(), Mode::Steady | Mode::Sleep) { 0.25 } else { 0.0 };
         let offset = me.value(OFFSET).unwrap_or(0.0) as f32 + dc;
         for c in 0..2 {
             // SAFETY: the main ports, stereo as checked.

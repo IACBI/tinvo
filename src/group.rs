@@ -243,6 +243,7 @@ impl Group {
         mix_r: &mut [f32],
         at: usize,
         mix: &mut Mix,
+        asked: bool,
         retire: &mut impl FnMut(Box<Insert>),
     ) {
         if fed > 0 {
@@ -259,8 +260,10 @@ impl Group {
             self.run(from, n, &key[done..], &mut mix_l[done..], &mut mix_r[done..], at + 2 * done, mix, retire);
             done += n;
             // An echo still in the chain keeps it running, from the frame
-            // the hold ran out on, as does a plugin that asks to go on.
-            if self.hold_left > 0 || !self.chain.keeps_going() {
+            // the hold ran out on, as does a plugin that asks to go on
+            // (`asked`: unless the group was removed).
+            let going = if asked { self.chain.keeps_going() } else { !self.chain.is_idle() };
+            if self.hold_left > 0 || !going {
                 break;
             }
             self.hold_left = self.hold();

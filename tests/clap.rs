@@ -2647,10 +2647,21 @@ fn a_plugin_s_tail_keeps_the_render_going() {
 fn a_plugin_on_a_group_keeps_it_running_while_it_asks_and_wakes_it_resting() {
     let dir = temp_dir("engine-going");
     let mut host = PluginHost::new();
-    for (stem, going) in [("steady", true), ("loud", true), ("sleep", false)] {
+    let loud = |out: &[f32]| out.iter().all(|x| x.abs() > 0.1);
+    let silent = |out: &[f32]| out.iter().all(|&x| x == 0.0);
+    for (stem, going) in [("steady", true), ("sleep", false)] {
         let sub = dir.join(stem);
         std::fs::create_dir_all(&sub).unwrap();
         let file = install(&sub, stem);
+        let wake = || {
+            std::fs::write(sub.join("wake"), "").unwrap();
+            let start = Instant::now();
+            while sub.join("wake").exists() {
+                assert!(start.elapsed() < Duration::from_secs(5), "{stem}: the request is made");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let grouped = [
             Edit::AddTrack(InstrumentKind::Kick),
             Edit::InsertGroup(0),
@@ -2661,29 +2672,53 @@ fn a_plugin_on_a_group_keeps_it_running_while_it_asks_and_wakes_it_resting() {
         assert!(insert.attach(Box::new(create(&mut host, &file, GAIN, Role::Effect).unwrap())).unwrap().is_none());
         e.handle(EngineCommand::SetSlot { chain: ChainId::Group(0), slot: 0, insert: Some(insert) });
         let fed = render(&mut e, 4800, 64);
-        assert!(
-            fed[fed.len() - 64..].iter().all(|x| x.abs() > 0.1),
-            "{stem}: processed while fed {:?}",
-            &fed[fed.len() - 8..]
-        );
+        assert!(loud(&fed[fed.len() - 64..]), "{stem}: processed while fed");
+        if !going {
+            // A request made while it is processed is answered there, and
+            // does not wake it once it rests.
+            wake();
+            render(&mut e, 512, 512);
+        }
         // Its only track leaves: the group runs out its 2 s hold, then
         // rests unless the plugin asks to go on.
         e.handle(EngineCommand::Edit(Edit::SetTrackGroup { track: 0, group: None }));
         let after = render(&mut e, 3 * RATE as usize, 512);
         let end = &after[after.len() - 1024..];
-        assert_eq!(end.iter().all(|x| x.abs() > 0.1), going, "{stem}");
-        assert_eq!(end.iter().all(|&x| x == 0.0), !going, "{stem}");
-        // Not quiet, it has a tail: a render waits for it.
-        assert_eq!(e.effects_idle(), stem != "loud", "{stem}");
-        if !going {
+        assert_eq!(loud(end), going, "{stem}");
+        assert_eq!(silent(end), !going, "{stem}");
+        if going {
+            // Removed, it plays out its hold and stops, whatever it asks.
+            e.handle(EngineCommand::Edit(Edit::RemoveGroup(0)));
+            let after = render(&mut e, 3 * RATE as usize, 512);
+            assert!(silent(&after[after.len() - 1024..]), "{stem}: removed");
+        } else {
             // Resting, it asks to be processed, and the group wakes.
-            std::fs::write(sub.join("wake"), "").unwrap();
-            let start = Instant::now();
-            while !render(&mut e, 512, 512).iter().any(|x| x.abs() > 0.1) {
-                assert!(start.elapsed() < Duration::from_secs(5), "woken by its request");
-                std::thread::sleep(Duration::from_millis(5));
+            wake();
+            assert!(loud(&render(&mut e, 512, 512)), "woken by its request");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_going_on_while_not_quiet_stops_on_the_same_frame_however_called() {
+    let dir = temp_dir("loud");
+    let file = install(&dir, "loud");
+    let mut host = PluginHost::new();
+    // One loud frame, the 100th: whatever the calls, the plugin goes on
+    // (and has a tail) at frame 128, 27 frames on, and not at 192, 91 on.
+    for size in [1, 4, 64] {
+        let mut i = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+        let mut seen = Vec::new();
+        for start in (0..320).step_by(size) {
+            let mut io: Vec<f32> = (start..start + size).flat_map(|f| [f32::from(u8::from(f == 100)); 2]).collect();
+            assert!(i.process(&mut io));
+            if (start + size) % 64 == 0 {
+                assert_eq!(i.keeps_going(), i.has_tail());
+                seen.push(i.keeps_going());
             }
         }
+        assert_eq!(seen, [false, true, false, false, false], "calls of {size}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
