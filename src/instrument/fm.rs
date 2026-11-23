@@ -139,6 +139,8 @@ struct Voice {
     /// feedback: the average keeps a high feedback from flipping between
     /// two values every sample.
     fb: [f32; 2],
+    /// Each operator's phase increment, as the last plan made it.
+    inc: [f64; OPS],
     /// Where the levels are, where they are going, by how much a frame,
     /// for how many frames more; a voice that has not played yet starts
     /// where it is told.
@@ -159,6 +161,7 @@ impl Voice {
             age: 0,
             ops: [Op { phase: 0.0, env: Adsr::new() }; OPS],
             fb: [0.0; 2],
+            inc: [0.0; OPS],
             now: Gains::ZERO,
             target: Gains::ZERO,
             step: Gains::ZERO,
@@ -209,23 +212,26 @@ pub struct FmSynth {
     ratio: [f32; OPS],
     /// The pitch bend wheel, −1 to 1.
     bend: f32,
+    /// Frames rendered, which places the plans' fixed frames.
+    frame: u64,
+    /// Something changed since the plans were made.
+    dirty: bool,
     /// Off in tests that measure what the limit keeps out.
     #[cfg(test)]
     limited: bool,
 }
 
-/// What a voice's operators do for one chunk.
-struct Plan {
-    inc: [f64; OPS],
-    gains: Gains,
-}
-
 /// The levels a voice glides to when they change, over [`RAMP`] frames
-/// whatever the callbacks, so a stolen voice or a turned knob never clicks.
+/// whatever the callbacks, so a stolen voice, a turned knob or a change of
+/// algorithm never clicks.
 #[derive(Clone, Copy, PartialEq)]
 struct Gains {
-    /// A heard operator's gain, or a modulator's peak index in radians.
-    amp: [f32; OPS],
+    /// How loud each operator is heard: 0 for a modulator.
+    gain: [f32; OPS],
+    /// How far each operator moves what it modulates, in radians: 0 for
+    /// an operator heard. Kept apart from the gain, so an operator that
+    /// changes role glides out of one and into the other.
+    index: [f32; OPS],
     /// How much of its modulation (and feedback) each operator takes.
     keep: [f32; OPS],
     /// Operator 4's feedback, in radians.
@@ -233,11 +239,12 @@ struct Gains {
 }
 
 impl Gains {
-    const ZERO: Gains = Gains { amp: [0.0; OPS], keep: [0.0; OPS], feedback: 0.0 };
+    const ZERO: Gains = Gains { gain: [0.0; OPS], index: [0.0; OPS], keep: [0.0; OPS], feedback: 0.0 };
 
     fn map(self, other: Gains, f: impl Fn(f32, f32) -> f32) -> Gains {
         Gains {
-            amp: std::array::from_fn(|k| f(self.amp[k], other.amp[k])),
+            gain: std::array::from_fn(|k| f(self.gain[k], other.gain[k])),
+            index: std::array::from_fn(|k| f(self.index[k], other.index[k])),
             keep: std::array::from_fn(|k| f(self.keep[k], other.keep[k])),
             feedback: f(self.feedback, other.feedback),
         }
@@ -257,6 +264,8 @@ impl FmSynth {
             clock: 0,
             ratio: [1.0; OPS],
             bend: 0.0,
+            frame: 0,
+            dirty: true,
             #[cfg(test)]
             limited: true,
         };
@@ -271,6 +280,7 @@ impl FmSynth {
         if let Some(spec) = PARAMS.get(index) {
             self.params[index] = spec.clamp(value);
             self.update_derived();
+            self.dirty = true;
         }
     }
 
@@ -281,6 +291,7 @@ impl FmSynth {
     /// Bends every voice by `amount` (−1 to 1) of the bend range.
     pub fn set_bend(&mut self, amount: f32) {
         self.bend = if amount.is_finite() { amount.clamp(-1.0, 1.0) } else { 0.0 };
+        self.dirty = true;
     }
 
     fn update_derived(&mut self) {
@@ -350,6 +361,7 @@ impl FmSynth {
             op.env.gate_on();
         }
         self.clock += 1;
+        self.dirty = true;
         VoiceId(self.next_id)
     }
 
@@ -390,36 +402,73 @@ impl FmSynth {
     }
 
     pub fn render(&mut self, out: &mut [f32]) {
-        for chunk in out.chunks_mut(CHUNK) {
-            self.render_chunk(chunk);
+        // The operators' plans are made at fixed frames, every CHUNK
+        // frames from the start and whenever something changes, so the
+        // output does not depend on how it is cut into callbacks.
+        let mut done = 0;
+        while done < out.len() {
+            let into = (self.frame % CHUNK as u64) as usize;
+            if into == 0 || self.dirty {
+                self.replan();
+            }
+            let n = (CHUNK - into).min(out.len() - done);
+            self.render_frames(&mut out[done..done + n]);
+            done += n;
+            self.frame += n as u64;
         }
     }
 
-    /// The operators' increments, gains and modulation limits for a voice.
-    fn plan(&self, v: &Voice, mods: &[u8; OPS], heard: u8) -> Plan {
+    /// Makes every sounding voice's plan, and puts away voices that are
+    /// over.
+    fn replan(&mut self) {
+        self.dirty = false;
+        let (mods, heard) = self.routes();
+        for i in 0..FM_VOICES {
+            if !Self::sounding(&self.voices[i], heard) {
+                // Over, perhaps by a change of algorithm: an operator no
+                // longer heard must not ring on, to come back with another.
+                if self.voices[i].ops.iter().any(|op| op.env.is_active()) {
+                    self.voices[i].clear();
+                }
+                continue;
+            }
+            let (inc, gains) = self.plan(&self.voices[i], &mods, heard);
+            let v = &mut self.voices[i];
+            v.inc = inc;
+            v.aim(gains);
+        }
+    }
+
+    /// The operators' increments, and their gains and modulation limits,
+    /// for a voice.
+    fn plan(&self, v: &Voice, mods: &[u8; OPS], heard: u8) -> ([f64; OPS], Gains) {
         let pr = &self.params;
         let sr = self.sample_rate;
         let base_hz = midi_to_hz(f32::from(v.note) + self.bend * pr[p::BEND_RANGE]);
         let gain = velocity_to_gain(v.velocity);
         let carriers = heard.count_ones() as f32;
         let (limit, nyquist) = (LIMIT * sr, 0.5 * sr);
-        let mut plan = Plan { inc: [0.0; OPS], gains: Gains { amp: [0.0; OPS], keep: [1.0; OPS], feedback: 0.0 } };
+        let mut inc = [0.0; OPS];
+        let mut g = Gains { gain: [0.0; OPS], index: [0.0; OPS], keep: [1.0; OPS], feedback: 0.0 };
         // Each operator's peak instantaneous frequency and how high its
-        // spectrum reaches, from 4 down.
+        // spectrum reaches, from 4 down, and the index each modulator can
+        // reach before the next plan, its envelope taken into account.
         let mut peak = [0.0f32; OPS];
         let mut reach = [0.0f32; OPS];
+        let mut most = [0.0f32; OPS];
         for o in (0..OPS).rev() {
             let hz = base_hz * self.ratio[o];
-            plan.inc[o] = f64::from(hz / sr).min(0.5);
+            inc[o] = f64::from(hz / sr).min(0.5);
             let sens = pr[p::op(o, p::VEL)];
             let level = pr[p::op(o, p::LEVEL)] * (1.0 - sens + sens * gain);
-            plan.gains.amp[o] = if heard & (1 << o) != 0 {
+            if heard & (1 << o) != 0 {
                 // An operator heard above the limit fades out by Nyquist.
                 let fade = ((nyquist - hz) / (nyquist - limit)).clamp(0.0, 1.0);
-                level / carriers * fade
+                g.gain[o] = level / carriers * fade;
             } else {
-                level * MAX_INDEX
-            };
+                g.index[o] = level * MAX_INDEX;
+                most[o] = g.index[o] * v.ops[o].env.peak_ahead();
+            }
             // Carson, for a modulating signal of bandwidth W moving the
             // frequency by up to D: the spectrum reaches D + W past the
             // carrier, here D + min(EDGE, 1 + β)·W, as the second sideband
@@ -427,15 +476,16 @@ impl FmSynth {
             // its operator by its index times its own peak frequency, and
             // a silent one not at all.
             let (mut index, mut shift, mut width) = (0.0f32, 0.0f32, 0.0f32);
-            for j in (o + 1..OPS).filter(|&j| mods[o] & (1 << j) != 0 && plan.gains.amp[j] > 0.0) {
-                index += plan.gains.amp[j];
-                shift += plan.gains.amp[j] * peak[j];
+            for j in (o + 1..OPS).filter(|&j| mods[o] & (1 << j) != 0 && most[j] > 0.0) {
+                index += most[j];
+                shift += most[j] * peak[j];
                 width = width.max(reach[j]);
             }
             let feedback = if o == OPS - 1 { MAX_FEEDBACK * pr[p::FEEDBACK] } else { 0.0 };
-            if feedback > 0.0 {
-                index += feedback;
-                shift += feedback * hz;
+            let fed = feedback * v.ops[o].env.peak_ahead();
+            if fed > 0.0 {
+                index += fed;
+                shift += fed * hz;
                 width = width.max(hz);
             }
             let top = |k: f32| hz + k * shift + (1.0 + k * index).min(EDGE) * width;
@@ -462,31 +512,23 @@ impl FmSynth {
             if !self.limited {
                 keep = 1.0;
             }
-            plan.gains.keep[o] = keep;
-            plan.gains.feedback = plan.gains.feedback.max(feedback);
+            g.keep[o] = keep;
+            g.feedback = g.feedback.max(feedback);
             peak[o] = hz + keep * shift;
             reach[o] = if index > 0.0 && keep > 0.0 { top(keep) } else { hz };
         }
-        plan
+        (inc, g)
     }
 
-    fn render_chunk(&mut self, out: &mut [f32]) {
+    fn render_frames(&mut self, out: &mut [f32]) {
         let (mods, heard) = self.routes();
-        for i in 0..FM_VOICES {
-            if !Self::sounding(&self.voices[i], heard) {
-                // Over, perhaps by a change of algorithm: an operator no
-                // longer heard must not ring on, to come back with another.
-                if self.voices[i].ops.iter().any(|op| op.env.is_active()) {
-                    self.voices[i].clear();
-                }
-                continue;
-            }
-            let plan = self.plan(&self.voices[i], &mods, heard);
-            let v = &mut self.voices[i];
-            v.aim(plan.gains);
+        for v in self.voices.iter_mut().filter(|v| Self::sounding(v, heard)) {
             for o in out.iter_mut() {
                 let g = v.next_gains();
+                // Each operator's output as a modulator (radians), from 4
+                // down, and what is heard.
                 let mut y = [0.0f32; OPS];
+                let mut heard_sum = 0.0;
                 for k in (0..OPS).rev() {
                     let e = v.ops[k].env.tick();
                     let mut m = 0.0;
@@ -499,18 +541,18 @@ impl FmSynth {
                         m += g.feedback * 0.5 * (v.fb[0] + v.fb[1]);
                     }
                     let op = &mut v.ops[k];
-                    let s = (TAU * op.phase + f64::from(m * g.keep[k])).sin() as f32;
-                    op.phase += plan.inc[k];
+                    let s = (TAU * op.phase + f64::from(m * g.keep[k])).sin() as f32 * e;
+                    op.phase += v.inc[k];
                     if op.phase >= 1.0 {
                         op.phase -= 1.0;
                     }
                     if k == OPS - 1 {
-                        v.fb = [s * e, v.fb[0]];
+                        v.fb = [s, v.fb[0]];
                     }
-                    y[k] = s * e * g.amp[k];
+                    y[k] = s * g.index[k];
+                    heard_sum += s * g.gain[k];
                 }
-                let s: f32 = (0..OPS).filter(|&k| heard & (1 << k) != 0).map(|k| y[k]).sum();
-                *o += s * VOICE_GAIN;
+                *o += heard_sum * VOICE_GAIN;
                 if !Self::sounding(v, heard) {
                     break;
                 }
@@ -789,14 +831,27 @@ mod tests {
 
     #[test]
     fn the_output_does_not_depend_on_how_it_is_cut_into_callbacks() {
+        // Notes come at frames of their own, as the engine plays them, and
+        // a modulator decays while they play, so the limits change.
         let play = |sizes: &[usize]| {
             let mut s = FmSynth::new(SR);
             s.set_param(p::FEEDBACK, 0.7);
             s.set_param(p::op(3, p::LEVEL), 0.4);
-            s.note_on(60, 100);
-            s.note_on(67, 80);
+            s.set_param(p::op(2, p::LEVEL), 0.8);
+            s.set_param(p::op(2, p::RATIO), 7.0);
+            s.set_param(p::op(2, p::DECAY), 0.05);
+            s.set_param(p::op(2, p::SUSTAIN), 0.0);
+            let events = [(0, 72u8), (1000, 79), (2345, 84)];
             let mut all = Vec::new();
-            for &n in sizes.iter().cycle().take(200) {
+            let mut sizes = sizes.iter().cycle();
+            while all.len() < 9000 {
+                for &(at, note) in &events {
+                    if all.len() == at {
+                        s.note_on(note, 100);
+                    }
+                }
+                let next = events.iter().map(|e| e.0).find(|&at| at > all.len()).unwrap_or(usize::MAX);
+                let n = (*sizes.next().unwrap()).min(next - all.len());
                 all.extend(render(&mut s, n));
             }
             all.truncate(9000);
@@ -805,6 +860,46 @@ mod tests {
         let whole = play(&[64]);
         assert!(play(&[64, 128, 192]) == whole);
         assert!(play(&[37, 1, 100, 129, 7]) == whole);
+    }
+
+    #[test]
+    fn a_change_of_algorithm_glides_instead_of_bursting() {
+        // Three modulators at full become heard: they glide from moving
+        // operator 1 to being heard beside it, never louder than four
+        // operators at their share.
+        let mut s = plain();
+        for o in 0..OPS {
+            s.set_param(p::op(o, p::LEVEL), 1.0);
+        }
+        s.note_on(69, 100);
+        render(&mut s, 4800);
+        s.set_param(p::ALGORITHM, 7.0);
+        let after = render(&mut s, 4800);
+        let peak = after.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak <= VOICE_GAIN * 1.0001, "{peak}");
+        // And back: no operator starts moving another at full at once.
+        s.set_param(p::ALGORITHM, 0.0);
+        let back = render(&mut s, 4800);
+        assert!(back.iter().all(|x| x.abs() <= VOICE_GAIN * 1.0001));
+    }
+
+    #[test]
+    fn a_modulator_that_has_died_away_limits_nothing() {
+        // Operator 3, high and hard, decays to nothing at once; operator 2
+        // goes on moving operator 1 as if operator 3 had never played.
+        let tone = |op3: f32| {
+            let mut s = plain();
+            s.set_param(p::op(1, p::LEVEL), 0.1);
+            s.set_param(p::op(2, p::RATIO), 16.0);
+            s.set_param(p::op(2, p::LEVEL), op3);
+            s.set_param(p::op(2, p::DECAY), 0.001);
+            s.set_param(p::op(2, p::SUSTAIN), 0.0);
+            s.note_on(81, 100);
+            render(&mut s, 24_000)[12_000..].to_vec()
+        };
+        let (died, never) = (tone(1.0), tone(0.0));
+        assert!(magnitude(&never, 1760.0) > 0.01, "operator 2 moves operator 1");
+        assert!(died.iter().zip(&never).all(|(a, b)| (a - b).abs() < 1e-6));
     }
 
     /// Energy away from the harmonics of `hz`, in dB of the whole.
@@ -959,5 +1054,16 @@ mod tests {
         t.set_param(p::op(3, p::LEVEL), 0.5);
         t.note_on(60, 100);
         assert!(render(&mut t, 4800) == out);
+    }
+
+    #[test]
+    fn a_note_between_the_plans_sounds_from_its_first_frame() {
+        let mut early = plain();
+        early.note_on(69, 100);
+        let early = render(&mut early, 2000);
+        let mut late = plain();
+        render(&mut late, 100);
+        late.note_on(69, 100);
+        assert!(render(&mut late, 2000) == early);
     }
 }
