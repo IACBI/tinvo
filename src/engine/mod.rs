@@ -325,6 +325,11 @@ pub const LIVE_QUEUE: usize = 256;
 const MAX_LIVE: usize = 32;
 /// Live notes one callback takes, so a flood cannot stretch it.
 const LIVE_BUDGET: usize = LIVE_QUEUE;
+/// Work one callback spends on live messages, in zones looked through
+/// ([`Instrument::note_work`]): a channel playing many samplers of many
+/// zones would otherwise cost millions of looks in one callback. What is
+/// over waits, in order, for the next.
+const LIVE_WORK: usize = 1 << 16;
 
 /// A live note sounding on a track.
 #[derive(Clone, Copy)]
@@ -1812,6 +1817,9 @@ pub struct Engine {
     limiter_reduction: f32,
     /// MIDI messages played live, taken at the start of each callback.
     live: Option<Arc<Mailbox<Message>>>,
+    /// A live message taken from the mailbox that the last callback's work
+    /// budget had no room for: the first the next one plays.
+    live_waiting: Option<Message>,
     live_track: usize,
     /// Live notes sounding, oldest first.
     held: [Held; MAX_LIVE],
@@ -1914,6 +1922,7 @@ impl Engine {
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
             live: None,
+            live_waiting: None,
             live_track: 0,
             held: [Held { track: 0, channel: 0, note: 0, voice: VoiceId::NONE, out: None, sustained: false }; MAX_LIVE],
             held_count: 0,
@@ -2554,11 +2563,36 @@ impl Engine {
     /// Plays the live notes waiting in the mailbox, up to a budget.
     fn play_live(&mut self) {
         let Some(live) = self.live.take() else { return };
-        for _ in 0..LIVE_BUDGET {
-            let Some(m) = live.pop() else { break };
+        let mut work = 0;
+        for n in 0..LIVE_BUDGET {
+            let Some(m) = self.live_waiting.take().or_else(|| live.pop()) else { break };
+            // The first always plays, so the queue moves on.
+            let cost = self.live_work(&m);
+            if n > 0 && work + cost > LIVE_WORK {
+                self.live_waiting = Some(m);
+                break;
+            }
+            work += cost;
             self.play_message(m);
         }
         self.live = Some(live);
+    }
+
+    /// The work playing `m` costs: a note's, what each track it reaches
+    /// looks through; anything else, one.
+    fn live_work(&self, m: &Message) -> usize {
+        let channel = match *m {
+            Message::NoteOn { channel, .. } | Message::NoteOff { channel, .. } => channel,
+            _ => return 1,
+        };
+        let targets = self.targets(channel);
+        self.tracks[..self.track_count]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| targets & 1 << i != 0)
+            .map(|(_, t)| t.instrument.note_work())
+            .sum::<usize>()
+            .max(1)
     }
 
     fn play_message(&mut self, m: Message) {
@@ -6880,6 +6914,28 @@ mod tests {
         press(&live, 64, 100);
         run(&mut e, 64);
         assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn live_notes_to_many_zones_wait_for_the_next_callback() {
+        use crate::instrument::zone::Placement;
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Sampler)]);
+        let sample = Arc::new(Sample::from_mono(&[0.5; 64], 48_000).unwrap());
+        let zones = (0..crate::instrument::zone::MAX_ZONES).map(|_| (Placement::WHOLE, sample.clone()));
+        e.handle(Command::SetSamples { track: 0, map: Some(Arc::new(SampleMap::new(zones))) });
+        // Each note looks through 1024 zones: 63 a callback fit the budget.
+        for k in 0..100u8 {
+            press(&live, k, 100);
+        }
+        run(&mut e, 64);
+        assert!(e.live_waiting.is_some(), "the 64th waits");
+        let mut left = 0;
+        while live.pop().is_some() {
+            left += 1;
+        }
+        assert_eq!(left, 100 - 64);
+        run(&mut e, 64);
+        assert!(e.live_waiting.is_none(), "played first in the next callback");
     }
 
     #[test]

@@ -206,6 +206,11 @@ impl Sampler {
     /// belong to the old samples); round robin starts over. Returns the
     /// previous map, which the caller must not drop on the audio thread.
     #[must_use]
+    /// The zones a note looks through.
+    pub fn zone_count(&self) -> usize {
+        self.map.as_ref().map_or(0, |m| m.zones().len())
+    }
+
     pub fn set_samples(&mut self, map: Option<Arc<SampleMap>>) -> Option<Arc<SampleMap>> {
         for v in &mut self.voices {
             v.playing = false;
