@@ -17,6 +17,19 @@ Author: 𝓐.𝓒.𝓑
   - An SFZ import of many unreadable lines keeps a count and the five it quotes.
   - A MIDI file of more than 65,535 tracks is refused.
   - The plugin cache and a scan's result are refused past the files, plugins and features a scan keeps, and a scan writes no more than it reads back.
+- Files are no longer written over or lost without a word:
+  - Save As and export ask before replacing another existing file. A file another program creates at the name while an export renders is kept, and the export takes the next free name.
+  - `--stems` writes no stem over an existing file and checks every stem's name before rendering. The stems are put in place before the mix, so a stem that fails leaves the mix as it was.
+  - A session that cannot lock its project, for a reason other than another session having it, no longer autosaves or offers recovery, as another session may share its autosave. It says so.
+  - Opening an autosave as a project is refused, and so is a save onto another project that has a crashed session's autosave, which the save would delete.
+  - An unreadable autosave is set aside without replacing one set aside before. One that cannot be moved is kept, and that session does not autosave.
+  - A lock file is judged by all of its contents, not only by how it starts.
+  - A file whose name is as long as a name can be (255 bytes) can be saved: temporary names no longer grow with it.
+- Paths and names are checked before they cause trouble:
+  - A save is refused when a sample path, as it would be written, could not be loaded back: a line break, more than 4096 bytes, or whitespace at either end.
+  - A project in a folder whose path is not Unicode text is refused on load and on save. The command line refuses arguments that are not Unicode text.
+  - A WAV export longer than a WAV file can hold is refused before it renders.
+  - The command line's errors name paths on one line, with control characters escaped.
 
 ## [0.29.0] - 2026-11-23
 

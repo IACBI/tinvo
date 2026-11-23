@@ -1002,8 +1002,9 @@ fn bpm(us: u32) -> f32 {
 
 /// Reads the MIDI file at `path` into a new project.
 pub fn load(path: &Path) -> Result<Import, String> {
-    let bytes = crate::fsutil::read_bytes(path, MAX_FILE_BYTES).map_err(|e| format!("{}: {e}", path.display()))?;
-    read(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    let bytes =
+        crate::fsutil::read_bytes(path, MAX_FILE_BYTES).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))?;
+    read(&bytes).map_err(|e| format!("{}: {e}", crate::fsutil::shown(path)))
 }
 
 #[cfg(test)]

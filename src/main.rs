@@ -100,7 +100,15 @@ fn main() -> ExitCode {
             _ => ExitCode::from(2),
         };
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // A project keeps its paths as text: an argument that is not Unicode
+    // could not be kept, and is refused rather than read some other way.
+    let args = match unicode_args(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match args.first().map(String::as_str) {
         None => cmd_edit(&[]),
         Some("-h" | "--help" | "help") => {
@@ -138,6 +146,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The arguments as text, or which one is not.
+fn unicode_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.map(|a| {
+        a.into_string().map_err(|bad| {
+            let bad = tinvo::tui::printable_line(&bad.to_string_lossy());
+            format!("the argument '{bad}' is not Unicode text; TINVO takes file names that are")
+        })
+    })
+    .collect()
 }
 
 fn cmd_render(args: &[String]) -> Result<(), String> {
@@ -257,8 +276,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     };
     for (path, _) in &stem_paths {
         render::check_destination(&project, Some(project_path), path)
+            .and_then(|()| render::check_free(path))
             .map_err(|e| format!("{} {e}", shown(&path.display().to_string())))?;
     }
+    render::check_length(&project, &opts, format)?;
     let mut plugins = plugin_source(&project)?;
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
@@ -286,6 +307,13 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
             file.write(&silence[..2 * n])?;
         }
     }
+    // The stems go in first, each under a name nothing took meanwhile: one
+    // that fails leaves the mix as it was.
+    let mut stems_done = Vec::new();
+    for (_, file) in files {
+        let (st, to) = file.finish_new()?;
+        stems_done.push((to, st));
+    }
     let stats = file.finish()?;
     let secs = frames as f64 / f64::from(opts.sample_rate);
     println!(
@@ -298,8 +326,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
         tinvo::dsp::gain_to_db(stats.peak),
         stats.clipped
     );
-    for (path, file) in files {
-        let st = file.finish()?;
+    for (path, st) in stems_done {
         println!("  stem {}: peak {:.2} dBFS", shown(&path.display().to_string()), tinvo::dsp::gain_to_db(st.peak));
     }
     Ok(())
@@ -431,7 +458,7 @@ fn cmd_slice(args: &[String]) -> Result<(), String> {
 
 fn cmd_demo(args: &[String]) -> Result<(), String> {
     let [out] = args else { return Err("demo needs exactly one output path".into()) };
-    Project::demo().save(out.as_ref()).map_err(|e| format!("{out}: {e}"))?;
+    Project::demo().save(out.as_ref()).map_err(|e| format!("{}: {e}", shown(out)))?;
     println!("Wrote demo project to {}", shown(out));
     Ok(())
 }
@@ -534,7 +561,7 @@ fn read_settings(file: Option<PathBuf>) -> Result<(Settings, Option<PathBuf>, bo
         Some(f) => {
             let (s, found) = settings::load(&f)?;
             if !found {
-                return Err(format!("{}: no such settings file", f.display()));
+                return Err(format!("{}: no such settings file", tinvo::fsutil::shown(&f)));
             }
             Ok((s, Some(f), true))
         }
@@ -1008,8 +1035,9 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
     if let Some(path) = check {
         // As the readers it checks read: a plain file, of a bounded size.
         let input = tinvo::fsutil::read_bytes(&path, tinvo::project::MAX_FILE_BYTES)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let accepted = fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
+        let accepted =
+            fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
         println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
         return Ok(());
     }
@@ -1119,12 +1147,13 @@ fn bench_instructions(file: &str) -> Result<(), String> {
         return Err("instruction budgets are counted on x86-64 Linux, where Valgrind runs".into());
     }
     // A line for each scenario: a megabyte is far more than a budget file holds.
-    let text = tinvo::fsutil::read_text(std::path::Path::new(file), 1 << 20).map_err(|e| format!("{file}: {e}"))?;
-    let budgets = bench::parse_budgets(&text).map_err(|e| format!("{file}: {e}"))?;
+    let text =
+        tinvo::fsutil::read_text(std::path::Path::new(file), 1 << 20).map_err(|e| format!("{}: {e}", shown(file)))?;
+    let budgets = bench::parse_budgets(&text).map_err(|e| format!("{}: {e}", shown(file)))?;
     let missing: Vec<&str> =
         bench::SCENARIOS.iter().map(|s| s.id).filter(|id| !budgets.iter().any(|(b, _)| b == id)).collect();
     if !missing.is_empty() {
-        return Err(format!("{file}: no budget for {}", missing.join(", ")));
+        return Err(format!("{}: no budget for {}", shown(file), missing.join(", ")));
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let count = |id: &str, seconds: f64| -> Result<u64, String> {
@@ -1183,6 +1212,18 @@ mod tests {
     }
 
     #[test]
+    fn arguments_that_are_not_unicode_are_refused() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        let bad = <OsString as std::os::unix::ffi::OsStringExt>::from_vec(vec![b'a', 0xff]);
+        #[cfg(windows)]
+        let bad = <OsString as std::os::windows::ffi::OsStringExt>::from_wide(&[u16::from(b'a'), 0xD800]);
+        let e = unicode_args([OsString::from("render"), bad].into_iter()).unwrap_err();
+        assert_eq!(e, "the argument 'a\u{fffd}' is not Unicode text; TINVO takes file names that are");
+        assert_eq!(unicode_args([OsString::from("é")].into_iter()), Ok(vec!["é".to_string()]));
+    }
+
+    #[test]
     fn usage_errors_are_one_line() {
         let e = cmd_render(&args(&["--song", "--pattern", "B", "a.tvo", "b.wav"])).unwrap_err();
         assert_eq!(e, "--pattern: --song, --region and --pattern each pick what to render; give one");
@@ -1195,6 +1236,32 @@ mod tests {
         assert_eq!(e, "unknown option '--odd\\nflag'");
         let e = cmd_bench(&args(&["--count", "odd\nscenario", "1"])).unwrap_err();
         assert!(e.starts_with("no scenario 'odd\\nscenario' (there are "), "{e}");
+    }
+
+    #[test]
+    fn stems_replace_no_file_and_a_render_too_long_is_refused_first() {
+        let dir = std::env::temp_dir().join(format!("tinvo-cli-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("song.tvo");
+        let mut p = Project::new();
+        p.apply(tinvo::engine::Edit::AddTrack(tinvo::instrument::InstrumentKind::Kick)).unwrap();
+        p.save(&song).unwrap();
+        let (s, mix) = (song.display().to_string(), dir.join("mix.wav").display().to_string());
+        cmd_render(&args(&[&s, &mix, "--pattern", "A", "--stems"])).unwrap();
+        let before = std::fs::read(&mix).unwrap();
+        let stems: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect();
+        assert!(stems.iter().any(|n| n.to_string_lossy().starts_with("mix-")), "{stems:?}");
+        let e = cmd_render(&args(&[&s, &mix, "--pattern", "A", "--stems", "--format", "16"])).unwrap_err();
+        assert!(e.contains("exists already; stems replace no file"), "{e}");
+        assert_eq!(std::fs::read(&mix).unwrap(), before, "the mix is as it was");
+        // A render longer than a WAV file holds is refused before it starts.
+        p.tempo = tinvo::engine::MIN_TEMPO;
+        p.save(&song).unwrap();
+        let e = cmd_render(&args(&[&s, &mix, "--pattern", "A", "--loops", "1000", "--format", "32f"])).unwrap_err();
+        assert!(e.ends_with("would not fit a WAV file; export fewer repeats"), "{e}");
+        assert_eq!(std::fs::read(&mix).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

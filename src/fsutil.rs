@@ -11,13 +11,20 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Creates a new, empty temporary file in the directory of `path`.
+/// `path` as an error names it: on one line, its control characters escaped,
+/// as a name may hold a line break or an escape sequence.
+pub fn shown(path: &Path) -> String {
+    crate::tui::printable_line(&path.display().to_string())
+}
+
+/// Creates a new, empty temporary file in the directory of `path`. Its name
+/// does not grow with `path`'s, so a file whose name is as long as a name
+/// may be can still be written.
 pub fn create_temp_beside(path: &Path) -> io::Result<(File, PathBuf)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     for _ in 0..64 {
-        let mut name = path.as_os_str().to_owned();
-        name.push(format!(".{}-{}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
-        let tmp = PathBuf::from(name);
+        let name = format!(".tinvo-{}-{}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+        let tmp = path.with_file_name(name);
         match OpenOptions::new().write(true).create_new(true).open(&tmp) {
             Ok(f) => return Ok((f, tmp)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -174,6 +181,22 @@ pub fn read_text(path: &Path, max: u64) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_is_named_on_one_line() {
+        assert_eq!(shown(Path::new("a\nb\u{1b}[2J.wav")), "a\\nb\\u{1b}[2J.wav");
+    }
+
+    #[test]
+    fn a_file_with_a_name_as_long_as_names_go_is_written() {
+        let dir = std::env::temp_dir().join(format!("tinvo-fsutil-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 255 bytes, the most a name may be on most file systems.
+        let path = dir.join(format!("{}.tvo", "a".repeat(251)));
+        write_atomic(&path, b"tinvo 20\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"tinvo 20\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn text_is_read_up_to_its_limit() {
