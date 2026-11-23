@@ -539,51 +539,43 @@ impl PolySynth {
     fn render_chunk(&mut self, out: &mut [f32]) {
         let sr = self.sample_rate;
         let pr = self.wheeled();
-        let bend = self.bend * pr[p::BEND_RANGE];
-        let max_hz = 0.45 * sr;
-        let (mix, base_cutoff, env_amt, reso) = (pr[p::MIX], pr[p::CUTOFF], pr[p::ENV_AMT], pr[p::RESO]);
-        let (lfo_pitch, lfo_cut, lfo_amp, vel_cut) =
-            (pr[p::LFO_PITCH], pr[p::LFO_CUTOFF], pr[p::LFO_AMP], pr[p::VEL_CUTOFF]);
-        let (w1, w2, mode, ratio, glide) = (self.wave1, self.wave2, self.mode, self.osc2_ratio, self.glide_coef);
-        let (pw, pwm, noise) = (pr[p::PW], pr[p::PWM], pr[p::NOISE]);
-        let (u, uni_ratio, uni_gain) = (self.unison, self.unison_ratio, self.unison_gain);
-        let (uni_octaves, osc2_octaves) = (self.unison_octaves, self.osc2_octaves);
-        let (t1, t2) = (self.table1, self.table2);
-        // Without its file (or the built-ins, before they are built), a
-        // table oscillator is silent; its phase runs on all the same.
-        let table: Option<&Wavetable> = match pr[p::TABLE] as usize {
-            i if i < BUILT_IN.len() => wavetable::built_in(i),
-            _ => self.map.as_deref().and_then(SampleMap::table),
-        };
-        let (wt_pos, lfo_pos, env_pos) = (pr[p::WT_POS], pr[p::LFO_POS], pr[p::ENV_POS]);
-        // The table levels of a pitch capped at `max_hz`, as a logarithm.
-        let lowest = (0.5 * sr / max_hz).log2();
-        // Taken off the logarithm so that rounding, here and in the
-        // increments, never leaves a level's top harmonic just past Nyquist.
-        const SLACK: f32 = 1e-4;
-        let incs = |f: f32, inc: &mut [[f64; MAX_UNISON]; 2], mip: &mut [[Mip; MAX_UNISON]; 2]| {
-            // The levels take a logarithm of the pitch: one for every copy,
-            // and only for a table.
-            let room = if t1 || t2 { (0.5 * sr / f).log2() - SLACK } else { 0.0 };
-            for k in 0..u {
-                let fk = f * uni_ratio[k];
-                inc[0][k] = f64::from(fk.min(max_hz) / sr);
-                inc[1][k] = f64::from((fk * ratio).min(max_hz) / sr);
-                if t1 {
-                    mip[0][k] = Mip::from_log2(f64::from((room - uni_octaves[k]).max(lowest)));
-                }
-                if t2 {
-                    mip[1][k] = Mip::from_log2(f64::from((room - uni_octaves[k] - osc2_octaves).max(lowest)));
-                }
-            }
-        };
-        let read = |osc: &mut Oscillator, wave: Waveform, on_table: bool, inc: f64, mip: &Mip, width: f64, pos: f32| {
-            if on_table {
-                let phase = osc.advance(inc);
-                table.map_or(0.0, |t| t.read(phase, pos, mip))
-            } else {
-                osc.next(wave, inc, width)
-            }
+        let c = Chunk {
+            sr,
+            bend: self.bend * pr[p::BEND_RANGE],
+            max_hz: 0.45 * sr,
+            mix: pr[p::MIX],
+            base_cutoff: pr[p::CUTOFF],
+            env_amt: pr[p::ENV_AMT],
+            reso: pr[p::RESO],
+            lfo_pitch: pr[p::LFO_PITCH],
+            lfo_cut: pr[p::LFO_CUTOFF],
+            lfo_amp: pr[p::LFO_AMP],
+            vel_cut: pr[p::VEL_CUTOFF],
+            w1: self.wave1,
+            w2: self.wave2,
+            mode: self.mode,
+            ratio: self.osc2_ratio,
+            glide: self.glide_coef,
+            pw: pr[p::PW],
+            pwm: pr[p::PWM],
+            noise: pr[p::NOISE],
+            u: self.unison,
+            uni_ratio: self.unison_ratio,
+            uni_gain: self.unison_gain,
+            uni_octaves: self.unison_octaves,
+            osc2_octaves: self.osc2_octaves,
+            t1: self.table1,
+            t2: self.table2,
+            // Without its file (or the built-ins, before they are built), a
+            // table oscillator is silent; its phase runs on all the same.
+            table: match pr[p::TABLE] as usize {
+                i if i < BUILT_IN.len() => wavetable::built_in(i),
+                _ => self.map.as_deref().and_then(SampleMap::table),
+            },
+            wt_pos: pr[p::WT_POS],
+            lfo_pos: pr[p::LFO_POS],
+            env_pos: pr[p::ENV_POS],
+            lowest: (0.5 / 0.45f32).log2(),
         };
 
         // The LFO runs even when no voice sounds, so its phase is a function
@@ -601,56 +593,137 @@ impl PolySynth {
             }
         }
 
+        // Two loops, so the oscillators without a table run as they did
+        // before tables were there.
+        let tables = c.t1 || c.t2;
         for v in self.voices.iter_mut().filter(|v| v.amp.is_active()) {
-            let gain = v.vel_gain * VOICE_GAIN;
-            let target = f32::from(v.note);
-            let cutoff_base = base_cutoff * (vel_cut * (v.vel_norm - 1.0)).exp2();
-            // Pitch only needs per-sample work while gliding or modulated.
-            let static_pitch = v.pitch == target && lfo_pitch == 0.0;
-            let mut inc = [[0.0; MAX_UNISON]; 2];
-            let mut mip = [[Mip::default(); MAX_UNISON]; 2];
-            if static_pitch {
-                incs(midi_to_hz(target + bend), &mut inc, &mut mip);
+            if tables {
+                voice_chunk::<true>(v, &c, out, &lfo);
+            } else {
+                voice_chunk::<false>(v, &c, out, &lfo);
             }
-            for (o, &l) in out.iter_mut().zip(&lfo) {
-                if !static_pitch {
-                    if v.pitch != target {
-                        v.pitch = target + (v.pitch - target) * glide;
-                        if (v.pitch - target).abs() < 1.0e-4 {
-                            v.pitch = target;
-                        }
-                    }
-                    incs(midi_to_hz(v.pitch + bend + l * lfo_pitch), &mut inc, &mut mip);
-                }
-                let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
-                let fe = v.fenv.tick();
-                let mut s = 0.0;
-                if t1 || t2 {
-                    let pos = wt_pos + lfo_pos * l + env_pos * fe;
-                    for k in 0..u {
-                        let a = read(&mut v.osc1[k], w1, t1, inc[0][k], &mip[0][k], width, pos);
-                        let b = read(&mut v.osc2[k], w2, t2, inc[1][k], &mip[1][k], width, pos);
-                        s += a * (1.0 - mix) + b * mix;
-                    }
-                } else {
-                    // Without a table, the oscillators as they always ran.
-                    for k in 0..u {
-                        s += v.osc1[k].next(w1, inc[0][k], width) * (1.0 - mix)
-                            + v.osc2[k].next(w2, inc[1][k], width) * mix;
-                    }
-                }
-                s *= uni_gain;
-                if noise > 0.0 {
-                    s += noise * v.noise.bipolar();
-                }
-                v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
-                let y = v.filter.process(s, mode);
-                let a = v.amp.tick() * (1.0 - lfo_amp * 0.5 * (1.0 - l));
-                *o += y * a * gain;
-                if !v.amp.is_active() {
-                    break;
+        }
+    }
+}
+
+/// Taken off a pitch's logarithm so that rounding, there and in the
+/// increments, never leaves a table level's top harmonic just past Nyquist.
+const SLACK: f32 = 1e-4;
+
+/// What every voice of a chunk shares.
+#[derive(Clone, Copy)]
+struct Chunk<'a> {
+    sr: f32,
+    bend: f32,
+    max_hz: f32,
+    mix: f32,
+    base_cutoff: f32,
+    env_amt: f32,
+    reso: f32,
+    lfo_pitch: f32,
+    lfo_cut: f32,
+    lfo_amp: f32,
+    vel_cut: f32,
+    w1: Waveform,
+    w2: Waveform,
+    mode: FilterMode,
+    ratio: f32,
+    glide: f32,
+    pw: f32,
+    pwm: f32,
+    noise: f32,
+    u: usize,
+    uni_ratio: [f32; MAX_UNISON],
+    uni_gain: f32,
+    uni_octaves: [f32; MAX_UNISON],
+    osc2_octaves: f32,
+    t1: bool,
+    t2: bool,
+    table: Option<&'a Wavetable>,
+    wt_pos: f32,
+    lfo_pos: f32,
+    env_pos: f32,
+    /// The table levels of a pitch capped at `max_hz`, as a logarithm.
+    lowest: f32,
+}
+
+/// Renders voice `v` into `out` for one chunk; `TABLE` when an oscillator
+/// plays a wavetable.
+#[inline]
+fn voice_chunk<const TABLE: bool>(v: &mut Voice, c: &Chunk, out: &mut [f32], lfo: &[f32; CHUNK]) {
+    let Chunk { sr, bend, max_hz, mix, base_cutoff, env_amt, reso, lfo_pitch, lfo_cut, lfo_amp, vel_cut, .. } = *c;
+    let Chunk { w1, w2, mode, ratio, glide, pw, pwm, noise, u, uni_ratio, uni_gain, .. } = *c;
+    let Chunk { uni_octaves, osc2_octaves, t1, t2, table, wt_pos, lfo_pos, env_pos, lowest, .. } = *c;
+    let incs = |f: f32, inc: &mut [[f64; MAX_UNISON]; 2], mip: &mut [[Mip; MAX_UNISON]; 2]| {
+        // The levels take a logarithm of the pitch: one for every copy.
+        let room = if TABLE { (0.5 * sr / f).log2() - SLACK } else { 0.0 };
+        for k in 0..u {
+            let fk = f * uni_ratio[k];
+            inc[0][k] = f64::from(fk.min(max_hz) / sr);
+            inc[1][k] = f64::from((fk * ratio).min(max_hz) / sr);
+            if TABLE && t1 {
+                mip[0][k] = Mip::from_log2(f64::from((room - uni_octaves[k]).max(lowest)));
+            }
+            if TABLE && t2 {
+                mip[1][k] = Mip::from_log2(f64::from((room - uni_octaves[k] - osc2_octaves).max(lowest)));
+            }
+        }
+    };
+    let read = |osc: &mut Oscillator, wave: Waveform, on_table: bool, inc: f64, mip: &Mip, width: f64, pos: f32| {
+        if on_table {
+            let phase = osc.advance(inc);
+            table.map_or(0.0, |t| t.read(phase, pos, mip))
+        } else {
+            osc.next(wave, inc, width)
+        }
+    };
+    let gain = v.vel_gain * VOICE_GAIN;
+    let target = f32::from(v.note);
+    let cutoff_base = base_cutoff * (vel_cut * (v.vel_norm - 1.0)).exp2();
+    // Pitch only needs per-sample work while gliding or modulated.
+    let static_pitch = v.pitch == target && lfo_pitch == 0.0;
+    let mut inc = [[0.0; MAX_UNISON]; 2];
+    let mut mip = [[Mip::default(); MAX_UNISON]; 2];
+    if static_pitch {
+        incs(midi_to_hz(target + bend), &mut inc, &mut mip);
+    }
+    for (o, &l) in out.iter_mut().zip(lfo) {
+        if !static_pitch {
+            if v.pitch != target {
+                v.pitch = target + (v.pitch - target) * glide;
+                if (v.pitch - target).abs() < 1.0e-4 {
+                    v.pitch = target;
                 }
             }
+            incs(midi_to_hz(v.pitch + bend + l * lfo_pitch), &mut inc, &mut mip);
+        }
+        let width = f64::from((pw + pwm * l).clamp(MIN_PW, MAX_PW));
+        let mut s = 0.0;
+        let fe = if TABLE {
+            let fe = v.fenv.tick();
+            let pos = wt_pos + lfo_pos * l + env_pos * fe;
+            for k in 0..u {
+                let a = read(&mut v.osc1[k], w1, t1, inc[0][k], &mip[0][k], width, pos);
+                let b = read(&mut v.osc2[k], w2, t2, inc[1][k], &mip[1][k], width, pos);
+                s += a * (1.0 - mix) + b * mix;
+            }
+            fe
+        } else {
+            for k in 0..u {
+                s += v.osc1[k].next(w1, inc[0][k], width) * (1.0 - mix) + v.osc2[k].next(w2, inc[1][k], width) * mix;
+            }
+            v.fenv.tick()
+        };
+        s *= uni_gain;
+        if noise > 0.0 {
+            s += noise * v.noise.bipolar();
+        }
+        v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
+        let y = v.filter.process(s, mode);
+        let a = v.amp.tick() * (1.0 - lfo_amp * 0.5 * (1.0 - l));
+        *o += y * a * gain;
+        if !v.amp.is_active() {
+            break;
         }
     }
 }
