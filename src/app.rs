@@ -11367,6 +11367,25 @@ mod tests {
     }
 
     #[test]
+    fn a_save_without_its_lock_stops_autosaving_and_leaves_the_other_autosave() {
+        let dir = std::env::temp_dir().join(format!("tinvo-app-unlocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.autosave = Autosave::at(dir.join("first.tvo.autosave"));
+        let song = dir.join("song.tvo");
+        // A file of another program where the lock goes: saved, unlocked.
+        std::fs::write(dir.join("song.tvo.lock"), "someone's notes").unwrap();
+        std::fs::write(dir.join("song.tvo.autosave"), "another session's work").unwrap();
+        a.save_to(song.clone());
+        assert!(a.status_text().unwrap().ends_with("and it is not autosaved"), "{:?}", a.status_text());
+        assert_eq!(a.autosave.path(), None);
+        assert_eq!(std::fs::read_to_string(dir.join("song.tvo.autosave")).unwrap(), "another session's work");
+        assert!(song.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_export_keeps_the_project_and_its_samples() {
         let dir = std::env::temp_dir().join(format!("tinvo-app-dest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
