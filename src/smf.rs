@@ -793,8 +793,10 @@ fn step_of(notes: &mut [Placed], drum: bool) -> (Step, usize) {
     (step, dropped)
 }
 
-/// Passes [`read`] makes at most to settle a project.
-const MAX_SETTLE: usize = 8;
+/// Passes [`read`] makes at most to settle a project: a few, and one more
+/// for each track whose notes the export may merge into another's, as
+/// tracks share channels one more each pass.
+const MAX_SETTLE: usize = 8 + MAX_TRACKS;
 
 /// Reads a format 0 or 1 MIDI file into a new project: one track per MIDI
 /// track and channel (and on channel 10, per drum), the tempo from the
@@ -807,18 +809,26 @@ const MAX_SETTLE: usize = 8;
 /// again, puts an early note at the very start on the start and plays
 /// drums a step long, which can tell apart entries that shared a pattern
 /// or need more patterns than there are. Reading the export again settles
-/// that, in a pass or two.
+/// that, in a pass or two, or one more per track whose notes merge into
+/// another's where tracks share a channel; a file that does not settle
+/// is refused.
 pub fn read(bytes: &[u8]) -> Result<Import, String> {
     let mut imp = read_once(bytes)?;
     let total = imp.notes + imp.dropped;
     // Of the file read, not of the complete files it is written back as.
     let incomplete = imp.incomplete.take();
+    let mut settled = false;
     for _ in 0..MAX_SETTLE {
         let again = read_once(&write(&imp.project, Source::Song, 1)?)?;
         if again.project == imp.project {
+            settled = true;
             break;
         }
         imp = Import { cut: imp.cut || again.cut, ..again };
+    }
+    // Only a project its own export reads back as is returned.
+    if !settled {
+        return Err("the file does not settle into a project its own export reads back as".into());
     }
     // Notes two strikes of one key became one of are left out too.
     imp.dropped = total.saturating_sub(imp.notes);
@@ -1040,6 +1050,20 @@ mod tests {
             out.extend(body);
         }
         out
+    }
+
+    #[test]
+    fn an_import_is_what_its_own_export_reads_back_as() {
+        // 24 tracks on one channel, one note each at the start: 15 pitches,
+        // then nine more on the first. The export shares channels between
+        // them, merging a track's note into another's, one more each pass.
+        let tracks: Vec<Vec<u8>> =
+            (0..24u8).map(|t| vec![0x00, 0x90, if t < 15 { 60 + t } else { 60 }, 100, 0x60, 0x80, 60, 0]).collect();
+        let refs: Vec<&[u8]> = tracks.iter().map(Vec::as_slice).collect();
+        let imp = read(&file(1, 96, &refs)).expect("reads");
+        let back = read(&write(&imp.project, Source::Song, 1).unwrap()).unwrap();
+        let (n, m) = (imp.project.tracks.len(), back.project.tracks.len());
+        assert!(back.project == imp.project, "{n} tracks read back as {m}");
     }
 
     #[test]

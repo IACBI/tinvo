@@ -727,7 +727,7 @@ fn check_project(input: &[u8], render: bool) -> Result<Outcome, String> {
         }
         Ok(p) => {
             check_project_invariants(&p, render)?;
-            Ok(Outcome { accepted: true, features: project_features(&text) })
+            Ok(Outcome { accepted: true, features: project_features(text) })
         }
     }
 }
@@ -847,13 +847,13 @@ fn check_midi(input: &[u8], render: bool) -> Result<Outcome, String> {
         Err(e) => return Err(format!("the project read does not load back: {e}\n{}", p.to_text())),
     }
     let again = |p: &Project| smf::read(&smf::write(p, Source::Song, 1)?);
+    // The import itself is the fixed point, not only a later reading.
     let second = again(p).map_err(|e| format!("its own export does not read back: {e}\n{}", p.to_text()))?;
-    let third = again(&second.project).map_err(|e| format!("a second export does not read back: {e}"))?;
-    if third.project != second.project || second.dropped != 0 {
+    if second.project != *p || second.dropped != 0 {
         return Err(format!(
             "exporting and reading again changes the project:\n{}\nbecomes\n{}",
-            second.project.to_text(),
-            third.project.to_text()
+            p.to_text(),
+            second.project.to_text()
         ));
     }
     if render {

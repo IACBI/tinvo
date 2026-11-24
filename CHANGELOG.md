@@ -67,6 +67,10 @@ Author: 𝓐.𝓒.𝓑
   - A sharp in octave -1 fits its grid cell (`C#-`).
   - Each parameter page names the page `f` opens next, the group's when there is one; on the inserts page first, so 64 columns show it.
   - The README names the mute and solo columns, and says which keys close a list.
+- Imports and checks hold to what they promise:
+  - A MIDI import is always a project its own export reads back as. One with more tracks than the export has channels for no longer loses another track on its next export; one that would not settle is refused.
+  - Synth parameters brought by formats 2 and 3 (glide, the LFO, velocity to cutoff; pulse width, noise, unison, detune) load only from those formats on, and a value a later format brought names that format.
+  - `tinvo fuzz TARGET --check` reads no more of a file than that target's reader does, refuses a project that is not UTF-8 text, and reads SFZ text as the editor does, Latin-1 where it is not UTF-8.
 
 ## [0.29.0] - 2026-11-23
 
