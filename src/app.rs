@@ -10837,7 +10837,7 @@ mod tests {
             assert!(top.contains("REC") && top.contains('*'), "{w}: {top}");
             // The long labels are used only while the file's name keeps
             // its room.
-            if w >= 100 {
+            if w >= 80 {
                 assert!(top.contains("untitled*"), "{w}: {top}");
             }
             // Every control is there, swing at its least too.
