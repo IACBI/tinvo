@@ -824,6 +824,17 @@ fn midi_seeds() -> Vec<Vec<u8>> {
     f.extend_from_slice(&(events.len() as u32).to_be_bytes());
     f.extend_from_slice(events);
     seeds.push(f);
+    // Format 1, 24 tracks of one note each, nine of them on one key: more
+    // tracks than an export has channels for, which takes passes to settle.
+    let mut f = b"MThd\0\0\0\x06\0\x01\0\x18\0\x60".to_vec();
+    for t in 0..24u8 {
+        let key = if t < 15 { 60 + t } else { 60 };
+        let events = [0x00, 0x90, key, 100, 0x60, 0x80, key, 0, 0x00, 0xFF, 0x2F, 0x00];
+        f.extend_from_slice(b"MTrk");
+        f.extend_from_slice(&(events.len() as u32).to_be_bytes());
+        f.extend_from_slice(&events);
+    }
+    seeds.push(f);
     seeds
 }
 
