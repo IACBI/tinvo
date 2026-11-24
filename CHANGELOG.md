@@ -72,6 +72,33 @@ Author: 𝓐.𝓒.𝓑
   - Synth parameters brought by formats 2 and 3 (glide, the LFO, velocity to cutoff; pulse width, noise, unison, detune) load only from those formats on, and a sampler track needs format 4 or later, which brought it. A value a later format brought names that format.
   - `tinvo fuzz TARGET --check` judges a file as the editor's reader would. It reads at most what that reader takes (16 MiB of MIDI, 8 MiB of SFZ, 256 MiB of a project or WAV file); a larger WAV file, which the sample loader can still load by skipping chunks it does not read, is left to the loader, and the checks do not run on it. A project that is not UTF-8 text or sits where it could not be loaded from is refused. SFZ text is read as the editor reads it, Latin-1 where it is not UTF-8, with includes from the file's own folder, each read once. A WAV file the sample loader refuses no longer counts as accepted. A failure a fuzz run saves is checked again with `--as-fuzzed`, which the printed command includes for SFZ files, so their includes are the fuzzer's own.
 
+- The 0.29.0 notes and the documentation said more than holds:
+  - FM: the modulation is turned down where an estimate of an operator's sidebands (Carson's rule) passes 45 % of the sample rate, so faint aliases can remain.
+  - Wavetables: `o` needs a WAV file of at least two samples, and a longer file's frames are whole ones, a part frame at its end left out. Loading sets the track's table to the file and, where neither oscillator plays a table, oscillator 1's wave to `table`; a lane on either still decides what plays. The 70 dB of foldback was measured at 48 kHz at eight pitches from 27 Hz to 11 kHz, at three fixed positions of each built-in table.
+  - Format 20 also brought `table` as a value of `osc1_wave` and `osc2_wave`, and `WT pos` as one of `wheel`. A format 19 file that uses them, a lane point too, is refused.
+  - The README now says, in both languages (and the Turkish usage block's comments are in Turkish):
+    - the audio callback's one lock, the MIDI mailbox's, is only tried;
+    - stems come from `tinvo render --stems`, without the master's inserts and limiter;
+    - a project whose lock file cannot be made opens with a warning, unlocked and without autosave;
+    - autosave writes new edits at most every 5 seconds;
+    - a MIDI export writes every step whatever its chance;
+    - a missing CLAP insert passes its input;
+    - the plugin cache follows a file's size and modification time, and a scan has a time limit;
+    - `c` cycles back to a single note;
+    - the pitch bend reaches FM synths, and `C` records while the song plays as well as a pattern;
+    - inserts can hold CLAP effects, and lanes reach groups, buses, the master, inserts and plugins;
+    - the export prompt takes `Tab` for the format and `↑` `↓` for repeats, at most 32 for MIDI;
+    - the Windows binary is `tinvo.exe`, and what `--device` and `--rescan` match and read, and it shows `--help`, `--version` and more options.
+  - ARCHITECTURE, ROADMAP and CONTRIBUTING are corrected in the same way:
+    - the capture thread waits on its device, and a take ends at its length limit;
+    - the edit summary names group names and the commands that carry built effects;
+    - fuzzing plays one accepted input in 16 by default;
+    - the bench's measured shares are those of its first four scenarios;
+    - a MIDI import keeps 32 tracks, not 16;
+    - Phase 5b's MIDI limits and Phase 12b's teardown and macOS notes are brought up to date;
+    - CI's triggers are pull requests, pushes to `main` and release tags;
+    - format 20 is frozen.
+
 ## [0.29.0] - 2026-11-23
 
 ### Added

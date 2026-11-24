@@ -9,9 +9,9 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security
 ## Ground rules
 
 - **No third-party crates.** Use only `std` and direct FFI to operating-system APIs. A pull request that adds a dependency will not be merged. Write the piece you need, with tests.
-- **The audio thread is sacred.** Code reachable from `Engine::process` must not allocate or free memory, lock, block, do I/O or panic on valid input. Size everything when the engine is built.
+- **The audio thread is sacred.** Code reachable from `Engine::process` must not allocate or free memory, block, do I/O or panic on valid input, nor take a lock other than a try-lock that fails at once (as the MIDI mailboxes do). Size everything when the engine is built.
 - **Every document change is an `Edit`.** New features that change the project go through `Project::apply`, need an inverse in `Project::inverse`, and must round-trip through the `.tvo` format. The exceptions are what the history stores whole before and after a step (`Meta` in `app.rs`: track names, sample paths and sampler zones, group names, song markers, plugin states): change those through the same helpers the editor uses (`App::meta` and a `Change`), so undo restores them.
-- **Do not break old files.** When the file format changes, bump `FORMAT_VERSION` and keep reading older versions. Add new instrument parameters at the end of the list.
+- **Do not break old files.** Format 20 is frozen: a change to what a project stores needs a new `FORMAT_VERSION`, and formats 1–20 must keep loading. Add new instrument parameters at the end of the list.
 - **Prove it.** New behaviour comes with tests that would fail without the change. DSP claims (pitch, timing, frequency response) are measured in tests, not assumed.
 
 ## Before you open a pull request
