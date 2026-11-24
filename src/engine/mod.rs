@@ -325,6 +325,11 @@ pub const LIVE_QUEUE: usize = 256;
 const MAX_LIVE: usize = 32;
 /// Live notes one callback takes, so a flood cannot stretch it.
 const LIVE_BUDGET: usize = LIVE_QUEUE;
+/// Work one callback spends on live messages, in zones looked through
+/// ([`Instrument::note_work`]): a channel playing many samplers of many
+/// zones would otherwise cost millions of looks in one callback. What is
+/// over waits, in order, for the next.
+const LIVE_WORK: usize = 1 << 16;
 
 /// A live note sounding on a track.
 #[derive(Clone, Copy)]
@@ -1812,6 +1817,9 @@ pub struct Engine {
     limiter_reduction: f32,
     /// MIDI messages played live, taken at the start of each callback.
     live: Option<Arc<Mailbox<Message>>>,
+    /// A live message taken from the mailbox that the last callback's work
+    /// budget had no room for: the first the next one plays.
+    live_waiting: Option<Message>,
     live_track: usize,
     /// Live notes sounding, oldest first.
     held: [Held; MAX_LIVE],
@@ -1835,6 +1843,10 @@ pub struct Engine {
     /// Frames of a device callback [`Engine::begin`] anchored that the
     /// calls to [`Engine::process`] have not rendered yet.
     anchored: u32,
+    /// Whether the callback [`Engine::begin`] started has had its commands
+    /// and live notes: its later parts take none, so a device callback
+    /// spends one budget on them however it is rendered.
+    drained: bool,
     /// Whether Play sends MIDI clock ([`Command::SetMidiClock`]).
     midi_clock: bool,
     /// The clock waits for its first pulse on a 16th note to send Continue.
@@ -1910,6 +1922,7 @@ impl Engine {
             loudness: LiveLoudness::new(sample_rate),
             limiter_reduction: 0.0,
             live: None,
+            live_waiting: None,
             live_track: 0,
             held: [Held { track: 0, channel: 0, note: 0, voice: VoiceId::NONE, out: None, sustained: false }; MAX_LIVE],
             held_count: 0,
@@ -1926,6 +1939,7 @@ impl Engine {
             click: Click::default(),
             midi: MidiSink { out: None, latency: 0, lost: false, tag: 0 },
             anchored: 0,
+            drained: false,
             midi_clock: false,
             clock_resume: false,
             clock_pulse: None,
@@ -2424,7 +2438,14 @@ impl Engine {
                     self.release_live();
                 }
                 let layout = matches!(e, Edit::InsertTrack { .. } | Edit::RemoveTrack(_));
+                // The live track removed last stays the last track until
+                // the editor's selection arrives, so no note is lost.
+                let live = self.live_track < self.track_count && matches!(e, Edit::RemoveTrack(_));
                 self.apply(e);
+                if live && self.live_track >= self.track_count && self.track_count > 0 {
+                    self.live_track = self.track_count - 1;
+                    self.sync_controllers();
+                }
                 if layout && self.recording {
                     self.push_take(Take::Layout);
                 }
@@ -2539,14 +2560,69 @@ impl Engine {
         }
     }
 
+    /// Wakes the resting groups a plugin on asks to be processed, before
+    /// the segment's delays are planned, which a waking group can change.
+    fn wake_groups(&mut self) {
+        for g in &mut self.groups[..self.group_count] {
+            if !g.is_live() && g.chain.take_process_request() {
+                g.hold_on();
+            }
+        }
+    }
+
     /// Plays the live notes waiting in the mailbox, up to a budget.
     fn play_live(&mut self) {
         let Some(live) = self.live.take() else { return };
-        for _ in 0..LIVE_BUDGET {
-            let Some(m) = live.pop() else { break };
+        let mut work = 0;
+        for n in 0..LIVE_BUDGET {
+            let Some(m) = self.live_waiting.take().or_else(|| live.pop()) else { break };
+            // The first always plays, so the queue moves on.
+            let cost = self.live_work(&m);
+            if n > 0 && work + cost > LIVE_WORK {
+                self.live_waiting = Some(m);
+                break;
+            }
+            work += cost;
             self.play_message(m);
         }
         self.live = Some(live);
+    }
+
+    /// The work playing `m` costs, in what the instruments it starts and
+    /// lets go of look through ([`Instrument::note_work`]): a release can
+    /// start release samples, so it costs what a start does.
+    fn live_work(&self, m: &Message) -> usize {
+        let tracks = &self.tracks[..self.track_count];
+        let work = |i: usize| tracks.get(i).map_or(1, |t| t.instrument.note_work());
+        let held = &self.held[..self.held_count];
+        let releases = |which: &dyn Fn(&Held) -> bool| -> usize {
+            held.iter().filter(|h| which(h)).map(|h| work(usize::from(h.track))).sum()
+        };
+        let sustained = |channel: u8| self.pedal & 1 << (channel & 0x0F) != 0;
+        let cost = match *m {
+            Message::NoteOn { channel, note, .. } => {
+                let targets = self.targets(channel);
+                let starts: usize = (0..tracks.len()).filter(|&i| targets & 1 << i != 0).map(work).sum();
+                // A key held again is let go first; each start past the
+                // room left lets the oldest held note go.
+                let again = |h: &Held| h.channel == channel && h.note == note;
+                let kept = held.iter().filter(|h| !again(h)).count();
+                let evicted = (kept + targets.count_ones() as usize).saturating_sub(MAX_LIVE);
+                let most = tracks.iter().map(|t| t.instrument.note_work()).max().unwrap_or(1);
+                starts + releases(&again) + evicted * most
+            }
+            Message::NoteOff { channel, .. } if sustained(channel) => 1,
+            Message::NoteOff { channel, note } => releases(&|h| h.channel == channel && h.note == note),
+            Message::Control { channel, controller: SUSTAIN, value } if value < 64 => {
+                releases(&|h| h.channel == channel && h.sustained)
+            }
+            Message::Control { channel, controller: ALL_SOUND_OFF..=127, .. } => {
+                releases(&|h| h.channel == channel) + tracks.len()
+            }
+            Message::Lost => releases(&|_| true),
+            _ => 1,
+        };
+        cost.max(1)
     }
 
     fn play_message(&mut self, m: Message) {
@@ -3912,6 +3988,7 @@ impl Engine {
     pub fn begin(&mut self, frames: u32) {
         self.anchor_midi(frames);
         self.anchored = frames;
+        self.drained = false;
     }
 
     fn anchor_midi(&mut self, frames: u32) {
@@ -3924,17 +4001,19 @@ impl Engine {
     /// commands. Real-time safe.
     pub fn process(&mut self, out: &mut [f32]) {
         let frames = (out.len() / 2) as u32;
+        let first = self.anchored == 0 || !self.drained;
         if self.anchored == 0 {
             self.anchor_midi(frames);
         } else {
             self.midi.latency = self.latency() as u64;
             self.anchored = self.anchored.saturating_sub(frames);
         }
+        self.drained = self.anchored > 0;
         if let Some(mut rx) = self.commands.take() {
             // A callback handles commands up to a work budget; the rest wait,
             // in order, for the next one. The UI may keep pushing while this
             // drains, so draining until empty would not be bounded.
-            let mut budget = COMMAND_BUDGET;
+            let mut budget = if first { COMMAND_BUDGET } else { 0 };
             while budget > 0 {
                 let Some(cmd) = rx.pop() else { break };
                 budget = budget.saturating_sub(command_cost(&cmd));
@@ -3944,7 +4023,9 @@ impl Engine {
         }
         self.plan_latency();
         self.midi.latency = self.latency() as u64;
-        self.play_live();
+        if first {
+            self.play_live();
+        }
         for chunk in out.chunks_mut(BLOCK * 2) {
             self.render_block(chunk);
         }
@@ -4235,6 +4316,7 @@ impl Engine {
         let mut pos = start;
         while pos < end {
             self.cursor = pos;
+            self.wake_groups();
             // Events due now go out as late as the sound does.
             self.plan_latency();
             self.midi.latency = self.latency() as u64;
@@ -4565,14 +4647,14 @@ impl Route<'_> {
         let Route { mix_l, mix_r, groups, scratch, a, b, fade, .. } = self;
         if t.route_left == 0 {
             let (l, r) = route_sum((mix_l, mix_r), groups, *a, *b, t.group);
-            mix_track(t, n, sig, l, r, at, mix);
+            mix_track(t, n, sig, sounding, l, r, at, mix);
             self.feed(t.group, sounding);
             return;
         }
         let (sl, sr) = (&mut scratch.0[..n], &mut scratch.1[..n]);
         sl.fill(0.0);
         sr.fill(0.0);
-        mix_track(t, n, sig, sl, sr, at, mix);
+        mix_track(t, n, sig, sounding, sl, sr, at, mix);
         let (left, fade) = (t.route_left, *fade as f32);
         let weight = |i: usize| left.saturating_sub(i as u32) as f32 / fade;
         if t.prev_group != Some(DROPPED) {
@@ -4598,8 +4680,12 @@ impl Route<'_> {
         let (a, b) = (self.a, self.b);
         for (i, g) in self.groups.iter_mut().enumerate() {
             let fed = self.fed[i];
-            if (i < self.group_count || i >= MAX_GROUPS) && (fed > 0 || g.is_live()) {
-                g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix, retire);
+            let used = i < self.group_count || i >= MAX_GROUPS;
+            if used && (fed > 0 || g.is_live()) {
+                // A removed group plays out its tail, not what its plugins
+                // would go on with.
+                let asked = i < MAX_GROUPS;
+                g.process(fed, a, b, key, &mut self.mix_l[a..b], &mut self.mix_r[a..b], 2 * a, mix, asked, retire);
                 // A removed group that has rung out is done with its effects.
                 if i >= MAX_GROUPS && !g.is_live() {
                     g.chain.clear(retire);
@@ -4668,11 +4754,13 @@ fn automate_slot(chain: &mut Chain, slot: u8, kind: EffectKind, index: u8, value
 /// Adds a track's signal for one segment (`n` frames, frame `i` the pair
 /// `sig` gives) to the mix and to the buses it sends to, through its fader
 /// and pan. `at` is the segment's first sample in the interleaved bus
-/// inputs.
+/// inputs; only the first `sounding` frames count as feeding a bus.
+#[allow(clippy::too_many_arguments)]
 fn mix_track(
     t: &mut Track,
     n: usize,
     sig: impl Fn(usize) -> (f32, f32),
+    sounding: usize,
     mix_l: &mut [f32],
     mix_r: &mut [f32],
     at: usize,
@@ -4684,6 +4772,7 @@ fn mix_track(
         s.current() != 0.0 || s.target() != 0.0
     });
     if sending.contains(&true) {
+        let mut fed = [0; send::BUSES];
         let mut inputs = mix.inputs(sending);
         for i in 0..n {
             let (x, y) = sig(i);
@@ -4695,12 +4784,20 @@ fn mix_track(
             let j = at + 2 * i;
             for (bus, input) in inputs.iter_mut().enumerate() {
                 if sending[bus] {
-                    let g = t.sends[bus].tick();
+                    // Fed while its send is or will be above zero: a send
+                    // reaching zero mid-segment feeds the bus up to there, as
+                    // does a removed track's fade ending.
+                    let s = &mut t.sends[bus];
+                    if i < sounding && (s.current() != 0.0 || s.target() != 0.0) {
+                        fed[bus] = i + 1;
+                    }
+                    let g = s.tick();
                     input[j] += l * g;
                     input[j + 1] += r * g;
                 }
             }
         }
+        mix.feed(fed);
     } else {
         for i in 0..n {
             let (x, y) = sig(i);
@@ -6837,11 +6934,69 @@ mod tests {
         run(&mut e, 96_000);
         let quiet = run(&mut e, 2400);
         assert!(quiet.iter().all(|x| x.abs() < 1e-6), "the note on track 1 must have been released");
+        // Removing the live track when it is the last moves it to the one
+        // before, which the editor selects too.
+        e.handle(Command::SetLiveTrack(1));
+        e.handle(Command::Edit(Edit::RemoveTrack(1)));
+        press(&live, 64, 100);
+        run(&mut e, 2400);
+        assert!(e.shared.track_peaks[0].take() > 0.0, "a note right after the removal is heard");
+        press(&live, 64, 0);
         // A live track past the last track plays nothing.
         e.handle(Command::SetLiveTrack(5));
         press(&live, 64, 100);
         run(&mut e, 64);
         assert_eq!(e.held_count, 0);
+    }
+
+    #[test]
+    fn live_notes_to_many_zones_wait_for_the_next_callback() {
+        use crate::instrument::zone::Placement;
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Sampler)]);
+        let sample = Arc::new(Sample::from_mono(&[0.5; 64], 48_000).unwrap());
+        let zones = (0..crate::instrument::zone::MAX_ZONES).map(|_| (Placement::WHOLE, sample.clone()));
+        e.handle(Command::SetSamples { track: 0, map: Some(Arc::new(SampleMap::new(zones))) });
+        // Each note looks through 1025 zones.
+        for k in 0..100u8 {
+            press(&live, k, 100);
+        }
+        // 32 fit at 1025 each; past them each also lets the oldest go, so
+        // 15 more fit, and the 48th waits.
+        run(&mut e, 64);
+        assert!(matches!(e.live_waiting, Some(Message::NoteOn { note: 47, .. })));
+        assert_eq!(e.held_count, MAX_LIVE);
+        // The waiting note goes first, the rest in order after it: 31 in
+        // the next callback, the last 22 in the one after.
+        let mut callbacks = 1;
+        while e.live_waiting.is_some() {
+            run(&mut e, 64);
+            callbacks += 1;
+        }
+        assert!(live.pop().is_none());
+        assert_eq!((callbacks, e.held[MAX_LIVE - 1].note), (3, 99));
+        // Letting go of the 32 held notes looks through each one's zones
+        // too: after it, 31 notes fit, not 63.
+        live.push(Message::Control { channel: 0, controller: 123, value: 0 }).unwrap();
+        for k in 0..40u8 {
+            press(&live, k, 100);
+        }
+        run(&mut e, 64);
+        assert!(matches!(e.live_waiting, Some(Message::NoteOn { note: 31, .. })), "{:?}", e.live_waiting.is_some());
+        run(&mut e, 64);
+        assert!(e.live_waiting.is_none() && live.pop().is_none());
+    }
+
+    #[test]
+    fn live_notes_are_taken_once_a_device_callback() {
+        let (mut e, live) = live_engine(&[Edit::AddTrack(InstrumentKind::Synth)]);
+        e.begin(256);
+        run(&mut e, 128);
+        press(&live, 60, 100);
+        run(&mut e, 128);
+        assert_eq!(e.held_count, 0, "a later part of the same callback takes none");
+        e.begin(128);
+        run(&mut e, 128);
+        assert_eq!(e.held_count, 1);
     }
 
     #[test]
@@ -7468,6 +7623,18 @@ mod tests {
         e.process(&mut out);
         e.process(&mut out);
         assert!(e.commands.as_mut().unwrap().pop().is_none());
+        // A device callback rendered in parts has one budget, not one a part.
+        for _ in 0..16 {
+            tx.push(Command::Edit(Edit::RemoveTrack(0))).unwrap();
+        }
+        e.begin(256);
+        for _ in 0..4 {
+            e.process(&mut out[..128]);
+        }
+        assert_eq!(e.track_count(), 8, "the parts of one callback");
+        e.begin(64);
+        e.process(&mut out);
+        assert_eq!(e.track_count(), 0, "the next callback");
     }
 
     fn effect_param(kind: EffectKind, id: &str) -> u8 {
@@ -8809,6 +8976,87 @@ mod tests {
                 got.extend(run(&mut e, size.min((reference.len() - got.len()) / 2)));
             }
             assert_eq!(got, reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_send_closing_mid_callback_stops_feeding_its_bus_there() {
+        // A chorus send closed by a held point and opened again: the frame
+        // it reaches zero falls inside large callbacks, and the chorus must
+        // run past it as an unfed bus does, at any buffer size.
+        use crate::mix::mp;
+        let n = InstrumentKind::Synth.params().len();
+        let chorus_send = (n + strip::sp::COUNT + send::CHORUS) as u8;
+        let point = |step, value| Edit::SetPoint { track: 0, lane: 0, pattern: 0, step, value: Some(value) };
+        let edits = vec![
+            // Silent until the send opens again: the chorus is idle when
+            // the send closes, so only feeding it moves its sweep on.
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetStep { track: 0, pattern: 0, step: 8, value: step(64) },
+            Edit::SetParam { track: 0, index: chorus_send, value: 0.0 },
+            Edit::SetMixParam { index: mp::CHORUS_DEPTH as u8, value: 0.004 },
+            // A track's lane targets start with its volume and pan.
+            Edit::SetLane { track: 0, lane: 0, target: Some(LaneTarget::Track(chorus_send + 2)), ramp: false },
+            point(1, SILENT_DB),
+            point(8, 0.0),
+        ];
+        let reference = {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = Vec::new();
+            while out.len() < 2 * 60_000 {
+                out.extend(run(&mut e, 1));
+            }
+            out
+        };
+        assert!(reference[2 * 30_000..].iter().any(|&x| x != 0.0));
+        for size in [17usize, 1000, 4096] {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut got = Vec::new();
+            while got.len() < reference.len() {
+                got.extend(run(&mut e, size.min((reference.len() - got.len()) / 2)));
+            }
+            assert!(got == reference, "buffer size {size}");
+        }
+    }
+
+    #[test]
+    fn a_removed_track_stops_feeding_its_bus_where_its_fade_ends() {
+        // Track 0 is silent with its chorus send open, and is removed on
+        // frame 8192: its fade ends inside large callbacks. Track 1's send
+        // opens on step 8 for a note there, which hears where the chorus's
+        // sweep is: moved on only while something fed it.
+        use crate::mix::mp;
+        let n = InstrumentKind::Synth.params().len();
+        let chorus_send = (n + strip::sp::COUNT + send::CHORUS) as u8;
+        let edits = vec![
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::AddTrack(InstrumentKind::Synth),
+            Edit::SetParam { track: 0, index: chorus_send, value: 0.0 },
+            Edit::SetStep { track: 1, pattern: 0, step: 8, value: step(64) },
+            Edit::SetMixParam { index: mp::CHORUS_DEPTH as u8, value: 0.004 },
+            Edit::SetLane { track: 1, lane: 0, target: Some(LaneTarget::Track(chorus_send + 2)), ramp: false },
+            Edit::SetPoint { track: 1, lane: 0, pattern: 0, step: 8, value: Some(0.0) },
+        ];
+        let render = |size: usize| {
+            let mut e = engine(&edits);
+            e.handle(Command::Play);
+            let mut out = Vec::new();
+            while out.len() < 2 * 60_000 {
+                if out.len() == 2 * 8192 {
+                    e.apply(Edit::RemoveTrack(0));
+                }
+                out.extend(run(&mut e, size));
+            }
+            out
+        };
+        let reference = render(1);
+        assert!(reference[2 * 48_000..].iter().any(|&x| x != 0.0));
+        for size in [64, 4096] {
+            let got = render(size);
+            let first = got.iter().zip(&reference).position(|(a, b)| a != b);
+            assert!(first.is_none(), "buffer size {size}: frame {:?}", first.map(|i| i / 2));
         }
     }
 

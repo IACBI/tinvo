@@ -206,6 +206,11 @@ impl Sampler {
     /// belong to the old samples); round robin starts over. Returns the
     /// previous map, which the caller must not drop on the audio thread.
     #[must_use]
+    /// The zones a note looks through.
+    pub fn zone_count(&self) -> usize {
+        self.map.as_ref().map_or(0, |m| m.zones().len())
+    }
+
     pub fn set_samples(&mut self, map: Option<Arc<SampleMap>>) -> Option<Arc<SampleMap>> {
         for v in &mut self.voices {
             v.playing = false;
@@ -503,9 +508,17 @@ impl Sampler {
                 // (Also just let go of a sustain loop, until it is past them.)
                 let seam = (looping && v.pos + SEAM >= r.loop_end)
                     || (v.wrapped && v.pos >= r.loop_start && v.pos < r.loop_start + SEAM);
+                // A loop let go reads on past its end: only what lies before
+                // its start still comes from its end.
                 let x = if seam {
                     let (s, e) = (r.loop_start as usize, r.loop_end as usize);
-                    if sinc { sample.sinc_looped(v.pos, s, e, v.wrapped) } else { sample.linear_looped(v.pos, s, e) }
+                    if sinc {
+                        sample.sinc_looped(v.pos, s, e, v.wrapped, looping)
+                    } else if looping {
+                        sample.linear_looped(v.pos, s, e)
+                    } else {
+                        sample.linear(v.pos)
+                    }
                 } else if sinc {
                     sample.sinc(v.pos)
                 } else {
@@ -770,6 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn a_sustain_loop_let_go_plays_the_frames_after_it() {
+        // Two silent frames looped, and two heard after them, the last.
+        let mut audio = vec![0.5f32; 2004];
+        audio[2000] = 0.0;
+        audio[2001] = 0.0;
+        let sample = Arc::new(Sample::from_mono(&audio, 48_000).unwrap());
+        for interp in [0.0, 1.0] {
+            let mut s = Sampler::new(SR);
+            let place = Placement { mode: Mode::Sustain(Some((2000, 2002))), ..Placement::WHOLE };
+            drop(s.set_samples(Some(Arc::new(SampleMap::new([(place, sample.clone())])))));
+            s.set_param(p::R, 5.0);
+            s.set_param(p::INTERP, interp);
+            let id = s.note_on(60, 100);
+            run(&mut s, 48_000);
+            s.note_off(id);
+            let mut tail = vec![0.0f32; 16];
+            s.render(&mut tail);
+            // Faded as an end is, but heard: the bug read the loop's silence.
+            assert!(tail.iter().any(|x| x.abs() > 1e-3), "interp {interp}: {tail:?}");
+            assert_eq!(s.active_voices(), 0);
+        }
+    }
+
+    #[test]
     fn a_looping_zone_without_points_takes_the_file_s_loop() {
         let mut s = with_mode(Mode::Continuous(None), Some((3000, 3500)));
         s.note_on(60, 100);
@@ -846,9 +883,9 @@ mod tests {
         }
         // Frames before the end, and a loop shorter than the kernel.
         assert_eq!(s.linear_looped(599.5, 200, 600), 0.1);
-        assert!((s.sinc_looped(599.5, 598, 600, false) - 0.1).abs() < 1e-3);
-        assert!((s.sinc_looped(200.5, 200, 600, true) - 0.1).abs() < 1e-3, "after a wrap");
-        assert!((s.sinc_looped(200.5, 200, 600, false) - 0.1).abs() > 0.01, "the first time, the lead-in");
+        assert!((s.sinc_looped(599.5, 598, 600, false, true) - 0.1).abs() < 1e-3);
+        assert!((s.sinc_looped(200.5, 200, 600, true, true) - 0.1).abs() < 1e-3, "after a wrap");
+        assert!((s.sinc_looped(200.5, 200, 600, false, true) - 0.1).abs() > 0.01, "the first time, the lead-in");
         assert_eq!(s.linear(599.5), 0.55, "the plain read crosses into the tail");
     }
 

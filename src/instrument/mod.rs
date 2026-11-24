@@ -544,6 +544,15 @@ impl Instrument {
         }
     }
 
+    /// The work a live note costs it, in zones looked through: a sampler
+    /// looks through all of its own, at least one either way.
+    pub fn note_work(&self) -> usize {
+        match self {
+            Instrument::Sampler(s) => 1 + s.zone_count(),
+            _ => 1,
+        }
+    }
+
     /// Whether it is a plugin whose last call said it has a tail to play.
     pub fn has_tail(&self) -> bool {
         matches!(self, Instrument::Plugin(p) if p.has_tail())

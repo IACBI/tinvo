@@ -687,6 +687,12 @@ fn voice_chunk<const TABLE: bool>(v: &mut Voice, c: &Chunk, out: &mut [f32], lfo
     if static_pitch {
         incs(midi_to_hz(target + bend), &mut inc, &mut mip);
     }
+    // Nor the filter while nothing moves its cutoff: exp2(0) is exactly 1,
+    // so it is tuned as each sample would tune it.
+    let static_cutoff = env_amt == 0.0 && lfo_cut == 0.0;
+    if static_cutoff {
+        v.filter.set(cutoff_base, reso, sr);
+    }
     for (o, &l) in out.iter_mut().zip(lfo) {
         if !static_pitch {
             if v.pitch != target {
@@ -718,7 +724,9 @@ fn voice_chunk<const TABLE: bool>(v: &mut Voice, c: &Chunk, out: &mut [f32], lfo
         if noise > 0.0 {
             s += noise * v.noise.bipolar();
         }
-        v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
+        if !static_cutoff {
+            v.filter.set(cutoff_base * (env_amt * fe + lfo_cut * l).exp2(), reso, sr);
+        }
         let y = v.filter.process(s, mode);
         let a = v.amp.tick() * (1.0 - lfo_amp * 0.5 * (1.0 - l));
         *o += y * a * gain;
@@ -733,6 +741,32 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn a_still_cutoff_is_tuned_once_a_chunk_and_sounds_the_same() {
+        // A cutoff envelope too small to move anything takes the per-sample
+        // path; none takes the tuned-once one. They must agree exactly.
+        let play = |env: f32, cutoff: f32| {
+            let mut s = PolySynth::new(SR);
+            s.set_param(p::CUTOFF, cutoff);
+            s.set_param(p::ENV_AMT, env);
+            for n in [48, 55, 60, 64] {
+                s.note_on(n, 100);
+            }
+            let mut buf = vec![0.0; 4096];
+            for chunk in buf.chunks_mut(100) {
+                s.render(chunk);
+            }
+            buf
+        };
+        for cutoff in [200.0, 4000.0] {
+            let (still, moving) = (play(0.0, cutoff), play(1e-30, cutoff));
+            assert!(still.iter().any(|x| x.abs() > 1e-3));
+            assert_eq!(still, moving, "cutoff {cutoff}");
+        }
+        let energy = |b: &[f32]| b.iter().map(|x| x * x).sum::<f32>();
+        assert!(energy(&play(0.0, 200.0)) < energy(&play(0.0, 4000.0)) * 0.5, "the cutoff is heard");
+    }
 
     #[test]
     fn the_lfo_moves_on_alike_with_and_without_a_voice() {

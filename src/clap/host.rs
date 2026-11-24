@@ -83,6 +83,11 @@ const MAX_PORT_CHANNELS: u32 = 32;
 
 /// The largest call an instance is activated for; longer ones are split.
 pub const MAX_FRAMES: usize = 8192;
+/// Frames of quiet output after which a plugin that goes on only while it
+/// is not quiet (`CLAP_PROCESS_CONTINUE_IF_NOT_QUIET`) is let rest. Counted
+/// frame by frame, so where it rests does not depend on how its calls are
+/// split.
+const QUIET_FRAMES: u32 = 64;
 
 /// Two values of each thread's own, which a real-time thread reads and sets
 /// without allocating, the first time too: whether it plays CLAP's audio
@@ -785,6 +790,8 @@ impl PluginHost {
             started: false,
             failed: false,
             tail: false,
+            going: false,
+            quiet: QUIET_FRAMES,
             plugin_ref,
             inbox: Some(self.inbox.clone()),
             host: ManuallyDrop::new(host),
@@ -1060,8 +1067,14 @@ pub struct Instance {
     /// It could not start processing, or its processing failed: it is not
     /// called again until restarted.
     failed: bool,
-    /// Its last process call said it has a tail still to play.
+    /// Its last process call said it has a tail still to play, or to go
+    /// on while its output is not quiet and it was not.
     tail: bool,
+    /// Its last process call asked to go on being processed, whatever its
+    /// input (`CLAP_PROCESS_CONTINUE`), or had a tail.
+    going: bool,
+    /// Frames since its output was last not quiet.
+    quiet: u32,
     plugin_ref: PluginRef,
     /// Where it goes if it is dropped off its host's thread.
     inbox: Option<Arc<Inbox>>,
@@ -1720,10 +1733,15 @@ impl Instance {
             in_events: &in_events,
             out_events: &out_events,
         };
+        // A request made before this call is answered by it; one made
+        // during it stays.
+        self.host.process.store(false, Ordering::Release);
         // SAFETY: audio thread, processing; every pointer in `process` is
         // valid until it returns, and its counts are the plugin's own.
         let status = unsafe { (self.fns.process)(self.plugin, &process) };
         self.tail = status == CLAP_PROCESS_TAIL;
+        self.going = status == CLAP_PROCESS_CONTINUE;
+        let if_loud = status == CLAP_PROCESS_CONTINUE_IF_NOT_QUIET;
         if status == CLAP_PROCESS_ERROR {
             // Its events stay queued for whatever follows: a restart clears
             // them, with the notes they belong to.
@@ -1739,7 +1757,9 @@ impl Instance {
         let out = b.input_planes;
         // SAFETY: as above, after the plugin returned.
         unsafe {
-            let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
+            // Bounded as a loaded sample is: a finite value huge enough would
+            // overflow the gains, sends and filters it passes through.
+            let clean = crate::sample::clean;
             if self.layout.outputs[0] == 2 {
                 let (l, r) = (b.plane(out, frames), b.plane(out + 1, frames));
                 for (i, f) in io.chunks_exact_mut(2).enumerate() {
@@ -1755,6 +1775,15 @@ impl Instance {
                 }
             }
         }
+        // Quiet: below what a delay or reverb counts as silence.
+        match io.chunks_exact(2).rposition(|f| f[0].abs() >= 1e-9 || f[1].abs() >= 1e-9) {
+            Some(i) => self.quiet = (frames - 1 - i) as u32,
+            None => self.quiet = self.quiet.saturating_add(frames as u32),
+        }
+        if if_loud && self.quiet < QUIET_FRAMES {
+            self.tail = true;
+        }
+        self.going |= self.tail;
         self.advance(frames);
         true
     }
@@ -1766,6 +1795,8 @@ impl Instance {
     /// audio thread (taken here), as CLAP asks of an active plugin.
     pub fn skip(&mut self, frames: usize) {
         self.tail = false;
+        self.going = false;
+        self.quiet = QUIET_FRAMES;
         if self.params_queued > 0 || self.host.flush.load(Ordering::Acquire) {
             self.flush_params();
         }
@@ -1822,6 +1853,13 @@ impl Instance {
         self.tail
     }
 
+    /// Whether its last process call asked to be processed again whatever
+    /// its input: `CLAP_PROCESS_CONTINUE`, or a tail ([`Instance::has_tail`]).
+    /// A group holding it runs on rather than resting.
+    pub fn keeps_going(&self) -> bool {
+        self.going
+    }
+
     /// Steady time, `frames` on; past what it can count, unknown (-1) for
     /// good, as CLAP allows.
     fn advance(&mut self, frames: usize) {
@@ -1845,6 +1883,8 @@ impl Instance {
             self.started = false;
         }
         self.tail = false;
+        self.going = false;
+        self.quiet = QUIET_FRAMES;
     }
 }
 
@@ -1883,6 +1923,8 @@ impl Drop for Instance {
                 started: false,
                 failed: self.failed,
                 tail: false,
+                going: false,
+                quiet: QUIET_FRAMES,
                 plugin_ref: self.plugin_ref,
                 inbox: None,
                 // SAFETY: moved out once; this drop touches neither again.

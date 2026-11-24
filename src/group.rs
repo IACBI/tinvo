@@ -243,6 +243,7 @@ impl Group {
         mix_r: &mut [f32],
         at: usize,
         mix: &mut Mix,
+        asked: bool,
         retire: &mut impl FnMut(Box<Insert>),
     ) {
         if fed > 0 {
@@ -259,8 +260,10 @@ impl Group {
             self.run(from, n, &key[done..], &mut mix_l[done..], &mut mix_r[done..], at + 2 * done, mix, retire);
             done += n;
             // An echo still in the chain keeps it running, from the frame
-            // the hold ran out on.
-            if self.hold_left > 0 || self.chain.is_idle() {
+            // the hold ran out on, as does a plugin that asks to go on
+            // (`asked`: unless the group was removed).
+            let going = if asked { self.chain.keeps_going() } else { !self.chain.is_idle() };
+            if self.hold_left > 0 || !going {
                 break;
             }
             self.hold_left = self.hold();
@@ -305,6 +308,7 @@ impl Group {
             let s = &self.sends[k];
             s.current() != 0.0 || s.target() != 0.0
         });
+        let mut fed = [0; send::BUSES];
         let mut inputs = sending.contains(&true).then(|| mix.inputs(sending));
         let mut peak = self.peak;
         for (i, f) in buf.chunks_exact(2).enumerate() {
@@ -317,13 +321,20 @@ impl Group {
                 let j = at + 2 * i;
                 for (bus, input) in inputs.iter_mut().enumerate() {
                     if sending[bus] {
-                        let g = self.sends[bus].tick();
+                        // Fed while its send is or will be above zero: a send
+                        // reaching zero mid-segment feeds the bus up to there.
+                        let s = &mut self.sends[bus];
+                        if s.current() != 0.0 || s.target() != 0.0 {
+                            fed[bus] = i + 1;
+                        }
+                        let g = s.tick();
                         input[j] += l * g;
                         input[j + 1] += r * g;
                     }
                 }
             }
         }
+        mix.feed(fed);
         if peak.is_finite() {
             self.peak = peak;
         }

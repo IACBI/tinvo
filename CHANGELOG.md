@@ -30,6 +30,17 @@ Author: 𝓐.𝓒.𝓑
   - A project in a folder whose path is not Unicode text is refused on load and on save. The command line refuses arguments that are not Unicode text.
   - A WAV export longer than a WAV file can hold is refused before it renders.
   - The command line's errors name paths on one line, with control characters escaped.
+- The engine plays as it should in cases it did not:
+  - Sample values too small to hear (subnormals) are stored as silence, so they no longer slow processing. A plugin's output is cleaned the same way and held to the range a sample may take.
+  - Removing tracks no longer leaves live notes aimed at a track that is gone: the live track moves to the last one left.
+  - A synth whose filter neither the envelope nor the LFO moves sets its cutoff once a chunk instead of every sample, and sounds the same.
+  - A sampler note let go inside its sustain loop goes on to the frames after the loop, instead of wrapping into the loop's start at the seam.
+  - With audio systems that split one device callback into parts (JACK), one callback takes one share of commands and live notes, not one share per part.
+  - An effect bus fed by a send that closes partway through a callback, or by a removed track whose fade ends there, stops being fed there, so what it plays does not depend on the buffer size.
+  - A CLAP plugin that asks to go on being processed (`CLAP_PROCESS_CONTINUE`, or `CLAP_PROCESS_CONTINUE_IF_NOT_QUIET` until its output has been quiet for 64 frames) keeps its group running past its hold. A removed group still stops after its hold and its effects' tails.
+  - A plugin on a resting group that asks to be processed (`request_process`) wakes the group, before the delays that line the tracks up are planned. A request a call already answered no longer wakes it later.
+  - `CLAP_PROCESS_CONTINUE_IF_NOT_QUIET` is judged frame by frame, so where a plugin's tail ends no longer depends on how its calls are split.
+  - Live notes reaching samplers of many zones spend a work budget each callback, counted in the zones that the notes they start and let go of look through; what is over waits, in order, for the next callback.
 
 ## [0.29.0] - 2026-11-23
 

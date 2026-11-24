@@ -660,6 +660,18 @@ impl Insert {
         }
     }
 
+    /// Whether it must go on being processed: it is not idle, or a plugin
+    /// asked to be processed whatever its input.
+    pub fn keeps_going(&self) -> bool {
+        !self.is_idle() || matches!(&self.effect, Effect::Plugin(p) if p.keeps_going())
+    }
+
+    /// Whether a plugin here asked to be processed since this was last
+    /// asked.
+    pub fn take_process_request(&self) -> bool {
+        matches!(&self.effect, Effect::Plugin(p) if p.take_process_request())
+    }
+
     /// Processes `buf` (interleaved stereo, at most [`BLOCK`] frames) in
     /// place. `key` is the key bus for the same frames.
     pub fn process(&mut self, buf: &mut [f32], key: &[f32]) {
@@ -1082,6 +1094,17 @@ impl Chain {
     /// Whether no slot holds sound that silent input would still bring out.
     pub fn is_idle(&self) -> bool {
         self.slots.iter().flatten().all(|s| s.is_idle())
+    }
+
+    /// Whether a slot must go on being processed ([`Insert::keeps_going`]).
+    pub fn keeps_going(&self) -> bool {
+        self.slots.iter().flatten().any(|s| s.keeps_going())
+    }
+
+    /// Whether a plugin in a slot asked to be processed since this was last
+    /// asked; every request is taken.
+    pub fn take_process_request(&self) -> bool {
+        self.slots.iter().flatten().fold(false, |asked, s| s.take_process_request() | asked)
     }
 
     /// Hands every insert it holds or waits to hold to `retire`, leaving it

@@ -133,8 +133,9 @@ pub struct Mix {
     returns: [Smoother; send::BUSES],
     /// Interleaved stereo send sums for the current block, per bus.
     inputs: [Vec<f32>; send::BUSES],
-    /// The buses fed in the current segment.
-    fed: [bool; send::BUSES],
+    /// How many of the current segment's first frames each bus was fed:
+    /// past them it runs as unfed, as it would in callbacks that end there.
+    fed: [usize; send::BUSES],
     /// The buses fed anywhere in the current block, whose sums need clearing.
     dirty: [bool; send::BUSES],
     wet: Vec<f32>,
@@ -153,7 +154,7 @@ impl Mix {
             limiter: Limiter::new(sample_rate),
             returns: [Smoother::new(0.0, LEVEL_SMOOTHING, sample_rate); send::BUSES],
             inputs: std::array::from_fn(|_| vec![0.0; 2 * frames]),
-            fed: [false; send::BUSES],
+            fed: [0; send::BUSES],
             dirty: [false; send::BUSES],
             wet: vec![0.0; 2 * frames],
             sample_rate,
@@ -224,25 +225,32 @@ impl Mix {
                 input.fill(0.0);
             }
         }
-        self.fed = [false; send::BUSES];
+        self.fed = [0; send::BUSES];
     }
 
     /// The send sum of `bus` for the current block, to add a track's send
-    /// into. Taking it marks the bus as fed.
+    /// into. Taking it marks the bus as fed for the whole segment.
     pub fn input(&mut self, bus: usize) -> &mut [f32] {
-        self.fed[bus] = true;
+        self.fed[bus] = usize::MAX;
         self.dirty[bus] = true;
         &mut self.inputs[bus]
     }
 
-    /// All send sums at once; the buses flagged in `used` are marked fed.
+    /// All send sums at once, the buses flagged in `used` to be added to;
+    /// [`Mix::feed`] then says how far into the segment each was fed.
     pub fn inputs(&mut self, used: [bool; send::BUSES]) -> [&mut [f32]; send::BUSES] {
-        for ((fed, dirty), u) in self.fed.iter_mut().zip(&mut self.dirty).zip(used) {
-            *fed |= u;
+        for (dirty, u) in self.dirty.iter_mut().zip(used) {
             *dirty |= u;
         }
         let [delay, reverb, chorus] = &mut self.inputs;
         [delay.as_mut_slice(), reverb.as_mut_slice(), chorus.as_mut_slice()]
+    }
+
+    /// Notes that each bus was fed the segment's first `frames` frames.
+    pub fn feed(&mut self, frames: [usize; send::BUSES]) {
+        for (fed, f) in self.fed.iter_mut().zip(frames) {
+            *fed = (*fed).max(f);
+        }
     }
 
     /// Adds the returns to the mix for the frames of the block from frame
@@ -255,14 +263,15 @@ impl Mix {
     pub fn add_returns(&mut self, mix_l: &mut [f32], mix_r: &mut [f32], from: usize) {
         let frames = mix_l.len();
         for bus in 0..send::BUSES {
+            let fed = self.fed[bus].min(frames);
             let mut done = 0;
             while done < frames {
                 // Unfed, a bus runs until it is idle, to the frame, so it
                 // stops on the same frame however the block is split. A
                 // repeat fed back on the way puts that frame further off,
                 // so it is asked again after each run.
-                let n = if self.fed[bus] {
-                    frames - done
+                let n = if done < fed {
+                    fed - done
                 } else {
                     let left = match bus {
                         send::DELAY => self.echo.frames_to_idle(),
@@ -292,7 +301,7 @@ impl Mix {
                 done += n;
             }
         }
-        self.fed = [false; send::BUSES];
+        self.fed = [0; send::BUSES];
     }
 
     /// Whether the delay, reverb and chorus hold nothing more to play.

@@ -392,6 +392,13 @@ fn an_effect_plays_on_the_audio_thread_and_ends_on_the_main_one() {
     }
     gain.stop();
     assert_eq!(stats(&gain).broken, 0);
+    // What it gives back is bounded as a loaded sample is: huge values to
+    // +-1024, subnormal ones and NaN to silence.
+    let mut io = vec![f32::MAX, -1e30, 1e-39, f32::NAN, 0.5, -0.25];
+    io.resize(128, 0.0);
+    assert!(gain.process(&mut io));
+    assert_eq!(io[..6], [1024.0, -1024.0, 0.0, 0.0, 0.25, -0.125]);
+    gain.stop();
     drop(gain);
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2632,6 +2639,86 @@ fn a_plugin_s_tail_keeps_the_render_going() {
         e.set_plugin(0, Box::new(create(&mut host, &file, SINE, Role::Instrument).unwrap()));
         render(&mut e, 128, 64);
         assert_eq!(e.effects_idle(), !tail, "{stem}: an instrument");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_on_a_group_keeps_it_running_while_it_asks_and_wakes_it_resting() {
+    let dir = temp_dir("engine-going");
+    let mut host = PluginHost::new();
+    let loud = |out: &[f32]| out.iter().all(|x| x.abs() > 0.1);
+    let silent = |out: &[f32]| out.iter().all(|&x| x == 0.0);
+    for (stem, going) in [("steady", true), ("sleep", false)] {
+        let sub = dir.join(stem);
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = install(&sub, stem);
+        let wake = || {
+            std::fs::write(sub.join("wake"), "").unwrap();
+            let start = Instant::now();
+            while sub.join("wake").exists() {
+                assert!(start.elapsed() < Duration::from_secs(5), "{stem}: the request is made");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let grouped = [
+            Edit::AddTrack(InstrumentKind::Kick),
+            Edit::InsertGroup(0),
+            Edit::SetTrackGroup { track: 0, group: Some(0) },
+        ];
+        let (mut e, _rx) = plugin_engine(&grouped);
+        let mut insert = Box::new(Insert::new(EffectKind::Plugin(gain_ref()), RATE as f32, 120.0));
+        assert!(insert.attach(Box::new(create(&mut host, &file, GAIN, Role::Effect).unwrap())).unwrap().is_none());
+        e.handle(EngineCommand::SetSlot { chain: ChainId::Group(0), slot: 0, insert: Some(insert) });
+        let fed = render(&mut e, 4800, 64);
+        assert!(loud(&fed[fed.len() - 64..]), "{stem}: processed while fed");
+        if !going {
+            // A request made while it is processed is answered there, and
+            // does not wake it once it rests.
+            wake();
+            render(&mut e, 512, 512);
+        }
+        // Its only track leaves: the group runs out its 2 s hold, then
+        // rests unless the plugin asks to go on.
+        e.handle(EngineCommand::Edit(Edit::SetTrackGroup { track: 0, group: None }));
+        let after = render(&mut e, 3 * RATE as usize, 512);
+        let end = &after[after.len() - 1024..];
+        assert_eq!(loud(end), going, "{stem}");
+        assert_eq!(silent(end), !going, "{stem}");
+        if going {
+            // Removed, it plays out its hold and stops, whatever it asks.
+            e.handle(EngineCommand::Edit(Edit::RemoveGroup(0)));
+            let after = render(&mut e, 3 * RATE as usize, 512);
+            assert!(silent(&after[after.len() - 1024..]), "{stem}: removed");
+        } else {
+            // Resting, it asks to be processed, and the group wakes.
+            wake();
+            assert!(loud(&render(&mut e, 512, 512)), "woken by its request");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_plugin_going_on_while_not_quiet_stops_on_the_same_frame_however_called() {
+    let dir = temp_dir("loud");
+    let file = install(&dir, "loud");
+    let mut host = PluginHost::new();
+    // One loud frame, the 100th: whatever the calls, the plugin goes on
+    // (and has a tail) at frame 128, 27 frames on, and not at 192, 91 on.
+    for size in [1, 4, 64] {
+        let mut i = create(&mut host, &file, GAIN, Role::Effect).unwrap();
+        let mut seen = Vec::new();
+        for start in (0..320).step_by(size) {
+            let mut io: Vec<f32> = (start..start + size).flat_map(|f| [f32::from(u8::from(f == 100)); 2]).collect();
+            assert!(i.process(&mut io));
+            if (start + size) % 64 == 0 {
+                assert_eq!(i.keeps_going(), i.has_tail());
+                seen.push(i.keeps_going());
+            }
+        }
+        assert_eq!(seen, [false, true, false, false, false], "calls of {size}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
