@@ -27,6 +27,7 @@ type Display = c_void;
 type Window = c_ulong;
 type Atom = c_ulong;
 type ErrorHandler = unsafe extern "C" fn(*mut Display, *mut c_void) -> c_int;
+type IoErrorHandler = unsafe extern "C" fn(*mut Display) -> c_int;
 
 const LIBRARY: &CStr = c"libX11.so.6";
 const RTLD_NOW: c_int = 2;
@@ -177,6 +178,7 @@ struct Lib {
     connection_number: unsafe extern "C" fn(*mut Display) -> c_int,
     get_default: unsafe extern "C" fn(*mut Display, *const c_char, *const c_char) -> *mut c_char,
     set_error_handler: unsafe extern "C" fn(Option<ErrorHandler>) -> Option<ErrorHandler>,
+    set_io_error_handler: unsafe extern "C" fn(Option<IoErrorHandler>) -> Option<IoErrorHandler>,
 }
 
 /// Looks `name` up in the loaded library as a function of type `T`.
@@ -231,6 +233,7 @@ fn lib() -> Result<&'static Lib, String> {
                 connection_number: symbol(handle, c"XConnectionNumber")?,
                 get_default: symbol(handle, c"XGetDefault")?,
                 set_error_handler: symbol(handle, c"XSetErrorHandler")?,
+                set_io_error_handler: symbol(handle, c"XSetIOErrorHandler")?,
             })
         }
     })
@@ -243,6 +246,20 @@ static OURS: AtomicPtr<Display> = AtomicPtr::new(null_mut());
 /// The handler set before TINVO's (Xlib's default, which ends the
 /// process, unless a plugin set its own).
 static BEFORE: OnceLock<Option<ErrorHandler>> = OnceLock::new();
+/// The handler for a lost connection set before TINVO's.
+static BEFORE_IO: OnceLock<Option<IoErrorHandler>> = OnceLock::new();
+
+/// A lost connection to the display (its server gone) ends the process in
+/// Xlib, without unwinding, after this returns: the terminal is given back
+/// first, then the handler there was before has its say.
+unsafe extern "C" fn on_io_error(display: *mut Display) -> c_int {
+    crate::tui::term::restore_now();
+    match BEFORE_IO.get().copied().flatten() {
+        // SAFETY: the handler Xlib had, with what Xlib passed.
+        Some(before) => unsafe { before(display) },
+        None => 0,
+    }
+}
 
 /// Xlib's default answer to an error ends the process; one on TINVO's
 /// connection (a window gone before a request about it reached the
@@ -278,9 +295,12 @@ struct Known {
     token: u64,
     /// The size the server last said it has.
     reported: (u32, u32),
-    /// A size was asked for since: the same report again is a window
+    /// The size asked for since: the same report again is a window
     /// manager refusing it, not the user sizing the window.
-    asked: bool,
+    asked: Option<(u32, u32)>,
+    /// A size the window manager refused, which is not asked for again
+    /// until the window's size changes otherwise.
+    refused: Option<(u32, u32)>,
 }
 
 thread_local! {
@@ -306,6 +326,7 @@ fn connection() -> Result<Connection, String> {
         }
         OURS.store(display, Ordering::Release);
         BEFORE.get_or_init(|| (lib.set_error_handler)(Some(on_error)));
+        BEFORE_IO.get_or_init(|| (lib.set_io_error_handler)(Some(on_io_error)));
         let atom = |name: &CStr| (lib.intern_atom)(display, name.as_ptr(), 0);
         Connection {
             lib,
@@ -354,14 +375,29 @@ pub(super) fn forget(token: u64) {
     });
 }
 
-/// Whether a size the server reports is news: not the one it reported
-/// before when a size was asked for since (a window manager refusing it
-/// would otherwise have the plugin fit, and be refused, again and again).
+/// Whether a size the server reports is news for the plugin. One a window
+/// manager kept, refusing what was asked, is, once: the plugin is sized
+/// back to the window it has, and what was refused is remembered, so that
+/// it is not asked for again (and refused, again and again) until the
+/// size changes otherwise.
 fn news(known: &mut Known, size: (u32, u32)) -> bool {
-    let refused = known.asked && known.reported == size;
+    let same = known.reported == size;
+    let refused = known.asked.filter(|&asked| asked != size && same);
     known.reported = size;
-    known.asked = false;
-    !refused
+    known.asked = None;
+    match refused {
+        Some(asked) => {
+            let again = known.refused == Some(asked);
+            known.refused = Some(asked);
+            !again
+        }
+        // The window moved, or was stacked: what was refused still is.
+        None if same => true,
+        None => {
+            known.refused = None;
+            true
+        }
+    }
 }
 
 /// Reads what the server sent, a bounded number of events, and returns
@@ -454,7 +490,7 @@ impl Parent {
             (c.lib.change_property)(c.display, window, name, utf8, 8, PROP_MODE_REPLACE, title.as_ptr(), len);
             (window, root)
         };
-        WINDOWS.with(|w| w.borrow_mut().push(Known { window, token, reported: (1, 1), asked: false }));
+        WINDOWS.with(|w| w.borrow_mut().push(Known { window, token, reported: (1, 1), asked: None, refused: None }));
         Ok(Self { c, window, root, axes: (false, false), told: Vec::new() })
     }
 
@@ -592,9 +628,14 @@ impl ParentWindow for Parent {
         if !(1..=MAX_SIDE).contains(&width) || !(1..=MAX_SIDE).contains(&height) {
             return false;
         }
-        self.hint((width, height));
         let window = self.window;
-        WINDOWS.with(|w| w.borrow_mut().iter_mut().filter(|k| k.window == window).for_each(|k| k.asked = true));
+        let size = (width, height);
+        let refused = WINDOWS.with(|w| w.borrow().iter().any(|k| k.window == window && k.refused == Some(size)));
+        if refused {
+            return false;
+        }
+        self.hint(size);
+        WINDOWS.with(|w| w.borrow_mut().iter_mut().filter(|k| k.window == window).for_each(|k| k.asked = Some(size)));
         // SAFETY: an open display and a window of its own.
         unsafe { (self.c.lib.resize_window)(self.c.display, self.window, width, height) };
         self.sync();
@@ -665,17 +706,30 @@ mod tests {
     }
 
     #[test]
-    fn a_size_refused_again_is_no_news() {
-        let mut k = Known { window: 1, token: 1, reported: (1, 1), asked: false };
+    fn a_size_refused_is_told_once_and_not_asked_again() {
+        let mut k = Known { window: 1, token: 1, reported: (1, 1), asked: None, refused: None };
         // A size of the user's, and one TINVO asked for and got.
         assert!(news(&mut k, (455, 333)));
-        k.asked = true;
+        k.asked = Some((450, 330));
         assert!(news(&mut k, (450, 330)));
-        // One a window manager refuses: the size it keeps comes back.
-        k.asked = true;
-        assert!(!news(&mut k, (450, 330)), "refused");
-        // The user sizing it to the same size again is news.
-        assert!(!k.asked);
+        assert_eq!(k.refused, None);
+        // One a window manager refuses: the size it keeps comes back, as
+        // news, so the plugin is sized back to the window it has.
+        k.asked = Some((600, 400));
+        assert!(news(&mut k, (450, 330)), "refused, and told");
+        assert_eq!((k.asked, k.refused), (None, Some((600, 400))));
+        // Refused again (it was asked by another way): not told again.
+        k.asked = Some((600, 400));
+        assert!(!news(&mut k, (450, 330)));
+        // The window moved, its size the same: the refusal stands.
         assert!(news(&mut k, (450, 330)));
+        assert_eq!(k.refused, Some((600, 400)));
+        // The user sizing it otherwise lets it be asked for again.
+        assert!(news(&mut k, (500, 350)));
+        assert_eq!(k.refused, None);
+        // Asking for the size it has is no refusal.
+        k.asked = Some((500, 350));
+        assert!(news(&mut k, (500, 350)));
+        assert_eq!(k.refused, None);
     }
 }

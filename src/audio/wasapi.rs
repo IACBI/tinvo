@@ -65,6 +65,33 @@ const E_CONSOLE: i32 = 0;
 const AUDCLNT_SHAREMODE_SHARED: i32 = 0;
 const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x0004_0000;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+const AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY: u32 = 0x1;
+const AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR: u32 = 0x4;
+
+/// The frames a capture device dropped before a packet at `position`
+/// (its device position, in frames) with `flags`, when the one before
+/// ended at `expected`: put back as silence, they keep a take in time. At
+/// most `most`; none when the device says its position is not to be
+/// trusted.
+fn dropped(expected: Option<u64>, position: u64, flags: u32, most: u64) -> u64 {
+    if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY == 0 || flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR != 0 {
+        return 0;
+    }
+    expected.map_or(0, |e| position.saturating_sub(e).min(most))
+}
+
+/// Where the next packet is expected after one of `frames` at `position`
+/// with `flags`, given where this one was (`expected`): unknown after a
+/// position not to be trusted, and unchanged by an empty packet.
+fn next_expected(expected: Option<u64>, position: u64, frames: u32, flags: u32) -> Option<u64> {
+    if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR != 0 {
+        None
+    } else if frames == 0 {
+        expected
+    } else {
+        position.checked_add(u64::from(frames))
+    }
+}
 const WAIT_OBJECT_0: u32 = 0;
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -778,6 +805,8 @@ where
         }));
 
         let mut result = Ok(());
+        // Where the last packet ended, in the device's frames.
+        let mut expected = None;
         'run: while !stop.load(Ordering::Acquire) {
             if WaitForSingleObject(event.0, 2000) != WAIT_OBJECT_0 {
                 result = Err("input device stopped responding".to_string());
@@ -792,12 +821,21 @@ where
                 if packet == 0 {
                     break;
                 }
-                let (mut data, mut frames, mut flags) = (ptr::null_mut(), 0u32, 0u32);
-                let hr =
-                    (cc.get_buffer)(capture.0, &mut data, &mut frames, &mut flags, ptr::null_mut(), ptr::null_mut());
+                let (mut data, mut frames, mut flags, mut position) = (ptr::null_mut(), 0u32, 0u32, 0u64);
+                let hr = (cc.get_buffer)(capture.0, &mut data, &mut frames, &mut flags, &mut position, ptr::null_mut());
                 if let Err(e) = check(hr, "GetBuffer") {
                     result = Err(format!("input device lost: {e}"));
                     break 'run;
+                }
+                // Up to two seconds' worth: the most the wait above allows.
+                let mut gap = dropped(expected, position, flags, 2 * u64::from(sample_rate)) as usize;
+                expected = next_expected(expected, position, frames, flags);
+                while gap > 0 {
+                    let chunk = gap.min(scratch.len() / keep);
+                    let dst = &mut scratch[..chunk * keep];
+                    dst.fill(0.0);
+                    callback.capture(dst);
+                    gap -= chunk;
                 }
                 let n = frames as usize;
                 let mut done = 0;
@@ -821,5 +859,44 @@ where
         }
         (ac.stop)(client.0);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_a_capture_device_dropped_are_put_back() {
+        const GAP: u32 = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+        // In step, or the first packet: nothing.
+        assert_eq!(dropped(Some(960), 960, 0, 96_000), 0);
+        assert_eq!(dropped(None, 5_000, GAP, 96_000), 0);
+        // 480 frames dropped, said so; not trusted when its time is not.
+        assert_eq!(dropped(Some(960), 1_440, GAP, 96_000), 480);
+        assert_eq!(dropped(Some(960), 1_440, GAP | AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, 96_000), 0);
+        assert_eq!(dropped(Some(960), 1_440, 0, 96_000), 0, "not said");
+        // Bounded, and never a step back.
+        assert_eq!(dropped(Some(0), u64::MAX, GAP, 96_000), 96_000);
+        assert_eq!(dropped(Some(2_000), 1_000, GAP, 96_000), 0);
+    }
+
+    #[test]
+    fn a_position_not_to_be_trusted_puts_nothing_back_after_it() {
+        const GAP: u32 = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+        const BAD: u32 = AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR;
+        // Packets of 480 frames; one says its position (0) is wrong, and the
+        // one after it a gap: nothing is known to have been dropped.
+        let mut expected = None;
+        let mut put_back = Vec::new();
+        for (position, frames, flags) in
+            [(0, 480, 0), (480, 480, 0), (0, 480, BAD), (1_440, 480, GAP), (2_880, 480, GAP)]
+        {
+            put_back.push(dropped(expected, position, flags, 96_000));
+            expected = next_expected(expected, position, frames, flags);
+        }
+        assert_eq!(put_back, [0, 0, 0, 0, 960]);
+        // An empty packet moves nothing.
+        assert_eq!(next_expected(Some(960), 0, 0, 0), Some(960));
     }
 }

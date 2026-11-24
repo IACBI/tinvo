@@ -15,7 +15,7 @@ use super::{
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -781,6 +781,21 @@ struct InputState<C> {
     callback: C,
     stopping: AtomicBool,
     health: Arc<StreamHealth>,
+    /// Buffers delivered, for the owning thread to see the queue alive.
+    delivered: AtomicU64,
+}
+
+/// How long a capture that has delivered buffers may go without one before
+/// its device counts as gone: an input unplugged can stop the queue's
+/// callbacks without an error.
+const CAPTURE_STALL: Duration = Duration::from_secs(2);
+/// How long a capture started may take to deliver its first buffer.
+const CAPTURE_FIRST: Duration = Duration::from_secs(5);
+
+/// Whether a capture whose callbacks have delivered `seen` buffers, the
+/// last (or, with none yet, its start) `since` ago, has stopped.
+fn stalled(seen: u64, since: Duration) -> bool {
+    since >= if seen == 0 { CAPTURE_FIRST } else { CAPTURE_STALL }
 }
 
 unsafe extern "C" fn captured<C: CaptureCallback>(
@@ -804,6 +819,8 @@ unsafe extern "C" fn captured<C: CaptureCallback>(
     // SAFETY: the buffer holds `audio_data_byte_size` bytes of stereo f32.
     let data = unsafe { std::slice::from_raw_parts(buf.audio_data as *const f32, samples) };
     callback.capture(data);
+    // SAFETY: as above; a shared field.
+    unsafe { &(*state).delivered }.fetch_add(1, Ordering::Relaxed);
     if !stopping.load(Ordering::Acquire) {
         // SAFETY: re-enqueueing the buffer we were handed.
         let status = unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null()) };
@@ -838,6 +855,7 @@ where
             callback: factory(rate as u32, 2),
             stopping: AtomicBool::new(false),
             health,
+            delivered: AtomicU64::new(0),
         }));
         let format = float_stereo(rate);
         let mut queue: AudioQueueRef = ptr::null_mut();
@@ -898,8 +916,19 @@ where
             channels: 2,
             format: "F32".into(),
         }));
+        let (mut seen, mut since) = (0, std::time::Instant::now());
         while !stop.load(Ordering::Acquire) {
             std::thread::park_timeout(Duration::from_millis(50));
+            // SAFETY: the state lives until `cleanup`; a shared field.
+            let now = unsafe { &(*state).delivered }.load(Ordering::Relaxed);
+            if now != seen {
+                (seen, since) = (now, std::time::Instant::now());
+            } else if stalled(seen, since.elapsed()) {
+                // SAFETY: as above.
+                let health = unsafe { &(*state).health };
+                health.fail(format!("input device stopped delivering audio ({:.0?} without any)", since.elapsed()));
+                break;
+            }
         }
         cleanup(queue);
     })
@@ -910,8 +939,15 @@ mod tests {
     use super::*;
     use crate::audio::{open_input, open_with};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
     use std::time::Instant;
+
+    #[test]
+    fn a_capture_that_delivers_nothing_counts_as_stopped() {
+        assert!(!stalled(0, Duration::from_secs(4)), "still starting");
+        assert!(stalled(0, CAPTURE_FIRST), "never started");
+        assert!(!stalled(10, Duration::from_millis(1900)));
+        assert!(stalled(10, CAPTURE_STALL), "stopped after delivering");
+    }
 
     /// Counts the frames it renders and plays a ramp: exactly representable
     /// values in ±0.5, repeating every 4096 frames, right the negative of left.

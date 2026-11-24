@@ -162,11 +162,21 @@ fn marker_start(bytes: &[u8]) -> usize {
     (1..PASTE_END.len()).rev().find(|&k| bytes.ends_with(&PASTE_END[..k])).unwrap_or(0)
 }
 
-/// Whether the process was asked to end (SIGTERM, or SIGHUP when its
-/// terminal went away) while the terminal was taken over. Always false on
-/// Windows.
+/// Whether the process was asked to end while the terminal was taken over:
+/// SIGTERM or SIGINT from another program, or SIGHUP when its terminal went
+/// away; on Windows, Ctrl+Break, or its console window closing.
 pub fn end_requested() -> bool {
     sys::end_requested()
+}
+
+/// Gives the terminal back at once, for when the process is about to end
+/// without unwinding (a library's fatal error handler): leaves the
+/// alternate screen and restores the modes the terminal had.
+pub fn restore_now() {
+    // The modes first: writing can wait on a terminal that reads nothing.
+    sys::restore_now();
+    let _ = io::stdout().write_all(LEAVE_SEQ.as_bytes());
+    let _ = io::stdout().flush();
 }
 
 /// Enter alternate screen, hide cursor, disable line wrap.
@@ -305,6 +315,7 @@ mod sys {
     use super::{Event, Key, Wake};
     use std::ffi::c_void;
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     type Handle = *mut c_void;
@@ -437,9 +448,49 @@ mod sys {
     /// The most records standing for nothing read past a poll's deadline.
     const MAX_SKIPPED: u32 = 256;
 
-    pub fn end_requested() -> bool {
-        false
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
     }
+
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+
+    static END: AtomicBool = AtomicBool::new(false);
+    /// The console was given back, the session's autosave written before.
+    static RESTORED: AtomicBool = AtomicBool::new(false);
+
+    /// Ctrl+Break (and Ctrl+C, should the console still send it) ends the
+    /// session as the editor's own quit does, autosave included.
+    unsafe extern "system" fn on_control(kind: u32) -> i32 {
+        match kind {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                END.store(true, Ordering::Relaxed);
+                1
+            }
+            CTRL_CLOSE_EVENT => {
+                END.store(true, Ordering::Relaxed);
+                // The process ends when this returns, and Windows ends it
+                // after 5 s regardless: the editor autosaves, then gives the
+                // console back, which is when this may return.
+                let start = Instant::now();
+                while !RESTORED.load(Ordering::Acquire) && start.elapsed() < Duration::from_millis(4500) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn end_requested() -> bool {
+        END.load(Ordering::Relaxed)
+    }
+
+    /// The console's modes come back when its `RawMode` drops; a process
+    /// ending without unwinding leaves the console to Windows.
+    pub fn restore_now() {}
 
     impl RawMode {
         pub fn enable(mouse: bool) -> io::Result<Self> {
@@ -461,6 +512,8 @@ mod sys {
                     SetConsoleMode(input, input_mode);
                     return Err(io::Error::other(format!("console lacks VT support: {err}")));
                 }
+                RESTORED.store(false, Ordering::Release);
+                SetConsoleCtrlHandler(Some(on_control), 1);
                 Ok(Self { input, output, input_mode, output_mode, buttons: 0, repeat: None, high: None })
             }
         }
@@ -474,11 +527,14 @@ mod sys {
         }
 
         pub fn restore(&mut self) {
-            // SAFETY: restoring modes captured in `enable`.
+            // SAFETY: restoring modes captured in `enable`, and taking out
+            // the handler it added.
             unsafe {
                 SetConsoleMode(self.input, self.input_mode);
                 SetConsoleMode(self.output, self.output_mode);
+                SetConsoleCtrlHandler(Some(on_control), 0);
             }
+            RESTORED.store(true, Ordering::Release);
         }
 
         /// The visible part of the screen buffer.
@@ -797,8 +853,25 @@ mod sys {
     }
 
     const SIGHUP: c_int = 1;
+    const SIGINT: c_int = 2;
     const SIGTERM: c_int = 15;
+    /// The signals that end a session from outside: the terminal going
+    /// away, and another program's interrupt or terminate. (The terminal's
+    /// own Ctrl+C is a key in raw mode.)
+    const ENDING: [c_int; 3] = [SIGHUP, SIGINT, SIGTERM];
     const SIG_DFL: usize = 0;
+    const SIG_IGN: usize = 1;
+
+    /// The attributes the terminal had, for `restore_now`.
+    static ORIGINAL: std::sync::Mutex<Option<Termios>> = std::sync::Mutex::new(None);
+
+    pub fn restore_now() {
+        // Not waiting: whoever holds it may be what is ending the process.
+        if let Some(t) = ORIGINAL.try_lock().ok().and_then(|o| *o) {
+            // SAFETY: attributes read by tcgetattr.
+            unsafe { tcsetattr(STDIN, TCSANOW, &t) };
+        }
+    }
 
     static END: AtomicBool = AtomicBool::new(false);
 
@@ -819,6 +892,8 @@ mod sys {
         more_since: Option<Instant>,
         /// The descriptors of the last wait, kept for the next.
         polled: Vec<PollFd>,
+        /// What `ENDING`'s signals were set to before.
+        handlers: [usize; 3],
     }
 
     /// Waits up to `timeout_ms` for `input` to be readable or one of
@@ -910,12 +985,26 @@ mod sys {
             // terminal back: the poll returns, interrupted, and the editor's
             // loop sees the request.
             // SAFETY: the handler only stores to an atomic.
-            unsafe {
-                signal(SIGHUP, on_end as extern "C" fn(c_int) as usize);
-                signal(SIGTERM, on_end as extern "C" fn(c_int) as usize);
+            // A signal ignored when TINVO started (as under `nohup`, or in
+            // the background of a script) stays ignored.
+            let handlers = ENDING.map(|s| unsafe {
+                let before = signal(s, on_end as extern "C" fn(c_int) as usize);
+                if before == SIG_IGN {
+                    signal(s, SIG_IGN);
+                }
+                before
+            });
+            if let Ok(mut saved) = ORIGINAL.lock() {
+                *saved = Some(original);
             }
-            let mut m =
-                Self { original, decoder: Decoder::default(), last_size: (0, 0), more_since: None, polled: Vec::new() };
+            let mut m = Self {
+                original,
+                decoder: Decoder::default(),
+                last_size: (0, 0),
+                more_since: None,
+                polled: Vec::new(),
+                handlers,
+            };
             m.last_size = m.size();
             Ok(m)
         }
@@ -927,11 +1016,18 @@ mod sys {
 
         pub fn restore(&mut self) {
             // SAFETY: restoring the attributes read in `enable`, and the
-            // default handling of the signals.
+            // handlers the signals had.
             unsafe {
                 tcsetattr(STDIN, TCSANOW, &self.original);
-                signal(SIGHUP, SIG_DFL);
-                signal(SIGTERM, SIG_DFL);
+                // Ignored, or else as by default: a handler a library set
+                // with `sigaction` could not be put back through `signal`,
+                // and none is set before the terminal is taken over.
+                for (s, h) in ENDING.into_iter().zip(self.handlers) {
+                    signal(s, if h == SIG_IGN { SIG_IGN } else { SIG_DFL });
+                }
+            }
+            if let Ok(mut saved) = ORIGINAL.lock() {
+                *saved = None;
             }
         }
 
@@ -1078,6 +1174,8 @@ mod sys {
     pub fn end_requested() -> bool {
         false
     }
+
+    pub fn restore_now() {}
 
     pub fn check(_wake: &mut Wake) -> io::Result<()> {
         Ok(())

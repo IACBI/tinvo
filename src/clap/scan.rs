@@ -691,27 +691,32 @@ fn cache_text(entries: &[Entry]) -> String {
     for e in entries {
         // Paths that are not Unicode are never found, so never cached.
         let Some(path) = e.path.to_str() else { continue };
-        text.push_str(&format!("file\t{}\t{}\n", escape(path), escape(&e.fingerprint)));
+        let mut entry = format!("file\t{}\t{}\n", escape(path), escape(&e.fingerprint));
         match &e.result {
             Ok(plugins) => {
                 for p in plugins {
-                    text.push_str(&plugin_line(p));
-                    text.push('\n');
+                    entry.push_str(&plugin_line(p));
+                    entry.push('\n');
                 }
             }
-            Err(why) => text.push_str(&format!("failed\t{}\n", escape(why))),
+            Err(why) => entry.push_str(&format!("failed\t{}\n", escape(why))),
         }
+        // Whole entries, as many as the cache is read back with: those past
+        // them are read again by the next scan, which keeps going from where
+        // this one got to rather than starting over.
+        if (text.len() + entry.len()) as u64 > MAX_CACHE_BYTES {
+            break;
+        }
+        text.push_str(&entry);
     }
     text
 }
 
 /// Writes the cache at `path`, its folder made if need be: the first
-/// [`MAX_FILES`] entries, as many as it is read back with.
+/// [`MAX_FILES`] entries, and of those as many as fit in the size it is read
+/// back at.
 pub fn write_cache(path: &Path, entries: &[Entry]) -> Result<(), String> {
     let text = cache_text(&entries[..entries.len().min(MAX_FILES)]);
-    if text.len() as u64 > MAX_CACHE_BYTES {
-        return Err("the plugin cache would be too large to keep".into());
-    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1000,6 +1005,17 @@ mod tests {
         let back = read_cache(&dir.join("cache"));
         assert_eq!(back.len(), MAX_FILES);
         assert_eq!(back[0].path, entries[0].path, "the first kept");
+        // Entries past the size it is read back at are left out whole, and
+        // those before them kept.
+        let why = "x".repeat(600_000);
+        let entries: Vec<Entry> = (0..40)
+            .map(|i| Entry { path: dir.join(format!("{i}.clap")), fingerprint: "f".into(), result: Err(why.clone()) })
+            .collect();
+        write_cache(&dir.join("cache"), &entries).unwrap();
+        assert!(std::fs::metadata(dir.join("cache")).unwrap().len() <= MAX_CACHE_BYTES);
+        let back = read_cache(&dir.join("cache"));
+        assert_eq!(back.len(), 27);
+        assert_eq!(back, entries[..27]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

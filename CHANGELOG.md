@@ -41,6 +41,19 @@ Author: 𝓐.𝓒.𝓑
   - A plugin on a resting group that asks to be processed (`request_process`) wakes the group, before the delays that line the tracks up are planned. A request a call already answered no longer wakes it later.
   - `CLAP_PROCESS_CONTINUE_IF_NOT_QUIET` is judged frame by frame, so where a plugin's tail ends no longer depends on how its calls are split.
   - Live notes reaching samplers of many zones spend a work budget each callback, counted in the zones that the notes they start and let go of look through; what is over waits, in order, for the next callback.
+- Each platform's edge cases are handled:
+  - Linux: an ALSA device that stays suspended, judged by its error as well as its state, is waited for 5 s, in steps that let the stream stop, and then reported lost, instead of keeping the stream's thread (and quitting) waiting without end.
+  - Linux: ALSA streams use the machine's own float byte order, so big-endian machines play and record the right values.
+  - Linux and macOS: SIGINT from another program ends the session as SIGTERM does, with an autosave and the terminal given back. A signal ignored when TINVO started, as under `nohup`, stays ignored.
+  - Windows: Ctrl+Break, or closing the console window, ends the session the same way. Closing the window waits for the autosave, within the 5 s Windows allows.
+  - Linux: losing the X display of an open plugin window gives the terminal back before Xlib ends the process.
+  - Linux: when a window manager refuses the size a plugin window asks for, the plugin is told the size it kept, and the same size is not asked for again until the window is resized otherwise.
+  - Linux: a JACK server whose sample rate changes while TINVO plays or records reports the stream lost, instead of playing at the wrong pitch and speed.
+  - Linux: a MIDI input whose ALSA sequencer source goes away lets go of the notes held on it. Another sender connected to the same port leaving does not.
+  - Windows: frames a WASAPI capture device dropped are recorded as silence, so a take stays in time.
+  - macOS: a recording whose input stops delivering audio for 2 s, such as an unplugged USB input, or delivers none in its first 5 s, reports the input lost instead of waiting.
+  - The plugin cache keeps as many whole entries as fit in its 16 MiB, instead of not being written at all, so a time-limited scan does not read again what it already read.
+  - 32-bit Windows builds link the window functions 32-bit Windows has.
 
 ## [0.29.0] - 2026-11-23
 

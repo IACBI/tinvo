@@ -16,7 +16,7 @@ use super::{
 };
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -57,6 +57,7 @@ struct Lib {
     buffer_size: unsafe extern "C" fn(*mut c_void) -> u32,
     set_process_callback: unsafe extern "C" fn(*mut c_void, ProcessCallback, *mut c_void) -> c_int,
     on_shutdown: unsafe extern "C" fn(*mut c_void, ShutdownCallback, *mut c_void),
+    set_sample_rate_callback: unsafe extern "C" fn(*mut c_void, ProcessCallback, *mut c_void) -> c_int,
     port_register: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_ulong, c_ulong) -> *mut c_void,
     port_get_buffer: PortGetBuffer,
     port_name: unsafe extern "C" fn(*const c_void) -> *const c_char,
@@ -115,6 +116,7 @@ fn load() -> Result<Lib, String> {
             buffer_size: symbol(handle, c"jack_get_buffer_size")?,
             set_process_callback: symbol(handle, c"jack_set_process_callback")?,
             on_shutdown: symbol(handle, c"jack_on_shutdown")?,
+            set_sample_rate_callback: symbol(handle, c"jack_set_sample_rate_callback")?,
             port_register: symbol(handle, c"jack_port_register")?,
             port_get_buffer: symbol(handle, c"jack_port_get_buffer")?,
             port_name: symbol(handle, c"jack_port_name")?,
@@ -209,16 +211,20 @@ impl Client {
         unsafe { (self.lib.disconnect)(self.ptr, f.as_ptr(), t.as_ptr()) };
     }
 
-    /// Installs the callbacks and activates the client. `state` and `dead`
+    /// Installs the callbacks and activates the client. `state` and `watch`
     /// must outlive the client.
-    fn start(&self, process: ProcessCallback, state: *mut c_void, dead: &Arc<AtomicBool>) -> Result<(), String> {
+    fn start(&self, process: ProcessCallback, state: *mut c_void, watch: &Arc<Watch>) -> Result<(), String> {
+        let watch = Arc::as_ptr(watch).cast_mut().cast();
         // SAFETY: an open, inactive client; the caller keeps `state` and
-        // `dead` alive until the client is closed.
+        // `watch` alive until the client is closed.
         unsafe {
             if (self.lib.set_process_callback)(self.ptr, process, state) != 0 {
                 return Err("cannot set the JACK process callback".into());
             }
-            (self.lib.on_shutdown)(self.ptr, on_shutdown, Arc::as_ptr(dead).cast_mut().cast());
+            (self.lib.on_shutdown)(self.ptr, on_shutdown, watch);
+            if (self.lib.set_sample_rate_callback)(self.ptr, on_rate, watch) != 0 {
+                return Err("cannot set the JACK sample rate callback".into());
+            }
             if (self.lib.activate)(self.ptr) != 0 {
                 return Err("cannot activate the JACK client".into());
             }
@@ -239,10 +245,29 @@ impl Drop for Client {
     }
 }
 
+/// What JACK's own threads tell the stream's: the server gone, and the
+/// sample rate it runs at.
+struct Watch {
+    dead: AtomicBool,
+    rate: AtomicU32,
+}
+
+impl Watch {
+    fn new(rate: u32) -> Arc<Self> {
+        Arc::new(Self { dead: AtomicBool::new(false), rate: AtomicU32::new(rate) })
+    }
+}
+
 unsafe extern "C" fn on_shutdown(arg: *mut c_void) {
-    // SAFETY: `arg` is the `dead` flag `start` registered, alive until the
+    // SAFETY: `arg` is the `Watch` `start` registered, alive until the
     // client is closed.
-    unsafe { &*(arg as *const AtomicBool) }.store(true, Ordering::Release);
+    unsafe { &*(arg as *const Watch) }.dead.store(true, Ordering::Release);
+}
+
+unsafe extern "C" fn on_rate(rate: u32, arg: *mut c_void) -> c_int {
+    // SAFETY: as above.
+    unsafe { &*(arg as *const Watch) }.rate.store(rate, Ordering::Release);
+    0
 }
 
 /// The device name for a stream connected to `ports`: JACK and the client
@@ -292,12 +317,19 @@ fn listing(ports: fn(&Client) -> Vec<String>) -> Vec<Device> {
     }
 }
 
-/// Waits on the audio thread until the stream is stopped or the server
-/// goes away.
-fn wait(stop: &AtomicBool, dead: &AtomicBool, health: &StreamHealth) {
+/// Waits on the audio thread until the stream is stopped, the server goes
+/// away, or its sample rate moves from `opened`: what plays and records
+/// would then be at the wrong pitch and speed, so the stream counts as
+/// lost, for the editor to open it again.
+fn wait(stop: &AtomicBool, watch: &Watch, health: &StreamHealth, opened: u32) {
     while !stop.load(Ordering::Acquire) {
-        if dead.load(Ordering::Acquire) {
+        if watch.dead.load(Ordering::Acquire) {
             health.fail("the JACK server stopped".into());
+            return;
+        }
+        let now = watch.rate.load(Ordering::Acquire);
+        if now != opened {
+            health.fail(format!("the JACK sample rate changed from {opened} Hz to {now} Hz"));
             return;
         }
         std::thread::park_timeout(Duration::from_millis(50));
@@ -380,9 +412,9 @@ where
             port_get_buffer: client.lib.port_get_buffer,
             scratch: vec![0.0; CHUNK * 2].into_boxed_slice(),
         }));
-        let dead = Arc::new(AtomicBool::new(false));
+        let watch = Watch::new(rate);
         let targets = client.playback_ports();
-        let started = client.start(render::<C>, state.cast(), &dead).and_then(|()| {
+        let started = client.start(render::<C>, state.cast(), &watch).and_then(|()| {
             for (port, target) in ports.iter().zip(&targets) {
                 client.connect(&client.port_name(*port), target)?;
             }
@@ -400,7 +432,7 @@ where
                     low_latency: false,
                     format: "F32".into(),
                 }));
-                wait(&stop, &dead, &health);
+                wait(&stop, &watch, &health, rate);
             }
             Err(e) => report(Err(e)),
         }
@@ -482,9 +514,9 @@ where
             port_get_buffer: client.lib.port_get_buffer,
             scratch: vec![0.0; CHUNK * 2].into_boxed_slice(),
         }));
-        let dead = Arc::new(AtomicBool::new(false));
+        let watch = Watch::new(rate);
         let sources = client.capture_ports();
-        let started = client.start(capture::<C>, state.cast(), &dead).and_then(|()| {
+        let started = client.start(capture::<C>, state.cast(), &watch).and_then(|()| {
             for (source, port) in sources.iter().zip(&ports) {
                 client.connect(source, &client.port_name(*port))?;
             }
@@ -500,7 +532,7 @@ where
                     channels: 2,
                     format: "F32".into(),
                 }));
-                wait(&stop, &dead, &health);
+                wait(&stop, &watch, &health, rate);
             }
             Err(e) => report(Err(e)),
         }
