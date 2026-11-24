@@ -1921,6 +1921,11 @@ mod tests {
         assert_eq!(check_path(Target::Sfz, &sfz), Ok(Verdict::Rejected(None)), "no parts.sfz beside it");
         std::fs::write(dir.join("parts.sfz"), "<region> sample=kick.wav key=36\n").unwrap();
         assert_eq!(check_path(Target::Sfz, &sfz), Ok(Verdict::Accepted));
+        // Its text reads as Latin-1 where it is not UTF-8, as the editor
+        // reads it: the include it names is found.
+        std::fs::write(dir.join("café.sfz"), "<region> sample=snare.wav key=38\n").unwrap();
+        std::fs::write(&sfz, b"#include \"caf\xe9.sfz\"\n").unwrap();
+        assert_eq!(check_path(Target::Sfz, &sfz), Ok(Verdict::Accepted));
         // A project that is not UTF-8 text.
         let project = dir.join("latin1.tvo");
         std::fs::write(&project, b"tinvo 20\ntrack synth\nname caf\xe9\nend\n").unwrap();
