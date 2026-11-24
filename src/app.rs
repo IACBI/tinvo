@@ -83,6 +83,8 @@ const MIN_W: u16 = 64;
 /// Columns the top bar keeps beside its controls before it shortens their
 /// labels: the master meter, and some of the file's name and the news.
 const HEADER_ROOM: u16 = 28;
+/// Columns of the file's name the top bar's news gives way to.
+const HEADER_NAME: usize = 10;
 const MIN_H: u16 = 16;
 const HISTORY_LIMIT: usize = 1000;
 /// The bytes of plugin states the history may keep beyond the project's
@@ -6219,6 +6221,10 @@ impl App {
         let must = screen::text_width(rec_short) as u16 + screen::text_width(dirty) as u16 + 1;
         let meter = room > meter_w + must;
         let end = if meter { w - meter_w - 1 } else { w };
+        // The file's name keeps some room too: the news beside it gives way,
+        // all but the recording's mark.
+        let name = format!("{playing}{file}");
+        let name_room = screen::text_width(&name).min(HEADER_NAME);
         // The longest that fits: recording comes first, then the CPU, the
         // loudness and the device.
         let right = [
@@ -6230,12 +6236,16 @@ impl App {
             format!(" {rec_short}"),
         ]
         .into_iter()
-        .find(|r| screen::text_width(r) + screen::text_width(dirty) <= usize::from(end.saturating_sub(controls)))
+        .enumerate()
+        .find(|(i, r)| {
+            let name = if *i == 5 { 0 } else { name_room };
+            screen::text_width(r) + screen::text_width(dirty) + name <= usize::from(end.saturating_sub(controls))
+        })
+        .map(|(_, r)| r)
         .filter(|r| !r.trim().is_empty());
         let rx = right.as_ref().map_or(end, |r| end - screen::text_width(r) as u16);
         // The file's name in what is left, its end cut off rather than the
         // unsaved mark.
-        let name = format!("{playing}{file}");
         let space = usize::from(rx.saturating_sub(controls)).saturating_sub(screen::text_width(dirty) + 1);
         let name = if screen::text_width(&name) <= space {
             name
@@ -10804,9 +10814,14 @@ mod tests {
         assert!(top.contains(" 4/4 "), "{top}");
         let meter = a.hits.borrow().iter().find(|h| h.target == Target::Meter).map(|h| h.x).unwrap();
         assert_eq!(a.target_at(meter, 0), Some(Target::Meter));
-        // With room, it is all there.
-        let wide = frame(&a).row_text(0);
-        assert!(wide.contains("audio offline  CPU"), "{wide}");
+        // With room, it is all there, the file's name too.
+        let mut s = Screen::new(160, 30);
+        a.draw(&mut s);
+        let wide = s.row_text(0);
+        assert!(wide.contains("audio offline  CPU") && wide.contains("untitled"), "{wide}");
+        // Short of room, the news gives way to the name.
+        let narrow = frame(&a).row_text(0);
+        assert!(narrow.contains("untitled") && !narrow.contains("audio offline"), "{narrow}");
     }
 
     #[test]
@@ -10820,6 +10835,11 @@ mod tests {
             a.draw(&mut s);
             let top = s.row_text(0);
             assert!(top.contains("REC") && top.contains('*'), "{w}: {top}");
+            // The long labels are used only while the file's name keeps
+            // its room.
+            if w >= 100 {
+                assert!(top.contains("untitled*"), "{w}: {top}");
+            }
             // Every control is there, swing at its least too.
             for t in [Target::Tempo, Target::Swing, Target::Pattern, Target::Length, Target::Division, Target::Meter] {
                 assert!(a.hits.borrow().iter().any(|h| h.target == t && h.width > 0), "{w}: {t:?} in {top}");
@@ -12706,6 +12726,7 @@ mod tests {
         let undo = a.settings_page.cursor[0];
         keys(&mut a, &[Key::Enter]);
         mouse(&mut a, MouseKind::ScrollDown, (10, 10));
+        mouse(&mut a, MouseKind::ScrollUp, (10, 10));
         assert_eq!(a.settings_page.cursor[0], undo);
         keys(&mut a, &[Key::Esc]);
         // A key another action has where both work is refused.
