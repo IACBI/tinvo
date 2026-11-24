@@ -110,6 +110,16 @@ impl Target {
         Self::ALL.into_iter().find(|t| t.id() == id)
     }
 
+    /// The most bytes `--check` reads, as the reader of the target's files
+    /// does: past it, the file is refused before it is read.
+    pub fn file_limit(self) -> u64 {
+        match self {
+            Self::Midi => smf::MAX_FILE_BYTES,
+            Self::Sfz => crate::sfz::MAX_SFZ_BYTES as u64,
+            Self::Project | Self::Wav | Self::Edits => crate::project::MAX_FILE_BYTES,
+        }
+    }
+
     fn max_len(self) -> usize {
         if self == Self::Edits { MAX_SCRIPT } else { MAX_INPUT }
     }
@@ -700,8 +710,11 @@ fn project_features(text: &str) -> Vec<u64> {
 }
 
 fn check_project(input: &[u8], render: bool) -> Result<Outcome, String> {
-    let text = String::from_utf8_lossy(input);
-    match Project::from_text(&text) {
+    // A project file is UTF-8 text, or it is refused before it is parsed.
+    let Ok(text) = std::str::from_utf8(input) else {
+        return Ok(Outcome { accepted: false, features: vec![hash_of(("error", "not UTF-8"))] });
+    };
+    match Project::from_text(text) {
         Err(e) => {
             let lines = text.lines().count().max(1);
             if e.line == 0 || e.line > lines {
@@ -1084,7 +1097,7 @@ fn mutate_sfz(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 /// `sfz`: the reader's result holds, repeats, saves and plays.
 fn check_sfz(input: &[u8], render: bool) -> Result<Outcome, String> {
-    let text = String::from_utf8_lossy(input);
+    let text = crate::sfz::decode(input.to_vec());
     let include = |name: &str| match name {
         "inc.sfz" => Ok("<region> sample=inc.wav key=60 loop_mode=loop_continuous".to_string()),
         "self.sfz" => Ok(text.to_string()),
@@ -1790,6 +1803,27 @@ mod tests {
                 assert_eq!(check(target, seed, true), Ok(true), "{} seed {i}", target.id());
             }
         }
+    }
+
+    #[test]
+    fn a_check_refuses_what_the_readers_refuse() {
+        // A project that is not UTF-8 text does not load, whatever it says.
+        let mut p = Project::new();
+        p.apply(Edit::AddTrack(crate::instrument::InstrumentKind::Synth)).unwrap();
+        p.tracks[0].name = "café".into();
+        let text = p.to_text().into_bytes();
+        assert_eq!(check(Target::Project, &text, false), Ok(true));
+        let at = text.windows(2).position(|w| w == "é".as_bytes()).unwrap();
+        let latin1 = [&text[..at], b"\xe9", &text[at + 2..]].concat();
+        assert_eq!(check(Target::Project, &latin1, false), Ok(false));
+        // An SFZ file reads its bytes as the editor does: Latin-1 where they
+        // are not UTF-8.
+        assert_eq!(crate::sfz::decode(b"sample=caf\xe9.wav".to_vec()), "sample=café.wav");
+        assert_eq!(crate::sfz::decode("\u{feff}sample=café.wav".into()), "sample=café.wav");
+        // And `--check` reads no more of a file than its reader would.
+        assert_eq!(Target::Midi.file_limit(), smf::MAX_FILE_BYTES);
+        assert_eq!(Target::Sfz.file_limit(), crate::sfz::MAX_SFZ_BYTES as u64);
+        assert_eq!(Target::Project.file_limit(), crate::project::MAX_FILE_BYTES);
     }
 
     #[test]

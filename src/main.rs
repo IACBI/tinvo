@@ -1033,9 +1033,15 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
         }
     }
     if let Some(path) = check {
-        // As the readers it checks read: a plain file, of a bounded size.
-        let input = tinvo::fsutil::read_bytes(&path, tinvo::project::MAX_FILE_BYTES)
-            .map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
+        // As the readers it checks read: a plain file, no larger than the
+        // target's reader takes, which refuses a larger one unread.
+        let input = match tinvo::fsutil::read_bytes(&path, target.file_limit()) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                println!("Rejected, as it should be: {e}");
+                return Ok(());
+            }
+            read => read.map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?,
+        };
         let accepted =
             fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
         println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
