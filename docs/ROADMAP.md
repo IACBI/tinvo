@@ -456,6 +456,25 @@ Known limits (left as they are):
 - While the MIDI input's queue overflows, a lost All Sound Off sent again a frame later can cut a note played just after it.
 - The first callback of the HAL's audio thread has not been traced for allocations on a Mac; Rust's counting allocator cannot see the system's.
 
+## Review: the whole project after 0.29.0 ✅ (0.29.1)
+
+A review of all of 0.29.0 from six sides (performance, robustness and input validation, code quality, the editor, the documents and repository, and each platform), made with an independent model reading the code, which then reviewed each fix. Each finding was checked against the code, and each fix that changes behaviour has a test that fails without it; most were also checked by undoing the fix and seeing a test fail:
+- Memory and inputs: the undo history counts the wavetables and plugin states it keeps; project files, samples, MIDI files, SFZ instruments and the plugin cache are bounded before they are read.
+- Files and sessions: no save or export writes over what the project uses, temporary names do not grow with the target's, and a crashed session's autosave is kept for recovery.
+- The engine: subnormals, the live track after tracks are removed, the synth, the sampler, JACK's split callbacks, buses, CLAP processing statuses and the live MIDI work budget.
+- Platforms: ALSA and its sequencer, signals, X11, JACK, WASAPI and CoreAudio capture, the plugin cache, and 32-bit Windows.
+- The editor: input while it is hidden, screens too small to draw, the top bar's name and news, group mutes shown, the wavetable a lane needs, views, the song view, help, narrow prompts and the next page's hint.
+- Imports and checks: a MIDI import is what its own export reads back as; synth parameters and the sampler load only from the formats that brought them; `fuzz --check` judges a file as the editor's reader would, and replays a saved failure as it was fuzzed.
+- Documents: README, ARCHITECTURE, ROADMAP, CONTRIBUTING, the changelog and the repository's description say what the code does.
+
+Known limits (left as they are):
+- A project whose file name is too long for `.lock` to be added (255 bytes on most file systems) cannot be locked: it opens with a warning, unlocked and not autosaved.
+- A plugin cache already at its 16 MiB cap keeps the entries written first; there is no rotating resume point for the files after them.
+- A MIDI file that takes many passes to settle takes as many reads: 1.3 s for 200,000 notes of 32 tracks, measured in release.
+- A WAV file over 256 MiB is left to the sample loader by `fuzz --check`, without the checks.
+- The song view and the piano roll show no group's mute, as they show no track's.
+- Not run on real hardware or a real terminal: unplugging a device, suspend and resume, a JACK rate change, a window manager refusing a plugin window's size, and the editor redrawing on a resize before it handles queued keys. Their logic is unit-tested.
+
 ## More kinds of music
 
 TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. Phases 11 to 14 have shipped; Phase 15 is planned. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.

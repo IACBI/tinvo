@@ -6,6 +6,8 @@ Author: 𝓐.𝓒.𝓑
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-11-25
+
 ### Fixed
 - Memory the editor keeps is bounded where it was not:
   - The undo history counts a wavetable built from a sample it keeps against its sample budget.
@@ -627,7 +629,8 @@ A review of the 0.13.0 backends against their documentation and sources (alsa-li
 - `.tvo` project files and WAV export.
 - Command-line tools: `render`, `demo`, `probe` and `bench`.
 
-[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/IACBI/tinvo/compare/v0.29.1...HEAD
+[0.29.1]: https://github.com/IACBI/tinvo/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/IACBI/tinvo/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/IACBI/tinvo/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/IACBI/tinvo/compare/v0.27.0...v0.28.0
