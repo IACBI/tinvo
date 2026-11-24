@@ -151,8 +151,8 @@ actions! {
     DeleteGroup "delete_group" Track [c('F')] "delete the track's group: its tracks go to the master, its lanes go";
     Left "left" Nav [Left] "step left; in the panel: value down; in lists: other page";
     Right "right" Nav [Right] "step right; in the panel: value up; in lists: other page";
-    Up "up" Nav [Up] "track, pitch, lane, parameter or song row above";
-    Down "down" Nav [Down] "track, pitch, lane, parameter or song row below";
+    Up "up" Nav [Up] "track, pitch, lane or song row above; in the panel: previous parameter";
+    Down "down" Nav [Down] "track, pitch, lane or song row below; in the panel: next parameter";
     First "first" Nav [Home] "first step or song entry";
     Last "last" Nav [End] "last step or song entry";
     Enter "enter" Nav [Enter, c('x')] "toggle the step or note, add a point, repeat a song entry, choose in a list, open a plugin insert's parameters";
@@ -195,8 +195,8 @@ actions! {
     CoarseUp "coarse_up" Params [PageUp] "value up, coarse";
     CoarseDown "coarse_down" Params [PageDown] "value down, coarse";
     Default "default" Params [c('0')] "back to the default value";
-    PrevEffect "prev_effect" Params [c(',')] "inserts page: the slot's previous effect (none, EQ, compressor, drive, delay, reverb, chorus)";
-    NextEffect "next_effect" Params [c('.')] "inserts page: the slot's next effect";
+    PrevEffect "prev_effect" Params [c(',')] "inserts page: the slot's previous built-in effect, or none; plugins come from the plugin list";
+    NextEffect "next_effect" Params [c('.')] "inserts page: the slot's next built-in effect, or none";
     EffectEarlier "effect_earlier" Params [c('<')] "inserts page: move the effect a slot earlier in the chain";
     EffectLater "effect_later" Params [c('>')] "inserts page: move the effect a slot later";
     RemoveEffect "remove_effect" Params [c('-')] "inserts page: empty the slot";

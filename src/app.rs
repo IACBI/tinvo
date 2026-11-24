@@ -15,7 +15,7 @@ use crate::dsp::loudness::ExportMeter;
 use crate::dsp::wavetable::{self, Wavetable};
 use crate::engine::{
     ChainId, Command, Division, Edit, Engine, HELD_FOR_GOOD, LIVE_QUEUE, LaneTarget, MAX_CHORD, MAX_LANES, MAX_OFFSET,
-    MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, MIN_SWING, Meter, Part, PlayPosition, PluginAt,
+    MAX_PATTERNS, MAX_RATCHET, MAX_STEPS, MAX_TRACKS, MIDI_OUT_QUEUE, Meter, Part, PlayPosition, PluginAt,
     RETIRE_QUEUE, Retired, Shared, Step, TAKE_QUEUE, Take as TakeEvent, part_position,
 };
 use crate::group::{MAX_GROUPS, group_param};
@@ -80,6 +80,9 @@ const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// Rows the grid keeps however many parameters the panel has.
 const MIN_GRID_ROWS: u16 = 3;
 const MIN_W: u16 = 64;
+/// Columns the top bar keeps beside its controls before it shortens their
+/// labels: the master meter, and some of the file's name and the news.
+const HEADER_ROOM: u16 = 28;
 const MIN_H: u16 = 16;
 const HISTORY_LIMIT: usize = 1000;
 /// The bytes of plugin states the history may keep beyond the project's
@@ -984,6 +987,9 @@ pub struct App {
     help_width: Cell<u16>,
     /// What the last frame drew where, for the mouse.
     hits: RefCell<Vec<Hit>>,
+    /// The last frame was too small to show the editor: what is typed or
+    /// clicked waits until it is not, since nothing it did could be seen.
+    hidden: Cell<bool>,
     /// The highest pitch the piano roll showed; it scrolls only when the
     /// cursor leaves the view, so a click does not move what is under the
     /// pointer. `None` centres the cursor.
@@ -1088,8 +1094,21 @@ enum Stroke {
     Length { step: usize, pitch: u8, y: u16, remove: bool },
 }
 
+/// A note's name in a grid cell of three columns. The sharps of octave -1,
+/// the only names longer, keep the sign of the octave without its digit:
+/// it is the one octave below zero, so `C#-` is still only C#-1.
+fn cell_note_name(note: u8) -> String {
+    let name = note_name(note);
+    match name.strip_suffix("-1") {
+        Some(sharp) if name.len() > 3 => format!("{sharp}-"),
+        _ => name,
+    }
+}
+
 /// What `a` asks, short enough for an 80-column terminal.
 const ADD_TRACK_PROMPT: &str = "Add: 1 Synth 2 Kick 3 Snare 4 Hat 5 Open hat 6 Clap 7 Sampler 8 Plugin 9 FM";
+/// The same, short enough for the narrowest terminal TINVO runs in.
+const ADD_TRACK_SHORT: &str = "Add 1Synth 2Kick 3Snare 4Hat 5OpenHat 6Clap 7Sampler 8Plugin 9FM";
 
 impl App {
     pub fn new(
@@ -1191,6 +1210,7 @@ impl App {
             help_rows: Cell::new(1),
             help_width: Cell::new(MIN_W),
             hits: RefCell::new(Vec::new()),
+            hidden: Cell::new(false),
             roll_top: Cell::new(None),
             stroke: None,
             stroke_at: None,
@@ -3426,6 +3446,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: Key) {
+        if self.hidden.get() {
+            return;
+        }
         // A key can change the track, pattern or view a drag is editing, so
         // it ends the drag; the release that follows does nothing.
         self.stroke = None;
@@ -3453,6 +3476,9 @@ impl App {
     /// Handles a mouse event, at a position in the last frame drawn.
     /// Questions and prompts answer only to keys.
     pub fn handle_mouse(&mut self, m: Mouse) {
+        if self.hidden.get() {
+            return;
+        }
         let target = self.target_at(m.x, m.y);
         match self.mode.clone() {
             Mode::Help(top) => {
@@ -3503,8 +3529,9 @@ impl App {
                     let tab = self.settings_page.tab as usize;
                     self.settings_page.cursor[tab] = i.min(self.settings_rows() - 1);
                 }
-                (MouseKind::ScrollUp, _) => self.settings_move(-1),
-                (MouseKind::ScrollDown, _) => self.settings_move(1),
+                // Waiting for a key, the action it goes to stays put.
+                (MouseKind::ScrollUp, _) if !self.settings_page.capture => self.settings_move(-1),
+                (MouseKind::ScrollDown, _) if !self.settings_page.capture => self.settings_move(1),
                 _ => {}
             },
             Mode::Plugins(mut p) => match (m.kind, target) {
@@ -3622,6 +3649,8 @@ impl App {
             }
             Target::Entry(i) | Target::TempoPoint(i) => (self.song_cursor, self.song_row) = (i, 0),
             Target::Part(i, t) => (self.song_cursor, self.song_row, self.track) = (i, t + 1, t),
+            // The right button only moves the cursor: no pattern is cued.
+            Target::SongCell(e) if !left => self.song_cursor = e,
             Target::SongCell(e) => {
                 self.song_cursor = e;
                 match self.entry_pattern(self.track, e) {
@@ -3688,7 +3717,8 @@ impl App {
                 self.key_song(pick(Action::SongPrev, Action::SongNext));
             }
             Target::TempoPoint(i) => {
-                self.song_cursor = i;
+                // The row a click there selects, so a key after it edits it.
+                (self.song_cursor, self.song_row) = (i, 0);
                 self.key_song(pick(Action::TempoPointDown, Action::TempoPointUp));
             }
             Target::Part(i, t) => {
@@ -3805,6 +3835,8 @@ impl App {
     /// key closes it.
     fn key_help(&mut self, top: usize, key: Key) {
         let last = self.help_lines().len().saturating_sub(self.help_rows.get());
+        // From where the screen shows: widened, the lines are fewer.
+        let top = top.min(last);
         self.mode = match (self.keys.action(&[Context::Nav], key), key) {
             (Some(Action::Up), _) => Mode::Help(top.saturating_sub(1)),
             (Some(Action::Down), _) => Mode::Help((top + 1).min(last)),
@@ -3996,6 +4028,9 @@ impl App {
     /// without its line breaks; elsewhere it does nothing, so pasted text
     /// never runs as keys.
     pub fn paste(&mut self, pasted: &str, cut_before: bool) {
+        if self.hidden.get() {
+            return;
+        }
         let Mode::Prompt(_, text) = &mut self.mode else {
             self.set_status("Pasting works in a text prompt only");
             return;
@@ -4368,13 +4403,39 @@ impl App {
     fn inserts_page_status(&self) -> String {
         let name = self.chain_name(self.insert_chain());
         format!(
-            "Insert effects of {name} ({} chain, {} effect, {} plugin, {} move, {}: instrument)",
+            "Insert effects of {name} ({} chain, {} effect, {} plugin, {} move, {})",
             self.k(Action::InsertChain),
             self.keys.labels(&[Action::PrevEffect, Action::NextEffect]),
             self.k(Action::Plugins),
             self.keys.labels(&[Action::EffectEarlier, Action::EffectLater]),
-            self.k(Action::Page)
+            self.next_page_hint(Page::Inserts)
         )
+    }
+
+    /// The page `f` goes to from `page`: the group's only when the
+    /// selected track has one.
+    fn page_after(&self, page: Page) -> Page {
+        match page {
+            Page::Instrument => Page::Strip,
+            Page::Strip if self.track_group().is_some() => Page::Group,
+            Page::Strip | Page::Group => Page::Mix,
+            Page::Mix | Page::Plugin => Page::Inserts,
+            Page::Inserts => Page::Instrument,
+        }
+    }
+
+    /// What a page's message says `f` does there, from the same order
+    /// `f` follows.
+    fn next_page_hint(&self, page: Page) -> String {
+        let name = match self.page_after(page) {
+            Page::Instrument => "instrument",
+            Page::Strip => "channel strip",
+            Page::Group => "group",
+            Page::Mix => "buses and master",
+            Page::Inserts => "insert effects",
+            Page::Plugin => "plugin",
+        };
+        format!("{}: {name}", self.k(Action::Page))
     }
 
     /// A track kind as the editor shows it: a plugin by its name.
@@ -4900,9 +4961,8 @@ impl App {
     }
 
     fn group_page_status(&self) -> String {
-        let f = self.k(Action::Page);
         let name = self.track_group().map_or("", |g| self.project.groups[usize::from(g)].name.as_str());
-        format!("{name}: the track's group, its strip and sends ({f}: buses and master)")
+        format!("{name}: the track's group, its strip and sends ({})", self.next_page_hint(Page::Group))
     }
 
     /// The group the selected track goes to.
@@ -5098,18 +5158,14 @@ impl App {
             Action::Record => self.toggle_recording(),
             Action::RecordNotes => self.toggle_note_recording(),
             Action::Page => {
-                let f = self.k(Action::Page);
-                let (page, status) = match self.page {
-                    Page::Instrument => (
-                        Page::Strip,
-                        format!("Channel strip: high-pass, EQ, compressor, drive, sends ({f}: buses and master)"),
-                    ),
-                    Page::Strip if self.track_group().is_some() => (Page::Group, self.group_page_status()),
-                    Page::Strip | Page::Group => {
-                        (Page::Mix, format!("Buses and master: delay, reverb, limiter ({f}: instrument)"))
-                    }
-                    Page::Mix | Page::Plugin => (Page::Inserts, self.inserts_page_status()),
-                    Page::Inserts => (Page::Instrument, format!("Instrument parameters ({f}: channel strip)")),
+                let page = self.page_after(self.page);
+                let next = self.next_page_hint(page);
+                let status = match page {
+                    Page::Strip => format!("Channel strip: high-pass, EQ, compressor, drive, sends ({next})"),
+                    Page::Group => self.group_page_status(),
+                    Page::Mix => format!("Buses and master: delay, reverb, limiter ({next})"),
+                    Page::Inserts | Page::Plugin => self.inserts_page_status(),
+                    Page::Instrument => format!("Instrument parameters ({next})"),
                 };
                 let back = self.page == Page::Plugin;
                 self.page = page;
@@ -5259,6 +5315,8 @@ impl App {
                 Some(group) => {
                     let mute = !self.project.groups[usize::from(group)].mute;
                     self.edit(Edit::SetGroupMute { group, mute });
+                    let name = &self.project.groups[usize::from(group)].name;
+                    self.set_status(format!("{name} {}", if mute { "muted" } else { "unmuted" }));
                 }
                 None => self.no_group(),
             },
@@ -5293,6 +5351,11 @@ impl App {
             Action::Automate if self.focus == Focus::Params => self.automate_param(self.param),
             Action::Automate => {
                 self.auto_view = !self.auto_view;
+                // One view over the grid at a time: what the title says goes
+                // back to the grid does.
+                if self.auto_view {
+                    self.roll = false;
+                }
                 if self.auto_view && self.project.tracks[self.track].lanes.iter().all(|l| l.target.is_none()) {
                     let status = format!(
                         "No lanes yet: pick a parameter ({}) and press {}",
@@ -5308,6 +5371,7 @@ impl App {
                 } else {
                     self.roll = !self.roll;
                     if self.roll {
+                        self.auto_view = false;
                         self.roll_top.set(None);
                         let t = &self.project.tracks[self.track];
                         let step = t.steps[self.pattern][self.step];
@@ -5393,6 +5457,7 @@ impl App {
             return;
         }
         self.auto_view = true;
+        self.roll = false;
         self.focus = Focus::Grid;
     }
 
@@ -6023,8 +6088,10 @@ impl App {
         self.hits.borrow_mut().clear();
         s.clear();
         let (w, h) = (s.width(), s.height());
-        if w < MIN_W || h < MIN_H {
+        self.hidden.set(w < MIN_W || h < MIN_H);
+        if self.hidden.get() {
             s.put(0, 0, &format!("TINVO needs at least {MIN_W}x{MIN_H} (now {w}x{h})"), self.style(Role::Warning));
+            s.put(0, 1, "Keys and clicks wait until it is larger", self.style(Role::Hint));
             return;
         }
         if let Mode::Help(top) = self.mode {
@@ -6078,8 +6145,6 @@ impl App {
             .as_ref()
             .and_then(|p| p.file_name())
             .map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
-        let swing =
-            if self.project.swing > MIN_SWING { format!("swing {:.0}%  ", self.project.swing) } else { String::new() };
         let playing = match self.play_pos {
             Some(PlayPosition { entry: Some(e), pattern, .. }) => {
                 format!("song {}/{} ({})  ", e + 1, self.project.song.len(), pattern_name(pattern))
@@ -6088,14 +6153,33 @@ impl App {
             _ => String::new(),
         };
         let dirty = if self.dirty { "*" } else { "" };
-        for (text, target) in [
+        let (pattern, division, meter) = (
+            pattern_name(self.pattern as u8),
+            self.project.divisions[self.pattern].name(),
+            self.project.meters[self.pattern].name(),
+        );
+        // Swing is shown at its least too, for the wheel to raise it.
+        let full = [
             (self.tempo_label(), Target::Tempo),
-            (swing, Target::Swing),
-            (format!("pattern {}", pattern_name(self.pattern as u8)), Target::Pattern),
+            (format!("swing {:.0}%  ", self.project.swing), Target::Swing),
+            (format!("pattern {pattern}"), Target::Pattern),
             (format!(" · {} steps", self.pattern_len()), Target::Length),
-            (format!(" of {}", self.project.divisions[self.pattern].name()), Target::Division),
-            (format!(" in {}  ", self.project.meters[self.pattern].name()), Target::Meter),
-        ] {
+            (format!(" of {division}"), Target::Division),
+            (format!(" in {meter}  "), Target::Meter),
+        ];
+        let compact = [
+            (self.tempo_label().trim_end().to_string() + " ", Target::Tempo),
+            (format!("sw {:.0}% ", self.project.swing), Target::Swing),
+            (format!("pat {pattern}"), Target::Pattern),
+            (format!(" ·{}", self.pattern_len()), Target::Length),
+            (format!(" {division}"), Target::Division),
+            (format!(" {meter} "), Target::Meter),
+        ];
+        // The full labels while they leave room for the file's name, the
+        // meter and what is being recorded; else the short ones.
+        let width = |c: &[(String, Target)]| c.iter().map(|(t, _)| screen::text_width(t)).sum::<usize>() as u16;
+        let labels = if x + width(&full) + HEADER_ROOM <= w { full } else { compact };
+        for (text, target) in labels {
             let n = s.put(x, 0, &text, bar);
             self.hit(x, 0, n, target);
             x += n;
@@ -6103,7 +6187,6 @@ impl App {
         // What is right of the controls is for the news below; it may cover
         // the file's name, never a control.
         let controls = x;
-        s.put(x, 0, &format!("{playing}{file}{dirty} "), bar);
         let short_term = self.loudness[1];
         let lufs = if short_term.is_nan() { String::new() } else { format!("{short_term:.1} LUFS  ") };
         let rec = match (&self.take, self.count_in, &self.note_rec) {
@@ -6117,6 +6200,13 @@ impl App {
             _ if self.step_entry => "REC  ".to_string(),
             _ => String::new(),
         };
+        // What has to be seen whatever the width: that it records.
+        let rec_short = match (&self.take, self.count_in, &self.note_rec) {
+            (Some(_), ..) | (None, None, Some(_)) => "● REC ",
+            (None, Some(_), _) => "COUNT ",
+            _ if self.step_entry => "REC ",
+            _ => "",
+        };
         let midi = match (&self.midi_input, self.midi_seen) {
             (None, _) => "",
             (Some(_), Some(t)) if t.elapsed() < Duration::from_millis(150) => "MIDI●  ",
@@ -6125,7 +6215,9 @@ impl App {
         let cpu = format!("CPU {:4.1}%  ", self.cpu * 100.0);
         let meter_w = 10u16;
         let room = w.saturating_sub(controls);
-        let meter = room > meter_w;
+        // The meter gives way to the recording's mark and the unsaved one.
+        let must = screen::text_width(rec_short) as u16 + screen::text_width(dirty) as u16 + 1;
+        let meter = room > meter_w + must;
         let end = if meter { w - meter_w - 1 } else { w };
         // The longest that fits: recording comes first, then the CPU, the
         // loudness and the device.
@@ -6134,11 +6226,26 @@ impl App {
             format!(" {rec}{midi}{lufs}{cpu}"),
             format!(" {rec}{midi}{cpu}"),
             format!(" {rec}{midi}"),
+            format!(" {rec}"),
+            format!(" {rec_short}"),
         ]
         .into_iter()
-        .find(|r| screen::text_width(r) <= usize::from(end.saturating_sub(controls)));
-        if let Some(right) = right.filter(|r| !r.trim().is_empty()) {
-            let rx = end - screen::text_width(&right) as u16;
+        .find(|r| screen::text_width(r) + screen::text_width(dirty) <= usize::from(end.saturating_sub(controls)))
+        .filter(|r| !r.trim().is_empty());
+        let rx = right.as_ref().map_or(end, |r| end - screen::text_width(r) as u16);
+        // The file's name in what is left, its end cut off rather than the
+        // unsaved mark.
+        let name = format!("{playing}{file}");
+        let space = usize::from(rx.saturating_sub(controls)).saturating_sub(screen::text_width(dirty) + 1);
+        let name = if screen::text_width(&name) <= space {
+            name
+        } else if space >= 2 {
+            format!("{}…", screen::fit(&name, space - 1))
+        } else {
+            String::new()
+        };
+        s.put(controls, 0, &format!("{name}{dirty} "), bar);
+        if let Some(right) = right {
             s.put(rx, 0, &right, bar);
         }
         self.hit(controls, 0, w - controls, Target::Inert);
@@ -6146,6 +6253,33 @@ impl App {
             let peak = self.master_meter[0].max(self.master_meter[1]);
             self.draw_meter(s, w - meter_w - 1, 0, meter_w, peak, bar.bg);
         }
+    }
+
+    /// A prompt's label, `what` then `help` then `end` on its line when
+    /// that leaves room to type; else `what` and `end` there, and `help`
+    /// on the line above (row `y - 1` of a screen `w` wide), so it is
+    /// still seen.
+    fn prompt_with_help(&self, s: &mut Screen, y: u16, w: u16, what: &str, help: &str, end: &str) -> String {
+        let long = format!("{what} {help}{end}");
+        if screen::text_width(&long) + MIN_INPUT <= usize::from(w) {
+            return long;
+        }
+        if y > 0 {
+            let style = self.style(Role::Hint);
+            s.fill(0, y - 1, w, ' ', style);
+            s.put(0, y - 1, help, style);
+        }
+        format!("{what}{end}")
+    }
+
+    /// Whether synth track `t` is set to play its own wavetable file, on an
+    /// oscillator playing a table, and has none.
+    fn wants_wavetable_file(&self, t: &TrackData) -> bool {
+        let specs = InstrumentKind::Synth.params();
+        let shows = |id: &str, text: &str| {
+            specs.iter().position(|s| s.id == id).is_some_and(|i| specs[i].format(t.params[i]) == text)
+        };
+        t.sample.is_none() && shows("wavetable", "file") && (shows("osc1_wave", "table") || shows("osc2_wave", "table"))
     }
 
     /// The tempo in the top bar: the set tempo, and while the song's tempo
@@ -6578,15 +6712,19 @@ impl App {
                 Some(c) => format!("{} {:>2}", screen::pad(&label, 5), c + 1),
                 None => label,
             };
+            // A muted group's tracks are silent too: its tag says so.
+            let group_muted = t.group.is_some_and(|g| self.project.groups.get(usize::from(g)).is_some_and(|g| g.mute));
             let name = match t.group {
+                Some(g) if group_muted => format!("G{}× {}", u32::from(g) + 1, t.name),
                 Some(g) => format!("G{} {}", u32::from(g) + 1, t.name),
                 None => t.name.clone(),
             };
             // Cut and padded by columns: a wide name must not push the
             // mute and solo marks out of their columns.
             s.put(1, y, &format!("{:>2} {} {}", ti + 1, screen::pad(&name, 12), screen::pad(&kind, 8)), name_style);
-            s.put(26, y, "M", if t.mute { self.style(Role::Mute) } else { dim });
-            s.put(28, y, "S", if t.solo { self.style(Role::Solo) } else { dim });
+            // Told by the letter as well as its colour: capital when on.
+            s.put(26, y, if t.mute { "M" } else { "m" }, if t.mute { self.style(Role::Mute) } else { dim });
+            s.put(28, y, if t.solo { "S" } else { "s" }, if t.solo { self.style(Role::Solo) } else { dim });
             self.draw_meter(s, 30, y, 5, self.meters[ti], Color::Default);
             s.put(LEFT - 1, y, "│", dim);
             self.hit(0, y, LEFT, Target::Track(ti));
@@ -6602,7 +6740,7 @@ impl App {
                             let r = if step.ratchet > 1 { char::from(b'0' + step.ratchet) } else { ' ' };
                             format!(" {}{r}", velocity_glyph(step.velocity))
                         } else {
-                            format!("{:<3}", note_name(step.note))
+                            format!("{:<3}", cell_note_name(step.note))
                         };
                         let role = match (step.chance < 100, t.kind.is_drum(), step.note_count() > 1) {
                             (true, ..) => Role::Chance,
@@ -6615,7 +6753,7 @@ impl App {
                     None if self.beat_at(i).is_some() => (" · ".to_string(), self.style(Role::Beat)),
                     None => (" · ".to_string(), dim),
                 };
-                if t.mute && t.steps[self.pattern][i].is_some() {
+                if (t.mute || group_muted) && t.steps[self.pattern][i].is_some() {
                     st.fg = self.style(Role::Muted).fg;
                 }
                 if self.play_step(ti) == Some(i) {
@@ -6707,8 +6845,9 @@ impl App {
                 let g = t.group.map_or(0, usize::from);
                 let members = self.project.tracks.iter().filter(|o| o.group == t.group).count();
                 let tracks = if members == 1 { "track" } else { "tracks" };
+                let muted = if self.project.groups[g].mute { " · MUTED" } else { "" };
                 format!(
-                    " {} · group of {members} {tracks} · comp {} ",
+                    " {}{muted} · group of {members} {tracks} · comp {} ",
                     self.project.groups[g].name,
                     reduction_text(self.group_reduction[g])
                 )
@@ -6746,6 +6885,11 @@ impl App {
                     }
                     InstrumentKind::Sampler => {
                         format!(" {} · Sampler · no sample, press {}{page} ", t.name, self.k(Action::LoadSample))
+                    }
+                    // Set to play its own file, which it has not: say how to
+                    // load one.
+                    InstrumentKind::Synth if self.wants_wavetable_file(t) => {
+                        format!(" {} · Synth · no wavetable file, press {}{page} ", t.name, self.k(Action::LoadSample))
                     }
                     kind => {
                         let window = match kind.plugin() {
@@ -6920,7 +7064,8 @@ impl App {
                     }
                     PromptKind::Style(r) => style_prompt(*r),
                     PromptKind::Channel => {
-                        "MIDI channel 1-16 that plays the track (empty: while selected): ".to_string()
+                        let help = "that plays the track (empty: while selected)";
+                        self.prompt_with_help(s, y, w, "MIDI channel 1-16", help, ": ")
                     }
                     PromptKind::Export => {
                         let what = format!(
@@ -6929,13 +7074,8 @@ impl App {
                             self.export_source_label(),
                             self.export_loops
                         );
-                        let long = format!("{what} (←→ what, Tab format, ↑↓ repeats; .mid for MIDI) file: ");
-                        // The keys' help goes first when the line is short.
-                        if screen::text_width(&long) + MIN_INPUT <= usize::from(w) {
-                            long
-                        } else {
-                            format!("{what} file: ")
-                        }
+                        let help = "(←→ what, Tab format, ↑↓ repeats; .mid for MIDI)";
+                        self.prompt_with_help(s, y, w, &what, help, " file: ")
                     }
                 };
                 // Typing or pasting more is cut; the line says why, first,
@@ -6971,7 +7111,8 @@ impl App {
                 s.put(0, y, &format!("{name}{ASK}"), prompt);
             }
             Mode::AddTrack => {
-                s.put(0, y, ADD_TRACK_PROMPT, prompt);
+                let fits = screen::text_width(ADD_TRACK_PROMPT) <= usize::from(w);
+                s.put(0, y, if fits { ADD_TRACK_PROMPT } else { ADD_TRACK_SHORT }, prompt);
             }
             _ => {
                 let recent = self.status.as_ref().filter(|(_, t)| t.elapsed() < Duration::from_secs(STATUS_SECONDS));
@@ -7233,10 +7374,15 @@ impl App {
             }
         }
         entries.push((String::new(), String::new(), "Fixed keys".into()));
+        // A list also closes on quit's keys, which settings can change, so
+        // they are named as they are now.
+        let close =
+            format!("close a list; so do the key that opened it and quit's: {}", self.keys.all_labels(Action::Quit));
         for (keys, text) in [
             ("y n", "answer a question (quit, delete a track)"),
             ("1-9", "the type of a new track, after add_track (8: a CLAP plugin, from a list; 9: the FM synth)"),
-            ("Esc Ctrl+C", "cancel a prompt, close a list"),
+            ("Esc Ctrl+C", "cancel a prompt"),
+            ("Esc", close.as_str()),
             ("Enter Del r Esc", "on the settings page: add a key or change a setting, remove a key, default, close"),
             ("←→ Tab ↑↓", "in the export prompt: what to export, format, repeats"),
             ("Home End ←→ Del", "in other prompts: move in the text, erase after the cursor"),
@@ -8232,6 +8378,108 @@ mod tests {
     }
 
     #[test]
+    fn nothing_typed_acts_while_the_editor_is_hidden() {
+        let mut a = app();
+        a.track = 0;
+        let steps = a.project.tracks[0].steps[0];
+        a.draw(&mut Screen::new(MIN_W - 1, MIN_H));
+        keys(&mut a, &[Key::Char('X'), Key::Enter]);
+        a.paste("x", false);
+        assert!(a.project.tracks[0].steps[0] == steps && !a.dirty, "a pattern cleared out of sight");
+        // Larger again, keys act.
+        a.draw(&mut Screen::new(MIN_W, MIN_H));
+        keys(&mut a, &[Key::Char('X')]);
+        assert!(a.project.tracks[0].steps[0] != steps);
+    }
+
+    #[test]
+    fn each_page_names_the_page_f_opens_next() {
+        let mut a = app();
+        let walk = |a: &mut App| {
+            (0..6)
+                .map(|_| {
+                    keys(a, &[Key::Char('f')]);
+                    (a.page, a.status_text().unwrap_or_default().to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        for grouped in [false, true] {
+            if grouped {
+                keys(&mut a, &[Key::Char('d')]);
+                assert!(a.track_group().is_some());
+            }
+            a.page = Page::Inserts;
+            let seen = walk(&mut a);
+            for pair in seen.windows(2) {
+                let status = &pair[0].1;
+                let next = match pair[1].0 {
+                    Page::Instrument => "f: instrument)",
+                    Page::Strip => "f: channel strip)",
+                    Page::Group => "f: group)",
+                    Page::Mix => "f: buses and master)",
+                    Page::Inserts => "f: insert effects)",
+                    Page::Plugin => unreachable!(),
+                };
+                assert!(status.ends_with(next), "grouped {grouped}: {status} should end {next}");
+            }
+            assert_eq!(seen.iter().any(|(p, _)| *p == Page::Group), grouped);
+        }
+    }
+
+    #[test]
+    fn help_scrolls_back_at_once_after_the_screen_grows() {
+        let mut a = app();
+        a.mode = Mode::Help(0);
+        let mut small = Screen::new(80, 24);
+        a.draw(&mut small);
+        keys(&mut a, &[Key::PageDown; 200]);
+        let low = match a.mode {
+            Mode::Help(t) => t,
+            _ => unreachable!(),
+        };
+        // Taller and wider: fewer lines, a nearer last page.
+        let mut big = Screen::new(200, 60);
+        a.draw(&mut big);
+        let last = a.help_lines().len() - a.help_rows.get();
+        assert!(last < low, "the last page moved up: {last} < {low}");
+        keys(&mut a, &[Key::Up]);
+        assert_eq!(a.mode, Mode::Help(last - 1), "one press moves the page shown");
+    }
+
+    #[test]
+    fn help_names_the_keys_that_close_a_list_as_they_are_now() {
+        let mut a = app();
+        a.keys.bind(Action::Quit, vec![Key::Char('q')]);
+        let lines = a.help_lines();
+        // An entry with its wrapped continuation lines, which have no keys.
+        let line = |keys: &str| {
+            let at = lines.iter().position(|l| l.keys.trim() == keys).expect("listed");
+            let more = lines[at + 1..].iter().take_while(|l| l.keys.trim().is_empty() && !l.heading);
+            std::iter::once(&lines[at]).chain(more).map(|l| l.text.trim()).collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(line("Esc Ctrl+C"), "cancel a prompt");
+        assert!(line("Esc").ends_with("quit's: q"), "{}", line("Esc"));
+        // Ctrl+C, no longer quit's, closes no list; it still cancels a prompt.
+        a.mode = Mode::MidiInputs(MidiPicker { output: false, ports: Vec::new(), cursor: 0 });
+        keys(&mut a, &[Key::Ctrl('c')]);
+        assert!(matches!(a.mode, Mode::MidiInputs(_)));
+        keys(&mut a, &[Key::Char('q')]);
+        assert!(matches!(a.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn the_piano_roll_and_automation_take_turns() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Char('A'), Key::Char('v')]);
+        assert!(a.roll_active() && !a.auto_view, "v from automation shows the roll");
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(a.auto_view && !a.roll, "A from the roll shows automation");
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(!a.auto_view && !a.roll, "and A again the grid, as its title says");
+    }
+
+    #[test]
     fn toggling_steps() {
         let mut a = app();
         a.track = 0; // kick, step 0 is set in the demo
@@ -8464,6 +8712,13 @@ mod tests {
         let text = screen_text(&a);
         assert!(text.contains("Group 1 · group of 1 track · comp") && text.contains("Mid gain"), "{text}");
         assert!(text.contains("Send reverb") && !text.contains("Send key"), "no key send: {text}");
+        // A muted group says so: in its title, the status and its tracks' tag.
+        keys(&mut a, &[Key::Char('Q')]);
+        let text = screen_text(&a);
+        assert!(text.contains("Group 1 · MUTED · group of") && text.contains("G1× "), "{text}");
+        assert_eq!(a.status_text(), Some("Group 1 muted"));
+        keys(&mut a, &[Key::Char('Q')]);
+        assert!(!screen_text(&a).contains("MUTED") && a.status_text() == Some("Group 1 unmuted"));
         while rx.pop().is_some() {}
         keys(&mut a, &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Right]);
         assert_eq!(a.project.groups[0].params[strip::sp::MID_GAIN], 0.5);
@@ -8947,6 +9202,13 @@ mod tests {
         assert_eq!(a.project.tracks[1].kind, InstrumentKind::Fm);
         assert_eq!(a.status_text(), Some("Added FM track"));
         assert!(ADD_TRACK_PROMPT.chars().count() <= 80 && ADD_TRACK_PROMPT.ends_with("9 FM"));
+        assert!(ADD_TRACK_SHORT.chars().count() <= usize::from(MIN_W) && ADD_TRACK_SHORT.ends_with("9FM"));
+        // At the narrowest, every choice is on screen.
+        a.mode = Mode::AddTrack;
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        assert!(s.row_text(MIN_H - 1).contains("8Plugin 9FM"), "{}", s.row_text(MIN_H - 1));
+        a.mode = Mode::Normal;
         keys(&mut a, &[Key::Char('D'), Key::Char('y')]);
         keys(&mut a, &[Key::Char('a'), Key::Char('0')]); // invalid choice
         assert_eq!((a.project.tracks.len(), a.track), (1, 0));
@@ -9923,6 +10185,24 @@ mod tests {
     }
 
     #[test]
+    fn a_synth_set_to_a_wavetable_file_it_lacks_says_how_to_load_one() {
+        let mut a = App::new(Project::default(), None, None, 48_000, "t".into());
+        a.edit(Edit::AddTrack(InstrumentKind::Synth));
+        a.track = 0;
+        let specs = InstrumentKind::Synth.params();
+        let at = |id: &str| specs.iter().position(|s| s.id == id).unwrap();
+        let choice = |id: &str, text: &str| {
+            let i = at(id);
+            (0..=specs[i].max as usize).find(|&v| specs[i].format(v as f32) == text).unwrap() as f32
+        };
+        let hint = format!("no wavetable file, press {}", a.k(Action::LoadSample));
+        a.edit(Edit::SetParam { track: 0, index: at("wavetable") as u8, value: choice("wavetable", "file") });
+        assert!(!screen_text(&a).contains(&hint), "no oscillator plays a table");
+        a.edit(Edit::SetParam { track: 0, index: at("osc2_wave") as u8, value: choice("osc2_wave", "table") });
+        assert!(screen_text(&a).contains(&hint), "{}", screen_text(&a));
+    }
+
+    #[test]
     fn synth_tracks_load_a_wavetable_as_one_undo_step() {
         let dir = std::env::temp_dir().join(format!("tinvo-table-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -10388,10 +10668,12 @@ mod tests {
         assert!(!a.project.tempo_ramp);
         keys(&mut a, &[Key::Char('u')]);
         assert!(!a.project.has_tempo_points());
-        // The wheel on the tempo row nudges the entry's point.
+        // The wheel on the tempo row nudges the entry's point, and selects
+        // that row as a click does, whatever row was selected.
+        a.song_row = 1;
         let at = spot(&a, Target::TempoPoint(0));
         mouse(&mut a, MouseKind::ScrollUp, at);
-        assert_eq!((a.song_cursor, a.project.tempo_points[0]), (0, Some(121.0)));
+        assert_eq!((a.song_cursor, a.song_row, a.project.tempo_points[0]), (0, 0, Some(121.0)));
     }
 
     #[test]
@@ -10519,12 +10801,33 @@ mod tests {
         let mut s = Screen::new(MIN_W, MIN_H);
         a.draw(&mut s);
         let top = s.row_text(0);
-        assert!(top.contains(" in 4/4"), "{top}");
+        assert!(top.contains(" 4/4 "), "{top}");
         let meter = a.hits.borrow().iter().find(|h| h.target == Target::Meter).map(|h| h.x).unwrap();
         assert_eq!(a.target_at(meter, 0), Some(Target::Meter));
         // With room, it is all there.
         let wide = frame(&a).row_text(0);
         assert!(wide.contains("audio offline  CPU"), "{wide}");
+    }
+
+    #[test]
+    fn the_header_always_shows_recording_unsaved_edits_and_swing() {
+        let mut a = app();
+        a.path = None;
+        a.dirty = true;
+        a.step_entry = true;
+        for w in [MIN_W, 80, 100, 140] {
+            let mut s = Screen::new(w, MIN_H);
+            a.draw(&mut s);
+            let top = s.row_text(0);
+            assert!(top.contains("REC") && top.contains('*'), "{w}: {top}");
+            // Every control is there, swing at its least too.
+            for t in [Target::Tempo, Target::Swing, Target::Pattern, Target::Length, Target::Division, Target::Meter] {
+                assert!(a.hits.borrow().iter().any(|h| h.target == t && h.width > 0), "{w}: {t:?} in {top}");
+            }
+        }
+        // Wide, the labels are whole.
+        let wide = frame(&a).row_text(0);
+        assert!(wide.contains("swing 50%") && wide.contains(" in 4/4"), "{wide}");
     }
 
     #[test]
@@ -10545,7 +10848,7 @@ mod tests {
         a.project.tracks[0].name = "キック太鼓ドラム音".into();
         let s = frame(&a);
         let y = (0..30).find(|&y| s.row_text(y).contains("キック")).unwrap();
-        assert_eq!((s.char_at(26, y), s.char_at(28, y)), ('M', 'S'), "{}", s.row_text(y));
+        assert_eq!((s.char_at(26, y), s.char_at(28, y)), ('m', 's'), "{}", s.row_text(y));
         // The type sits where it does after a plain name.
         let plain = frame(&app());
         let row = plain.row_text(y);
@@ -10605,6 +10908,15 @@ mod tests {
         let line = s.row_text(MIN_H - 1);
         assert!(line.starts_with("Export [24-bit, song ×4] file: "), "{line}");
         assert!(line.ends_with("export█"), "the end of the name and the cursor: {line}");
+        // The keys' help is still seen, on the line above.
+        assert!(s.row_text(MIN_H - 2).starts_with("(←→ what, Tab format"), "{}", s.row_text(MIN_H - 2));
+        // So is what an empty MIDI channel means.
+        a.mode = Mode::Prompt(PromptKind::Channel, String::new());
+        let mut s = Screen::new(80, 24);
+        a.draw(&mut s);
+        let both = format!("{}\n{}", s.row_text(22), s.row_text(23));
+        assert!(both.contains("(empty: while selected)") && both.contains("MIDI channel 1-16"), "{both}");
+        a.mode = Mode::Prompt(PromptKind::Export, typed.into());
         // A wide screen has room for the keys' help.
         let wide = frame(&a).row_text(29);
         assert!(wide.contains("(←→ what, Tab format, ↑↓ repeats; .mid for MIDI) file: "), "{wide}");
@@ -10671,6 +10983,10 @@ mod tests {
         assert_eq!(a.pattern, 1);
         click(&mut a, Target::SongCell(3));
         assert_eq!(a.pattern, 1, "a rest has no pattern to edit");
+        // The right button only moves the song cursor: nothing is cued.
+        let at = spot(&a, Target::SongCell(1));
+        mouse(&mut a, MouseKind::Press(Button::Right), at);
+        assert_eq!((a.pattern, a.song_cursor), (1, 1));
         assert!(a.status_text().unwrap().ends_with("rests in entry 4"), "{:?}", a.status_text());
         a.pattern = 5;
         assert!(frame(&a).row_text(y).starts_with(" Song: F in no entry"), "{}", frame(&a).row_text(y));
@@ -11925,6 +12241,12 @@ mod tests {
         assert_eq!(note_name(61), "C#4");
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+        // In a grid cell, every name takes at most its three columns.
+        assert!((0..=127).all(|n| cell_note_name(n).chars().count() <= 3));
+        assert_eq!(
+            (cell_note_name(1), cell_note_name(0), cell_note_name(61)),
+            ("C#-".into(), "C-1".into(), "C#4".into())
+        );
     }
 
     #[test]
@@ -12379,6 +12701,13 @@ mod tests {
         keys(&mut a, &[Key::Char('z')]);
         assert_eq!(a.keys.keys(Action::Undo), [Key::Char('u'), Key::Ctrl('z'), Key::Char('z')]);
         assert!(a.settings_changed && !a.settings_page.capture);
+        // The wheel does not move the cursor off the action a key is
+        // waited for.
+        let undo = a.settings_page.cursor[0];
+        keys(&mut a, &[Key::Enter]);
+        mouse(&mut a, MouseKind::ScrollDown, (10, 10));
+        assert_eq!(a.settings_page.cursor[0], undo);
+        keys(&mut a, &[Key::Esc]);
         // A key another action has where both work is refused.
         keys(&mut a, &[Key::Enter, Key::Char('n')]);
         assert_eq!(a.keys.keys(Action::Undo).len(), 3);
@@ -12737,10 +13066,13 @@ mod tests {
         let s = frame(&a);
         let (mx, my) = spot(&a, Target::Mute(2));
         let (sx, sy) = spot(&a, Target::Solo(3));
-        assert_eq!((s.char_at(mx, my), s.char_at(sx, sy)), ('M', 'S'));
+        assert_eq!((s.char_at(mx, my), s.char_at(sx, sy)), ('m', 's'));
         click(&mut a, Target::Mute(2));
         click(&mut a, Target::Solo(3));
         assert!(a.project.tracks[2].mute && a.project.tracks[3].solo);
+        // On, the letters are capitals, not only another colour.
+        let s = frame(&a);
+        assert_eq!((s.char_at(mx, my), s.char_at(sx, sy)), ('M', 'S'));
         assert_eq!(a.track, 3);
         click(&mut a, Target::Play);
         assert!(a.status_text().unwrap().starts_with("No audio output. Use 'e'"));
