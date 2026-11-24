@@ -64,7 +64,11 @@ USAGE:
     tinvo fuzz project|wav|edits|midi|sfz [--seconds N | --runs N] [--seed N] [--render-every N]
                                         fuzz what TINVO reads (default 60 s); a failing
                                         input is reduced and saved to a file
-    tinvo fuzz TARGET --check FILE      check one input, such as a saved failure
+    tinvo fuzz TARGET --check FILE [--as-fuzzed]
+                                        check one file as the editor reads it; with
+                                        --as-fuzzed as a fuzz run did (an SFZ file's
+                                        includes are then the fuzzer's), to repeat a
+                                        saved failure
     tinvo plugins [--rescan]            list the CLAP plugins in CLAP's folders and in
                                         CLAP_PATH; files read before are taken from a
                                         cache until they change, unless --rescan
@@ -1017,6 +1021,7 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
     let mut opts = Options { seed, runs: u64::MAX, time: None, render_every: 16 };
     let mut check = None;
+    let mut as_fuzzed = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         let mut number = |name: &str| -> Result<u64, String> {
@@ -1029,11 +1034,16 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
             "--seed" => opts.seed = number("--seed")?,
             "--render-every" => opts.render_every = number("--render-every")?,
             "--check" => check = Some(PathBuf::from(it.next().ok_or("--check needs a file")?)),
+            "--as-fuzzed" => as_fuzzed = true,
             s => return Err(format!("unknown option '{}'", shown(s))),
         }
     }
+    if as_fuzzed && check.is_none() {
+        return Err(format!("--as-fuzzed goes with --check FILE{SEE_HELP}"));
+    }
     if let Some(path) = check {
-        let verdict = fuzz::check_path(target, &path).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
+        let verdict =
+            fuzz::check_path(target, &path, as_fuzzed).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
         match verdict {
             fuzz::Verdict::Accepted => println!("Accepted, and every invariant holds"),
             fuzz::Verdict::Rejected(None) => println!("Rejected, as it should be"),
@@ -1077,11 +1087,11 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
             let name = format!("fuzz-{}-{}.input", target.id(), opts.seed);
             std::fs::write(&name, &f.input).map_err(|e| format!("{}; and saving the input failed: {e}", f.message))?;
             Err(format!(
-                "after {} inputs: {}\nThe input ({} bytes) is in {name}; check it again with: tinvo fuzz {} --check {name}",
+                "after {} inputs: {}\nThe input ({} bytes) is in {name}; check it again with: {}",
                 f.runs,
                 f.message,
                 f.input.len(),
-                target.id()
+                fuzz::replay_command(target, &name)
             ))
         }
     }
