@@ -69,8 +69,8 @@ Author: 𝓐.𝓒.𝓑
   - The README names the mute and solo columns, and says which keys close a list.
 - Imports and checks hold to what they promise:
   - A MIDI import is always a project its own export reads back as. One with more tracks than the export has channels for no longer loses another track on its next export; one that would not settle is refused.
-  - Synth parameters brought by formats 2 and 3 (glide, the LFO, velocity to cutoff; pulse width, noise, unison, detune) load only from those formats on, and a value a later format brought names that format.
-  - `tinvo fuzz TARGET --check` reads no more of a file than that target's reader does, refuses a project that is not UTF-8 text, and reads SFZ text as the editor does, Latin-1 where it is not UTF-8.
+  - Synth parameters brought by formats 2 and 3 (glide, the LFO, velocity to cutoff; pulse width, noise, unison, detune) load only from those formats on, and a sampler track only from format 4, which brought it. A value a later format brought names that format.
+  - `tinvo fuzz TARGET --check` judges a file as the editor's reader would. It reads no more of it than that reader does, leaving a larger WAV file to the sample loader, and refuses a project that is not UTF-8 text or sits where it could not be loaded from. SFZ text is read as the editor reads it, Latin-1 where it is not UTF-8, with includes from the file's own folder. A WAV file the sample loader refuses no longer counts as accepted.
 
 ## [0.29.0] - 2026-11-23
 

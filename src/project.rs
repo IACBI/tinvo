@@ -2489,7 +2489,7 @@ fn check_pattern(p: u8) -> Result<(), EditError> {
 /// Refuses a project path that is not Unicode text: the sample paths a
 /// project keeps are text, relative to its folder, and could not be
 /// written or found from it.
-fn unicode_path(path: &Path) -> Result<(), &'static str> {
+pub fn unicode_path(path: &Path) -> Result<(), &'static str> {
     if path.to_str().is_some() && std::path::absolute(path).is_ok_and(|p| p.to_str().is_some()) {
         Ok(())
     } else {
@@ -4515,6 +4515,12 @@ pattern_division A 1/8
     }
 
     #[test]
+    fn a_sampler_track_loads_only_from_format_4() {
+        assert!(Project::from_text("tinvo 3\ntrack sampler\nend").is_err());
+        Project::from_text("tinvo 4\ntrack sampler\nparam root 48\nend").unwrap();
+    }
+
+    #[test]
     fn a_synth_parameter_loads_only_from_the_format_that_brought_it() {
         for (id, value, since) in
             [("glide", "0.5", 2), ("vel_cutoff", "0.5", 2), ("pulse_width", "0.5", 3), ("unison", "3", 3)]
@@ -4579,7 +4585,8 @@ pattern_division A 1/8
             ("tinvo 4\nsong A", 2, "unknown key"),
             ("tinvo 4\ntrack kick\npattern B\nend", 3, "unknown track key"),
             ("tinvo 4\ntrack kick\nsample a.wav\nend", 3, "has no sample"),
-            ("tinvo 3\ntrack sampler\nsample a.wav\nend", 3, "unknown track key"),
+            // Format 3 has no sampler, let alone its sample.
+            ("tinvo 3\ntrack sampler\nsample a.wav\nend", 2, "unknown instrument"),
             ("tinvo 4\ntrack sampler\nsample\nend", 3, "expected 'sample"),
             ("tinvo 17\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "unknown track key"),
             ("tinvo 18\ntrack kick\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "has no zones"),

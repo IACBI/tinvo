@@ -60,6 +60,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Cursor;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -163,7 +164,12 @@ pub fn check(target: Target, input: &[u8], render: bool) -> Result<bool, String>
 }
 
 fn check_caught(target: Target, input: &[u8], render: bool) -> Result<Outcome, String> {
-    match panic::catch_unwind(AssertUnwindSafe(|| target.check(input, render))) {
+    caught(|| target.check(input, render))
+}
+
+/// What `check`, run by `f`, found, with a panic as a failure.
+fn caught(f: impl FnOnce() -> Result<Outcome, String>) -> Result<Outcome, String> {
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
         Err(payload) => {
             let message = payload
@@ -174,6 +180,56 @@ fn check_caught(target: Target, input: &[u8], render: bool) -> Result<Outcome, S
             Err(format!("panic: {message}"))
         }
     }
+}
+
+/// What `tinvo fuzz TARGET --check FILE` found of a file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// The reader takes it, and every invariant holds.
+    Accepted,
+    /// The reader refuses it; why, when that is not in what it holds (its
+    /// size, its path).
+    Rejected(Option<String>),
+    /// The sample loader takes it, but it is larger than the checks read
+    /// (why), so they did not run.
+    AcceptedUnchecked(String),
+}
+
+/// Checks the file at `path` as the editor's reader for `target` reads it:
+/// no more of it than that reader would, a project only where it could be
+/// loaded from, and an SFZ file with its includes from its own folder.
+pub fn check_path(target: Target, path: &Path) -> Result<Verdict, String> {
+    check_path_within(target, path, target.file_limit())
+}
+
+fn check_path_within(target: Target, path: &Path, limit: u64) -> Result<Verdict, String> {
+    if target == Target::Project {
+        if let Err(e) = crate::project::unicode_path(path) {
+            return Ok(Verdict::Rejected(Some(e.into())));
+        }
+    }
+    let input = match crate::fsutil::read_bytes(path, limit) {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            // The sample loader seeks past chunks it does not read, so a
+            // file over the limit can still load: it decides.
+            if target == Target::Wav {
+                return Ok(match sample::load(path) {
+                    Ok(_) => Verdict::AcceptedUnchecked(e.to_string()),
+                    Err(e) => Verdict::Rejected(Some(e)),
+                });
+            }
+            return Ok(Verdict::Rejected(Some(e.to_string())));
+        }
+        read => read.map_err(|e| e.to_string())?,
+    };
+    let outcome = match target {
+        Target::Sfz => {
+            let dir = path.parent().unwrap_or(Path::new(""));
+            caught(|| check_sfz_from(&input, true, Some(dir)))?
+        }
+        _ => check_caught(target, &input, true)?,
+    };
+    Ok(if outcome.accepted { Verdict::Accepted } else { Verdict::Rejected(None) })
 }
 
 /// How long a run goes on.
@@ -1108,10 +1164,17 @@ fn mutate_sfz(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 /// `sfz`: the reader's result holds, repeats, saves and plays.
 fn check_sfz(input: &[u8], render: bool) -> Result<Outcome, String> {
+    check_sfz_from(input, render, None)
+}
+
+/// [`check_sfz`], with includes read from folder `dir` as the editor
+/// reads them, or else from two made up for fuzzing.
+fn check_sfz_from(input: &[u8], render: bool, dir: Option<&Path>) -> Result<Outcome, String> {
     let text = crate::sfz::decode(input.to_vec());
-    let include = |name: &str| match name {
-        "inc.sfz" => Ok("<region> sample=inc.wav key=60 loop_mode=loop_continuous".to_string()),
-        "self.sfz" => Ok(text.to_string()),
+    let include = |name: &str| match (dir, name) {
+        (Some(dir), _) => crate::sfz::read_include(dir, name),
+        (None, "inc.sfz") => Ok("<region> sample=inc.wav key=60 loop_mode=loop_continuous".to_string()),
+        (None, "self.sfz") => Ok(text.to_string()),
         _ => Err("no such file".to_string()),
     };
     let read = crate::sfz::parse(&text, include);
@@ -1391,6 +1454,8 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
         check_slices(s, hash_of(input))?;
         check_table(s.audio())?;
     }
+    // Accepted only where the sample loader takes it, as the editor would.
+    let accepted = loaded.is_some();
     if render {
         if let Some(s) = loaded {
             let single = Arc::new(SampleMap::single(s.clone()));
@@ -1419,7 +1484,7 @@ fn check_wav(input: &[u8], render: bool) -> Result<Outcome, String> {
         let known = [&b"fmt "[..], b"data", b"fact", b"LIST"].contains(&id);
         features.push(hash_of(("chunk", if known { id } else { b"?" })));
     }
-    Ok(Outcome { accepted: true, features })
+    Ok(Outcome { accepted, features })
 }
 
 /// The slicer on a sample, both ways, over a part of it the input picks:
@@ -1835,6 +1900,72 @@ mod tests {
         assert_eq!(Target::Midi.file_limit(), smf::MAX_FILE_BYTES);
         assert_eq!(Target::Sfz.file_limit(), crate::sfz::MAX_SFZ_BYTES as u64);
         assert_eq!(Target::Project.file_limit(), crate::project::MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn check_path_reads_a_file_as_its_reader_does() {
+        let dir = std::env::temp_dir().join(format!("tinvo-fuzz-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A MIDI file larger than the MIDI reader takes is refused unread.
+        let midi = dir.join("padded.mid");
+        let mut bytes = midi_seeds()[0].clone();
+        bytes.extend_from_slice(b"XFIL");
+        let pad = smf::MAX_FILE_BYTES as u32;
+        bytes.extend_from_slice(&pad.to_be_bytes());
+        bytes.resize(bytes.len() + pad as usize, 0);
+        std::fs::write(&midi, &bytes).unwrap();
+        assert!(matches!(check_path(Target::Midi, &midi), Ok(Verdict::Rejected(Some(e))) if e.contains("16 MiB")));
+        // An SFZ file's includes come from its folder.
+        let sfz = dir.join("kit.sfz");
+        std::fs::write(&sfz, "#include \"parts.sfz\"\n").unwrap();
+        assert_eq!(check_path(Target::Sfz, &sfz), Ok(Verdict::Rejected(None)), "no parts.sfz beside it");
+        std::fs::write(dir.join("parts.sfz"), "<region> sample=kick.wav key=36\n").unwrap();
+        assert_eq!(check_path(Target::Sfz, &sfz), Ok(Verdict::Accepted));
+        // A project that is not UTF-8 text.
+        let project = dir.join("latin1.tvo");
+        std::fs::write(&project, b"tinvo 20\ntrack synth\nname caf\xe9\nend\n").unwrap();
+        assert_eq!(check_path(Target::Project, &project), Ok(Verdict::Rejected(None)));
+        // A WAV file over the limit is the sample loader's to judge.
+        let wav = dir.join("long.wav");
+        let (encoded, _) = wav::encode(&[0.25; 64], 1, 48_000, SampleFormat::Float32, 0).unwrap();
+        std::fs::write(&wav, &encoded).unwrap();
+        assert_eq!(check_path_within(Target::Wav, &wav, 1 << 20), Ok(Verdict::Accepted));
+        assert!(matches!(check_path_within(Target::Wav, &wav, 100), Ok(Verdict::AcceptedUnchecked(_))));
+        std::fs::write(&wav, &encoded[..40]).unwrap();
+        assert!(matches!(check_path_within(Target::Wav, &wav, 10), Ok(Verdict::Rejected(Some(_)))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_wav_the_sample_loader_refuses_is_not_accepted() {
+        let mut empty = b"RIFF".to_vec();
+        empty.extend_from_slice(&36u32.to_le_bytes());
+        empty.extend_from_slice(b"WAVEfmt ");
+        empty.extend_from_slice(&16u32.to_le_bytes());
+        for v in [1u16, 1] {
+            empty.extend_from_slice(&v.to_le_bytes());
+        }
+        empty.extend_from_slice(&48_000u32.to_le_bytes());
+        empty.extend_from_slice(&96_000u32.to_le_bytes());
+        for v in [2u16, 16] {
+            empty.extend_from_slice(&v.to_le_bytes());
+        }
+        empty.extend_from_slice(b"data");
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        assert!(sample::read(&mut Cursor::new(&empty)).is_err());
+        assert_eq!(check(Target::Wav, &empty, false), Ok(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_project_in_a_folder_not_named_in_unicode_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(b"tinvo-fuzz-\xff"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("song.tvo");
+        std::fs::write(&project, Project::new().to_text()).unwrap();
+        assert!(matches!(check_path(Target::Project, &project), Ok(Verdict::Rejected(Some(_)))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

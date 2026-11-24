@@ -173,7 +173,12 @@ pub fn parse(text: &str, mut include: impl FnMut(&str) -> Result<String, String>
 /// Reads the SFZ file at `path`; includes are found from its folder.
 pub fn read_file(path: &Path) -> Result<Instrument, String> {
     let dir = path.parent().unwrap_or(Path::new(""));
-    parse(&read_text(path)?, |name| read_text(&dir.join(name.replace('\\', "/"))))
+    parse(&read_text(path)?, |name| read_include(dir, name))
+}
+
+/// The text of the file an `#include` names, found from folder `dir`.
+pub fn read_include(dir: &Path, name: &str) -> Result<String, String> {
+    read_text(&dir.join(name.replace('\\', "/")))
 }
 
 /// A plain file's text, at most [`MAX_SFZ_BYTES`] of it, read without

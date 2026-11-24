@@ -1033,18 +1033,15 @@ fn cmd_fuzz(args: &[String]) -> Result<(), String> {
         }
     }
     if let Some(path) = check {
-        // As the readers it checks read: a plain file, no larger than the
-        // target's reader takes, which refuses a larger one unread.
-        let input = match tinvo::fsutil::read_bytes(&path, target.file_limit()) {
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                println!("Rejected, as it should be: {e}");
-                return Ok(());
+        let verdict = fuzz::check_path(target, &path).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
+        match verdict {
+            fuzz::Verdict::Accepted => println!("Accepted, and every invariant holds"),
+            fuzz::Verdict::Rejected(None) => println!("Rejected, as it should be"),
+            fuzz::Verdict::Rejected(Some(why)) => println!("Rejected, as it should be: {why}"),
+            fuzz::Verdict::AcceptedUnchecked(why) => {
+                println!("Accepted by the sample loader, but {why}: too large for the checks, which did not run")
             }
-            read => read.map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?,
-        };
-        let accepted =
-            fuzz::check(target, &input, true).map_err(|e| format!("{}: {e}", tinvo::fsutil::shown(&path)))?;
-        println!("{}", if accepted { "Accepted, and every invariant holds" } else { "Rejected, as it should be" });
+        }
         return Ok(());
     }
     if opts.time.is_none() && opts.runs == u64::MAX {

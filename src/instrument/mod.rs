@@ -99,6 +99,7 @@ impl InstrumentKind {
         match self {
             InstrumentKind::Fm => 20,
             InstrumentKind::Plugin(_) => 16,
+            InstrumentKind::Sampler => 4,
             _ => 1,
         }
     }
