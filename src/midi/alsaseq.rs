@@ -309,6 +309,14 @@ pub fn open_output(port: &Port) -> Result<OutHandle, String> {
     Ok(OutHandle { seq, port: mine })
 }
 
+/// Whether `ev` says the subscription from `client`:`port` (the source
+/// the input reads) ended. Another sender connected to the same port and
+/// leaving is no reason to let the held keys go.
+fn source_gone(ev: &Event, client: c_int, port: c_int) -> bool {
+    // `snd_seq_connect_t`: the sender's address, then the destination's.
+    ev.kind == EVENT_PORT_UNSUBSCRIBED && c_int::from(ev.data[0]) == client && c_int::from(ev.data[1]) == port
+}
+
 /// The note message an event carries, if any.
 fn message(ev: &Event) -> Option<Message> {
     let [channel, note, velocity, ..] = ev.data;
@@ -324,7 +332,6 @@ fn message(ev: &Event) -> Option<Message> {
             Some(Message::Control { channel, controller, value: word(8).clamp(0, 127) as u8 })
         }
         EVENT_PITCHBEND => Some(Message::Bend { channel, value: word(8).clamp(-8192, 8191) as i16 }),
-        EVENT_PORT_UNSUBSCRIBED => Some(Message::Lost),
         _ => None,
     }
 }
@@ -376,6 +383,7 @@ where
     if n <= 0 {
         return Err(alsa_error("cannot poll the sequencer", n));
     }
+    let (from_client, from_port) = (source.client, source.number);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let thread = std::thread::Builder::new()
@@ -414,7 +422,10 @@ where
                         _ => {}
                     }
                     // SAFETY: a valid event from the sequencer.
-                    if let Some(m) = message(unsafe { &*ev }) {
+                    let ev = unsafe { &*ev };
+                    if source_gone(ev, from_client, from_port) {
+                        handler(Message::Lost);
+                    } else if let Some(m) = message(ev) {
                         handler(m);
                     }
                 }
@@ -432,6 +443,17 @@ mod tests {
 
     fn note(kind: u8, channel: u8, note: u8, velocity: u8) -> Event {
         Event { kind, data: [channel, note, velocity, 0, 0, 0, 0, 0, 0, 0, 0, 0], ..Event::default() }
+    }
+
+    #[test]
+    fn only_the_source_read_going_away_lets_keys_go() {
+        // Sender 20:0 to TINVO's 128:0.
+        let gone = note(EVENT_PORT_UNSUBSCRIBED, 20, 0, 128);
+        assert!(source_gone(&gone, 20, 0));
+        assert!(!source_gone(&gone, 20, 1), "another port of it");
+        assert!(!source_gone(&gone, 21, 0), "another sender");
+        assert!(!source_gone(&note(EVENT_NOTEOFF, 20, 0, 0), 20, 0));
+        assert_eq!(message(&gone), None);
     }
 
     #[test]

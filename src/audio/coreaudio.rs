@@ -789,6 +789,14 @@ struct InputState<C> {
 /// its device counts as gone: an input unplugged can stop the queue's
 /// callbacks without an error.
 const CAPTURE_STALL: Duration = Duration::from_secs(2);
+/// How long a capture started may take to deliver its first buffer.
+const CAPTURE_FIRST: Duration = Duration::from_secs(5);
+
+/// Whether a capture whose callbacks have delivered `seen` buffers, the
+/// last (or, with none yet, its start) `since` ago, has stopped.
+fn stalled(seen: u64, since: Duration) -> bool {
+    since >= if seen == 0 { CAPTURE_FIRST } else { CAPTURE_STALL }
+}
 
 unsafe extern "C" fn captured<C: CaptureCallback>(
     user: *mut c_void,
@@ -915,10 +923,10 @@ where
             let now = unsafe { &(*state).delivered }.load(Ordering::Relaxed);
             if now != seen {
                 (seen, since) = (now, std::time::Instant::now());
-            } else if seen > 0 && since.elapsed() >= CAPTURE_STALL {
+            } else if stalled(seen, since.elapsed()) {
                 // SAFETY: as above.
                 let health = unsafe { &(*state).health };
-                health.fail(format!("input device stopped delivering audio for {} s", CAPTURE_STALL.as_secs()));
+                health.fail(format!("input device stopped delivering audio ({:.0?} without any)", since.elapsed()));
                 break;
             }
         }
@@ -931,8 +939,15 @@ mod tests {
     use super::*;
     use crate::audio::{open_input, open_with};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
     use std::time::Instant;
+
+    #[test]
+    fn a_capture_that_delivers_nothing_counts_as_stopped() {
+        assert!(!stalled(0, Duration::from_secs(4)), "still starting");
+        assert!(stalled(0, CAPTURE_FIRST), "never started");
+        assert!(!stalled(10, Duration::from_millis(1900)));
+        assert!(stalled(10, CAPTURE_STALL), "stopped after delivering");
+    }
 
     /// Counts the frames it renders and plays a ramp: exactly representable
     /// values in ±0.5, repeating every 4096 frames, right the negative of left.

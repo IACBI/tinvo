@@ -381,7 +381,8 @@ pub(super) fn forget(token: u64) {
 /// it is not asked for again (and refused, again and again) until the
 /// size changes otherwise.
 fn news(known: &mut Known, size: (u32, u32)) -> bool {
-    let refused = known.asked.filter(|&asked| asked != size && known.reported == size);
+    let same = known.reported == size;
+    let refused = known.asked.filter(|&asked| asked != size && same);
     known.reported = size;
     known.asked = None;
     match refused {
@@ -390,6 +391,8 @@ fn news(known: &mut Known, size: (u32, u32)) -> bool {
             known.refused = Some(asked);
             !again
         }
+        // The window moved, or was stacked: what was refused still is.
+        None if same => true,
         None => {
             known.refused = None;
             true
@@ -718,6 +721,9 @@ mod tests {
         // Refused again (it was asked by another way): not told again.
         k.asked = Some((600, 400));
         assert!(!news(&mut k, (450, 330)));
+        // The window moved, its size the same: the refusal stands.
+        assert!(news(&mut k, (450, 330)));
+        assert_eq!(k.refused, Some((600, 400)));
         // The user sizing it otherwise lets it be asked for again.
         assert!(news(&mut k, (500, 350)));
         assert_eq!(k.refused, None);

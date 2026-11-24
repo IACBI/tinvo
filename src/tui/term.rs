@@ -173,9 +173,10 @@ pub fn end_requested() -> bool {
 /// without unwinding (a library's fatal error handler): leaves the
 /// alternate screen and restores the modes the terminal had.
 pub fn restore_now() {
+    // The modes first: writing can wait on a terminal that reads nothing.
+    sys::restore_now();
     let _ = io::stdout().write_all(LEAVE_SEQ.as_bytes());
     let _ = io::stdout().flush();
-    sys::restore_now();
 }
 
 /// Enter alternate screen, hide cursor, disable line wrap.
@@ -457,6 +458,8 @@ mod sys {
     const CTRL_CLOSE_EVENT: u32 = 2;
 
     static END: AtomicBool = AtomicBool::new(false);
+    /// The console was given back, the session's autosave written before.
+    static RESTORED: AtomicBool = AtomicBool::new(false);
 
     /// Ctrl+Break (and Ctrl+C, should the console still send it) ends the
     /// session as the editor's own quit does, autosave included.
@@ -468,9 +471,13 @@ mod sys {
             }
             CTRL_CLOSE_EVENT => {
                 END.store(true, Ordering::Relaxed);
-                // The process ends when this returns (Windows ends it after
-                // 5 s regardless): time for the editor to autosave and go.
-                std::thread::sleep(Duration::from_secs(4));
+                // The process ends when this returns, and Windows ends it
+                // after 5 s regardless: the editor autosaves, then gives the
+                // console back, which is when this may return.
+                let start = Instant::now();
+                while !RESTORED.load(Ordering::Acquire) && start.elapsed() < Duration::from_millis(4500) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 1
             }
             _ => 0,
@@ -505,6 +512,7 @@ mod sys {
                     SetConsoleMode(input, input_mode);
                     return Err(io::Error::other(format!("console lacks VT support: {err}")));
                 }
+                RESTORED.store(false, Ordering::Release);
                 SetConsoleCtrlHandler(Some(on_control), 1);
                 Ok(Self { input, output, input_mode, output_mode, buttons: 0, repeat: None, high: None })
             }
@@ -526,6 +534,7 @@ mod sys {
                 SetConsoleMode(self.output, self.output_mode);
                 SetConsoleCtrlHandler(Some(on_control), 0);
             }
+            RESTORED.store(true, Ordering::Release);
         }
 
         /// The visible part of the screen buffer.
@@ -851,7 +860,7 @@ mod sys {
     /// own Ctrl+C is a key in raw mode.)
     const ENDING: [c_int; 3] = [SIGHUP, SIGINT, SIGTERM];
     const SIG_DFL: usize = 0;
-    const SIG_ERR: usize = usize::MAX;
+    const SIG_IGN: usize = 1;
 
     /// The attributes the terminal had, for `restore_now`.
     static ORIGINAL: std::sync::Mutex<Option<Termios>> = std::sync::Mutex::new(None);
@@ -883,7 +892,7 @@ mod sys {
         more_since: Option<Instant>,
         /// The descriptors of the last wait, kept for the next.
         polled: Vec<PollFd>,
-        /// The handlers `ENDING`'s signals had before.
+        /// What `ENDING`'s signals were set to before.
         handlers: [usize; 3],
     }
 
@@ -976,7 +985,15 @@ mod sys {
             // terminal back: the poll returns, interrupted, and the editor's
             // loop sees the request.
             // SAFETY: the handler only stores to an atomic.
-            let handlers = ENDING.map(|s| unsafe { signal(s, on_end as extern "C" fn(c_int) as usize) });
+            // A signal ignored when TINVO started (as under `nohup`, or in
+            // the background of a script) stays ignored.
+            let handlers = ENDING.map(|s| unsafe {
+                let before = signal(s, on_end as extern "C" fn(c_int) as usize);
+                if before == SIG_IGN {
+                    signal(s, SIG_IGN);
+                }
+                before
+            });
             if let Ok(mut saved) = ORIGINAL.lock() {
                 *saved = Some(original);
             }
@@ -1002,8 +1019,11 @@ mod sys {
             // handlers the signals had.
             unsafe {
                 tcsetattr(STDIN, TCSANOW, &self.original);
+                // Ignored, or else as by default: a handler a library set
+                // with `sigaction` could not be put back through `signal`,
+                // and none is set before the terminal is taken over.
                 for (s, h) in ENDING.into_iter().zip(self.handlers) {
-                    signal(s, if h == SIG_ERR { SIG_DFL } else { h });
+                    signal(s, if h == SIG_IGN { SIG_IGN } else { SIG_DFL });
                 }
             }
             if let Ok(mut saved) = ORIGINAL.lock() {

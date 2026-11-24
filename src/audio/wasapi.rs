@@ -79,6 +79,19 @@ fn dropped(expected: Option<u64>, position: u64, flags: u32, most: u64) -> u64 {
     }
     expected.map_or(0, |e| position.saturating_sub(e).min(most))
 }
+
+/// Where the next packet is expected after one of `frames` at `position`
+/// with `flags`, given where this one was (`expected`): unknown after a
+/// position not to be trusted, and unchanged by an empty packet.
+fn next_expected(expected: Option<u64>, position: u64, frames: u32, flags: u32) -> Option<u64> {
+    if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR != 0 {
+        None
+    } else if frames == 0 {
+        expected
+    } else {
+        position.checked_add(u64::from(frames))
+    }
+}
 const WAIT_OBJECT_0: u32 = 0;
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -816,7 +829,7 @@ where
                 }
                 // Up to two seconds' worth: the most the wait above allows.
                 let mut gap = dropped(expected, position, flags, 2 * u64::from(sample_rate)) as usize;
-                expected = Some(position + u64::from(frames));
+                expected = next_expected(expected, position, frames, flags);
                 while gap > 0 {
                     let chunk = gap.min(scratch.len() / keep);
                     let dst = &mut scratch[..chunk * keep];
@@ -866,5 +879,24 @@ mod tests {
         // Bounded, and never a step back.
         assert_eq!(dropped(Some(0), u64::MAX, GAP, 96_000), 96_000);
         assert_eq!(dropped(Some(2_000), 1_000, GAP, 96_000), 0);
+    }
+
+    #[test]
+    fn a_position_not_to_be_trusted_puts_nothing_back_after_it() {
+        const GAP: u32 = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+        const BAD: u32 = AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR;
+        // Packets of 480 frames; one says its position (0) is wrong, and the
+        // one after it a gap: nothing is known to have been dropped.
+        let mut expected = None;
+        let mut put_back = Vec::new();
+        for (position, frames, flags) in
+            [(0, 480, 0), (480, 480, 0), (0, 480, BAD), (1_440, 480, GAP), (2_880, 480, GAP)]
+        {
+            put_back.push(dropped(expected, position, flags, 96_000));
+            expected = next_expected(expected, position, frames, flags);
+        }
+        assert_eq!(put_back, [0, 0, 0, 0, 960]);
+        // An empty packet moves nothing.
+        assert_eq!(next_expected(Some(960), 0, 0, 0), Some(960));
     }
 }

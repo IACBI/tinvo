@@ -23,6 +23,7 @@ const CAPTURE_LATENCY_US: c_uint = 100_000;
 /// Native-endian float: the buffers passed are plain `f32`s.
 const SND_PCM_FORMAT_FLOAT: c_int = if cfg!(target_endian = "big") { 15 } else { 14 };
 const SND_PCM_STATE_SUSPENDED: c_int = 7;
+const ESTRPIPE: c_int = 86;
 /// How long a suspended device is given to resume before it counts as lost.
 const RESUME_WAIT: Duration = Duration::from_secs(5);
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
@@ -208,7 +209,9 @@ pub(crate) fn alsa_error(what: &str, err: c_int) -> String {
 unsafe fn recover(pcm: *mut c_void, err: c_int, stop: &AtomicBool, what: &str) -> Result<(), String> {
     // SAFETY: an open handle, as the caller says.
     let r = unsafe {
-        if snd_pcm_state(pcm) != SND_PCM_STATE_SUSPENDED {
+        // By the error as well as the state: a PCM of several devices
+        // reports its first one's state, while another may be suspended.
+        if err != -ESTRPIPE && snd_pcm_state(pcm) != SND_PCM_STATE_SUSPENDED {
             snd_pcm_recover(pcm, err, 1)
         } else {
             match resume(|| snd_pcm_resume(pcm), stop, RESUME_WAIT, Duration::from_millis(20)) {
