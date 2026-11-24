@@ -173,16 +173,26 @@ pub fn parse(text: &str, mut include: impl FnMut(&str) -> Result<String, String>
 /// Reads the SFZ file at `path`; includes are found from its folder.
 pub fn read_file(path: &Path) -> Result<Instrument, String> {
     let dir = path.parent().unwrap_or(Path::new(""));
-    parse(&read_text(path)?, |name| read_text(&dir.join(name.replace('\\', "/"))))
+    parse(&read_text(path)?, |name| read_include(dir, name))
+}
+
+/// The text of the file an `#include` names, found from folder `dir`.
+pub fn read_include(dir: &Path, name: &str) -> Result<String, String> {
+    read_text(&dir.join(name.replace('\\', "/")))
 }
 
 /// A plain file's text, at most [`MAX_SFZ_BYTES`] of it, read without
 /// waiting on a pipe or a device. Bytes that are not UTF-8 read as
 /// Latin-1, which older instruments are written in.
 fn read_text(path: &Path) -> Result<String, String> {
-    let bytes = fsutil::read_bytes(path, MAX_SFZ_BYTES as u64).map_err(|e| e.to_string())?;
+    Ok(decode(fsutil::read_bytes(path, MAX_SFZ_BYTES as u64).map_err(|e| e.to_string())?))
+}
+
+/// An SFZ file's bytes as text: UTF-8, or else Latin-1, without a leading
+/// byte order mark.
+pub fn decode(bytes: Vec<u8>) -> String {
     let text = String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().iter().map(|&b| char::from(b)).collect());
-    Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text))
+    text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)
 }
 
 /// Whether `path` names an SFZ file, by its extension.

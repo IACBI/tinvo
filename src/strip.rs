@@ -444,10 +444,12 @@ mod tests {
         let s = InstrumentKind::Synth;
         let lfo_sync = s.params().iter().position(|p| p.id == "lfo_sync").unwrap();
         assert_eq!(track_param_since(s, lfo_sync), 12);
-        assert_eq!(track_param_since(s, lfo_sync - 1), 1);
+        // Detune, just before it, came with unison in format 3.
+        assert_eq!(track_param_since(s, lfo_sync - 1), 3);
         let since =
             |k: InstrumentKind, id: &str| track_param_since(k, k.params().iter().position(|p| p.id == id).unwrap());
         assert_eq!((since(s, "bend_range"), since(s, "wheel")), (13, 13));
+        assert_eq!((since(s, "cutoff"), since(s, "glide"), since(s, "unison")), (1, 2, 3));
         let m = InstrumentKind::Sampler;
         assert_eq!((since(m, "bend_range"), since(m, "resonance")), (13, 1));
     }

@@ -27,6 +27,8 @@ pub fn param_since(kind: InstrumentKind, index: usize) -> u32 {
         InstrumentKind::Synth if index == synth::p::LFO_SYNC => 12,
         InstrumentKind::Synth if index >= synth::p::TABLE => 20,
         InstrumentKind::Synth if index >= synth::p::BEND_RANGE => 13,
+        InstrumentKind::Synth if index >= synth::p::PW => 3,
+        InstrumentKind::Synth if index >= synth::p::GLIDE => 2,
         InstrumentKind::Sampler if index >= sampler::BEND_RANGE => 13,
         InstrumentKind::Fm => 20,
         _ => 1,
@@ -97,6 +99,7 @@ impl InstrumentKind {
         match self {
             InstrumentKind::Fm => 20,
             InstrumentKind::Plugin(_) => 16,
+            InstrumentKind::Sampler => 4,
             _ => 1,
         }
     }

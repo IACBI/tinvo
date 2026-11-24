@@ -2240,7 +2240,11 @@ fn known_value(kind: InstrumentKind, index: usize, value: f32, ver: u32) -> Resu
     match crate::instrument::param_max(kind, index, ver) {
         Some(max) if value > max => {
             let id = track_param(kind, index).map_or("?", |s| s.id);
-            Err(format!("'{id}' has no value {value} before format {}", ver + 1))
+            // The first format that has it, not merely the next one.
+            let since = (ver + 1..=FORMAT_VERSION)
+                .find(|&v| crate::instrument::param_max(kind, index, v).is_none_or(|m| value <= m))
+                .unwrap_or(FORMAT_VERSION);
+            Err(format!("'{id}' has no value {value} before format {since}"))
         }
         _ => Ok(()),
     }
@@ -2485,7 +2489,7 @@ fn check_pattern(p: u8) -> Result<(), EditError> {
 /// Refuses a project path that is not Unicode text: the sample paths a
 /// project keeps are text, relative to its folder, and could not be
 /// written or found from it.
-fn unicode_path(path: &Path) -> Result<(), &'static str> {
+pub fn unicode_path(path: &Path) -> Result<(), &'static str> {
     if path.to_str().is_some() && std::path::absolute(path).is_ok_and(|p| p.to_str().is_some()) {
         Ok(())
     } else {
@@ -4503,6 +4507,28 @@ pattern_division A 1/8
             assert!(e.message.contains("before format 20"), "{line}: {e:?}");
             Project::from_text(&old.replace("tinvo 19", "tinvo 20")).unwrap();
             Project::from_text(&old.replace(" 4", " 3").replace(" 11", " 10")).unwrap();
+            // The format named is the one that brought the value, from any
+            // older one.
+            let e = Project::from_text(&old.replace("tinvo 19", "tinvo 13")).unwrap_err();
+            assert!(e.message.contains("before format 20"), "{line}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_sampler_track_loads_only_from_format_4() {
+        assert!(Project::from_text("tinvo 3\ntrack sampler\nend").is_err());
+        Project::from_text("tinvo 4\ntrack sampler\nparam root 48\nend").unwrap();
+    }
+
+    #[test]
+    fn a_synth_parameter_loads_only_from_the_format_that_brought_it() {
+        for (id, value, since) in
+            [("glide", "0.5", 2), ("vel_cutoff", "0.5", 2), ("pulse_width", "0.5", 3), ("unison", "3", 3)]
+        {
+            let file = |ver: u32| format!("tinvo {ver}\ntrack synth\nparam {id} {value}\nend");
+            let e = Project::from_text(&file(since - 1)).unwrap_err();
+            assert!(e.line == 3 && e.message.contains("unknown parameter"), "{id} in {}: {e:?}", since - 1);
+            Project::from_text(&file(since)).unwrap_or_else(|e| panic!("{id} in {since}: {e:?}"));
         }
     }
 
@@ -4559,7 +4585,8 @@ pattern_division A 1/8
             ("tinvo 4\nsong A", 2, "unknown key"),
             ("tinvo 4\ntrack kick\npattern B\nend", 3, "unknown track key"),
             ("tinvo 4\ntrack kick\nsample a.wav\nend", 3, "has no sample"),
-            ("tinvo 3\ntrack sampler\nsample a.wav\nend", 3, "unknown track key"),
+            // Format 3 has no sampler, let alone its sample.
+            ("tinvo 3\ntrack sampler\nsample a.wav\nend", 2, "unknown instrument"),
             ("tinvo 4\ntrack sampler\nsample\nend", 3, "expected 'sample"),
             ("tinvo 17\ntrack sampler\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "unknown track key"),
             ("tinvo 18\ntrack kick\nzone 0-127 - 0-127 1/1 attack 0 0 0 - a.wav\nend", 3, "has no zones"),
