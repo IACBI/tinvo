@@ -54,6 +54,19 @@ Author: 𝓐.𝓒.𝓑
   - macOS: a recording whose input stops delivering audio for 2 s, such as an unplugged USB input, or delivers none in its first 5 s, reports the input lost instead of waiting.
   - The plugin cache keeps as many whole entries as fit in its 16 MiB, instead of not being written at all, so a time-limited scan does not read again what it already read.
   - 32-bit Windows builds link the window functions 32-bit Windows has.
+- The editor says and does what it should:
+  - While the terminal is too small to draw the editor, keys, clicks and pastes wait instead of acting on what cannot be seen, and the warning says so.
+  - The wheel no longer moves the settings page's cursor while a key is awaited.
+  - The top bar shows that something records, the unsaved mark and swing at every width, swing at 50 % too, so the wheel can raise it. Its labels shorten before they push out the file's name, and the news beside the name gives way to it.
+  - A muted group shows: its tracks are tagged `G1×` and dimmed, its page's title says MUTED, and `Q` says what it did. Mute and solo are capitals while on, not only another colour.
+  - A synth set to play its own wavetable file, which has none, says how to load one.
+  - The piano roll and the automation view take turns, so the key the title names goes back to the grid.
+  - The right button on a song line moves the cursor without opening a pattern, and the wheel on the tempo row selects that row.
+  - Help scrolls back at once after the terminal grows, and names the keys that close a list as they are set. Its insert-effect and arrow texts match what the keys do.
+  - The add-track menu shows all nine choices at 64 columns; the export and MIDI channel prompts keep their hints at 80 columns, on the line above.
+  - A sharp in octave -1 fits its grid cell (`C#-`).
+  - Each parameter page names the page `f` opens next, the group's when there is one.
+  - The README names the mute and solo columns, and says which keys close a list.
 
 ## [0.29.0] - 2026-11-23
 
