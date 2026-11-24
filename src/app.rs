@@ -83,6 +83,8 @@ const MIN_W: u16 = 64;
 /// Columns the top bar keeps beside its controls before it shortens their
 /// labels: the master meter, and some of the file's name and the news.
 const HEADER_ROOM: u16 = 28;
+/// Columns of a section's name the export prompt shows.
+const EXPORT_NAME: usize = 20;
 /// Columns of the file's name the top bar's news gives way to.
 const HEADER_NAME: usize = 10;
 const MIN_H: u16 = 16;
@@ -1529,6 +1531,7 @@ impl App {
     pub fn midi_message(&mut self, m: Message) {
         self.midi_seen = Some(Instant::now());
         let entering = self.step_entry
+            && !self.hidden.get()
             && self.note_rec.is_none()
             && self.mode == Mode::Normal
             && !self.song_view
@@ -3449,6 +3452,8 @@ impl App {
 
     pub fn handle_key(&mut self, key: Key) {
         if self.hidden.get() {
+            // What a drag was editing is out of sight: it ends here.
+            self.stroke = None;
             return;
         }
         // A key can change the track, pattern or view a drag is editing, so
@@ -3479,12 +3484,15 @@ impl App {
     /// Questions and prompts answer only to keys.
     pub fn handle_mouse(&mut self, m: Mouse) {
         if self.hidden.get() {
+            // A release out of sight ends the drag without acting on it.
+            self.stroke = None;
             return;
         }
         let target = self.target_at(m.x, m.y);
         match self.mode.clone() {
             Mode::Help(top) => {
                 let last = self.help_lines().len().saturating_sub(self.help_rows.get());
+                let top = top.min(last);
                 match m.kind {
                     MouseKind::ScrollUp => self.mode = Mode::Help(top.saturating_sub(3)),
                     MouseKind::ScrollDown => self.mode = Mode::Help((top + 3).min(last)),
@@ -4405,12 +4413,12 @@ impl App {
     fn inserts_page_status(&self) -> String {
         let name = self.chain_name(self.insert_chain());
         format!(
-            "Insert effects of {name} ({} chain, {} effect, {} plugin, {} move, {})",
+            "Insert effects ({}) of {name}: {} chain, {} effect, {} plugin, {} move",
+            self.next_page_hint(Page::Inserts),
             self.k(Action::InsertChain),
             self.keys.labels(&[Action::PrevEffect, Action::NextEffect]),
             self.k(Action::Plugins),
             self.keys.labels(&[Action::EffectEarlier, Action::EffectLater]),
-            self.next_page_hint(Page::Inserts)
         )
     }
 
@@ -6170,7 +6178,7 @@ impl App {
             (format!(" in {meter}  "), Target::Meter),
         ];
         let compact = [
-            (self.tempo_label().trim_end().to_string() + " ", Target::Tempo),
+            (format!(" {:.0} BPM ", self.tempo_now()), Target::Tempo),
             (format!("sw {:.0}% ", self.project.swing), Target::Swing),
             (format!("pat {pattern}"), Target::Pattern),
             (format!(" ·{}", self.pattern_len()), Target::Length),
@@ -6223,8 +6231,7 @@ impl App {
         let end = if meter { w - meter_w - 1 } else { w };
         // The file's name keeps some room too: the news beside it gives way,
         // all but the recording's mark.
-        let name = format!("{playing}{file}");
-        let name_room = screen::text_width(&name).min(HEADER_NAME);
+        let name_room = screen::text_width(&file).min(HEADER_NAME);
         // The longest that fits: recording comes first, then the CPU, the
         // loudness and the device.
         let right = [
@@ -6247,10 +6254,14 @@ impl App {
         // The file's name in what is left, its end cut off rather than the
         // unsaved mark.
         let space = usize::from(rx.saturating_sub(controls)).saturating_sub(screen::text_width(dirty) + 1);
-        let name = if screen::text_width(&name) <= space {
-            name
+        // What plays goes before the name is cut; the grid shows it too.
+        let whole = format!("{playing}{file}");
+        let name = if screen::text_width(&whole) <= space {
+            whole
+        } else if screen::text_width(&file) <= space {
+            file
         } else if space >= 2 {
-            format!("{}…", screen::fit(&name, space - 1))
+            format!("{}…", screen::fit(&file, space - 1))
         } else {
             String::new()
         };
@@ -6286,28 +6297,37 @@ impl App {
     /// oscillator playing a table, and has none.
     fn wants_wavetable_file(&self, t: &TrackData) -> bool {
         let specs = InstrumentKind::Synth.params();
+        // The base value, or any an automation lane takes it to.
         let shows = |id: &str, text: &str| {
-            specs.iter().position(|s| s.id == id).is_some_and(|i| specs[i].format(t.params[i]) == text)
+            specs.iter().position(|s| s.id == id).is_some_and(|i| {
+                let lane = Some(LaneTarget::Track(2 + i as u8));
+                let points =
+                    t.lanes.iter().filter(|l| l.target == lane).flat_map(|l| l.points.iter().flatten().flatten());
+                std::iter::once(&t.params[i]).chain(points).any(|&v| specs[i].format(v) == text)
+            })
         };
         t.sample.is_none() && shows("wavetable", "file") && (shows("osc1_wave", "table") || shows("osc2_wave", "table"))
     }
 
     /// The tempo in the top bar: the set tempo, and while the song's tempo
     /// points set another, that one first.
-    fn tempo_label(&self) -> String {
+    /// The tempo playing now: the entry's, while a song with tempo points
+    /// plays, else the set one.
+    fn tempo_now(&self) -> f64 {
         let p = &self.project;
-        let playing = match self.play_pos {
+        match self.play_pos {
             Some(PlayPosition { entry: Some(e), pulse, .. })
                 if p.has_tempo_points() && usize::from(e) < p.song.len() =>
             {
-                Some(p.tempo_in_entry(usize::from(e), u64::from(pulse)))
+                p.tempo_in_entry(usize::from(e), u64::from(pulse))
             }
-            _ => None,
-        };
-        match playing {
-            Some(bpm) if (bpm - f64::from(p.tempo)).abs() >= 0.5 => format!(" {bpm:.0} BPM (set {:.0})  ", p.tempo),
-            _ => format!(" {:.0} BPM  ", p.tempo),
+            _ => f64::from(p.tempo),
         }
+    }
+
+    fn tempo_label(&self) -> String {
+        let (now, set) = (self.tempo_now(), f64::from(self.project.tempo));
+        if (now - set).abs() >= 0.5 { format!(" {now:.0} BPM (set {set:.0})  ") } else { format!(" {set:.0} BPM  ") }
     }
 
     fn visible_steps(&self, w: u16) -> (usize, usize) {
@@ -6423,7 +6443,13 @@ impl App {
         const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let t = &self.project.tracks[self.track];
         let dim = self.style(Role::Dim);
-        let title = view_title("Automation", &t.name, &self.k(Action::Automate));
+        // From the panel, A gives a parameter a lane: the way back to the
+        // grid starts with leaving the panel.
+        let back = match self.focus {
+            Focus::Params => format!("{} {}", self.k(Action::Focus), self.k(Action::Automate)),
+            _ => self.k(Action::Automate),
+        };
+        let title = view_title("Automation", &t.name, &back);
         s.put(1, 1, &title, self.style(Role::Title));
         self.draw_ruler(s, w);
         let (first, last) = self.visible_steps(w);
@@ -6924,7 +6950,12 @@ impl App {
                 Some(s) => format!(" step {}: {} ", self.step + 1, step_summary(&s)),
                 None => format!(" new step: {} ", step_summary(&self.brushes[self.track])),
             };
-            s.put(w.saturating_sub(screen::text_width(&brush) as u16 + 2), y, &brush, dim);
+            // It gives way to the title, which may say what is missing.
+            let bx = w.saturating_sub(screen::text_width(&brush) as u16 + 2);
+            let taken = if self.page == Page::Group { x + 10 } else { x };
+            if bx > taken {
+                s.put(bx, y, &brush, dim);
+            }
         }
         for (slot, i) in params.into_iter().enumerate() {
             let (row, col) = (slot / cols, slot % cols);
@@ -7078,12 +7109,15 @@ impl App {
                         self.prompt_with_help(s, y, w, "MIDI channel 1-16", help, ": ")
                     }
                     PromptKind::Export => {
-                        let what = format!(
-                            "Export [{}, {} ×{}]",
-                            self.export_format.label(),
-                            self.export_source_label(),
-                            self.export_loops
-                        );
+                        // A long section name is cut, never the repeats after it.
+                        let source = self.export_source_label();
+                        let source = match source.strip_suffix('\'') {
+                            _ if screen::text_width(&source) <= EXPORT_NAME => source,
+                            // A quoted name keeps its closing quote.
+                            Some(open) => format!("{}…'", screen::fit(open, EXPORT_NAME - 2)),
+                            None => format!("{}…", screen::fit(&source, EXPORT_NAME - 1)),
+                        };
+                        let what = format!("Export [{}, {source} ×{}]", self.export_format.label(), self.export_loops);
                         let help = "(←→ what, Tab format, ↑↓ repeats; .mid for MIDI)";
                         self.prompt_with_help(s, y, w, &what, help, " file: ")
                     }
@@ -7386,8 +7420,10 @@ impl App {
         entries.push((String::new(), String::new(), "Fixed keys".into()));
         // A list also closes on quit's keys, which settings can change, so
         // they are named as they are now.
-        let close =
-            format!("close a list; so do the key that opened it and quit's: {}", self.keys.all_labels(Action::Quit));
+        let close = format!(
+            "close a list; so do quit's keys ({}) and the key that shows that list",
+            self.keys.all_labels(Action::Quit)
+        );
         for (keys, text) in [
             ("y n", "answer a question (quit, delete a track)"),
             ("1-9", "the type of a new track, after add_track (8: a CLAP plugin, from a list; 9: the FM synth)"),
@@ -8131,7 +8167,12 @@ pub unsafe fn run(
                         app.handle_mouse(m);
                     }
                     Event::Resize => {
+                        // Drawn now (not sent), so input after it in this
+                        // batch meets the size guard as the new size has it.
+                        let (w, h) = term.size();
+                        screen.resize(w, h);
                         screen.invalidate();
+                        app.draw(&mut screen);
                         stale = true;
                     }
                 }
@@ -8272,6 +8313,15 @@ fn recovery_key(key: Key) -> Option<Option<Recovery>> {
     }
 }
 
+/// What `key` answers to the recovery question, on a screen `small` or
+/// not: on one too short to show the answers, only quitting.
+fn recovery_answer(key: Key, small: bool) -> Option<Option<Recovery>> {
+    recovery_key(key).filter(|a| !small || a.is_none())
+}
+
+/// Rows the recovery question needs to show every answer.
+const RECOVERY_ROWS: u16 = 9;
+
 /// "3 min ago" and the like, for when the autosave was written.
 fn age(d: Duration) -> String {
     match d.as_secs() {
@@ -8301,7 +8351,13 @@ fn ask_recovery(
         let (w, h) = term.size();
         screen.resize(w, h);
         screen.clear();
+        // Too short to show the answers, only quitting is taken: the
+        // autosave stays for the next start.
+        let small = h < RECOVERY_ROWS;
         screen.put(2, 1, "Unsaved changes found", theme.get(Role::Warning).bold());
+        if small {
+            screen.put(2, 2, "Make the terminal taller to answer; q quits", text);
+        }
         screen.put(2, 3, "The last session ended without saving. Its edits were autosaved", text);
         screen.put(2, 4, &format!("{when} to {}", found.path.display()), text);
         let discard =
@@ -8327,7 +8383,7 @@ fn ask_recovery(
             }
             match ev {
                 Event::Key(k) => {
-                    if let Some(answer) = recovery_key(k) {
+                    if let Some(answer) = recovery_answer(k, small) {
                         return Ok(answer);
                     }
                 }
@@ -8396,10 +8452,100 @@ mod tests {
         keys(&mut a, &[Key::Char('X'), Key::Enter]);
         a.paste("x", false);
         assert!(a.project.tracks[0].steps[0] == steps && !a.dirty, "a pattern cleared out of sight");
+        // Nor a paste into a prompt, or a MIDI key in step entry.
+        a.mode = Mode::Prompt(PromptKind::Rename, String::new());
+        a.paste("x", false);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::Rename, String::new()));
+        a.mode = Mode::Normal;
+        a.step_entry = true;
+        let step = a.step;
+        a.midi_message(Message::NoteOn { channel: 0, note: 60, velocity: 100 });
+        a.midi_message(Message::NoteOff { channel: 0, note: 60 });
+        assert!(a.project.tracks[0].steps[0] == steps && a.step == step, "a step written out of sight");
+        a.step_entry = false;
         // Larger again, keys act.
         a.draw(&mut Screen::new(MIN_W, MIN_H));
         keys(&mut a, &[Key::Char('X')]);
         assert!(a.project.tracks[0].steps[0] != steps);
+    }
+
+    #[test]
+    fn a_drag_out_of_sight_ends_without_acting() {
+        let mut a = app();
+        a.track = a.project.tracks.iter().position(|t| t.kind == InstrumentKind::Synth).unwrap();
+        keys(&mut a, &[Key::Char('v')]);
+        let i = (0..12).find(|&i| a.project.tracks[a.track].steps[0][i].is_none()).unwrap();
+        let p = a.roll_note;
+        let at = spot(&a, Target::Note(i, p));
+        click(&mut a, Target::Note(i, p));
+        let has = |a: &App| a.project.tracks[a.track].steps[0][i].is_some_and(|s| s.has_note(p));
+        assert!(has(&a));
+        // Pressed on the note, the terminal shrinks, the button is let go.
+        frame(&a);
+        mouse(&mut a, MouseKind::Press(Button::Left), at);
+        a.draw(&mut Screen::new(MIN_W - 1, MIN_H));
+        mouse(&mut a, MouseKind::Release, at);
+        // Larger again, a release anywhere no longer removes it.
+        frame(&a);
+        mouse(&mut a, MouseKind::Release, (0, 29));
+        assert!(has(&a), "the note pressed before the shrink stays");
+    }
+
+    #[test]
+    fn a_screen_too_short_for_the_recovery_answers_takes_only_quitting() {
+        assert_eq!(recovery_answer(Key::Char('n'), false), Some(Some(Recovery::Discard)));
+        assert_eq!(recovery_answer(Key::Char('n'), true), None);
+        assert_eq!(recovery_answer(Key::Char('y'), true), None);
+        assert_eq!(recovery_answer(Key::Char('q'), true), Some(None));
+    }
+
+    #[test]
+    fn the_header_keeps_recording_and_the_name_with_the_longest_labels() {
+        let mut a = app();
+        a.step_entry = true;
+        a.dirty = true;
+        for _ in 0..64 {
+            a.global_action(Action::PatternLonger);
+            a.global_action(Action::BeatsUp);
+        }
+        for _ in 0..4 {
+            a.global_action(Action::StepsFiner);
+        }
+        a.project.tempo = 120.0;
+        a.project.tempo_points[0] = Some(300.0);
+        a.play_pos = Some(PlayPosition { entry: Some(0), pattern: 0, step: 0, pulse: 0 });
+        for w in [MIN_W, 80] {
+            let mut s = Screen::new(w, MIN_H);
+            a.draw(&mut s);
+            let top = s.row_text(0);
+            assert!(top.contains("REC") && top.contains('*'), "{w}: {top}");
+            if w >= 80 {
+                assert!(top.contains("untitled*"), "{w}: {top}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_step_summary_gives_way_to_what_the_title_says_is_missing() {
+        let mut a = App::new(Project::default(), None, None, 48_000, "t".into());
+        a.edit(Edit::AddTrack(InstrumentKind::Synth));
+        a.track = 0;
+        let specs = InstrumentKind::Synth.params();
+        let at = |id: &str| specs.iter().position(|s| s.id == id).unwrap();
+        let choice = |id: &str, text: &str| {
+            let i = at(id);
+            (0..=specs[i].max as usize).find(|&v| specs[i].format(v as f32) == text).unwrap() as f32
+        };
+        a.edit(Edit::SetParam { track: 0, index: at("wavetable") as u8, value: choice("wavetable", "file") });
+        a.edit(Edit::SetParam { track: 0, index: at("osc1_wave") as u8, value: choice("osc1_wave", "table") });
+        let mut s = Screen::new(MIN_W, MIN_H);
+        a.draw(&mut s);
+        let hint = format!("press {}", a.k(Action::LoadSample));
+        assert!(
+            (0..MIN_H).any(|y| s.row_text(y).contains(&hint)),
+            "{:#?}",
+            (0..MIN_H).map(|y| s.row_text(y)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -8430,9 +8576,16 @@ mod tests {
                     Page::Inserts => "f: insert effects)",
                     Page::Plugin => unreachable!(),
                 };
-                assert!(status.ends_with(next), "grouped {grouped}: {status} should end {next}");
+                let next = format!("({}", next);
+                assert!(status.contains(&next), "grouped {grouped}: {status} should name {next}");
             }
             assert_eq!(seen.iter().any(|(p, _)| *p == Page::Group), grouped);
+            // On screen too, at the narrowest, the inserts page's included.
+            a.page = Page::Mix;
+            keys(&mut a, &[Key::Char('f')]);
+            let mut s = Screen::new(MIN_W, MIN_H);
+            a.draw(&mut s);
+            assert!(s.row_text(MIN_H - 1).contains("(f: instrument)"), "{}", s.row_text(MIN_H - 1));
         }
     }
 
@@ -8454,6 +8607,10 @@ mod tests {
         assert!(last < low, "the last page moved up: {last} < {low}");
         keys(&mut a, &[Key::Up]);
         assert_eq!(a.mode, Mode::Help(last - 1), "one press moves the page shown");
+        // So does one turn of the wheel.
+        a.mode = Mode::Help(low);
+        mouse(&mut a, MouseKind::ScrollUp, (10, 10));
+        assert_eq!(a.mode, Mode::Help(last - 3));
     }
 
     #[test]
@@ -8468,7 +8625,7 @@ mod tests {
             std::iter::once(&lines[at]).chain(more).map(|l| l.text.trim()).collect::<Vec<_>>().join(" ")
         };
         assert_eq!(line("Esc Ctrl+C"), "cancel a prompt");
-        assert!(line("Esc").ends_with("quit's: q"), "{}", line("Esc"));
+        assert!(line("Esc").contains("quit's keys (q)"), "{}", line("Esc"));
         // Ctrl+C, no longer quit's, closes no list; it still cancels a prompt.
         a.mode = Mode::MidiInputs(MidiPicker { output: false, ports: Vec::new(), cursor: 0 });
         keys(&mut a, &[Key::Ctrl('c')]);
@@ -8487,6 +8644,12 @@ mod tests {
         assert!(a.auto_view && !a.roll, "A from the roll shows automation");
         keys(&mut a, &[Key::Char('A')]);
         assert!(!a.auto_view && !a.roll, "and A again the grid, as its title says");
+        // From the panel, where A gives a parameter a lane, the title says
+        // to leave the panel first.
+        keys(&mut a, &[Key::Char('A')]);
+        assert!(screen_text(&a).contains(" A: grid"));
+        a.focus = Focus::Params;
+        assert!(screen_text(&a).contains(" Tab A: grid"), "{}", screen_text(&a));
     }
 
     #[test]
@@ -10210,6 +10373,13 @@ mod tests {
         assert!(!screen_text(&a).contains(&hint), "no oscillator plays a table");
         a.edit(Edit::SetParam { track: 0, index: at("osc2_wave") as u8, value: choice("osc2_wave", "table") });
         assert!(screen_text(&a).contains(&hint), "{}", screen_text(&a));
+        // Also when only automation takes it to the file.
+        a.edit(Edit::SetParam { track: 0, index: at("wavetable") as u8, value: 0.0 });
+        assert!(!screen_text(&a).contains(&hint));
+        let mut lane = crate::project::LaneData::new(Some(LaneTarget::Track(2 + at("wavetable") as u8)), false);
+        lane.points[0][3] = Some(choice("wavetable", "file"));
+        a.project.tracks[0].lanes[0] = lane;
+        assert!(screen_text(&a).contains(&hint), "{}", screen_text(&a));
     }
 
     #[test]
@@ -11099,6 +11269,14 @@ mod tests {
         assert_eq!(a.export_source_label(), "the start to 'chorus'");
         a.project.loop_region = Some((1, 3));
         assert_eq!(a.export_source_label(), "loop region");
+        // A long name is cut in the prompt; the repeats after it are not.
+        a.project.set_marker(2, &"漢".repeat(16)).unwrap();
+        a.project.loop_region = Some((2, 3));
+        a.mode = Mode::Prompt(PromptKind::Export, "x".into());
+        let mut s = Screen::new(80, 24);
+        a.draw(&mut s);
+        let line = s.row_text(23);
+        assert!(line.contains("…' ×") && line.contains(&format!("×{}]", a.export_loops)), "{line}");
     }
 
     #[test]
@@ -12726,6 +12904,7 @@ mod tests {
         let undo = a.settings_page.cursor[0];
         keys(&mut a, &[Key::Enter]);
         mouse(&mut a, MouseKind::ScrollDown, (10, 10));
+        assert_eq!(a.settings_page.cursor[0], undo);
         mouse(&mut a, MouseKind::ScrollUp, (10, 10));
         assert_eq!(a.settings_page.cursor[0], undo);
         keys(&mut a, &[Key::Esc]);
