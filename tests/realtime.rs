@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tinvo::clap::PluginRef;
 use tinvo::clap::host::{Instance, Mode, PluginHost, Role};
+use tinvo::clip::{ClipAudio, ClipData, ClipList};
 use tinvo::dsp::noise::Rng;
 use tinvo::dsp::wavetable::{self, Wavetable};
 use tinvo::engine::{
@@ -864,15 +865,74 @@ fn plugins_in_the_engine() -> usize {
     calls
 }
 
+/// Audio tracks playing clips while their lists are replaced, song entries
+/// come and go under them, and the song stops, starts and loops.
+fn clips() -> usize {
+    let mut p = Project::new();
+    let ok = |r: Result<Edit, _>| r.map(drop).unwrap();
+    for i in 0..4 {
+        ok(p.apply(Edit::InsertSongEntry { index: i, pattern: 0 }));
+    }
+    ok(p.apply(Edit::SetLoop(Some((1, 3)))));
+    for _ in 0..3 {
+        ok(p.apply(Edit::AddTrack(InstrumentKind::Audio)));
+    }
+    let mut rng = Rng::new(7);
+    let mut noise = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.bipolar() * 0.5).collect() };
+    let audio = [
+        Arc::new(ClipAudio::new(vec![noise(60_000), noise(60_000)], 44_100).unwrap()),
+        Arc::new(ClipAudio::new(vec![noise(30_000)], 48_000).unwrap()),
+    ];
+    let list = |shift: u16, k: usize| {
+        let clips: Vec<ClipData> = (0..6u16)
+            .flat_map(|e| {
+                [
+                    ClipData::new("a.wav".into(), e, shift % 40, 50_000),
+                    ClipData {
+                        start: 100,
+                        fade_in: 500,
+                        fade_out: 500,
+                        ..ClipData::new("b.wav".into(), e, 40 + shift % 40, 20_000)
+                    },
+                ]
+            })
+            .collect();
+        let a = Arc::clone(&audio[k % 2]);
+        Some(ClipList::build(&clips, move |_| Some(Arc::clone(&a))))
+    };
+    let mut rig = Rig::new(&p);
+    for t in 0..3u8 {
+        rig.send(Command::SetClips { track: t, clips: list(u16::from(t), usize::from(t)) });
+    }
+    let mut calls = play_song(&mut rig, 300);
+    for k in 0..400usize {
+        let track = (k % 3) as u8;
+        let cmd = match k % 9 {
+            0 | 1 => Command::SetClips { track, clips: list(k as u16, k) },
+            2 => Command::SetClips { track, clips: None },
+            3 => Command::Edit(Edit::InsertSongEntry { index: (k % 4) as u16, pattern: 0 }),
+            4 => Command::Edit(Edit::RemoveSongEntry((k % 4) as u16)),
+            5 => Command::Edit(Edit::SetTempo(90.0 + (k % 60) as f32)),
+            6 => Command::Stop,
+            7 => Command::PlaySong { entry: (k % 3) as u16 },
+            _ => Command::Edit(Edit::SetPatternLength { pattern: 0, len: 4 + (k % 13) as u8 }),
+        };
+        rig.send(cmd);
+        calls += (0..8).map(|_| rig.callback()).sum::<usize>();
+    }
+    calls
+}
+
 /// A check: how often the allocator was called while armed.
 type Check = fn() -> usize;
 
 fn main() {
-    let checks: [(&str, Check); 11] = [
+    let checks: [(&str, Check); 12] = [
         ("the demo song", demo_song),
         ("every strip stage, bus and ramp, with a sample", heavy_song),
         ("as many tracks as a project holds, likewise", full_song),
         ("edits, samples, effects and transport commands while playing", edits_while_playing),
+        ("audio clips replaced, moved and cut while playing", clips),
         ("live notes", live_notes),
         ("recording notes and count-ins", recording_notes),
         ("MIDI out and its clock", midi_out),

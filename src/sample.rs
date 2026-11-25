@@ -136,6 +136,12 @@ impl Sample {
         &self.data[PAD..self.data.len() - PAD]
     }
 
+    /// Frame `i` (`i < frames`) as it is.
+    #[inline]
+    pub fn at(&self, i: usize) -> f32 {
+        self.data[i + PAD]
+    }
+
     /// Linear interpolation at `pos` (in frames, `0 <= pos < frames`).
     #[inline]
     pub fn linear(&self, pos: f64) -> f32 {
@@ -221,7 +227,7 @@ pub fn load(path: &Path) -> Result<Sample, String> {
 /// left of the project's [`PROJECT_FRAMES`].
 pub fn load_within(path: &Path, max_frames: usize) -> Result<Sample, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", crate::fsutil::shown(path));
-    let file = open(path).map_err(|e| fail(&e))?;
+    let file = open_plain(path).map_err(|e| fail(&e))?;
     read_limited(&mut std::io::BufReader::new(file), max_frames).map_err(|e| fail(&e))
 }
 
@@ -229,7 +235,7 @@ pub fn load_within(path: &Path, max_frames: usize) -> Result<Sample, String> {
 /// device would wait for it, with the editor stopped until it gave in:
 /// checked by name first, and again on what was opened, in case the name
 /// changed in between.
-fn open(path: &Path) -> Result<std::fs::File, String> {
+pub fn open_plain(path: &Path) -> Result<std::fs::File, String> {
     if !std::fs::metadata(path).map_err(|e| e.to_string())?.is_file() {
         return Err("not a file".into());
     }
@@ -244,7 +250,7 @@ fn open(path: &Path) -> Result<std::fs::File, String> {
 /// what it holds can be known before it is read.
 /// The error does not name the file.
 pub fn header(path: &Path) -> Result<wav::Info, String> {
-    let mut file = std::io::BufReader::new(open(path)?);
+    let mut file = std::io::BufReader::new(open_plain(path)?);
     let info = wav::read_info(&mut file).map_err(|e| e.to_string())?;
     if info.frames == 0 {
         return Err("the file contains no audio".into());

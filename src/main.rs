@@ -267,6 +267,10 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(format!("cannot load samples:\n  {}", errors.join("\n  ")));
     }
+    let (clips, errors) = project.load_clips(&bank);
+    if !errors.is_empty() {
+        return Err(format!("cannot load clips:\n  {}", errors.join("\n  ")));
+    }
     // Every stem's file is checked before the mix is written.
     let out_path = std::path::Path::new(out);
     let stem = out_path.file_stem().map_or("out".into(), |s| s.to_string_lossy().into_owned());
@@ -288,7 +292,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     let start = Instant::now();
     let mut file = wav::FileWriter::create(out.as_ref(), 2, opts.sample_rate, format)?;
     let mut meter = ExportMeter::new(opts.sample_rate);
-    let frames = render::render_into(&project, &track_samples, &opts, &mut *plugins, &mut |b| {
+    let frames = render::render_into(&project, &track_samples, &clips, &opts, &mut *plugins, &mut |b| {
         meter.push(b);
         file.write(b)
     })?;
@@ -299,7 +303,7 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     for (path, part) in stem_paths {
         let mut file = wav::FileWriter::create(&path, 2, opts.sample_rate, format)?;
         let stem = render::stem_project(&project, part);
-        render::render_into(&stem, &track_samples, &opts, &mut *plugins, &mut |b| file.write(b))?;
+        render::render_into(&stem, &track_samples, &clips, &opts, &mut *plugins, &mut |b| file.write(b))?;
         files.push((path, file));
     }
     // Stems end at different times; padded to one length they line up.

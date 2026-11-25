@@ -477,7 +477,7 @@ Known limits (left as they are):
 
 ## More kinds of music
 
-TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. Phases 11 to 14 have shipped; Phase 15 is planned. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
+TINVO is at home with pattern-based electronic music: techno, house, electro, synthwave, lo-fi and boom bap, ambient loops. Phase 9 added triplet and 32nd-note grids, time signatures and tempo changes, and Phase 10 live-played parts: recording, the pedal and wheels, MIDI files and MIDI output. The phases below take it further, toward larger arrangements, plugins, sampled instruments and recorded vocals and instruments. Phases 11 to 14 have shipped; Phase 15 is under way. They are ordered so that each builds on the ones before. Like every phase so far, each ends with a usable, tested program and adds no dependency. Sizes are relative.
 
 ### Phase 11: Mixer (medium) ✅ (0.25.0)
 
@@ -680,6 +680,27 @@ For vocals, guitars and other live instruments: pop, rock, singer-songwriter.
 - Export and stems include audio tracks. A new project format (clip paths stored like sample paths).
 - Not in this phase: time-stretching and pitch correction.
 - Tests: clips on their exact frames, a slow reader making a reported dropout rather than blocking the audio thread, latency compensation measured the way the loopback check measures it, comp edits as undo steps.
+
+It comes in three parts, each merged on its own, in project format 21.
+
+#### 15a: Clips in memory
+
+- An audio track (`track audio`) holds up to 256 clips, each at a song entry and a pulse into it, with a trim, a gain and fades. Its files load whole, mono or stereo, against the project's sample budget. It takes no steps, parts, MIDI channel or MIDI out.
+- The engine plays one clip at a time per track, the latest to start, at the file's rate through sinc, from its exact frame at any buffer size, with a 3 ms fade at every cut. Starting partway through the song, or a loop going back, finds the clip where it would be, from the tempo of the entries before.
+- Song entries inserted or removed move the clips, also in the engine's list while it plays. The history restores a track's clips whole, like its zones.
+- Export, stems and `tinvo render` play them; a file a clip plays is never written over.
+- An `audio` bench scenario, with an instruction budget.
+- Then the clip view: clips as blocks along the song, one row per track, with a waveform overview, a key to add an audio track, and clips placed, moved, trimmed and faded there as undo steps.
+
+The first half, everything but the clip view, is in.
+
+#### 15b: Streaming
+
+- Long clips streamed from disk: a reader thread fills buffers ahead of the audio thread, which never touches a file or allocates; a slow reader makes a reported dropout.
+
+#### 15c: Recording
+
+- Recording onto an audio track while the song plays, with a count-in, the round trip compensated, punch-in over a range, and takes kept per range to build a comp from.
 
 ## Known limitations of the foundation
 

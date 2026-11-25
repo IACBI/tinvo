@@ -19,6 +19,7 @@ use tinvo::clap::host::{
 };
 use tinvo::clap::scan::{self, Catalog, Options};
 use tinvo::clap::{PluginRef, Roles};
+use tinvo::clip::ClipBank;
 use tinvo::engine::{
     ChainId, Command as EngineCommand, Edit, Engine, LaneTarget, PluginAt, PluginPlace, RETIRE_QUEUE, Retired, Shared,
     Step,
@@ -2109,6 +2110,7 @@ fn came_back(rx: &mut Consumer<Retired>) -> Vec<Back> {
                 ("insert", inst.as_ref().map(|i| i.token()), inst)
             }
             Retired::Samples(_) => ("sample", None, None),
+            Retired::Clips(_) => ("clips", None, None),
         })
         .collect()
 }
@@ -3351,7 +3353,7 @@ fn sine_song() -> Project {
 fn export(p: &Project, plugins: &mut dyn PluginSource) -> Result<Vec<f32>, String> {
     let opts = RenderOptions { loops: 1, ..Default::default() };
     let mut out = Vec::new();
-    render_into(p, &[], &opts, plugins, &mut |b| {
+    render_into(p, &[], &ClipBank::new(), &opts, plugins, &mut |b| {
         out.extend_from_slice(b);
         Ok(())
     })?;
@@ -3482,7 +3484,7 @@ fn an_export_refuses_plugins_later_than_it_makes_up_for() {
     p.apply(Edit::AddTrack(InstrumentKind::Synth)).unwrap();
     let opts = RenderOptions { sample_rate: 200, loops: 1, ..Default::default() };
     let mut plugins = catalog_plugins(&dir.join("low"), "latency");
-    let e = render_into(&p, &[], &opts, &mut plugins, &mut |_| Ok(())).unwrap_err();
+    let e = render_into(&p, &[], &ClipBank::new(), &opts, &mut plugins, &mut |_| Ok(())).unwrap_err();
     assert_eq!(e, "the plugins on one path come later together than the 500 ms an export makes up for");
     // At 48 kHz, 5 ms.
     assert!(export(&p, &mut catalog_plugins(&dir.join("high"), "latency")).is_ok());

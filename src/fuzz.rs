@@ -39,6 +39,7 @@
 //! and parameter names for projects; chunk sizes and format fields for WAV
 //! files) keep most inputs close to valid, where most of the code is.
 
+use crate::clip::{self, ClipData};
 use crate::dsp::noise::Rng;
 use crate::dsp::wavetable::{Mip, Wavetable};
 use crate::engine::{
@@ -486,7 +487,7 @@ fn mutate_bytes(rng: &mut Rng, b: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 
 // ---------------------------------------------------------------- projects
 
-const PROJECT_KEYS: [&str; 29] = [
+const PROJECT_KEYS: [&str; 30] = [
     "tinvo",
     "master_insert",
     "master_insert_param",
@@ -514,6 +515,7 @@ const PROJECT_KEYS: [&str; 29] = [
     "point",
     "param",
     "step",
+    "clip",
     "end",
     "#",
 ];
@@ -733,6 +735,14 @@ fn project_seeds() -> Vec<Vec<u8>> {
     table.sample = Some("tables/sweep one.wav".into());
     table.params[0] = 4.0;
     rich.tracks.push(table);
+    let mut audio = TrackData::new(InstrumentKind::Audio);
+    audio.name = "Vocal é".into();
+    let mut late = ClipData::new("takes/vocal two.wav".into(), 3, 95, 96_000);
+    (late.start, late.gain_db, late.fade_in, late.fade_out) = (480, -3.5, 64, 2_000);
+    audio.clips =
+        vec![ClipData::new("/abs/pad.wav".into(), 0, 0, 1 << 20), ClipData::new("takes/a.wav".into(), 0, 12, 10), late]
+            .into();
+    rich.tracks.push(audio);
     let mut texts = vec![Project::new().to_text(), Project::demo().to_text(), rich.to_text()];
     texts.extend(
         [
@@ -747,6 +757,7 @@ fn project_seeds() -> Vec<Vec<u8>> {
             "tinvo 11\nsong A B A\npattern_length C 3\n\ntrack kick\nparts . C -\nstep 1 36 100 1 100 1 0 -\nend\n",
             // Plugins by a few ids, so a long run keeps finding ids it has
             // seen: the ids a run takes are never given back.
+            "tinvo 21\nsong A B\n\ntrack audio\nclip 0 0 0 48000 0 0 0 a.wav\nclip 1 6 100 9 -6 1 2 b c.wav\nend\n",
             "tinvo 16\nmaster_insert 0 plugin org.tinvo.fuzz.fx\n\ngroup G\ninsert 7 plugin org.tinvo.fuzz.fx\nend\n\ntrack plugin org.tinvo.fuzz.synth\ngroup 1\nparam send_reverb -12\ninsert 1 plugin org.tinvo.fuzz.fx\ninsert_param 1 bypass 1\nstep 0 60 100 1 100 1 0 -\nend\n",
         ]
         .map(String::from),
@@ -801,6 +812,7 @@ fn check_project(input: &[u8], render: bool) -> Result<Outcome, String> {
 fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
     check_markers(p)?;
     check_parts(p)?;
+    check_clips(p)?;
     let saved = p.to_text();
     let back = Project::from_text(&saved).map_err(|e| format!("the saved project does not load: {e}\n{saved}"))?;
     if back != *p {
@@ -818,6 +830,23 @@ fn check_project_invariants(p: &Project, render: bool) -> Result<(), String> {
     }
     if render {
         render_check(p, &[])?;
+    }
+    Ok(())
+}
+
+/// Clips sit on audio tracks, on song entries, in song order, each one
+/// valid.
+fn check_clips(p: &Project) -> Result<(), String> {
+    for (i, t) in p.tracks.iter().enumerate() {
+        if !t.clips.is_empty() && t.kind != InstrumentKind::Audio {
+            return Err(format!("track {i}, a {} track, has clips", t.kind.id()));
+        }
+        if let Some(e) = clip::list_problem(&t.clips) {
+            return Err(format!("track {i}'s clips: {e}"));
+        }
+        if let Some(c) = t.clips.iter().find(|c| usize::from(c.entry) >= p.song.len()) {
+            return Err(format!("track {i} has a clip {c:?} past the song's {} entries", p.song.len()));
+        }
     }
     Ok(())
 }
@@ -854,14 +883,15 @@ fn check_markers(p: &Project) -> Result<(), String> {
     Ok(())
 }
 
-/// The project without what edits do not carry: track names, samples and
-/// markers.
+/// The project without what edits do not carry: track names, samples,
+/// clips and markers.
 fn without_meta(p: &Project) -> Project {
     let mut p = p.clone();
     for t in &mut p.tracks {
         t.name.clear();
         t.sample = None;
         t.zones = Arc::new([]);
+        t.clips = Arc::new([]);
     }
     for g in &mut p.groups {
         g.name.clear();

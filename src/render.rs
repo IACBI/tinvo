@@ -13,6 +13,7 @@
 use crate::clap::PluginRef;
 use crate::clap::host::{Instance, Mode, PluginHost, Request, Role};
 use crate::clap::scan::Catalog;
+use crate::clip::ClipBank;
 use crate::engine::transport::Transport;
 use crate::engine::{BLOCK, Command, Edit, Engine, MAX_PATTERNS, RETIRE_QUEUE, Retired, Shared};
 use crate::instrument::SampleMap;
@@ -22,8 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Checks that an export may write `out`: a `.wav`, `.mid` or `.midi` file
-/// that is neither the project at `project_path` nor a sample `project`
-/// plays, which writing it would destroy. The error follows the path, as
+/// that is neither the project at `project_path` nor a sample or clip
+/// `project` plays, which writing it would destroy. The error follows the path, as
 /// in "song.tvo is the project itself".
 pub fn check_destination(project: &Project, project_path: Option<&Path>, out: &Path) -> Result<(), String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -34,7 +35,7 @@ pub fn check_destination(project: &Project, project_path: Option<&Path>, out: &P
 }
 
 /// Checks that writing `out` destroys nothing `project` needs: that it is
-/// not a folder, a sample the project plays, nor (if given) the project at
+/// not a folder, a sample or clip file the project plays, nor (if given) the project at
 /// `project_path`. A project's save passes no `project_path`, as it may
 /// write over itself. The error follows the path.
 pub fn check_overwrite(project: &Project, project_path: Option<&Path>, out: &Path) -> Result<(), String> {
@@ -55,6 +56,9 @@ pub fn check_overwrite(project: &Project, project_path: Option<&Path>, out: &Pat
     }
     if project.tracks.iter().flat_map(TrackData::sample_paths).any(|s| same(Path::new(s))) {
         return Err("is a sample the project plays".into());
+    }
+    if project.tracks.iter().flat_map(TrackData::clip_paths).any(|s| same(Path::new(s))) {
+        return Err("is a clip the project plays".into());
     }
     Ok(())
 }
@@ -309,7 +313,8 @@ impl Playing {
 /// Renders the project as interleaved stereo, handing it to `sink` block by
 /// block, and returns the number of frames rendered. Memory use does not
 /// depend on the length of the render. `samples` holds what each track
-/// plays (see [`Project::sample_maps`]); missing entries play silence. Every
+/// plays (see [`Project::sample_maps`]); missing entries play silence, as
+/// clips whose files `clips` does not hold do. Every
 /// plugin place gets an instance from `plugins` before anything is
 /// rendered. A `sink` error, a plugin that cannot load or fails, or plugins
 /// on one path later together than is made up for, stop the render, and
@@ -317,6 +322,7 @@ impl Playing {
 pub fn render_into(
     project: &Project,
     samples: &[Option<Arc<SampleMap>>],
+    clips: &ClipBank,
     opts: &RenderOptions,
     plugins: &mut dyn PluginSource,
     sink: &mut dyn FnMut(&[f32]) -> Result<(), String>,
@@ -326,6 +332,9 @@ pub fn render_into(
     let mut engine = Engine::with_edits(sr as f32, &project.to_edits(), Arc::clone(&shared), None);
     for (track, sample) in samples.iter().enumerate() {
         engine.set_samples(track, sample.clone());
+    }
+    for (track, list) in project.clip_lists(clips).into_iter().enumerate() {
+        engine.set_clips(track, list);
     }
     let mut playing = Playing::attach(&mut engine, project, sr, plugins)?;
     if shared.latency_over.load(std::sync::atomic::Ordering::Relaxed) {
@@ -414,12 +423,23 @@ pub fn render_into(
 /// [`render_into`] collected in memory, for a project without plugins.
 #[cfg(test)]
 pub fn render(project: &Project, samples: &[Option<Arc<SampleMap>>], opts: &RenderOptions) -> Vec<f32> {
+    render_with(project, samples, &ClipBank::new(), opts)
+}
+
+/// [`render`], with the clips' audio in `clips`.
+#[cfg(test)]
+pub fn render_with(
+    project: &Project,
+    samples: &[Option<Arc<SampleMap>>],
+    clips: &ClipBank,
+    opts: &RenderOptions,
+) -> Vec<f32> {
     let mut out = Vec::new();
     let mut sink = |b: &[f32]| {
         out.extend_from_slice(b);
         Ok(())
     };
-    render_into(project, samples, opts, &mut NoPlugins, &mut sink).expect("collecting cannot fail");
+    render_into(project, samples, clips, opts, &mut NoPlugins, &mut sink).expect("collecting cannot fail");
     out
 }
 
@@ -956,5 +976,31 @@ mod tests {
         let opts = RenderOptions { loops: 1, max_tail_seconds: 1.0, ..Default::default() };
         let out = render(&p, &[], &opts);
         assert_eq!(out.len() / 2, main_frames(&p, &opts) as usize + 48_000);
+    }
+
+    #[test]
+    fn an_export_plays_the_clips_and_writes_over_none_of_their_files() {
+        let mut p = Project::new();
+        p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Audio)).unwrap();
+        let dir = std::env::temp_dir().join(format!("tinvo-clip-dest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("take.wav");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.display().to_string();
+        p.tracks[0].clips = vec![crate::clip::ClipData::new(path.clone(), 0, 12, 1000)].into();
+        assert_eq!(check_destination(&p, None, &file), Err("is a clip the project plays".into()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut bank = ClipBank::new();
+        bank.insert(path, Arc::new(crate::clip::ClipAudio::new(vec![vec![0.5; 1000]], 48_000).unwrap()));
+        let opts = RenderOptions { loops: 1, max_tail_seconds: 0.0, source: Source::Song, ..Default::default() };
+        let out = render_with(&p, &[], &bank, &opts);
+        // A bar at 120 BPM; the clip from its second beat for 1000 frames.
+        assert_eq!(out.len(), 2 * 96_000);
+        let first = out.iter().position(|x| x.abs() > 1e-6).map(|i| i / 2);
+        assert_eq!(first, Some(12_000));
+        assert!(out[2 * 13_000..].iter().all(|&x| x == 0.0));
+        // Without its file the clip is silent.
+        assert!(render(&p, &[], &opts).iter().all(|&x| x == 0.0));
     }
 }
