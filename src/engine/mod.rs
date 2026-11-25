@@ -1889,6 +1889,23 @@ pub struct Engine {
     song_frames_ok: bool,
     /// The frame the entry playing started on, unrounded.
     entry_frame: f64,
+    /// Audio tracks to resolve before the callback renders, one bit each
+    /// ([`Engine::settle_clips`]), and whether an edit put another entry
+    /// under the playhead.
+    clips_pending: u64,
+    clips_moved: bool,
+}
+
+/// What brings the song to where [`Engine::resolve_clips`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolve {
+    /// It has only just come there: Play, a loop going back, an entry that
+    /// does not follow the one before.
+    Jumped,
+    /// It played up to there, and an edit or new clips came.
+    Edited,
+    /// It played up to there, and an edit put another entry under it.
+    Moved,
 }
 
 /// A removed track and the frames left of its fade.
@@ -1982,6 +1999,8 @@ impl Engine {
             song_frames: [0.0; MAX_SONG + 1],
             song_frames_ok: false,
             entry_frame: 0.0,
+            clips_pending: 0,
+            clips_moved: false,
         })
     }
 
@@ -2397,7 +2416,7 @@ impl Engine {
             return;
         };
         p.replace(clips, &mut |l| retire_any(retired, Retired::Clips(l)));
-        self.resolve_clips(track, self.now, false);
+        self.clips_pending |= 1 << track;
     }
 
     /// Same as handling [`Command::SetSamples`].
@@ -3152,7 +3171,7 @@ impl Engine {
         }
         self.entry_frame = self.transport.exact_frame(0.0);
         for t in 0..self.track_count {
-            self.resolve_clips(t, at, true);
+            self.resolve_clips(t, at, Resolve::Jumped);
         }
         if self.midi_clock {
             match e.entry.filter(|&i| self.song_mode && i > 0) {
@@ -3514,7 +3533,7 @@ impl Engine {
         let on = next <= end && e.entry.is_some() && e.entry == before.map(|b| b + 1);
         if !on {
             for t in 0..self.track_count {
-                self.resolve_clips(t, self.cursor, true);
+                self.resolve_clips(t, self.cursor, Resolve::Jumped);
             }
         }
     }
@@ -3550,7 +3569,7 @@ impl Engine {
                 let _ = f;
                 self.tracks[t].clip_next = pulse + 1;
                 if let Some(p) = self.tracks[t].instrument.player() {
-                    p.play(k, 0.0, false);
+                    p.play(k, 0.0);
                 }
             }
         }
@@ -3581,14 +3600,11 @@ impl Engine {
     }
 
     /// Makes audio track `t` play what the song laid out plays at frame
-    /// `at` of the entry playing: the clip that started last before it,
-    /// where it has got to, if it has not ended. Starts still to come in
-    /// the entry are left to [`Self::fire_clips`]. `jumped` says the song
-    /// has only just come to `at` (Play, a loop going back, an entry that
-    /// does not follow the one before); otherwise it played up to there,
-    /// and what it started stays started, and a clip a new list was just
-    /// given in place of one that plays the same frames goes on where it is.
-    fn resolve_clips(&mut self, t: usize, at: u64, jumped: bool) {
+    /// `at` of the entry playing: the clip that started last by then (one
+    /// starting on `at` itself included), where it has got to, if it has
+    /// not ended. Starts still to come in the entry are left to
+    /// [`Self::fire_clips`].
+    fn resolve_clips(&mut self, t: usize, at: u64, how: Resolve) {
         if self.tracks[t].instrument.player_ref().is_none() {
             return;
         }
@@ -3604,7 +3620,7 @@ impl Engine {
         let tr = &self.transport;
         // A pulse before the transport's origin has passed: the frames
         // before it are no longer the transport's to give.
-        let started = |k: u64| (e.start + k) as f64 / 6.0 < tr.origin() || tr.pulse_frame(e.start + k) < at;
+        let started = |k: u64| (e.start + k) as f64 / 6.0 < tr.origin() || tr.pulse_frame(e.start + k) <= at;
         let gone = (tr.position_at(at) * 6.0 - e.start as f64).floor().clamp(0.0, len as f64) as u64;
         let mut q = gone;
         while q < len && started(q) {
@@ -3613,7 +3629,9 @@ impl Engine {
         while q > 0 && !started(q - 1) {
             q -= 1;
         }
-        if !jumped {
+        // What fired in this entry stays started, unless the entry is
+        // another now.
+        if how == Resolve::Edited {
             q = q.max(self.tracks[t].clip_next.saturating_sub(e.start).min(len));
         }
         self.tracks[t].clip_next = e.start + q;
@@ -3624,32 +3642,53 @@ impl Engine {
                 || usize::from(c.entry) < self.song_len
                     && u64::from(c.pulse) < self.pattern_pulses(self.song[usize::from(c.entry)])
         };
-        // Where a clip started, on the frame it started on: as the transport
-        // put it, or, before its origin or in an entry before, from where
-        // this entry started and the song's layout.
-        let onset = |c: &crate::clip::Placed| -> f64 {
+        // Output frames since a clip started, its start rounded to a frame
+        // as the transport rounds it: as the transport put it, or, before its
+        // origin or in an entry before, from where this entry started and the
+        // song's layout, both ends rounded on the song's timeline.
+        let elapsed = |c: &crate::clip::Placed| -> f64 {
             let p = e.start + u64::from(c.pulse);
+            let since_entry = at as f64 - self.entry_frame.round();
             if c.entry == j && p as f64 / 6.0 >= tr.origin() {
-                tr.pulse_frame(p) as f64
+                at as f64 - tr.pulse_frame(p) as f64
             } else if c.entry == j {
-                (self.entry_frame + self.frames_into(usize::from(j), c.pulse)).round()
+                at as f64 - (self.entry_frame + self.frames_into(usize::from(j), c.pulse)).round()
             } else {
                 let a = usize::from(c.entry);
-                let before = self.song_frames[usize::from(j)] - self.song_frames[a] - self.frames_into(a, c.pulse);
-                (self.entry_frame - before).round()
+                let onset = (self.song_frames[a] + self.frames_into(a, c.pulse)).round();
+                since_entry + self.song_frames[usize::from(j)].round() - onset
             }
         };
         let found = list.clips()[..first].iter().rposition(active).map(|k| {
             let c = &list.clips()[k];
-            let elapsed = (at as f64 - onset(c)).max(0.0);
             let inc = c.audio.as_ref().map_or(0.0, |a| f64::from(a.sample_rate()) / f64::from(self.sample_rate));
-            (k, elapsed * inc, c.frames())
+            (k, elapsed(c).max(0.0) * inc, c.frames())
         });
         let Some(p) = self.tracks[t].instrument.player() else { return };
+        let playing = p.playing().map(|(k, _)| k);
         match found {
-            Some((k, pos, frames)) if pos < frames => p.play(k, pos, !jumped),
+            // Played up to here, the clip playing is where it is, whatever
+            // the tempo did meanwhile.
+            Some((k, _, _)) if how != Resolve::Jumped && playing == Some(k) => {}
+            Some((k, pos, frames)) if pos < frames => p.play(k, pos),
             _ => p.silence(),
         }
+    }
+
+    /// Resolves the audio tracks an edit or new clips left to resolve,
+    /// once for every command a callback took.
+    fn settle_clips(&mut self) {
+        if self.clips_pending == 0 {
+            return;
+        }
+        let how = if self.clips_moved { Resolve::Moved } else { Resolve::Edited };
+        for t in 0..self.track_count {
+            if self.clips_pending & 1 << t != 0 {
+                self.resolve_clips(t, self.now, how);
+            }
+        }
+        self.clips_pending = 0;
+        self.clips_moved = false;
     }
 
     /// Applies an edit. Invalid track/step indices are ignored and values are
@@ -3661,21 +3700,20 @@ impl Engine {
     }
 
     fn apply_edit(&mut self, edit: Edit) {
-        // What plays under the playhead may be another entry, or a longer
-        // or shorter one, after these.
-        let moves_song = matches!(
-            edit,
-            Edit::InsertSongEntry { .. }
-                | Edit::RemoveSongEntry(_)
-                | Edit::SetSongEntry { .. }
-                | Edit::SetPatternLength { .. }
-                | Edit::SetPatternDivision { .. }
-        );
+        // What plays under the playhead may be a longer or shorter entry
+        // after these, or another one.
+        let j = self.entry_now().entry.map(usize::from);
+        let under = |i: u16| j.is_some_and(|j| usize::from(i) <= j);
+        let (moves, other) = match edit {
+            Edit::InsertSongEntry { index, .. } | Edit::RemoveSongEntry(index) => (true, under(index)),
+            Edit::SetSongEntry { index, .. } => (true, j == Some(usize::from(index))),
+            Edit::SetPatternLength { .. } | Edit::SetPatternDivision { .. } => (true, false),
+            _ => (false, false),
+        };
         self.apply_edit_inner(edit);
-        if moves_song {
-            for t in 0..self.track_count {
-                self.resolve_clips(t, self.now, false);
-            }
+        if moves && self.transport.is_playing() {
+            self.clips_pending = u64::MAX;
+            self.clips_moved |= other;
         }
     }
 
@@ -4270,6 +4308,7 @@ impl Engine {
             }
             self.commands = Some(rx);
         }
+        self.settle_clips();
         self.plan_latency();
         self.midi.latency = self.latency() as u64;
         if first {
@@ -9587,6 +9626,37 @@ mod tests {
                 left(&out)
             };
             close(&play(true), &play(false), "the same clip, on");
+            // Faster, so the song is further on than the clip has played.
+            let short = [clip(0, 24, 10_000)];
+            let play = |again: bool| {
+                let mut e = clip_engine(&[0, 0], &[], &short, &a);
+                e.handle(Command::PlaySong { entry: 0 });
+                let mut out = run(&mut e, 30_000);
+                e.apply(Edit::SetTempo(240.0));
+                if again {
+                    e.set_clips(0, Some(ClipList::build(&short, |_| Some(Arc::clone(&a)))));
+                }
+                out.extend(run(&mut e, 10_000));
+                left(&out)
+            };
+            let out = play(true);
+            assert!(out[30_000..34_000].iter().all(|&x| x > 0.2), "still playing");
+            close(&out, &play(false), "the short clip, on");
+        }
+
+        #[test]
+        fn a_loop_going_back_onto_a_clip_s_start_fades_out_the_clip_before() {
+            let a = audio(3 * ENTRY, 48_000);
+            let at = |entry: u16, start: u64| ClipData { start, ..clip(entry, 0, 2 * ENTRY) };
+            let clips = [at(0, 0), at(1, 50_000), at(2, 100_000)];
+            let mut e = clip_engine(&[0, 0, 0], &[Edit::SetLoop(Some((1, 2)))], &clips, &a);
+            e.handle(Command::PlaySong { entry: 0 });
+            let out = left(&run(&mut e, 3 * ENTRY + 1000));
+            let s = signal(3 * ENTRY);
+            // Entry 1's clip from its start, entry 2's fading under it.
+            let wrap = 3 * ENTRY;
+            assert!(out[wrap + 10] - s[50_010] > 0.1, "the fade: {} {}", out[wrap + 10], s[50_010]);
+            close(&out[wrap + 144..], &s[50_144..50_000 + 1000], "entry 1's clip again");
         }
 
         #[test]
@@ -9613,16 +9683,18 @@ mod tests {
             let rate = 44_100;
             let tone: Vec<f32> = (0..3 * ENTRY).map(|i| (i as f32 * 0.37).sin() * 0.5).collect();
             let a = Arc::new(ClipAudio::new(vec![tone], rate).unwrap());
-            let clips = [clip(0, 1, 2 * ENTRY)];
-            let whole = {
+            for pulse in [1, 2, 3, 5] {
+                let clips = [clip(0, pulse, 2 * ENTRY)];
+                let whole = {
+                    let mut e = clip_engine(&[0, 0], &[], &clips, &a);
+                    e.handle(Command::PlaySong { entry: 0 });
+                    left(&run(&mut e, ENTRY + 10_000))
+                };
                 let mut e = clip_engine(&[0, 0], &[], &clips, &a);
-                e.handle(Command::PlaySong { entry: 0 });
-                left(&run(&mut e, ENTRY + 10_000))
-            };
-            let mut e = clip_engine(&[0, 0], &[], &clips, &a);
-            e.handle(Command::PlaySong { entry: 1 });
-            let from = left(&run(&mut e, 10_000));
-            close(&from[144..], &whole[ENTRY + 144..], "from entry 1");
+                e.handle(Command::PlaySong { entry: 1 });
+                let from = left(&run(&mut e, 10_000));
+                close(&from[144..], &whole[ENTRY + 144..], &format!("from entry 1, a clip at pulse {pulse}"));
+            }
         }
 
         #[test]

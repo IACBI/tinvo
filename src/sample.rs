@@ -152,7 +152,9 @@ impl Sample {
     }
 
     /// Windowed-sinc interpolation at `pos` (in frames, `0 <= pos < frames`).
-    #[inline]
+    // Always: with a second caller (clips), LLVM stopped inlining it into
+    // the sampler's voice loop, which then took 19 % more instructions.
+    #[inline(always)]
     pub fn sinc(&self, pos: f64) -> f32 {
         let i = pos as usize;
         let phase = (pos - i as f64) * SINC_PHASES as f64;

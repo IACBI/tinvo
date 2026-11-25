@@ -7,7 +7,7 @@ Author: 𝓐.𝓒.𝓑
 ## [Unreleased]
 
 ### Added
-- Audio tracks (`track audio`), which play WAV clips placed on the song rather than notes. A clip starts at a song entry and a pulse into it, plays a part of its file (a trim) with a gain and fades, and leaves the file as it is. Mono and stereo files play at their own rate, resampled with sinc (a file at a higher rate than the output's through a low-pass first, so nothing folds back), and the tempo does not stretch them.
+- Audio tracks (`track audio`), which play WAV clips placed on the song rather than notes. A clip starts at a song entry and a pulse into it, plays a part of its file (a trim) with a gain and fades, and leaves the file as it is. Mono and stereo files up to 192 kHz play at their own rate, resampled with sinc (a file at a higher rate than the output's through a low-pass first, so little folds back), and the tempo does not stretch them.
   - A track plays one clip at a time, the latest to start. A clip starts on its exact frame at any buffer size. Starting the song partway through a clip, or a loop going back into one, picks it up where it would be, counting the tempo of the entries before; it fades in over 3 ms there, as every cut fades out.
   - Clips play while the song plays, not a single pattern. Inserting or removing a song entry takes its clips with it, also while playing (the clip then under the playhead plays from where it would be), and undo brings them back. New clips or a tempo change leave the clip playing as it is.
   - Export, stems and `tinvo render` include them. Their files share the project's sample budget, are never written over by an export or a save, and a WAV export is refused while one is missing.

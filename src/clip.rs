@@ -124,6 +124,9 @@ impl ClipAudio {
         if !(1..=2).contains(&channels.len()) || channels.iter().any(|c| c.len() != channels[0].len()) {
             return Err("a clip is one or two channels of the same length".into());
         }
+        if sample_rate > MAX_RATE {
+            return Err(format!("a clip's file is at most {MAX_RATE} Hz, and this one is {sample_rate} Hz"));
+        }
         kernel();
         let overview = overview(&channels);
         let channels = channels.iter().map(|c| Sample::from_mono(c, sample_rate)).collect::<Result<Vec<_>, _>>()?;
@@ -159,14 +162,14 @@ impl ClipAudio {
     /// Channel `c` (the first again for a mono clip) at frame `pos`
     /// (`0 <= pos < frames`), read `step` frames apart: as it is on a whole
     /// frame and interpolated between frames, or, further apart than one,
-    /// through a low-pass as far below the file's Nyquist frequency, so
-    /// nothing above the output's folds back.
+    /// through a low-pass as far below the file's Nyquist frequency, which
+    /// takes frames outside `trim` (from, to) for silence.
     #[inline]
-    fn at(&self, c: usize, pos: f64, step: f64) -> f32 {
+    fn at(&self, c: usize, pos: f64, step: f64, trim: (i64, i64)) -> f32 {
         let s = &self.channels[c.min(self.channels.len() - 1)];
         let i = pos as usize;
         if step > 1.0 {
-            lowpassed(s, pos, step)
+            lowpassed(s, pos, step, trim)
         } else if i as f64 == pos {
             s.at(i)
         } else {
@@ -177,9 +180,13 @@ impl ClipAudio {
 
 /// Half the width of the low-pass kernel, in zero crossings.
 const KERNEL_HALF: usize = 8;
-/// Its cutoff as a fraction of the output's Nyquist frequency: what lies
-/// above that output's Nyquist frequency is 30 dB down or more by then.
+/// Its cutoff as a fraction of the output's Nyquist frequency. What lies
+/// above the output's Nyquist frequency is turned down, by 30 dB or more
+/// from 1.1 times it; nearer, some folds back.
 const CUTOFF: f64 = 0.9;
+/// The highest sample rate a clip's file may have: reading one far above
+/// the output's takes a tap of the low-pass for each of its frames.
+pub const MAX_RATE: u32 = 192_000;
 /// Values of the kernel tabulated per zero crossing.
 const KERNEL_STEPS: usize = 512;
 
@@ -205,14 +212,14 @@ fn kernel() -> &'static [f32] {
 }
 
 /// `s` at `pos` through a low-pass a little below its Nyquist frequency over `step`,
-/// for reading it `step` (`> 1`) frames apart. Frames outside it are
+/// for reading it `step` (`> 1`) frames apart. Frames outside `trim` are
 /// silence; the weights are normalised, so a constant stays as it is.
-fn lowpassed(s: &Sample, pos: f64, step: f64) -> f32 {
+fn lowpassed(s: &Sample, pos: f64, step: f64, trim: (i64, i64)) -> f32 {
     let table = kernel();
     let reach = KERNEL_HALF as f64 * step / CUTOFF;
     let scale = KERNEL_STEPS as f64 * CUTOFF / step;
     let (lo, hi) = ((pos - reach).ceil() as i64, (pos + reach).floor() as i64);
-    let frames = s.frames() as i64;
+    let (from, to) = (trim.0.max(0), trim.1.min(s.frames() as i64));
     let (mut acc, mut sum) = (0.0f32, 0.0f32);
     for i in lo..=hi {
         let x = (i as f64 - pos).abs() * scale;
@@ -221,7 +228,7 @@ fn lowpassed(s: &Sample, pos: f64, step: f64) -> f32 {
         let b = table.get(k + 1).copied().unwrap_or(0.0);
         let w = a + (b - a) * (x - k as f64) as f32;
         sum += w;
-        if (0..frames).contains(&i) {
+        if (from..to).contains(&i) {
             acc += s.at(i as usize) * w;
         }
     }
@@ -256,6 +263,9 @@ pub fn read_limited<R: Read + Seek>(r: &mut R, max_values: usize) -> Result<Clip
     }
     if info.channels > 2 {
         return Err(format!("a clip is mono or stereo, and the file has {} channels", info.channels));
+    }
+    if info.sample_rate > MAX_RATE {
+        return Err(format!("a clip's file is at most {MAX_RATE} Hz, and this one is {} Hz", info.sample_rate));
     }
     if info.frames > sample::MAX_FRAMES as u64 {
         return Err(format!("longer than {} frames", sample::MAX_FRAMES));
@@ -455,36 +465,44 @@ impl Player {
         self.voice.filter(|v| !v.old).map(|v| (v.clip, v.pos))
     }
 
-    /// Puts `new` in place of the track's clips. What was playing fades
-    /// out unless [`Player::play`] carries it on at once; a fade already
-    /// under way goes on. `retire` gets the lists nothing plays from any
-    /// more.
+    /// Puts `new` in place of the track's clips. The clip playing plays on
+    /// if `new` holds it (the same frames of the same file from the same
+    /// place) and still reaches where it has got to; otherwise it fades out.
+    /// A fade under way goes on. `retire` gets the lists nothing plays from
+    /// any more.
     pub fn replace(&mut self, new: Option<Box<ClipList>>, retire: &mut impl FnMut(Box<ClipList>)) {
-        if let Some(v) = self.voice.take() {
+        let cur = self.list.take();
+        let carried = match (self.voice, &cur, &new) {
+            (Some(v), Some(c), Some(n)) => c
+                .clips
+                .get(v.clip)
+                .and_then(|was| n.clips().iter().position(|c| c.same_as(was)).filter(|&k| v.pos < n.clips()[k].len)),
+            _ => None,
+        };
+        if let (Some(k), Some(v)) = (carried, &mut self.voice) {
+            v.clip = k;
+        } else if let Some(v) = self.voice.take() {
             // It fades from here, in place of a fade there was: one at a time.
             self.tail = Some(Voice { old: true, fade: self.declick, ..v });
             if let Some(l) = self.old.take() {
                 retire(l);
             }
-            self.old = self.list.take();
-        } else if self.tail.is_some_and(|t| t.old) {
-            // Fading from the list before; nothing plays from this one.
-            if let Some(l) = self.list.take() {
-                retire(l);
-            }
-        } else {
-            if let Some(l) = self.old.take() {
-                retire(l);
-            }
-            match &mut self.tail {
-                Some(t) => {
-                    t.old = true;
-                    self.old = self.list.take();
+            self.old = cur;
+            self.list = new;
+            return;
+        }
+        // No voice reads `cur` now; a fade from it goes on from it.
+        match &mut self.tail {
+            Some(t) if !t.old => {
+                t.old = true;
+                if let Some(l) = self.old.take() {
+                    retire(l);
                 }
-                None => {
-                    if let Some(l) = self.list.take() {
-                        retire(l);
-                    }
+                self.old = cur;
+            }
+            _ => {
+                if let Some(l) = cur {
+                    retire(l);
                 }
             }
         }
@@ -495,21 +513,10 @@ impl Player {
     }
 
     /// Plays clip `k` from `pos` frames of the file into it, cutting off what
-    /// plays. With `carry`, a voice [`Player::replace`] has only just cut off
-    /// that plays the same frames of the same file goes on where it is.
-    pub fn play(&mut self, k: usize, pos: f64, carry: bool) {
+    /// plays, unless it already plays there.
+    pub fn play(&mut self, k: usize, pos: f64) {
         let Some(c) = self.list.as_ref().and_then(|l| l.clips().get(k)) else { return };
         let inc = c.audio.as_ref().map_or(1.0, |a| f64::from(a.sample_rate()) / self.rate);
-        if carry {
-            if let (Some(t), Some(old)) = (self.tail, &self.old) {
-                if t.old && t.fade == self.declick && old.clips.get(t.clip).is_some_and(|o| o.same_as(c)) {
-                    self.voice = Some(Voice { clip: k, old: false, inc, fade: 0, ..t });
-                    self.tail = None;
-                    return;
-                }
-            }
-        }
-        // Already there, as when the song only jumps to where it is.
         if self.voice.is_some_and(|v| !v.old && v.clip == k && (v.pos - pos).abs() <= v.inc) {
             return;
         }
@@ -612,8 +619,9 @@ fn sound(c: &Placed, v: &mut Voice, out: &mut [f32], declick: u32, tail: bool) -
             g *= v.fade as f32 / d;
             v.fade -= 1;
         }
-        f[0] += a.at(0, src, v.inc) * g;
-        f[1] += a.at(1, src, v.inc) * g;
+        let trim = (c.start as i64, (c.start + c.len).ceil() as i64);
+        f[0] += a.at(0, src, v.inc, trim) * g;
+        f[1] += a.at(1, src, v.inc, trim) * g;
         v.pos += v.inc;
     }
     true
@@ -663,12 +671,12 @@ mod tests {
         let (stereo, _) = wav::encode(&[0.5, -0.5, 0.25, -0.25], 2, 44_100, wav::SampleFormat::Float32, 0).unwrap();
         let a = read_limited(&mut std::io::Cursor::new(&stereo), 4).unwrap();
         assert_eq!((a.frames(), a.channels(), a.sample_rate(), a.cost()), (2, 2, 44_100, 4));
-        assert_eq!((a.at(0, 1.0, 1.0), a.at(1, 1.0, 1.0)), (0.25, -0.25));
+        assert_eq!((a.at(0, 1.0, 1.0, (0, 2)), a.at(1, 1.0, 1.0, (0, 2))), (0.25, -0.25));
         assert!(read_limited(&mut std::io::Cursor::new(&stereo), 3).unwrap_err().contains("values left"));
         let (three, _) = wav::encode(&[0.0; 6], 3, 48_000, wav::SampleFormat::Pcm16, 0).unwrap();
         assert!(read_limited(&mut std::io::Cursor::new(&three), 100).unwrap_err().contains("3 channels"));
         let mono = ClipAudio::new(vec![vec![0.0, 0.5, -1.0]], 48_000).unwrap();
-        assert_eq!(mono.at(1, 2.0, 1.0), -1.0, "a mono clip plays on both sides");
+        assert_eq!(mono.at(1, 2.0, 1.0, (0, 3)), -1.0, "a mono clip plays on both sides");
         assert_eq!(mono.peak(0, 3), 1.0);
         assert!(ClipAudio::new(vec![vec![0.0; 3], vec![0.0; 2]], 48_000).is_err());
     }
@@ -690,7 +698,7 @@ mod tests {
     fn a_voice_follows_its_clip_when_an_entry_before_goes() {
         let mut p = Player::new(48_000.0);
         p.replace(Some(list(&[(0, 0), (1, 0), (2, 0)])), &mut |_| panic!("nothing to give back"));
-        p.play(2, 0.0, false);
+        p.play(2, 0.0);
         p.remove_entry(0);
         assert_eq!(p.playing().map(|(k, _)| k), Some(1));
         assert_eq!(p.list().unwrap().clips()[1].at(), (1, 0));
@@ -708,7 +716,7 @@ mod tests {
     fn a_list_replaced_mid_fade_goes_back_once_the_fade_is_over() {
         let mut p = Player::new(48_000.0);
         p.replace(Some(list(&[(0, 0)])), &mut |_| panic!("nothing to give back"));
-        p.play(0, 0.0, false);
+        p.play(0, 0.0);
         let mut back = 0;
         p.replace(Some(list(&[(0, 5)])), &mut |_| back += 1);
         assert_eq!(back, 0, "the old list plays on while it fades");
@@ -725,12 +733,12 @@ mod tests {
     fn playing_where_it_already_plays_changes_nothing() {
         let mut p = Player::new(48_000.0);
         p.replace(Some(list(&[(0, 0)])), &mut |_| {});
-        p.play(0, 0.0, false);
+        p.play(0, 0.0);
         let mut out = vec![0.0; 2 * 100];
         p.render(&mut out);
-        p.play(0, 100.0, false);
+        p.play(0, 100.0);
         assert!(p.tail.is_none(), "no cut");
-        p.play(0, 500.0, false);
+        p.play(0, 500.0);
         assert!(p.tail.is_some(), "a jump is a cut");
     }
 
@@ -748,7 +756,7 @@ mod tests {
                 Some(ClipList::build(&[ClipData::new("t".into(), 0, 0, 9600)], |_| Some(Arc::clone(&a)))),
                 &mut |_| {},
             );
-            p.play(0, 0.0, false);
+            p.play(0, 0.0);
             let mut out = vec![0.0; 2 * 4800];
             p.render(&mut out);
             let mid = &out[2 * 1000..2 * 3800];
@@ -762,7 +770,7 @@ mod tests {
     fn a_fade_under_way_goes_on_when_the_clips_are_taken_away_again() {
         let mut p = Player::new(48_000.0);
         p.replace(Some(list(&[(0, 0)])), &mut |_| {});
-        p.play(0, 0.0, false);
+        p.play(0, 0.0);
         let mut out = vec![0.0; 2 * 48];
         p.render(&mut out);
         let mut back = 0;
@@ -777,5 +785,53 @@ mod tests {
         // 3 ms is 144 frames, 48 of them gone.
         assert!(out[2 * 90] > 0.0 && out[2 * 96..].iter().all(|&x| x == 0.0));
         assert!(p.take_old().is_some() && !p.is_active());
+    }
+
+    #[test]
+    fn new_clips_holding_the_clip_playing_leave_a_fade_under_way_alone() {
+        let a = audio(1000);
+        let two = || {
+            let clips = [ClipData::new("a".into(), 0, 0, 1000), ClipData::new("b".into(), 0, 5, 1000)];
+            ClipList::build(&clips, |_| Some(Arc::clone(&a)))
+        };
+        let render = |again: bool| {
+            let mut p = Player::new(48_000.0);
+            p.replace(Some(two()), &mut |_| {});
+            p.play(0, 0.0);
+            let mut out = vec![0.0; 2 * 300];
+            p.render(&mut out[..2 * 100]);
+            p.play(1, 0.0);
+            p.render(&mut out[2 * 100..2 * 172]);
+            if again {
+                let mut back = 0;
+                p.replace(Some(two()), &mut |_| back += 1);
+                assert_eq!(back, 0, "the fade reads the list before");
+            }
+            p.render(&mut out[2 * 172..]);
+            out
+        };
+        assert_eq!(render(true), render(false));
+    }
+
+    #[test]
+    fn a_file_read_through_the_low_pass_plays_nothing_outside_the_trim() {
+        let mut audio = vec![0.0; 2000];
+        audio[99] = 1.0;
+        let a = Arc::new(ClipAudio::new(vec![audio], 96_000).unwrap());
+        let mut p = Player::new(48_000.0);
+        let c = ClipData { start: 100, ..ClipData::new("t".into(), 0, 0, 1000) };
+        p.replace(Some(ClipList::build(&[c], |_| Some(Arc::clone(&a)))), &mut |_| {});
+        p.play(0, 0.0);
+        let mut out = vec![0.0; 2 * 100];
+        p.render(&mut out);
+        assert!(out.iter().all(|&x| x == 0.0), "{:?}", &out[..8]);
+    }
+
+    #[test]
+    fn a_clip_s_file_is_at_most_192_khz() {
+        assert!(ClipAudio::new(vec![vec![0.0; 4]], MAX_RATE).is_ok());
+        assert!(ClipAudio::new(vec![vec![0.0; 4]], MAX_RATE + 1).unwrap_err().contains("192000 Hz"));
+        let (wav, _) = wav::encode(&[0.0; 4], 1, 384_000, wav::SampleFormat::Pcm16, 0).unwrap();
+        assert!(read_limited(&mut std::io::Cursor::new(&wav), 100).unwrap_err().contains("384000 Hz"));
     }
 }

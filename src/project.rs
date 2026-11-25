@@ -1382,6 +1382,14 @@ impl Project {
     /// Edits that undo `edit` when applied after it, computed from the state
     /// *before* `edit` is applied. Fails exactly when `apply` would fail.
     pub fn inverse(&self, edit: &Edit) -> Result<Vec<Edit>, EditError> {
+        // Refused as [`Project::apply`] refuses them.
+        match *edit {
+            Edit::SetStep { track, value, .. } => self.plays_notes(track, value.is_some())?,
+            Edit::SetPart { track, part, .. } => self.plays_notes(track, part != Part::Follow)?,
+            Edit::SetChannel { track, channel } => self.plays_notes(track, channel.is_some())?,
+            Edit::SetMidiOut { track, on } => self.plays_notes(track, on)?,
+            _ => {}
+        }
         let inv = match *edit {
             Edit::SetTempo(_) => vec![Edit::SetTempo(self.tempo)],
             Edit::SetSwing(_) => vec![Edit::SetSwing(self.swing)],
@@ -4767,6 +4775,11 @@ pattern_division A 1/8
         );
         assert_eq!(p.apply(Edit::SetMidiOut { track: tr, on: true }), Err(EditError::AudioTrack(tr)));
         assert_eq!(p.apply(Edit::SetPart { track: tr, index: 0, part: Part::Rest }), Err(EditError::AudioTrack(tr)));
+        // Undo refuses them likewise, rather than give an inverse of an edit
+        // that does not apply.
+        let note = Edit::SetStep { track: tr, pattern: 2, step: 34, value: Some(Step::new(0, 0, 0)) };
+        assert_eq!(p.inverse(&note), Err(EditError::AudioTrack(tr)));
+        assert_eq!(p.inverse(&Edit::SetChannel { track: tr, channel: Some(1) }), Err(EditError::AudioTrack(tr)));
         p.apply(Edit::SetStep { track: tr, pattern: 0, step: 0, value: None }).unwrap();
         p.tracks[t].clips = (0..3).map(|e| ClipData::new(format!("{e}.wav"), e, 0, 10)).collect::<Vec<_>>().into();
         p.apply(Edit::InsertSongEntry { index: 1, pattern: 0 }).unwrap();
