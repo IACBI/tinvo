@@ -91,6 +91,7 @@
 //! and loading is lossless.
 
 use crate::clap::PluginRef;
+use crate::clip::{ClipBank, ClipData, ClipList};
 use crate::engine::{ChainId, PluginAt};
 use crate::engine::{
     DEFAULT_PATTERN_LEN, Division, Edit, LaneTarget, MAX_CHORD, MAX_LANES, MAX_PATTERNS, MAX_SONG, MAX_STEPS,
@@ -107,7 +108,7 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 /// Oldest format version this build can read.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "tvo";
@@ -152,6 +153,9 @@ pub struct TrackData {
     /// A plugin instrument's state, as it last saved it (`clap.state`):
     /// what an instance of it loads before it plays.
     pub state: Option<Arc<[u8]>>,
+    /// Audio tracks: their clips, in song order, paths kept as `sample`'s.
+    /// Shared, as the history keeps them.
+    pub clips: Arc<[ClipData]>,
 }
 
 pub use crate::engine::PluginPlace;
@@ -266,6 +270,18 @@ impl TrackData {
         (!map.is_empty()).then(|| Arc::new(map))
     }
 
+    /// The files an audio track's clips play, in song order.
+    pub fn clip_paths(&self) -> impl Iterator<Item = &str> {
+        self.clips.iter().map(|c| c.path.as_str())
+    }
+
+    /// The engine's list of an audio track's clips, with what `bank` holds
+    /// of their files; `None` for a track that has none.
+    pub fn clip_list(&self, bank: &ClipBank) -> Option<Box<ClipList>> {
+        (self.kind == InstrumentKind::Audio && !self.clips.is_empty())
+            .then(|| ClipList::build(&self.clips, |p| bank.get(p).map(Arc::clone)))
+    }
+
     pub fn new(kind: InstrumentKind) -> Self {
         Self {
             name: kind.label().to_string(),
@@ -285,6 +301,7 @@ impl TrackData {
             parts: Box::new([Part::Follow; MAX_SONG]),
             chain: [const { None }; MAX_SLOTS],
             state: None,
+            clips: Arc::new([]),
         }
     }
 }
@@ -407,6 +424,9 @@ pub enum EditError {
     SlotAutomated(u8),
     /// The lane is not on a plugin's parameter.
     NotPluginLane(u8),
+    /// An audio track plays clips: it has no steps, parts, MIDI channel or
+    /// MIDI output.
+    AudioTrack(u8),
 }
 
 impl fmt::Display for EditError {
@@ -436,6 +456,9 @@ impl fmt::Display for EditError {
                 write!(f, "a lane automates the effect in insert slot {}", u32::from(*s) + 1)
             }
             EditError::NotPluginLane(l) => write!(f, "lane {} is not on a plugin parameter", u32::from(*l) + 1),
+            EditError::AudioTrack(t) => {
+                write!(f, "track {} is an audio track, which plays clips, not notes", u32::from(*t) + 1)
+            }
         }
     }
 }
@@ -640,6 +663,7 @@ impl Project {
                         m.entry += 1;
                     }
                 }
+                self.move_clips(|e| Some(if e >= index { e + 1 } else { e }));
                 edit
             }
             Edit::RemoveSongEntry(index) => {
@@ -660,6 +684,12 @@ impl Project {
                         m.entry -= 1;
                     }
                 }
+                // Clips go with their entry too, and come back the same way.
+                self.move_clips(|e| match e.cmp(&index) {
+                    std::cmp::Ordering::Less => Some(e),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Greater => Some(e - 1),
+                });
                 edit
             }
             Edit::SetSongEntry { index, pattern } => {
@@ -685,6 +715,7 @@ impl Project {
             Edit::SetPart { track, index, part } => {
                 check_part(part)?;
                 self.entry(index)?;
+                self.plays_notes(track, part != Part::Follow)?;
                 self.track_mut(track)?.parts[usize::from(index)] = part;
                 edit
             }
@@ -730,6 +761,7 @@ impl Project {
             }
             Edit::SetStep { track, pattern, step, value } => {
                 check_pattern(pattern)?;
+                self.plays_notes(track, value.is_some())?;
                 let tr = self.track_mut(track)?;
                 let slot =
                     tr.steps[usize::from(pattern)].get_mut(usize::from(step)).ok_or(EditError::NoSuchStep(step))?;
@@ -796,11 +828,13 @@ impl Project {
                 edit
             }
             Edit::SetChannel { track, channel } => {
+                self.plays_notes(track, channel.is_some())?;
                 let channel = channel.map(|c| c.min(15));
                 self.track_mut(track)?.channel = channel;
                 Edit::SetChannel { track, channel }
             }
             Edit::SetMidiOut { track, on } => {
+                self.plays_notes(track, on)?;
                 self.track_mut(track)?.midi_out = on;
                 edit
             }
@@ -1060,6 +1094,22 @@ impl Project {
 
     fn track_mut(&mut self, t: u8) -> Result<&mut TrackData, EditError> {
         self.tracks.get_mut(usize::from(t)).ok_or(EditError::NoSuchTrack(t))
+    }
+
+    /// Refuses giving track `t` something only a track that plays notes
+    /// has (`needs`): an audio track takes only the defaults.
+    fn plays_notes(&self, t: u8, needs: bool) -> Result<(), EditError> {
+        if needs && !self.track(t)?.kind.plays_notes() { Err(EditError::AudioTrack(t)) } else { Ok(()) }
+    }
+
+    /// Moves every clip to the entry `to` gives for its own, or removes it
+    /// for `None`.
+    fn move_clips(&mut self, to: impl Fn(u16) -> Option<u16>) {
+        for t in &mut self.tracks {
+            if t.clips.iter().any(|c| to(c.entry) != Some(c.entry)) {
+                t.clips = t.clips.iter().filter_map(|c| Some(ClipData { entry: to(c.entry)?, ..c.clone() })).collect();
+            }
+        }
     }
 
     /// Validates giving lane `lane` of `track` the target `target`.
@@ -1332,6 +1382,14 @@ impl Project {
     /// Edits that undo `edit` when applied after it, computed from the state
     /// *before* `edit` is applied. Fails exactly when `apply` would fail.
     pub fn inverse(&self, edit: &Edit) -> Result<Vec<Edit>, EditError> {
+        // Refused as [`Project::apply`] refuses them.
+        match *edit {
+            Edit::SetStep { track, value, .. } => self.plays_notes(track, value.is_some())?,
+            Edit::SetPart { track, part, .. } => self.plays_notes(track, part != Part::Follow)?,
+            Edit::SetChannel { track, channel } => self.plays_notes(track, channel.is_some())?,
+            Edit::SetMidiOut { track, on } => self.plays_notes(track, on)?,
+            _ => {}
+        }
         let inv = match *edit {
             Edit::SetTempo(_) => vec![Edit::SetTempo(self.tempo)],
             Edit::SetSwing(_) => vec![Edit::SetSwing(self.swing)],
@@ -1568,6 +1626,20 @@ impl Project {
             for z in t.zones.iter() {
                 let _ = writeln!(s, "zone {} {}", zone_text(&z.place), crate::sample::relativize(&z.path, dir));
             }
+            for c in t.clips.iter() {
+                let _ = writeln!(
+                    s,
+                    "clip {} {} {} {} {} {} {} {}",
+                    c.entry,
+                    c.pulse,
+                    c.start,
+                    c.len,
+                    c.gain_db,
+                    c.fade_in,
+                    c.fade_out,
+                    crate::sample::relativize(&c.path, dir)
+                );
+            }
             let _ = writeln!(s, "gain_db {}", t.gain_db);
             let _ = writeln!(s, "pan {}", t.pan);
             let _ = writeln!(s, "mute {}", t.mute);
@@ -1656,8 +1728,10 @@ impl Project {
         let mut tempo_lines = Vec::new();
         // Effects in all chains read so far.
         let mut inserts = 0usize;
-        // The current track's zones.
+        // The current track's zones and clips, and where each clip was read.
         let mut zones: Vec<ZoneData> = Vec::new();
+        let mut clips: Vec<ClipData> = Vec::new();
+        let mut clip_lines = Vec::new();
 
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -1709,6 +1783,9 @@ impl Project {
             }
 
             if let Some(t) = current.as_mut() {
+                if !t.kind.plays_notes() && matches!(key, "step" | "parts" | "midi_channel" | "midi_out") {
+                    return Err(err(format!("an audio track has no {}", key.replace('_', " "))));
+                }
                 match key {
                     "name" => t.name = sanitize_name(rest),
                     "sample" if ver >= 4 => {
@@ -1733,6 +1810,20 @@ impl Project {
                             return Err(err(format!("more than {MAX_ZONES} zones in a track")));
                         }
                         zones.push(parse_zone(rest, ver).map_err(err)?);
+                    }
+                    "clip" if ver >= 21 => {
+                        if t.kind != InstrumentKind::Audio {
+                            return Err(err(format!("a {} track has no clips", t.kind.id())));
+                        }
+                        if clips.len() >= crate::clip::MAX_CLIPS {
+                            return Err(err(format!("more than {} clips in a track", crate::clip::MAX_CLIPS)));
+                        }
+                        let c = parse_clip(rest).map_err(err)?;
+                        if clips.last().is_some_and(|l| l.at() >= c.at()) {
+                            return Err(err("a track's clips come in song order, one at each place".into()));
+                        }
+                        clip_lines.push((c.entry, line_no));
+                        clips.push(c);
                     }
                     "gain_db" => t.gain_db = parse_in(rest, &VOLUME).map_err(err)?,
                     "pan" => t.pan = parse_in(rest, &PAN).map_err(err)?,
@@ -1938,6 +2029,7 @@ impl Project {
                         }
                         let mut t = current.take().expect("inside a track block");
                         t.zones = std::mem::take(&mut zones).into();
+                        t.clips = std::mem::take(&mut clips).into();
                         p.tracks.push(t);
                     }
                     _ => return Err(err(format!("unknown track key '{key}'"))),
@@ -2114,6 +2206,14 @@ impl Project {
                 return Err(ParseError::new(line, format!("marker '{}' is past the end of the song", m.name)));
             }
         }
+        for (entry, line) in clip_lines {
+            if usize::from(entry) >= p.song.len() {
+                return Err(ParseError {
+                    line,
+                    message: format!("a clip on song entry {entry}, past the end of the song"),
+                });
+            }
+        }
         for (entry, line) in tempo_lines {
             if usize::from(entry) >= p.song.len() {
                 return Err(ParseError { line, message: format!("tempo point {entry} is past the end of the song") });
@@ -2149,11 +2249,16 @@ impl Project {
         unicode_path(path).map_err(std::io::Error::other)?;
         // Each sample path as it would be written, which a load must take.
         let dir = project_dir(path);
-        for p in self.tracks.iter().flat_map(TrackData::sample_paths) {
+        for (p, what) in self
+            .tracks
+            .iter()
+            .flat_map(|t| t.sample_paths().map(|p| (p, "sample")).chain(t.clip_paths().map(|p| (p, "clip"))))
+        {
             let written = crate::sample::relativize(p, dir.as_deref());
             if let Some(why) = crate::sample::unwritable(&written) {
                 let shown = crate::tui::printable_line(&written);
-                return Err(std::io::Error::other(format!("the sample path {shown} would not load back: {why}")));
+                let why = why.replace("sample", what);
+                return Err(std::io::Error::other(format!("the {what} path {shown} would not load back: {why}")));
             }
         }
         // The states' lines alone may be over: then nothing is built, as
@@ -2207,6 +2312,40 @@ impl Project {
         (bank, errors)
     }
 
+    /// Loads every file the clips play, each once, holding at most what
+    /// the project's budget leaves after the samples in `samples`. Returns
+    /// those that loaded, by path, and why the others did not.
+    pub fn load_clips(&self, samples: &Bank) -> (ClipBank, Vec<String>) {
+        // Their frames, as the editor counts them when it loads either.
+        let used: usize = samples.values().map(|s| s.frames()).sum();
+        self.load_clips_within(crate::sample::PROJECT_FRAMES.saturating_sub(used))
+    }
+
+    /// [`Project::load_clips`], holding at most `budget` values together.
+    pub fn load_clips_within(&self, budget: usize) -> (ClipBank, Vec<String>) {
+        let (mut bank, mut errors, mut tried) = (ClipBank::new(), Vec::new(), std::collections::HashSet::new());
+        let mut left = budget;
+        for path in self.tracks.iter().flat_map(TrackData::clip_paths) {
+            if !tried.insert(path) {
+                continue;
+            }
+            match crate::clip::load_within(Path::new(path), left) {
+                Ok(a) => {
+                    left -= a.cost();
+                    bank.insert(path.to_string(), Arc::new(a));
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        (bank, errors)
+    }
+
+    /// The engine's list of each track's clips, with what `bank` holds of
+    /// their files ([`TrackData::clip_list`]).
+    pub fn clip_lists(&self, bank: &ClipBank) -> Vec<Option<Box<ClipList>>> {
+        self.tracks.iter().map(|t| t.clip_list(bank)).collect()
+    }
+
     /// What each track plays of the samples in `bank`
     /// ([`TrackData::sample_map`]).
     pub fn sample_maps(&self, bank: &Bank) -> Vec<Option<Arc<SampleMap>>> {
@@ -2227,6 +2366,9 @@ impl Project {
             }
             if !t.zones.is_empty() {
                 t.zones = t.zones.iter().map(|z| ZoneData { path: resolve(&z.path), ..z.clone() }).collect();
+            }
+            if !t.clips.is_empty() {
+                t.clips = t.clips.iter().map(|c| ClipData { path: resolve(&c.path), ..c.clone() }).collect();
             }
         }
         Ok(p)
@@ -2606,6 +2748,43 @@ fn chord_text(st: &Step) -> String {
 /// The words of `rest`, at most `max + 1` of them: enough to tell a line
 /// with too many from one with `max`, without collecting every word of a
 /// huge line.
+/// Reads a clip line: `<entry> <pulse> <start> <len> <gain_db> <fade_in>
+/// <fade_out> <path>`, the path to the end of the line.
+fn parse_clip(rest: &str) -> Result<ClipData, String> {
+    const FORM: &str = "expected 'clip <entry> <pulse> <start> <frames> <gain_db> <fade_in> <fade_out> <path>'";
+    let mut left = rest;
+    let mut f = [""; 7];
+    for slot in &mut f {
+        let (word, after) = left.split_once(char::is_whitespace).ok_or(FORM)?;
+        *slot = word;
+        left = after.trim_start();
+    }
+    if left.is_empty() {
+        return Err(FORM.into());
+    }
+    if left.len() > crate::sample::MAX_PATH_BYTES {
+        return Err(format!("a clip path is at most {} bytes long", crate::sample::MAX_PATH_BYTES));
+    }
+    let entry: u16 = parse_num(f[0])?;
+    if usize::from(entry) >= MAX_SONG {
+        return Err(format!("a song has at most {MAX_SONG} entries"));
+    }
+    let c = ClipData {
+        path: left.to_string(),
+        entry,
+        pulse: parse_num(f[1])?,
+        start: parse_num(f[2])?,
+        len: parse_num(f[3])?,
+        gain_db: parse_finite(f[4])?,
+        fade_in: parse_num(f[5])?,
+        fade_out: parse_num(f[6])?,
+    };
+    match c.problem() {
+        Some(why) => Err(why),
+        None => Ok(c),
+    }
+}
+
 fn fields(rest: &str, max: usize) -> Vec<&str> {
     rest.split_whitespace().take(max + 1).collect()
 }
@@ -4512,6 +4691,103 @@ pattern_division A 1/8
             let e = Project::from_text(&old.replace("tinvo 19", "tinvo 13")).unwrap_err();
             assert!(e.message.contains("before format 20"), "{line}: {e:?}");
         }
+    }
+
+    #[test]
+    fn clips_round_trip_in_format_21_with_their_paths_relative_to_the_project() {
+        let dir = std::env::temp_dir().join(format!("tinvo-clips-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = dir.join("takes").join("vocal 1.wav").to_string_lossy().into_owned();
+        let outside = crate::sample::absolute("elsewhere/pad.wav").to_string_lossy().into_owned();
+        let mut p = Project::new();
+        p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        p.apply(Edit::InsertSongEntry { index: 1, pattern: 1 }).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Audio)).unwrap();
+        let late = ClipData {
+            start: 480,
+            gain_db: -3.5,
+            fade_in: 64,
+            fade_out: 2000,
+            ..ClipData::new(outside.clone(), 1, 95, 96_000)
+        };
+        let t = p.tracks.len() - 1;
+        p.tracks[t].clips = vec![ClipData::new(inside.clone(), 0, 0, 1 << 20), late.clone()].into();
+        let file = dir.join("song.tvo");
+        p.save(&file).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("tinvo 21\n"), "{text}");
+        assert!(text.contains("\nclip 0 0 0 1048576 0 0 0 takes/vocal 1.wav\n"), "{text}");
+        assert!(text.contains(&format!("\nclip 1 95 480 96000 -3.5 64 2000 {outside}\n")), "{text}");
+        let back = Project::load(&file).unwrap();
+        assert_eq!(std::path::Path::new(&back.tracks[t].clips[0].path), std::path::Path::new(&inside));
+        assert_eq!(back.tracks[t].clips[1], late);
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_holds_only_clips_an_audio_track_can_play() {
+        let audio = |body: &str| format!("tinvo 21\nsong A B\n\ntrack audio\n{body}end\n");
+        Project::from_text(&audio("clip 0 0 0 10 0 0 0 a.wav\nclip 1 767 5 1 6 1 1 b c.wav\n")).unwrap();
+        for (text, why) in [
+            ("tinvo 20\nsong A\n\ntrack audio\nend\n".to_string(), "an audio track before format 21"),
+            ("tinvo 20\nsong A\n\ntrack sampler\nclip 0 0 0 10 0 0 0 a.wav\nend\n".into(), "a clip before format 21"),
+            ("tinvo 21\nsong A\n\ntrack synth\nclip 0 0 0 10 0 0 0 a.wav\nend\n".into(), "a clip on a synth"),
+            (audio("clip 2 0 0 10 0 0 0 a.wav\n"), "a clip past the song"),
+            (audio("clip 1 0 0 10 0 0 0 a.wav\nclip 0 5 0 10 0 0 0 b.wav\n"), "clips out of order"),
+            (audio("clip 0 5 0 10 0 0 0 a.wav\nclip 0 5 0 10 0 0 0 b.wav\n"), "two clips in one place"),
+            (audio("clip 0 768 0 10 0 0 0 a.wav\n"), "a pulse past the longest entry"),
+            (audio("clip 0 0 0 0 0 0 0 a.wav\n"), "an empty clip"),
+            (audio("clip 0 0 0 10 0 11 0 a.wav\n"), "a fade longer than the clip"),
+            (audio("clip 0 0 0 10 NaN 0 0 a.wav\n"), "a gain that is no number"),
+            (audio("clip 0 0 0 10 0 0 0\n"), "no path"),
+            (audio("step 0 60 100 1\n"), "a step on an audio track"),
+            (audio("midi_out true\n"), "MIDI out on an audio track"),
+            (audio("parts A B\n"), "parts on an audio track"),
+        ] {
+            assert!(Project::from_text(&text).is_err(), "{why} loads:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_clip_path_loads_as_a_sample_path_does() {
+        // A folder whose name starts with a space, as an absolute path a
+        // save writes for a file outside the project's folder.
+        let text = "tinvo 21\nsong A\n\ntrack audio\nclip 0 0 0 10 0 0 0 / Session/take one.wav\nend\n";
+        let p = Project::from_text(text).unwrap();
+        assert_eq!(p.tracks[0].clips[0].path, "/ Session/take one.wav");
+        assert!(p.to_text().contains("\nclip 0 0 0 10 0 0 0 / Session/take one.wav\n"));
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
+    }
+
+    #[test]
+    fn an_audio_track_takes_no_notes_and_its_clips_follow_the_song_s_entries() {
+        let mut p = Project::new();
+        for i in 0..3 {
+            p.apply(Edit::InsertSongEntry { index: i, pattern: 0 }).unwrap();
+        }
+        p.apply(Edit::AddTrack(InstrumentKind::Audio)).unwrap();
+        let t = p.tracks.len() - 1;
+        let tr = t as u8;
+        assert_eq!(
+            p.apply(Edit::SetStep { track: tr, pattern: 0, step: 0, value: Some(Step::new(60, 100, 1)) }),
+            Err(EditError::AudioTrack(tr))
+        );
+        assert_eq!(p.apply(Edit::SetMidiOut { track: tr, on: true }), Err(EditError::AudioTrack(tr)));
+        assert_eq!(p.apply(Edit::SetPart { track: tr, index: 0, part: Part::Rest }), Err(EditError::AudioTrack(tr)));
+        // Undo refuses them likewise, rather than give an inverse of an edit
+        // that does not apply.
+        let note = Edit::SetStep { track: tr, pattern: 2, step: 34, value: Some(Step::new(0, 0, 0)) };
+        assert_eq!(p.inverse(&note), Err(EditError::AudioTrack(tr)));
+        assert_eq!(p.inverse(&Edit::SetChannel { track: tr, channel: Some(1) }), Err(EditError::AudioTrack(tr)));
+        p.apply(Edit::SetStep { track: tr, pattern: 0, step: 0, value: None }).unwrap();
+        p.tracks[t].clips = (0..3).map(|e| ClipData::new(format!("{e}.wav"), e, 0, 10)).collect::<Vec<_>>().into();
+        p.apply(Edit::InsertSongEntry { index: 1, pattern: 0 }).unwrap();
+        let at = |p: &Project| p.tracks[t].clips.iter().map(|c| (c.path.clone(), c.entry)).collect::<Vec<_>>();
+        assert_eq!(at(&p), [("0.wav".into(), 0), ("1.wav".into(), 2), ("2.wav".into(), 3)]);
+        p.apply(Edit::RemoveSongEntry(2)).unwrap();
+        assert_eq!(at(&p), [("0.wav".into(), 0), ("2.wav".into(), 2)]);
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
     }
 
     #[test]

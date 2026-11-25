@@ -15,6 +15,7 @@
 //!   engine     real-time audio graph: transport, tracks, mixer
 //!   instrument synthesizers, sampler and drum voices
 //!   sample     loaded audio samples and their interpolation
+//!   clip       audio clips on audio tracks: their audio and their player
 //!   sfz, slice SFZ instruments and sliced samples, as sampler zones
 //!   dsp        allocation-free signal-processing primitives
 //!   rt         lock-free primitives for crossing the real-time boundary
@@ -30,6 +31,7 @@ pub mod autosave;
 pub mod base64;
 pub mod bench;
 pub mod clap;
+pub mod clip;
 pub mod dsp;
 pub mod engine;
 pub mod fsutil;

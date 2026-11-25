@@ -242,6 +242,12 @@ impl Transport {
         self.playing
     }
 
+    /// The position the frames are counted from, in 16th notes: every
+    /// position before it has passed.
+    pub fn origin(&self) -> f64 {
+        self.origin
+    }
+
     /// Starts from pulse 0 at `now`.
     pub fn start(&mut self, now: u64) {
         self.playing = true;

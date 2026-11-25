@@ -15,6 +15,7 @@
 //!   compiler, not on the machine's load, so the budgets on it, in
 //!   `bench/instructions.txt`, catch a regression of a few percent.
 
+use crate::clip::{ClipAudio, ClipData, ClipList};
 use crate::engine::{ChainId, Command, Edit, Engine, LaneTarget, MAX_LANES, MAX_PATTERNS, MAX_TRACKS, Shared, Step};
 use crate::group::MAX_GROUPS;
 use crate::insert::{EffectKind, MAX_INSERTS, MAX_SLOTS};
@@ -47,11 +48,12 @@ pub struct Scenario {
 struct Setup {
     project: Project,
     samples: Vec<Option<Arc<SampleMap>>>,
+    clips: Vec<Option<Box<ClipList>>>,
     play: Command,
 }
 
 /// Every scenario, cheapest first.
-pub const SCENARIOS: [Scenario; 10] = [
+pub const SCENARIOS: [Scenario; 11] = [
     Scenario { id: "demo", label: "Demo song", budget: 0.15, build: demo },
     Scenario { id: "strip", label: "Demo song, every strip stage on, mid band swept", budget: 0.25, build: strip },
     Scenario {
@@ -92,6 +94,12 @@ pub const SCENARIOS: [Scenario; 10] = [
         budget: 0.15,
         build: zones,
     },
+    Scenario {
+        id: "audio",
+        label: "16 audio tracks, each playing stereo clips at 44.1 kHz resampled through sinc, cut and faded",
+        budget: 0.15,
+        build: audio,
+    },
 ];
 
 pub fn find(id: &str) -> Option<Scenario> {
@@ -110,6 +118,9 @@ impl Scenario {
         let mut engine = Engine::with_edits(SAMPLE_RATE as f32, &edits, Arc::new(Shared::new()), None);
         for (track, sample) in setup.samples.into_iter().enumerate() {
             engine.set_samples(track, sample);
+        }
+        for (track, list) in setup.clips.into_iter().enumerate() {
+            engine.set_clips(track, list);
         }
         engine.handle(setup.play);
         engine
@@ -183,7 +194,7 @@ fn ok(r: Result<Edit, crate::project::EditError>) {
 }
 
 fn demo() -> Setup {
-    Setup { project: Project::demo(), samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+    Setup { project: Project::demo(), samples: Vec::new(), clips: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
 /// The demo with every stage of every track's channel strip on, and the mid
@@ -214,7 +225,7 @@ fn strip() -> Setup {
             }
         }
     }
-    Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
 /// The demo's tracks repeated to as many as a project has groups, each
@@ -243,7 +254,7 @@ fn groups() -> Setup {
     for track in 0..p.tracks.len() {
         ok(p.apply(Edit::SetTrackGroup { track: track as u8, group: Some(track as u8) }));
     }
-    Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
 /// The groups scenario with [`MAX_INSERTS`] effects, the kinds in turn:
@@ -297,7 +308,7 @@ fn tracks32() -> Setup {
     let mut p = Project::demo();
     let demo = p.tracks.clone();
     p.tracks.extend(demo.iter().cycle().take(MAX_TRACKS - demo.len()).cloned());
-    Setup { project: p, samples: Vec::new(), play: Command::PlaySong { entry: 0 } }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::PlaySong { entry: 0 } }
 }
 
 /// Sets instrument parameters of track 0 by id.
@@ -327,7 +338,7 @@ fn synth() -> Setup {
         &[("osc1_wave", 1.0), ("unison", 3.0), ("noise", 0.2), ("lfo_pitch", 0.3), ("lfo_pw", 0.3)],
     );
     chords(&mut p, 48, 2);
-    Setup { project: p, samples: Vec::new(), play: Command::Play }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::Play }
 }
 
 /// The synth with both oscillators on a built-in table: the position moves
@@ -350,7 +361,7 @@ fn wavetable() -> Setup {
         ],
     );
     chords(&mut p, 48, 2);
-    Setup { project: p, samples: Vec::new(), play: Command::Play }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::Play }
 }
 
 /// One FM track with every voice busy: four operators in a chain, each
@@ -365,7 +376,7 @@ fn fm() -> Setup {
         &[("feedback", 0.6), ("op2_level", 0.3), ("op3_level", 0.3), ("op4_level", 0.3), ("op1_sustain", 1.0)],
     );
     chords(&mut p, 48, 2);
-    Setup { project: p, samples: Vec::new(), play: Command::Play }
+    Setup { project: p, samples: Vec::new(), clips: Vec::new(), play: Command::Play }
 }
 
 /// One sampler track with every voice busy, playing a 44.1 kHz sample at
@@ -384,7 +395,12 @@ fn sampler() -> Setup {
         })
         .collect();
     let sample = Sample::from_mono(&audio, rate as u32).expect("a valid sample");
-    Setup { project: p, samples: vec![Some(Arc::new(SampleMap::single(Arc::new(sample))))], play: Command::Play }
+    Setup {
+        project: p,
+        samples: vec![Some(Arc::new(SampleMap::single(Arc::new(sample))))],
+        clips: Vec::new(),
+        play: Command::Play,
+    }
 }
 
 /// One sampler track whose every key played answers as many zones as a
@@ -414,7 +430,37 @@ fn zones() -> Setup {
         };
         (place, Arc::clone(&sample))
     });
-    Setup { project: p, samples: vec![Some(Arc::new(SampleMap::new(zones)))], play: Command::Play }
+    Setup { project: p, samples: vec![Some(Arc::new(SampleMap::new(zones)))], clips: Vec::new(), play: Command::Play }
+}
+
+/// Sixteen audio tracks in a song of one entry, each playing a stereo clip
+/// of a 44.1 kHz file (so every frame interpolates) with fades, one after
+/// another starting part way through the entry and cutting off the one
+/// before.
+fn audio() -> Setup {
+    let mut p = Project::new();
+    ok(p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }));
+    let rate = 44_100;
+    let side = |f: f32| -> Vec<f32> {
+        (0..rate * 3).map(|i| ((i as f32 / rate as f32 * f).fract() * 2.0 - 1.0) * 0.3).collect()
+    };
+    let audio = Arc::new(ClipAudio::new(vec![side(110.0), side(165.0)], rate as u32).expect("valid audio"));
+    let mut clips = Vec::new();
+    for t in 0..16u16 {
+        ok(p.apply(Edit::AddTrack(InstrumentKind::Audio)));
+        let at = [(0, 0), (1 + t, 1000), (48 + t, 7000)];
+        let track: Vec<ClipData> = at
+            .iter()
+            .map(|&(pulse, start)| ClipData {
+                start,
+                fade_in: 500,
+                fade_out: 2000,
+                ..ClipData::new("bench.wav".into(), 0, pulse, 100_000)
+            })
+            .collect();
+        clips.push(Some(ClipList::build(&track, |_| Some(Arc::clone(&audio)))));
+    }
+    Setup { project: p, samples: Vec::new(), clips, play: Command::PlaySong { entry: 0 } }
 }
 
 /// Instruction budgets: `id instructions-per-second` lines, `#` comments.

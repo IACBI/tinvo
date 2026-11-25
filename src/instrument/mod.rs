@@ -14,6 +14,7 @@ pub mod zone;
 use crate::clap::PluginRef;
 use crate::clap::host::{Instance, NoteId, Role};
 use crate::clap::slot::PluginSlot;
+use crate::clip::Player;
 pub use drums::Drum;
 pub use fm::{FM_VOICES, FmSynth};
 pub use sampler::{HELD_NOTES, SAMPLER_VOICES, Sampler};
@@ -57,13 +58,15 @@ pub enum InstrumentKind {
     Clap,
     /// The four-operator FM synth.
     Fm,
+    /// An audio track: it plays clips placed on the song, not notes.
+    Audio,
     /// A CLAP plugin, by its id. Not in [`InstrumentKind::ALL`], which is
     /// the built-in kinds.
     Plugin(PluginRef),
 }
 
 impl InstrumentKind {
-    pub const ALL: [InstrumentKind; 8] = [
+    pub const ALL: [InstrumentKind; 9] = [
         InstrumentKind::Synth,
         InstrumentKind::Kick,
         InstrumentKind::Snare,
@@ -72,6 +75,7 @@ impl InstrumentKind {
         InstrumentKind::Clap,
         InstrumentKind::Sampler,
         InstrumentKind::Fm,
+        InstrumentKind::Audio,
     ];
 
     /// Stable identifier used in project files; `plugin` for every plugin,
@@ -87,6 +91,7 @@ impl InstrumentKind {
             InstrumentKind::HatOpen => "openhat",
             InstrumentKind::Clap => "clap",
             InstrumentKind::Fm => "fm",
+            InstrumentKind::Audio => "audio",
         }
     }
 
@@ -97,6 +102,7 @@ impl InstrumentKind {
     /// The project format that introduced it.
     pub fn since(self) -> u32 {
         match self {
+            InstrumentKind::Audio => 21,
             InstrumentKind::Fm => 20,
             InstrumentKind::Plugin(_) => 16,
             InstrumentKind::Sampler => 4,
@@ -115,6 +121,7 @@ impl InstrumentKind {
             InstrumentKind::HatOpen => "Open hat",
             InstrumentKind::Clap => "Clap",
             InstrumentKind::Fm => "FM",
+            InstrumentKind::Audio => "Audio",
             InstrumentKind::Plugin(_) => "Plugin",
         }
     }
@@ -123,7 +130,7 @@ impl InstrumentKind {
     /// parameters are not among them.
     pub fn params(self) -> &'static [ParamSpec] {
         match self {
-            InstrumentKind::Plugin(_) => &[],
+            InstrumentKind::Plugin(_) | InstrumentKind::Audio => &[],
             InstrumentKind::Synth => &synth::PARAMS,
             InstrumentKind::Sampler => &sampler::PARAMS,
             InstrumentKind::Fm => &fm::PARAMS,
@@ -140,10 +147,20 @@ impl InstrumentKind {
     }
 
     pub fn is_drum(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            InstrumentKind::Synth | InstrumentKind::Sampler | InstrumentKind::Fm | InstrumentKind::Plugin(_)
+            InstrumentKind::Kick
+                | InstrumentKind::Snare
+                | InstrumentKind::HatClosed
+                | InstrumentKind::HatOpen
+                | InstrumentKind::Clap
         )
+    }
+
+    /// Whether it plays notes: steps, live notes and MIDI. An audio track
+    /// plays its clips instead.
+    pub fn plays_notes(self) -> bool {
+        self != InstrumentKind::Audio
     }
 
     /// The plugin it is, for a plugin.
@@ -342,6 +359,8 @@ pub enum Instrument {
     Drum(Drum),
     /// Silent until an instance is attached ([`Instrument::attach`]).
     Plugin(PluginSlot),
+    /// An audio track's clips.
+    Audio(Player),
 }
 
 impl Instrument {
@@ -353,6 +372,7 @@ impl Instrument {
             InstrumentKind::Synth => Instrument::Synth(PolySynth::new(sample_rate)),
             InstrumentKind::Fm => Instrument::Fm(FmSynth::new(sample_rate)),
             InstrumentKind::Sampler => Instrument::Sampler(Sampler::new(sample_rate)),
+            InstrumentKind::Audio => Instrument::Audio(Player::new(sample_rate)),
             k => Instrument::Drum(Drum::new(k, sample_rate)),
         }
     }
@@ -364,6 +384,7 @@ impl Instrument {
             Instrument::Sampler(_) => InstrumentKind::Sampler,
             Instrument::Drum(d) => d.kind(),
             Instrument::Plugin(p) => InstrumentKind::Plugin(p.plugin()),
+            Instrument::Audio(_) => InstrumentKind::Audio,
         }
     }
 
@@ -374,7 +395,7 @@ impl Instrument {
             Instrument::Fm(s) => s.set_param(index, value),
             Instrument::Sampler(s) => s.set_param(index, value),
             Instrument::Drum(d) => d.set_param(index, value),
-            Instrument::Plugin(_) => {}
+            Instrument::Plugin(_) | Instrument::Audio(_) => {}
         }
     }
 
@@ -384,7 +405,7 @@ impl Instrument {
             Instrument::Fm(s) => s.param(index),
             Instrument::Sampler(s) => s.param(index),
             Instrument::Drum(d) => d.param(index),
-            Instrument::Plugin(_) => None,
+            Instrument::Plugin(_) | Instrument::Audio(_) => None,
         }
     }
 
@@ -402,6 +423,7 @@ impl Instrument {
                 .instance()
                 .and_then(|i| i.note_on(note, f32::from(velocity.min(127)) / 127.0))
                 .map_or(VoiceId::NONE, |n| VoiceId(n.get() as u32 + 1)),
+            Instrument::Audio(_) => VoiceId::NONE,
         }
     }
 
@@ -410,7 +432,7 @@ impl Instrument {
             Instrument::Synth(s) => s.note_off(id),
             Instrument::Fm(s) => s.note_off(id),
             Instrument::Sampler(s) => s.note_off(id),
-            Instrument::Drum(_) => {}
+            Instrument::Drum(_) | Instrument::Audio(_) => {}
             Instrument::Plugin(p) => {
                 let note = id.0.checked_sub(1).and_then(|n| i32::try_from(n).ok()).and_then(NoteId::from_id);
                 if let (Some(i), Some(n)) = (p.instance(), note) {
@@ -442,7 +464,7 @@ impl Instrument {
             Instrument::Synth(s) => s.set_bend(amount),
             Instrument::Fm(s) => s.set_bend(amount),
             Instrument::Sampler(s) => s.set_bend(amount),
-            Instrument::Drum(_) | Instrument::Plugin(_) => {}
+            Instrument::Drum(_) | Instrument::Plugin(_) | Instrument::Audio(_) => {}
         }
     }
 
@@ -458,7 +480,7 @@ impl Instrument {
         match self {
             Instrument::Synth(s) => s.start(),
             Instrument::Sampler(s) => s.start(),
-            Instrument::Fm(_) | Instrument::Drum(_) | Instrument::Plugin(_) => {}
+            Instrument::Fm(_) | Instrument::Drum(_) | Instrument::Plugin(_) | Instrument::Audio(_) => {}
         }
     }
 
@@ -468,7 +490,7 @@ impl Instrument {
             Instrument::Synth(s) => s.release_all(),
             Instrument::Fm(s) => s.release_all(),
             Instrument::Sampler(s) => s.release_all(),
-            Instrument::Drum(_) => {}
+            Instrument::Drum(_) | Instrument::Audio(_) => {}
             Instrument::Plugin(p) => {
                 if let Some(i) = p.instance() {
                     i.release_all();
@@ -478,7 +500,8 @@ impl Instrument {
     }
 
     /// Silences every voice at once, released ones too (a plugin is sent a
-    /// choke of every note, or All Sound Off).
+    /// choke of every note, or All Sound Off). An audio track's clips play
+    /// on: they are not notes ([`Player::silence`] stops them).
     pub fn stop_all(&mut self) {
         match self {
             Instrument::Synth(s) => s.stop_all(),
@@ -490,6 +513,7 @@ impl Instrument {
                     i.choke_all();
                 }
             }
+            Instrument::Audio(_) => {}
         }
     }
 
@@ -521,7 +545,7 @@ impl Instrument {
     /// Whether it plays in stereo ([`Instrument::render_stereo`]) rather
     /// than mono ([`Instrument::render`]).
     pub fn is_stereo(&self) -> bool {
-        matches!(self, Instrument::Plugin(_))
+        matches!(self, Instrument::Plugin(_) | Instrument::Audio(_))
     }
 
     /// Adds the instrument's mono output into `out`. A stereo instrument
@@ -532,7 +556,7 @@ impl Instrument {
             Instrument::Fm(s) => s.render(out),
             Instrument::Sampler(s) => s.render(out),
             Instrument::Drum(d) => d.render(out),
-            Instrument::Plugin(_) => {}
+            Instrument::Plugin(_) | Instrument::Audio(_) => {}
         }
     }
 
@@ -540,10 +564,14 @@ impl Instrument {
     /// one, or a plugin with no instance or one that failed, leaves silence.
     pub fn render_stereo(&mut self, out: &mut [f32]) {
         out.fill(0.0);
-        if let Instrument::Plugin(p) = self {
-            if let Some(i) = p.instance() {
-                i.process(out);
+        match self {
+            Instrument::Plugin(p) => {
+                if let Some(i) = p.instance() {
+                    i.process(out);
+                }
             }
+            Instrument::Audio(p) => p.render(out),
+            _ => {}
         }
     }
 
@@ -566,6 +594,22 @@ impl Instrument {
         match self {
             Instrument::Plugin(p) => p.latency(),
             _ => 0,
+        }
+    }
+
+    /// An audio track's player.
+    pub fn player(&mut self) -> Option<&mut Player> {
+        match self {
+            Instrument::Audio(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// [`Instrument::player`], to look at.
+    pub fn player_ref(&self) -> Option<&Player> {
+        match self {
+            Instrument::Audio(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -604,7 +648,9 @@ mod tests {
 
     #[test]
     fn param_specs_are_consistent() {
-        for k in InstrumentKind::ALL {
+        // An audio track has no instrument parameters.
+        assert!(InstrumentKind::Audio.params().is_empty());
+        for k in InstrumentKind::ALL.into_iter().filter(|k| k.plays_notes()) {
             let specs = k.params();
             assert!(!specs.is_empty());
             for (i, s) in specs.iter().enumerate() {
@@ -716,7 +762,7 @@ mod tests {
 
     #[test]
     fn instruments_make_sound_at_defaults() {
-        for k in InstrumentKind::ALL {
+        for k in InstrumentKind::ALL.into_iter().filter(|k| k.plays_notes()) {
             let mut inst = Instrument::new(k, SR);
             // A sampler is silent until it has a sample.
             let tone: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.05).sin()).collect();

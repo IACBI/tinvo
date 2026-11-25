@@ -10,6 +10,7 @@ use crate::autosave::{self, Autosave};
 use crate::clap::PluginRef;
 use crate::clap::ffi::{CLAP_PARAM_CLEAR_ALL, CLAP_PARAM_CLEAR_AUTOMATIONS};
 use crate::clap::host::{Instance, ParamInfo, PluginHandle, Request, Role as PluginRole};
+use crate::clip::{ClipBank, ClipData, ClipList};
 use crate::dsp::gain_to_db;
 use crate::dsp::loudness::ExportMeter;
 use crate::dsp::wavetable::{self, Wavetable};
@@ -206,7 +207,7 @@ impl EngineLink {
                     Retired::Insert(mut i) => {
                         self.gone.extend(i.plugin_slot().and_then(|s| s.instance()).map(|i| i.token()))
                     }
-                    Retired::Samples(_) => {}
+                    Retired::Samples(_) | Retired::Clips(_) => {}
                 }
             }
         }
@@ -236,6 +237,7 @@ impl EngineLink {
         let carries = match &cmd {
             _ if self.retired.is_none() => 0,
             Command::SetSamples { map: Some(_), .. }
+            | Command::SetClips { clips: Some(_), .. }
             | Command::SetPlugin { .. }
             | Command::SetSlotPlugin { .. }
             | Command::Return(_) => 1,
@@ -295,12 +297,18 @@ struct TrackMeta {
     name: String,
     sample: Option<String>,
     zones: Arc<[ZoneData]>,
+    clips: Arc<[ClipData]>,
 }
 
 impl TrackMeta {
     /// The sample files it plays, as [`TrackData::sample_paths`].
     fn sample_paths(&self) -> impl Iterator<Item = &str> {
         self.sample.as_deref().into_iter().chain(self.zones.iter().map(|z| z.path.as_str()))
+    }
+
+    /// The files its clips play, as [`TrackData::clip_paths`].
+    fn clip_paths(&self) -> impl Iterator<Item = &str> {
+        self.clips.iter().map(|c| c.path.as_str())
     }
 }
 
@@ -905,6 +913,8 @@ pub struct App {
     /// Every sample loaded this session, by absolute path. Undo can bring a
     /// sample back without reading the disk again.
     bank: HashMap<String, Arc<Sample>>,
+    /// The clips' audio, by path; it shares the samples' budget.
+    clip_bank: ClipBank,
     undo: VecDeque<Change>,
     redo: Vec<Change>,
     /// The bytes of plugin states the history keeps beyond the project's:
@@ -1165,6 +1175,7 @@ impl App {
             brushes,
             clipboard: None,
             bank: HashMap::new(),
+            clip_bank: ClipBank::new(),
             undo: VecDeque::new(),
             redo: Vec::new(),
             state_budget: HISTORY_STATE_BYTES,
@@ -1845,14 +1856,17 @@ impl App {
     /// the present first, undo and redo alike; an undo or redo reads the
     /// rest again from disk.
     fn prune_bank_within(&mut self, budget: usize) {
-        let Self { bank, project, undo, redo, .. } = self;
-        if bank.is_empty() {
+        let Self { bank, clip_bank, project, undo, redo, .. } = self;
+        if bank.is_empty() && clip_bank.is_empty() {
             return;
         }
         let mut keep: std::collections::HashSet<&str> =
             project.tracks.iter().flat_map(TrackData::sample_paths).collect();
-        // Steps share a track's zones until they change: each list is read once.
-        let mut lists = std::collections::HashSet::new();
+        let mut keep_clips: std::collections::HashSet<&str> =
+            project.tracks.iter().flat_map(TrackData::clip_paths).collect();
+        // Steps share a track's zones and clips until they change: each
+        // list is read once.
+        let (mut lists, mut clip_lists) = (std::collections::HashSet::new(), std::collections::HashSet::new());
         let mut spent = 0;
         // Nearest first, undo and redo alike.
         let (u, r) = (undo.len(), redo.len());
@@ -1870,8 +1884,28 @@ impl App {
                     }
                 }
             }
+            if clip_lists.insert(Arc::as_ptr(&m.clips).cast::<ClipData>()) {
+                for path in m.clip_paths() {
+                    if let (false, Some(a)) = (keep_clips.contains(path), clip_bank.get(path)) {
+                        if spent + a.cost() <= budget {
+                            spent += a.cost();
+                            keep_clips.insert(path);
+                        }
+                    }
+                }
+            }
         }
         bank.retain(|path, _| keep.contains(path.as_str()));
+        clip_bank.retain(|path, _| keep_clips.contains(path.as_str()));
+    }
+
+    /// What the clips the tracks play cost of the budget the samples share
+    /// ([`ClipAudio::cost`]), each file once.
+    fn clips_used(&self) -> usize {
+        let mut paths: Vec<&str> = self.project.tracks.iter().flat_map(TrackData::clip_paths).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths.iter().filter_map(|p| self.clip_bank.get(*p)).map(|a| a.cost()).sum()
     }
 
     /// Reads again the files the tracks play that are not loaded (let go to
@@ -1884,6 +1918,12 @@ impl App {
         paths.dedup();
         let (loaded, wanted): (Vec<&str>, Vec<&str>) = paths.into_iter().partition(|p| self.bank.contains_key(*p));
         let mut used: usize = loaded.iter().filter_map(|p| self.bank.get(*p)).map(|s| s.frames()).sum();
+        let mut clips: Vec<&str> = self.project.tracks.iter().flat_map(TrackData::clip_paths).collect();
+        clips.sort_unstable();
+        clips.dedup();
+        let (clips_loaded, clips_wanted): (Vec<&str>, Vec<&str>) =
+            clips.into_iter().partition(|p| self.clip_bank.contains_key(*p));
+        used += clips_loaded.iter().filter_map(|p| self.clip_bank.get(*p)).map(|a| a.cost()).sum::<usize>();
         let (mut got, mut failed) = (Vec::new(), Vec::new());
         for p in wanted {
             let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
@@ -1895,15 +1935,29 @@ impl App {
                 Err(e) => failed.push((p.to_string(), e)),
             }
         }
-        if got.is_empty() {
-            return failed;
+        let mut got_clips = Vec::new();
+        for p in clips_wanted {
+            match crate::clip::load_within(Path::new(p), sample_mod::PROJECT_FRAMES.saturating_sub(used)) {
+                Ok(a) => {
+                    used += a.cost();
+                    got_clips.push((p.to_string(), Arc::new(a)));
+                }
+                Err(e) => failed.push((p.to_string(), e)),
+            }
         }
         let tracks: Vec<usize> = (0..self.track_count())
             .filter(|&i| self.project.tracks[i].sample_paths().any(|p| got.iter().any(|(k, _)| k == p)))
             .collect();
+        let clip_tracks: Vec<usize> = (0..self.track_count())
+            .filter(|&i| self.project.tracks[i].clip_paths().any(|p| got_clips.iter().any(|(k, _)| k == p)))
+            .collect();
         self.bank.extend(got);
+        self.clip_bank.extend(got_clips);
         for i in tracks {
             self.send_sample(i);
+        }
+        for i in clip_tracks {
+            self.send_clips(i);
         }
         failed
     }
@@ -1994,7 +2048,12 @@ impl App {
                 .project
                 .tracks
                 .iter()
-                .map(|t| TrackMeta { name: t.name.clone(), sample: t.sample.clone(), zones: Arc::clone(&t.zones) })
+                .map(|t| TrackMeta {
+                    name: t.name.clone(),
+                    sample: t.sample.clone(),
+                    zones: Arc::clone(&t.zones),
+                    clips: Arc::clone(&t.clips),
+                })
                 .collect(),
             groups: self.project.groups.iter().map(|g| g.name.clone()).collect(),
             markers: self.project.markers.clone(),
@@ -2118,7 +2177,33 @@ impl App {
                 t.zones = Arc::clone(&m.zones);
                 self.send_sample(i);
             }
+            let t = &mut self.project.tracks[i];
+            if t.clips != m.clips {
+                t.clips = Arc::clone(&m.clips);
+                self.send_clips(i);
+            }
         }
+    }
+
+    /// Sends audio track `i` its clips, with what the bank holds of their
+    /// files.
+    fn send_clips(&mut self, i: usize) {
+        let t = &self.project.tracks[i];
+        if t.kind == InstrumentKind::Audio {
+            let clips = t.clip_list(&self.clip_bank);
+            self.send(Command::SetClips { track: i as u8, clips });
+        }
+    }
+
+    /// Each track's clips as the engine plays them, for a new engine.
+    pub fn track_clips(&self) -> Vec<Option<Box<ClipList>>> {
+        self.project.clip_lists(&self.clip_bank)
+    }
+
+    /// Adds already-loaded clip audio (as from [`Project::load_clips`]).
+    pub fn with_clips(mut self, clips: ClipBank) -> Self {
+        self.clip_bank.extend(clips);
+        self
     }
 
     /// Sends what track `i` plays of the bank's samples to the engine.
@@ -2162,7 +2247,8 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let used: usize =
+            others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() + self.clips_used();
         let left = sample_mod::PROJECT_FRAMES.saturating_sub(used).min(sample_mod::MAX_FRAMES);
         let loaded = Arc::new(sample_mod::load_within(&path, left).map_err(|e| format!("Cannot load {noun}: {e}"))?);
         let secs = loaded.frames() as f64 / f64::from(loaded.sample_rate);
@@ -2228,7 +2314,8 @@ impl App {
             .collect();
         others.sort_unstable();
         others.dedup();
-        let mut used: usize = others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        let mut used: usize =
+            others.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() + self.clips_used();
         let mut failed = std::collections::BTreeMap::<String, String>::new();
         let mut skipped = std::collections::BTreeMap::<&str, usize>::new();
         // First what each file holds, from what is loaded or the file's
@@ -2612,7 +2699,11 @@ impl App {
         let mut keys: Vec<&str> = meta.tracks.iter().flat_map(TrackMeta::sample_paths).collect();
         keys.sort_unstable();
         keys.dedup();
-        keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum::<usize>() <= budget
+        let mut clips: Vec<&str> = meta.tracks.iter().flat_map(TrackMeta::clip_paths).collect();
+        clips.sort_unstable();
+        clips.dedup();
+        let samples: usize = keys.iter().filter_map(|k| self.bank.get(*k)).map(|s| s.frames()).sum();
+        samples + clips.iter().filter_map(|k| self.clip_bank.get(*k)).map(|a| a.cost()).sum::<usize>() <= budget
     }
 
     fn after_history_move(&mut self, c: &Change, verb: &str) {
@@ -6029,6 +6120,13 @@ impl App {
                 None => return self.set_status(format!("Not exported: {}", self.plugins.why_no_catalog())),
             }
         };
+        let missing =
+            self.project.tracks.iter().flat_map(TrackData::clip_paths).find(|p| !self.clip_bank.contains_key(*p));
+        if let Some(p) = missing {
+            return self.set_status(format!(
+                "Not exported: the clip file {p} is missing; put it back and open the project again"
+            ));
+        }
         let started = Instant::now();
         let samples = self.track_samples();
         let mut meter = ExportMeter::new(self.sample_rate);
@@ -6037,21 +6135,22 @@ impl App {
         let (live, mut asked) = (&mut self.plugins, Vec::new());
         let mut served = Instant::now();
         let result = wav::FileWriter::create(path, 2, self.sample_rate, self.export_format).and_then(|mut file| {
-            let frames = render::render_into(&self.project, &samples, &opts, &mut *plugins, &mut |b| {
-                asked.extend(live.poll());
-                // Their timers, descriptors and windows too, as often as a
-                // frame is drawn.
-                if served.elapsed() >= FRAME {
-                    served = Instant::now();
-                    let (fds, round) = live.fds();
-                    let mut wake = Wake { fds, ..Wake::default() };
-                    // One that cannot be checked waits for the next frame.
-                    let _ = term::check_descriptors(&mut wake);
-                    live.serve_main_thread(&wake.ready, round);
-                }
-                meter.push(b);
-                file.write(b)
-            })?;
+            let frames =
+                render::render_into(&self.project, &samples, &self.clip_bank, &opts, &mut *plugins, &mut |b| {
+                    asked.extend(live.poll());
+                    // Their timers, descriptors and windows too, as often as a
+                    // frame is drawn.
+                    if served.elapsed() >= FRAME {
+                        served = Instant::now();
+                        let (fds, round) = live.fds();
+                        let mut wake = Wake { fds, ..Wake::default() };
+                        // One that cannot be checked waits for the next frame.
+                        let _ = term::check_descriptors(&mut wake);
+                        live.serve_main_thread(&wake.ready, round);
+                    }
+                    meter.push(b);
+                    file.write(b)
+                })?;
             let (stats, to) = if replace { (file.finish()?, path.to_path_buf()) } else { file.finish_new()? };
             Ok((frames, stats, to))
         });
@@ -7593,6 +7692,7 @@ fn with_extension(text: &str, ext: &str) -> PathBuf {
 pub fn start_audio(
     project: &Project,
     samples: &[Option<Arc<SampleMap>>],
+    clips: Vec<Option<Box<ClipList>>>,
     config: &StreamConfig,
     live: Option<&Arc<Mailbox<Message>>>,
     midi_out: Option<&OutSlot>,
@@ -7613,7 +7713,7 @@ pub fn start_audio(
     let (take_tx, take_rx) = spsc::channel::<TakeEvent>(TAKE_QUEUE);
     let edits = project.to_edits();
     let samples = samples.to_vec();
-    let held = samples.iter().flatten().count() + project.insert_count();
+    let held = samples.iter().flatten().count() + clips.iter().flatten().count() + project.insert_count();
     let cb_shared = shared.clone();
     let stream = audio::open_with(config, move |sample_rate| {
         let mut engine = Engine::with_edits(sample_rate as f32, &edits, cb_shared.clone(), Some(rx));
@@ -7633,6 +7733,9 @@ pub fn start_audio(
         }
         for (track, sample) in samples.into_iter().enumerate() {
             engine.set_samples(track, sample);
+        }
+        for (track, list) in clips.into_iter().enumerate() {
+            engine.set_clips(track, list);
         }
         EngineCallback { engine, shared: cb_shared, sample_rate: sample_rate as f32, load: 0.0 }
     })?;
@@ -7699,8 +7802,9 @@ impl Output {
         }
         app.audio_config = self.config.clone();
         let samples = app.track_samples();
+        let clips = app.track_clips();
         let (stream, link, sr) =
-            match start_audio(&app.project, &samples, &config, self.live.as_ref(), self.midi_out.as_ref()) {
+            match start_audio(&app.project, &samples, clips, &config, self.live.as_ref(), self.midi_out.as_ref()) {
                 Ok(v) => v,
                 Err(e) => {
                     // The old engine's instances are home: their states are
@@ -8057,12 +8161,15 @@ pub unsafe fn run(
     };
     screen.invalidate();
 
-    let (samples, errors) = project.load_samples();
+    let (samples, mut errors) = project.load_samples();
+    let (clips, clip_errors) = project.load_clips(&samples);
+    errors.extend(clip_errors);
     if let Some(first) = errors.first() {
-        message = format!("{} sample(s) missing, e.g. {first}", errors.len());
+        message = format!("{} sample or clip file(s) missing, e.g. {first}", errors.len());
     }
     let mut app = App::new(project, path, None, 48_000, "no audio".into())
         .with_bank(samples)
+        .with_clips(clips)
         .with_settings(settings)
         .with_settings_file(settings_path);
     if recovered || midi {
@@ -13474,5 +13581,46 @@ mod tests {
         mouse(&mut a, MouseKind::Press(Button::Left), at);
         assert_eq!(a.project.tracks[0].steps[0], steps);
         assert_eq!(a.mode, Mode::Confirm(Confirm::Quit));
+    }
+
+    #[test]
+    fn undoing_a_song_entry_s_removal_gives_the_engine_its_clips_back() {
+        let (tx, mut rx) = spsc::channel(256);
+        let mut p = Project::new();
+        p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        p.apply(Edit::InsertSongEntry { index: 1, pattern: 0 }).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Audio)).unwrap();
+        let t = p.tracks.len() - 1;
+        p.tracks[t].clips = vec![ClipData::new("a.wav".into(), 1, 0, 10)].into();
+        let mut a = App::new(p, None, Some(EngineLink::new(tx, Arc::new(Shared::new()))), 48_000, "t".into());
+        assert!(a.edit(Edit::RemoveSongEntry(1)));
+        assert!(a.project.tracks[t].clips.is_empty());
+        while rx.pop().is_some() {}
+        a.undo();
+        assert_eq!(a.project.tracks[t].clips[0].entry, 1);
+        let sent: Vec<Command> = std::iter::from_fn(|| rx.pop()).collect();
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::SetClips { track, clips: Some(l) }
+                if usize::from(*track) == t && l.clips().len() == 1)),
+            "the clips go back to the engine"
+        );
+        a.redo();
+        assert!(a.project.tracks[t].clips.is_empty());
+    }
+
+    #[test]
+    fn an_audio_track_is_drawn_and_takes_no_notes() {
+        let mut p = Project::new();
+        p.apply(Edit::InsertSongEntry { index: 0, pattern: 0 }).unwrap();
+        p.apply(Edit::AddTrack(InstrumentKind::Audio)).unwrap();
+        let t = p.tracks.len() - 1;
+        p.tracks[t].clips = vec![ClipData::new("a.wav".into(), 0, 0, 10)].into();
+        let mut a = App::new(p, None, None, 48_000, "t".into());
+        a.track = t;
+        let mut s = Screen::new(120, 40);
+        a.draw(&mut s);
+        keys(&mut a, &[Key::Enter, Key::Char('z'), Key::Char('x')]);
+        a.draw(&mut s);
+        assert!(a.project.tracks[t].steps.iter().flatten().all(Option::is_none));
     }
 }
