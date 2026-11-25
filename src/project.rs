@@ -2308,7 +2308,8 @@ impl Project {
     /// the project's budget leaves after the samples in `samples`. Returns
     /// those that loaded, by path, and why the others did not.
     pub fn load_clips(&self, samples: &Bank) -> (ClipBank, Vec<String>) {
-        let used: usize = samples.values().map(|s| s.cost()).sum();
+        // Their frames, as the editor counts them when it loads either.
+        let used: usize = samples.values().map(|s| s.frames()).sum();
         self.load_clips_within(crate::sample::PROJECT_FRAMES.saturating_sub(used))
     }
 
@@ -4738,6 +4739,17 @@ pattern_division A 1/8
         ] {
             assert!(Project::from_text(&text).is_err(), "{why} loads:\n{text}");
         }
+    }
+
+    #[test]
+    fn a_clip_path_loads_as_a_sample_path_does() {
+        // A folder whose name starts with a space, as an absolute path a
+        // save writes for a file outside the project's folder.
+        let text = "tinvo 21\nsong A\n\ntrack audio\nclip 0 0 0 10 0 0 0 / Session/take one.wav\nend\n";
+        let p = Project::from_text(text).unwrap();
+        assert_eq!(p.tracks[0].clips[0].path, "/ Session/take one.wav");
+        assert!(p.to_text().contains("\nclip 0 0 0 10 0 0 0 / Session/take one.wav\n"));
+        assert_eq!(Project::from_text(&p.to_text()).unwrap(), p);
     }
 
     #[test]

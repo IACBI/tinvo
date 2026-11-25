@@ -881,7 +881,7 @@ fn clips() -> usize {
     let mut noise = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.bipolar() * 0.5).collect() };
     let audio = [
         Arc::new(ClipAudio::new(vec![noise(60_000), noise(60_000)], 44_100).unwrap()),
-        Arc::new(ClipAudio::new(vec![noise(30_000)], 48_000).unwrap()),
+        Arc::new(ClipAudio::new(vec![noise(30_000)], 96_000).unwrap()),
     ];
     let list = |shift: u16, k: usize| {
         let clips: Vec<ClipData> = (0..6u16)

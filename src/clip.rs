@@ -61,8 +61,13 @@ impl ClipData {
 
     /// What makes it a clip no project may hold, if anything does.
     pub fn problem(&self) -> Option<String> {
-        if let Some(why) = sample::unstorable(&self.path) {
-            return Some(why.replace("sample", "clip"));
+        // As a sample's path: whatever a line holds, with what the project
+        // writes checked when it saves.
+        if self.path.is_empty() || self.path.contains(['\n', '\r']) {
+            return Some("a clip's path is one line, not empty".into());
+        }
+        if self.path.len() > sample::MAX_PATH_BYTES {
+            return Some(format!("a clip path is at most {} bytes long", sample::MAX_PATH_BYTES));
         }
         if self.pulse >= MAX_PULSE {
             return Some(format!("a clip starts before pulse {MAX_PULSE} of its entry"));
@@ -119,6 +124,7 @@ impl ClipAudio {
         if !(1..=2).contains(&channels.len()) || channels.iter().any(|c| c.len() != channels[0].len()) {
             return Err("a clip is one or two channels of the same length".into());
         }
+        kernel();
         let overview = overview(&channels);
         let channels = channels.iter().map(|c| Sample::from_mono(c, sample_rate)).collect::<Result<Vec<_>, _>>()?;
         Ok(Self { channels: channels.into_boxed_slice(), overview })
@@ -151,14 +157,75 @@ impl ClipAudio {
     }
 
     /// Channel `c` (the first again for a mono clip) at frame `pos`
-    /// (`0 <= pos < frames`): read as it is on a whole frame, interpolated
-    /// between frames.
+    /// (`0 <= pos < frames`), read `step` frames apart: as it is on a whole
+    /// frame and interpolated between frames, or, further apart than one,
+    /// through a low-pass as far below the file's Nyquist frequency, so
+    /// nothing above the output's folds back.
     #[inline]
-    fn at(&self, c: usize, pos: f64) -> f32 {
+    fn at(&self, c: usize, pos: f64, step: f64) -> f32 {
         let s = &self.channels[c.min(self.channels.len() - 1)];
         let i = pos as usize;
-        if i as f64 == pos { s.at(i) } else { s.sinc(pos) }
+        if step > 1.0 {
+            lowpassed(s, pos, step)
+        } else if i as f64 == pos {
+            s.at(i)
+        } else {
+            s.sinc(pos)
+        }
     }
+}
+
+/// Half the width of the low-pass kernel, in zero crossings.
+const KERNEL_HALF: usize = 8;
+/// Its cutoff as a fraction of the output's Nyquist frequency: what lies
+/// above that output's Nyquist frequency is 30 dB down or more by then.
+const CUTOFF: f64 = 0.9;
+/// Values of the kernel tabulated per zero crossing.
+const KERNEL_STEPS: usize = 512;
+
+/// A Blackman-windowed sinc, from its centre to [`KERNEL_HALF`] crossings
+/// out (one value past them), built once, before any clip plays.
+fn kernel() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Box<[f32]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let half = KERNEL_HALF as f64;
+        (0..=KERNEL_HALF * KERNEL_STEPS + 1)
+            .map(|i| {
+                let x = i as f64 / KERNEL_STEPS as f64;
+                if x >= half {
+                    return 0.0;
+                }
+                let a = std::f64::consts::PI * x;
+                let sinc = if x == 0.0 { 1.0 } else { a.sin() / a };
+                let w = 0.42 + 0.5 * (a / half).cos() + 0.08 * (2.0 * a / half).cos();
+                (sinc * w) as f32
+            })
+            .collect()
+    })
+}
+
+/// `s` at `pos` through a low-pass a little below its Nyquist frequency over `step`,
+/// for reading it `step` (`> 1`) frames apart. Frames outside it are
+/// silence; the weights are normalised, so a constant stays as it is.
+fn lowpassed(s: &Sample, pos: f64, step: f64) -> f32 {
+    let table = kernel();
+    let reach = KERNEL_HALF as f64 * step / CUTOFF;
+    let scale = KERNEL_STEPS as f64 * CUTOFF / step;
+    let (lo, hi) = ((pos - reach).ceil() as i64, (pos + reach).floor() as i64);
+    let frames = s.frames() as i64;
+    let (mut acc, mut sum) = (0.0f32, 0.0f32);
+    for i in lo..=hi {
+        let x = (i as f64 - pos).abs() * scale;
+        let k = x as usize;
+        let Some(&a) = table.get(k) else { continue };
+        let b = table.get(k + 1).copied().unwrap_or(0.0);
+        let w = a + (b - a) * (x - k as f64) as f32;
+        sum += w;
+        if (0..frames).contains(&i) {
+            acc += s.at(i as usize) * w;
+        }
+    }
+    if sum > 0.0 { acc / sum } else { 0.0 }
 }
 
 fn overview(channels: &[Vec<f32>]) -> Box<[f32]> {
@@ -389,24 +456,40 @@ impl Player {
     }
 
     /// Puts `new` in place of the track's clips. What was playing fades
-    /// out unless [`Player::play`] carries it on at once; `retire` gets
-    /// the lists nothing plays from any more.
+    /// out unless [`Player::play`] carries it on at once; a fade already
+    /// under way goes on. `retire` gets the lists nothing plays from any
+    /// more.
     pub fn replace(&mut self, new: Option<Box<ClipList>>, retire: &mut impl FnMut(Box<ClipList>)) {
-        if self.tail.is_some_and(|t| t.old) {
-            self.tail = None;
-        }
-        if let Some(l) = self.old.take() {
-            retire(l);
-        }
         if let Some(v) = self.voice.take() {
+            // It fades from here, in place of a fade there was: one at a time.
             self.tail = Some(Voice { old: true, fade: self.declick, ..v });
-        } else if let Some(t) = &mut self.tail {
-            t.old = true;
+            if let Some(l) = self.old.take() {
+                retire(l);
+            }
+            self.old = self.list.take();
+        } else if self.tail.is_some_and(|t| t.old) {
+            // Fading from the list before; nothing plays from this one.
+            if let Some(l) = self.list.take() {
+                retire(l);
+            }
+        } else {
+            if let Some(l) = self.old.take() {
+                retire(l);
+            }
+            match &mut self.tail {
+                Some(t) => {
+                    t.old = true;
+                    self.old = self.list.take();
+                }
+                None => {
+                    if let Some(l) = self.list.take() {
+                        retire(l);
+                    }
+                }
+            }
         }
-        match self.list.take() {
-            Some(l) if self.tail.is_some() => self.old = Some(l),
-            Some(l) => retire(l),
-            None => self.tail = None,
+        if self.tail.is_some_and(|t| t.old) && self.old.is_none() {
+            self.tail = None;
         }
         self.list = new;
     }
@@ -529,8 +612,8 @@ fn sound(c: &Placed, v: &mut Voice, out: &mut [f32], declick: u32, tail: bool) -
             g *= v.fade as f32 / d;
             v.fade -= 1;
         }
-        f[0] += a.at(0, src) * g;
-        f[1] += a.at(1, src) * g;
+        f[0] += a.at(0, src, v.inc) * g;
+        f[1] += a.at(1, src, v.inc) * g;
         v.pos += v.inc;
     }
     true
@@ -580,12 +663,12 @@ mod tests {
         let (stereo, _) = wav::encode(&[0.5, -0.5, 0.25, -0.25], 2, 44_100, wav::SampleFormat::Float32, 0).unwrap();
         let a = read_limited(&mut std::io::Cursor::new(&stereo), 4).unwrap();
         assert_eq!((a.frames(), a.channels(), a.sample_rate(), a.cost()), (2, 2, 44_100, 4));
-        assert_eq!((a.at(0, 1.0), a.at(1, 1.0)), (0.25, -0.25));
+        assert_eq!((a.at(0, 1.0, 1.0), a.at(1, 1.0, 1.0)), (0.25, -0.25));
         assert!(read_limited(&mut std::io::Cursor::new(&stereo), 3).unwrap_err().contains("values left"));
         let (three, _) = wav::encode(&[0.0; 6], 3, 48_000, wav::SampleFormat::Pcm16, 0).unwrap();
         assert!(read_limited(&mut std::io::Cursor::new(&three), 100).unwrap_err().contains("3 channels"));
         let mono = ClipAudio::new(vec![vec![0.0, 0.5, -1.0]], 48_000).unwrap();
-        assert_eq!(mono.at(1, 2.0), -1.0, "a mono clip plays on both sides");
+        assert_eq!(mono.at(1, 2.0, 1.0), -1.0, "a mono clip plays on both sides");
         assert_eq!(mono.peak(0, 3), 1.0);
         assert!(ClipAudio::new(vec![vec![0.0; 3], vec![0.0; 2]], 48_000).is_err());
     }
@@ -649,5 +732,50 @@ mod tests {
         assert!(p.tail.is_none(), "no cut");
         p.play(0, 500.0, false);
         assert!(p.tail.is_some(), "a jump is a cut");
+    }
+
+    #[test]
+    fn a_file_read_further_apart_than_its_frames_is_low_passed_first() {
+        // 30 kHz and 5 kHz tones at 96 kHz, played at 48 kHz: the first
+        // would fold back to 18 kHz.
+        let tone = |f: f32| -> Vec<f32> {
+            (0..9600).map(|i| (std::f32::consts::TAU * f * i as f32 / 96_000.0).sin() * 0.5).collect()
+        };
+        let rms = |f: f32| {
+            let a = Arc::new(ClipAudio::new(vec![tone(f)], 96_000).unwrap());
+            let mut p = Player::new(48_000.0);
+            p.replace(
+                Some(ClipList::build(&[ClipData::new("t".into(), 0, 0, 9600)], |_| Some(Arc::clone(&a)))),
+                &mut |_| {},
+            );
+            p.play(0, 0.0, false);
+            let mut out = vec![0.0; 2 * 4800];
+            p.render(&mut out);
+            let mid = &out[2 * 1000..2 * 3800];
+            (mid.iter().map(|x| x * x).sum::<f32>() / mid.len() as f32).sqrt()
+        };
+        assert!(rms(30_000.0) < 0.01, "{}", rms(30_000.0));
+        assert!((rms(5_000.0) - 0.5 / 2f32.sqrt()).abs() < 0.01, "{}", rms(5_000.0));
+    }
+
+    #[test]
+    fn a_fade_under_way_goes_on_when_the_clips_are_taken_away_again() {
+        let mut p = Player::new(48_000.0);
+        p.replace(Some(list(&[(0, 0)])), &mut |_| {});
+        p.play(0, 0.0, false);
+        let mut out = vec![0.0; 2 * 48];
+        p.render(&mut out);
+        let mut back = 0;
+        p.replace(None, &mut |_| back += 1);
+        let mut out = vec![0.0; 2 * 48];
+        p.render(&mut out);
+        p.replace(None, &mut |_| back += 1);
+        assert_eq!(back, 0, "the fading list is kept");
+        let mut out = vec![0.0; 2 * 200];
+        p.render(&mut out);
+        assert!(out[0] > 0.0 && out[0] < 0.5 * 0.7, "it fades on: {}", out[0]);
+        // 3 ms is 144 frames, 48 of them gone.
+        assert!(out[2 * 90] > 0.0 && out[2 * 96..].iter().all(|&x| x == 0.0));
+        assert!(p.take_old().is_some() && !p.is_active());
     }
 }
